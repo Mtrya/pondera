@@ -1,7 +1,7 @@
 [project]
-name = "chess-transformer"
-version = "0.1.0"
-description = "Add your description here"
+name = "pondera"
+version = "0.2.0"
+description = "Search-free chess training: distillation + self-play RL with internalized search"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

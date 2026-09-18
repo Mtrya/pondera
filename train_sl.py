@@ -16,13 +16,13 @@ from transformers import (
 )
 
 from chess_core import UCI_MOVE_TO_IDX
-from model import ChessFormerModel
+from model import PonderaModel
 
 
 class SLTrainer:
     def __init__(
         self,
-        model: ChessFormerModel,
+        model: PonderaModel,
         dataloader: DataLoader,
         learning_rate: float,
         value_ratio: float,
@@ -93,7 +93,7 @@ class SLTrainer:
 
         # swanlab
         swanlab.init(
-            project="chessformer",
+            project="pondera",
             experiment_name=experiment_name,
             config={
                 "value_ratio": self.value_ratio,
@@ -287,7 +287,7 @@ class SLTrainer:
         swanlab.finish()
 
     def _save_checkpoint(self, epoch: int, mark: str):
-        checkpoint_path = f"./ckpts/chessformer-sl_{mark}.pth"
+        checkpoint_path = f"./ckpts/pondera-sl_{mark}.pth"
         checkpoint = {
             "epoch": epoch,
             "global_steps": self.global_steps,
@@ -407,7 +407,7 @@ def train():
         "possible_moves": len(UCI_MOVE_TO_IDX),
         "dtype": torch.float32,
     }
-    model = ChessFormerModel(**model_config)
+    model = PonderaModel(**model_config)
     ds = load_dataset("kaupane/lichess-2023-01-stockfish-annotated", split="depth18")
     ds = ds.with_format("torch")
     dataloader = DataLoader(
@@ -426,7 +426,7 @@ def train():
         warmup_ratio=0.05,
         lr_scheduler_type="cosine",
         model_config=model_config,
-        experiment_name="chessformer-sl_0",
+        experiment_name="pondera-sl_0",
     )
     trainer.train()
 

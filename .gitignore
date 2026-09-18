@@ -5,5 +5,12 @@
 log/*
 *.md
 !README.md
+!AGENTS.md
+!notes/**/*.md
+!results/**/*.md
 data/*_human/
 data/*_stockfish/
+data/probe/
+config.json
+bin/
+swanlog/

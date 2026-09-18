@@ -15,8 +15,8 @@ import chess.svg
 import gradio as gr
 import torch
 
-from chess_core import ChessformerConfig, Engine, StockfishConfig
-from model import ChessFormerModel
+from chess_core import PonderaConfig, Engine, StockfishConfig
+from model import PonderaModel
 
 
 class ChessApp:
@@ -54,7 +54,7 @@ class ChessApp:
                 "possible_moves": 1969,
                 "dtype": torch.float32,
             }
-            model = ChessFormerModel(**config)
+            model = PonderaModel(**config)
             model.from_pretrained(path)
             model.to(self.device)
             model.eval()
@@ -258,8 +258,8 @@ class ChessApp:
             config = StockfishConfig(engine_path="/usr/games/stockfish", depth=depth)
             return Engine(type="stockfish", stockfish_config=config)
         elif engine_type in self.models:
-            config = ChessformerConfig(
-                chessformer=self.models[engine_type],
+            config = PonderaConfig(
+                pondera=self.models[engine_type],
                 device=self.device,
                 temperature=temperature,
                 depth=depth if depth > 0 else 0,
@@ -267,7 +267,7 @@ class ChessApp:
                 decay_rate=0.6,
                 max_batch_size=800,
             )
-            return Engine(type="chessformer", chessformer_config=config)
+            return Engine(type="pondera", pondera_config=config)
 
         return None
 
@@ -311,7 +311,7 @@ class ChessApp:
         """Generate move history in PGN format"""
         try:
             game = chess.pgn.Game()
-            game.headers["Event"] = "ChessFormer Demo"
+            game.headers["Event"] = "Pondera Demo"
             game.headers["Date"] = datetime.now().strftime("%Y.%m.%d")
             game.headers["White"] = (
                 "You" if self.user_color == chess.WHITE else "Engine"
@@ -618,9 +618,9 @@ app = ChessApp(torch.device("cpu"))
 def create_interface():
     """Create the Gradio interface with improved layout"""
 
-    with gr.Blocks(title="ChessFormer Demo", theme=gr.themes.Soft()) as interface:
-        gr.Markdown("# 🏆 ChessFormer Demo")
-        gr.Markdown("Play chess against ChessFormer models or Stockfish!")
+    with gr.Blocks(title="Pondera Demo", theme=gr.themes.Soft()) as interface:
+        gr.Markdown("# 🏆 Pondera Demo")
+        gr.Markdown("Play chess against Pondera models or Stockfish!")
 
         with gr.Row():
             # Left column - Analysis + History
@@ -696,7 +696,7 @@ def create_interface():
                     maximum=2.0,
                     value=0.5,
                     step=0.1,
-                    label="Temperature (ChessFormer only)",
+                    label="Temperature (Pondera only)",
                 )
 
                 new_game_button = gr.Button(
@@ -730,11 +730,11 @@ def create_interface():
         # Available models info
         gr.Markdown("### 🤖 Available Models")
         if app.models:
-            model_info = "**Loaded ChessFormer models:**\n" + "\n".join(
+            model_info = "**Loaded Pondera models:**\n" + "\n".join(
                 [f"• {name}" for name in app.models.keys()]
             )
         else:
-            model_info = "⚠️ No ChessFormer models found. Make sure model checkpoints are in the ./ckpts/ directory."
+            model_info = "⚠️ No Pondera models found. Make sure model checkpoints are in the ./ckpts/ directory."
         gr.Markdown(model_info)
 
         # Function to update depth limits based on engine selection

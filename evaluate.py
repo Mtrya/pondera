@@ -1,11 +1,11 @@
 """
-Evaluate ChessFormerModel's different checkpoints on several metrics:
-- loss on kaupane/lichess-2023-01-stockfish-annotated dataset's depth27 split
+Evaluate PonderaModel's different checkpoints on several metrics:
+- policy metrics (CE loss / top-1 accuracy / invalid-move probability) on the
+  kaupane/chess-positions stockfish_val split
 - stockfish (Stockfish 17 depth 24) analyzed game quality + move annotation (best/excellent/good/inaccuracy/mistake/blunder)
 """
 
 import math
-import multiprocessing
 from typing import Dict, List, Optional, Tuple
 
 import chess
@@ -14,11 +14,11 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from chess_core import UCI_MOVE_TO_IDX, ChessformerConfig, Engine, StockfishConfig
-from model import ChessFormerModel
+from chess_core import UCI_MOVE_TO_IDX, PonderaConfig, Engine, StockfishConfig
+from model import PonderaModel
 
 
-def load_model(checkpoint_path: str, device: torch.device) -> ChessFormerModel:
+def load_model(checkpoint_path: str, device: torch.device) -> PonderaModel:
     print(f"Loading model from {checkpoint_path}...")
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -33,7 +33,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> ChessFormerModel:
                 "dropout": 0.00,
                 "possible_moves": 1969,
             }
-        model = ChessFormerModel(
+        model = PonderaModel(
             num_blocks=config.get("num_blocks"),
             hidden_size=config.get("hidden_size"),
             intermediate_size=config.get("intermediate_size"),
@@ -48,7 +48,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> ChessFormerModel:
         print("Model loaded successfully")
         return model
     except FileNotFoundError:
-        model = ChessFormerModel.from_pretrained(checkpoint_path)
+        model = PonderaModel.from_pretrained(checkpoint_path)
         model.to(device)
         model.eval()
         print("Model loaded successfully")
@@ -59,13 +59,18 @@ def load_model(checkpoint_path: str, device: torch.device) -> ChessFormerModel:
 
 
 def evaluate_loss(
-    model: ChessFormerModel,
+    model: PonderaModel,
     dataset_name: str,
     dataset_split: str,
     batch_size: int,
     device: torch.device,
+    max_batches: Optional[int] = None,
 ) -> Dict[str, float]:
-    """Calculate loss on a validation dataset"""
+    """Policy-only metrics on a (fen, next_move) validation dataset.
+
+    The current dataset schema has no score/valid_moves fields, so value loss
+    is skipped and legal-move masks are derived with python-chess on the fly.
+    """
 
     # Prepare dataloader and progress bar
     dataset = load_dataset(dataset_name, split=dataset_split)
@@ -75,23 +80,27 @@ def evaluate_loss(
         batch_size=batch_size,
         shuffle=True,
     )
-    pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc="Validation")
+    total = len(dataloader)
+    if max_batches is not None:
+        total = min(total, max_batches)
+    pbar = tqdm(enumerate(dataloader), total=total, desc="Validation")
 
     # Main loop
     model = model.to(device)
     model.eval()
     total_act_loss = 0.0
-    total_val_loss = 0.0
     total_inv_loss = 0.0
+    total_top1 = 0.0
+    n_batches = 0
 
-    with torch.no_grad(), multiprocessing.Pool(processes=12) as pool:
+    with torch.no_grad():
         for idx, sample in pbar:
+            if max_batches is not None and idx >= max_batches:
+                break
             fens = sample["fen"]
-            repetition_counts = sample["repetition_count"].to(device)
-            best_moves_uci = sample["best_move"]
-            scores = sample["score"].to(device)
-            valid_moves_str_list = sample["valid_moves"]
+            best_moves_uci = sample["next_move"]
             batch_size = len(fens)
+            repetition_counts = torch.ones(batch_size, dtype=torch.long, device=device)
 
             try:
                 best_moves_indices = [UCI_MOVE_TO_IDX[move] for move in best_moves_uci]
@@ -103,83 +112,78 @@ def evaluate_loss(
             )
 
             invalid_move_mask = torch.ones(
-                (batch_size, 1969), device=device, dtype=torch.float32
+                (batch_size, len(UCI_MOVE_TO_IDX)), device=device, dtype=torch.float32
             )
             for i in range(batch_size):
-                valid_uci_moves = valid_moves_str_list[i].split(" ")
-                try:
-                    valid_indices = [UCI_MOVE_TO_IDX[move] for move in valid_uci_moves]
-                    if valid_indices:
-                        invalid_move_mask[i, valid_indices] = 0.0
-                except Exception:
-                    raise
+                board = chess.Board(fens[i])
+                valid_indices = [UCI_MOVE_TO_IDX[m.uci()] for m in board.legal_moves]
+                if board.can_claim_draw():
+                    valid_indices.append(0)  # "<claim_draw>" is index 0
+                invalid_move_mask[i, valid_indices] = 0.0
 
             # Compute losses
-            actions, values = model(fens, repetition_counts)
+            actions, _ = model(fens, repetition_counts)
             act_loss = torch.nn.functional.cross_entropy(actions, best_moves_tensor)
-            val_loss = torch.nn.functional.mse_loss(values, scores)
             probs = torch.softmax(actions, dim=-1)
             invalid_probs_sum = (probs * invalid_move_mask).sum(dim=-1)
             inv_loss = invalid_probs_sum.mean()
+            top1 = (actions.argmax(dim=-1) == best_moves_tensor).float().mean()
 
             total_act_loss += act_loss.item()
-            total_val_loss += val_loss.item()
             total_inv_loss += inv_loss.item()
+            total_top1 += top1.item()
+            n_batches += 1
 
             pbar.set_postfix(
                 {
-                    "ActLoss": f"{total_act_loss / (idx + 1):.4f}",
-                    "ValLoss": f"{total_val_loss / (idx + 1):.4f}",
-                    "InvLoss": f"{total_inv_loss / (idx + 1):.4f}",
+                    "ActLoss": f"{total_act_loss / n_batches:.4f}",
+                    "Top1": f"{total_top1 / n_batches:.3f}",
+                    "InvProb": f"{total_inv_loss / n_batches:.4f}",
                 }
             )
 
-    avg_act_loss = total_act_loss / len(dataloader)
-    avg_val_loss = total_val_loss / len(dataloader)
-    avg_inv_loss = total_inv_loss / len(dataloader)
-
     results = {
-        "act_loss": avg_act_loss,
-        "val_loss": avg_val_loss,
-        "invalid_move_loss": avg_inv_loss,
+        "act_loss": total_act_loss / n_batches,
+        "top1": total_top1 / n_batches,
+        "invalid_move_prob": total_inv_loss / n_batches,
     }
 
     return results
 
 
 def compare_checkpoints(
-    checkpoint_path_list: List[str], device, batch_size=512
+    checkpoint_path_list: List[str], device, batch_size=512, max_batches: Optional[int] = None
 ) -> Dict[str, str]:
-    """Compare checkpoints based on evaluation loss"""
-    dataset_name = "kaupane/lichess-2023-01-stockfish-annotated"
-    dataset_split = "depth27"
+    """Compare checkpoints based on policy metrics on the stockfish_val split"""
+    dataset_name = "kaupane/chess-positions"
+    dataset_split = "stockfish_val"
     best_act_checkpoint = None
-    best_val_checkpoint = None
+    best_top1_checkpoint = None
     best_inv_checkpoint = None
     best_act_loss = math.inf
-    best_val_loss = math.inf
+    best_top1 = -math.inf
     best_inv_loss = math.inf
     for checkpoint in checkpoint_path_list:
         print(f"Start evaluating {checkpoint}")
         model = load_model(checkpoint, device)
         result = evaluate_loss(
-            model, dataset_name, dataset_split, batch_size=batch_size, device=device
+            model, dataset_name, dataset_split, batch_size=batch_size, device=device, max_batches=max_batches
         )
         if result["act_loss"] < best_act_loss:
             best_act_loss = result["act_loss"]
             best_act_checkpoint = checkpoint
-        if result["val_loss"] < best_val_loss:
-            best_val_loss = result["val_loss"]
-            best_val_checkpoint = checkpoint
-        if result["invalid_move_loss"] < best_inv_loss:
-            best_inv_loss = result["invalid_move_loss"]
+        if result["top1"] > best_top1:
+            best_top1 = result["top1"]
+            best_top1_checkpoint = checkpoint
+        if result["invalid_move_prob"] < best_inv_loss:
+            best_inv_loss = result["invalid_move_prob"]
             best_inv_checkpoint = checkpoint
     print(f"Best act loss {best_act_loss} from {best_act_checkpoint}")
-    print(f"Best val loss {best_val_loss} from {best_val_checkpoint}")
-    print(f"Best inv loss {best_inv_loss} from {best_inv_checkpoint}")
+    print(f"Best top1 {best_top1} from {best_top1_checkpoint}")
+    print(f"Best invalid move prob {best_inv_loss} from {best_inv_checkpoint}")
     return {
         "best_act_model": best_act_checkpoint,
-        "best_val_model": best_val_checkpoint,
+        "best_top1_model": best_top1_checkpoint,
         "best_inv_model": best_inv_checkpoint,
     }
 
@@ -313,13 +317,13 @@ def play_games(
 
 
 def evaluate_win_rate(
-    chessformer_engine, stockfish_path: str, depths: List[int], num_games: int
+    pondera_engine, stockfish_path: str, depths: List[int], num_games: int
 ) -> Dict[str, Dict[str, float]]:
     """
     Evaluates win rate against Stockfish at various depths.
     Returns: {depth, summary}
         - summary: wins, losses, draws, errors, total_played, win_rate, loss_rate, draw_rate, error_rate
-        - 'wins' refers to ChessFormer wins.
+        - 'wins' refers to Pondera wins.
     """
     results_per_depth = {}
 
@@ -335,18 +339,18 @@ def evaluate_win_rate(
 
         all_results = []
 
-        # Play games with ChessFormer as White
+        # Play games with Pondera as White
         results_white = play_games(
-            engine1=chessformer_engine,
+            engine1=pondera_engine,
             engine2=stockfish_engine,
             max_moves=200,
             num_games=num_games_per_color,
         )
         all_results.extend(results_white)
-        # Play games with ChessFormer as Black
+        # Play games with Pondera as Black
         results_black = play_games(
             engine1=stockfish_engine,
-            engine2=chessformer_engine,
+            engine2=pondera_engine,
             max_moves=200,
             num_games=num_games_per_color,
         )
@@ -415,7 +419,7 @@ def _classify_delta_e(delta_e: float) -> str:
 
 
 def analyze_game_quality(
-    chessformer_engine: Engine,
+    pondera_engine: Engine,
     stockfish_path: str,
     num_games: int,
     opponent_depth: int,
@@ -423,8 +427,8 @@ def analyze_game_quality(
     max_moves_per_game: int = 200,
 ) -> Dict[str, float]:
     """
-    Analyzes the quality of moves made by ChessFormer against a Stockfish opponent.
-    Plays games (<5 recommended), while analyzing ChessFormer's moves using a strong Stockfish engine.
+    Analyzes the quality of moves made by Pondera against a Stockfish opponent.
+    Plays games (<5 recommended), while analyzing Pondera's moves using a strong Stockfish engine.
 
     Should be interactive: for each position and move made, print position score and move analysis.
 
@@ -455,10 +459,10 @@ def analyze_game_quality(
 
     for game_idx in range(num_games):
         board = chess.Board()
-        # Alternate colors: ChessFormer plays white in even games
-        chessformer_is_white = game_idx % 2 == 0
+        # Alternate colors: Pondera plays white in even games
+        pondera_is_white = game_idx % 2 == 0
         print(
-            f"\nStarting Game {game_idx + 1}/{num_games} (ChessFormer plays {'White' if chessformer_is_white else 'Black'})."
+            f"\nStarting Game {game_idx + 1}/{num_games} (Pondera plays {'White' if pondera_is_white else 'Black'})."
         )
 
         move_count = 0
@@ -466,24 +470,24 @@ def analyze_game_quality(
             not board.is_game_over(claim_draw=True)
             and move_count < max_moves_per_game * 2
         ):
-            is_chessformer_turn = (
-                board.turn == chess.WHITE and chessformer_is_white
-            ) or (board.turn == chess.BLACK and not chessformer_is_white)
+            is_pondera_turn = (
+                board.turn == chess.WHITE and pondera_is_white
+            ) or (board.turn == chess.BLACK and not pondera_is_white)
 
             current_player_engine = (
-                chessformer_engine if is_chessformer_turn else opponent_engine
+                pondera_engine if is_pondera_turn else opponent_engine
             )
-            player_name = "ChessFormer" if is_chessformer_turn else "Stockfish"
+            player_name = "Pondera" if is_pondera_turn else "Stockfish"
 
-            # Analyze pre-move position if it's ChessFormer's turn
+            # Analyze pre-move position if it's Pondera's turn
             score_before_pov = None
-            if is_chessformer_turn:
+            if is_pondera_turn:
                 try:
                     # From analyzer (white)'s perspective
                     score_before_analyzer = analyzer_engine.analyze_position(
                         board.copy(stack=True)
                     )
-                    if not chessformer_is_white:
+                    if not pondera_is_white:
                         score_before_pov = -score_before_analyzer
                     else:
                         score_before_pov = score_before_analyzer
@@ -506,11 +510,11 @@ def analyze_game_quality(
                 board, return_perplexity=True
             )
             # Print opponent's move
-            if not is_chessformer_turn:
+            if not is_pondera_turn:
                 print(f"  Opponent's move: {move_uci}")
 
-            # Analyze post-move position if it's ChessFormer's turn
-            if is_chessformer_turn and score_before_pov is not None:
+            # Analyze post-move position if it's Pondera's turn
+            if is_pondera_turn and score_before_pov is not None:
                 # Handle special action of draw claim
                 if move_uci == "<claim_draw>":
                     if board.can_claim_draw():
@@ -529,7 +533,7 @@ def analyze_game_quality(
                     else:
                         # Should not happen with Engine class filtering, but check anyway
                         print(
-                            f"Warning: ChessFormer proposed illegal move: <claim_draw> for FEN: {board.fen()}"
+                            f"Warning: Pondera proposed illegal move: <claim_draw> for FEN: {board.fen()}"
                         )
                         analysis_errors += 1
                 # Not draw claim, should be normal uci move
@@ -545,7 +549,7 @@ def analyze_game_quality(
                         )
 
                         if score_after_analyzer is not None:
-                            if not chessformer_is_white:
+                            if not pondera_is_white:
                                 score_after_pov = -score_after_analyzer
                             else:
                                 score_after_pov = score_after_analyzer
@@ -566,7 +570,7 @@ def analyze_game_quality(
                         else:
                             # Should not happen with Engine class filtering, but check anyway
                             print(
-                                f"Warning: ChessFormer proposed illegal move: {move_uci} for FEN: {board.fen()}"
+                                f"Warning: Pondera proposed illegal move: {move_uci} for FEN: {board.fen()}"
                             )
                             analysis_errors += 1
 
@@ -583,8 +587,8 @@ def analyze_game_quality(
         # Game End
         outcome = board.outcome(claim_draw=True)
         if outcome:
-            white_player = "ChessFormer" if chessformer_is_white else "Stockfish"
-            black_player = "Stockfish" if chessformer_is_white else "ChessFormer"
+            white_player = "Pondera" if pondera_is_white else "Stockfish"
+            black_player = "Stockfish" if pondera_is_white else "Pondera"
             print(
                 f"Game {game_idx + 1} finished: {outcome.termination.name} - Result: {white_player} {outcome.result()} {black_player}"
             )
@@ -626,11 +630,10 @@ def eval_loss(model_path, device):
     Will first test all model checkpoints on the loss/invalid_moves_rate,
     Since it would make no sense to evaluate models that can't even make valid moves any further
     """
-    dataset_name = "kaupane/lichess-2023-01-stockfish-annotated"
-    # dataset_split = "depth18[:65536]"
-    dataset_split = "depth27[32768:]"
+    dataset_name = "kaupane/chess-positions"
+    dataset_split = "stockfish_val"
     model = load_model(model_path, device=device)
-    batch_size = 4
+    batch_size = 512
     results = evaluate_loss(model, dataset_name, dataset_split, batch_size, device)
 
 
@@ -638,9 +641,9 @@ def main(model_path, device):
     """
     Continue to test selected models on win rate & game quality.
     """
-    chessformer_model = load_model(model_path, device=device)
-    config = ChessformerConfig(
-        chessformer=chessformer_model,
+    pondera_model = load_model(model_path, device=device)
+    config = PonderaConfig(
+        pondera=pondera_model,
         device=device,
         temperature=0.5,
         depth=0,
@@ -648,9 +651,9 @@ def main(model_path, device):
         decay_rate=0.6,
         max_batch_size=864,
     )
-    chessformer_engine = Engine("chessformer", config)
+    pondera_engine = Engine("pondera", config)
     analyze_game_quality(
-        chessformer_engine=chessformer_engine,
+        pondera_engine=pondera_engine,
         stockfish_path="/usr/games/stockfish",
         num_games=4,
         opponent_depth=0,
@@ -659,7 +662,7 @@ def main(model_path, device):
 
 
 if __name__ == "__main__":
-    # model_path = "./ckpts/chessformer-sl_10.pth"
+    # model_path = "./ckpts/pondera-sl_10.pth"
     model_path = "kaupane/ChessFormer-RL"
     device = torch.device("cpu")
     eval_loss(model_path, device)
