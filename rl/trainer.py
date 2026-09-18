@@ -20,7 +20,7 @@ from chess_core import (
     StockfishConfig,
 )
 from common import ensure_runtime_dirs
-from model import ChessFormerModel
+from model import PonderaModel
 from rl.buffer import Game, ReplayBuffer
 
 
@@ -29,7 +29,7 @@ class RLTrainer:
 
     def __init__(
         self,
-        model: ChessFormerModel,
+        model: PonderaModel,
         learning_rate: float,
         value_ratio: float,
         entropy_ratio: float,
@@ -118,7 +118,7 @@ class RLTrainer:
 
         # swanlab
         swanlab.init(
-            project="chessformer",
+            project="pondera",
             experiment_name=experiment_name,
             config={
                 "learning_rate": self.learning_rate,
@@ -471,7 +471,7 @@ class RLTrainer:
 
     def _save_checkpoint(self, episode: str, mark: str):
         """Save model checkpoint"""
-        checkpoint_path = f"./ckpts/chessformer-rl_{mark}.pth"
+        checkpoint_path = f"./ckpts/pondera-rl_{mark}.pth"
         checkpoint = {
             "episode": episode,
             "global_steps": self.global_steps,

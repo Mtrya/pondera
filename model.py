@@ -227,6 +227,67 @@ class FENTokenizer(nn.Module):
 
         return torch.cat([batch_tokens, repetition_tokens], dim=1)  # (B, 73, D)
 
+    def forward_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        """Pre-encoded token ids -> embeddings. Mirrors forward() on parsed FENs.
+
+        Args:
+            ids: (B, 73) integer tensor with the layout from chess_core.tokenize
+
+        Returns:
+            (B, 73, hidden_size)
+        """
+        device = self.side_embed.weight.device
+        ids = ids.to(device=device, dtype=torch.long)
+        bs = ids.shape[0]
+
+        square_indices = torch.arange(64, device=device)
+        board_tokens = self.piece_embed(ids[:, :64]) + self.pos_embed(
+            square_indices
+        )  # (B,64,D)
+
+        side_token = self.side_embed(ids[:, 64]).unsqueeze(1)  # (B,1,D)
+
+        castling_params = torch.cat(
+            [
+                self.castling_embed_K,
+                self.castling_embed_Q,
+                self.castling_embed_k,
+                self.castling_embed_q,
+            ],
+            dim=1,
+        ).view(4, -1)  # (4,D)
+        castling_present = ids[:, 65:69].unsqueeze(-1).bool()  # (B,4,1)
+        castling_tokens = torch.where(
+            castling_present,
+            castling_params.unsqueeze(0),
+            self.no_castling_embed.view(1, 1, -1),
+        )  # (B,4,D)
+
+        ep_ids = ids[:, 69]
+        ep_square_tokens = self.pos_embed(ep_ids.clamp(max=63))  # (B,D)
+        ep_token = torch.where(
+            (ep_ids < 64).unsqueeze(-1),
+            ep_square_tokens,
+            self.no_en_passant_embed.view(1, -1).expand(bs, -1),
+        ).unsqueeze(1)  # (B,1,D)
+
+        half_move_token = self.half_move_embed(ids[:, 70]).unsqueeze(1)  # (B,1,D)
+        full_move_token = self.full_move_embed(ids[:, 71]).unsqueeze(1)  # (B,1,D)
+        repetition_token = self.repetition_embed(ids[:, 72]).unsqueeze(1)  # (B,1,D)
+
+        return torch.cat(
+            [
+                board_tokens,
+                side_token,
+                castling_tokens,
+                ep_token,
+                half_move_token,
+                full_move_token,
+                repetition_token,
+            ],
+            dim=1,
+        )  # (B,73,D)
+
 
 # --- Helper Modules --- #
 class SwiGLUFFN(nn.Module):
@@ -327,7 +388,7 @@ class TransformerEncoderLayer(nn.Module):
             )
             return self.dropout_sa(attn_output), attn_weights
         else:
-            x = self.self_attn(x, x, x)[0]
+            x = self.self_attn(x, x, x, need_weights=False)[0]
             return self.dropout_sa(x)
 
     def _ff_block(self, x):
@@ -338,7 +399,7 @@ class TransformerEncoderLayer(nn.Module):
 
 
 # --- Model Arch --- #
-class ChessFormerModel(nn.Module, PyTorchModelHubMixin):
+class PonderaModel(nn.Module, PyTorchModelHubMixin):
     def __init__(
         self,
         num_blocks,
@@ -417,9 +478,16 @@ class ChessFormerModel(nn.Module, PyTorchModelHubMixin):
                 nn.init.normal_(param, std=0.02)
 
     def forward(
-        self, fen: List[str], repetitions: torch.Tensor, return_attention: bool = False
+        self,
+        fen: List[str] = None,
+        repetitions: torch.Tensor = None,
+        return_attention: bool = False,
+        ids: torch.Tensor = None,
     ) -> torch.Tensor:
-        x = self.fen_tokenizer(fen, repetitions)  # (B,73,D), pos embed are added here
+        if ids is not None:
+            x = self.fen_tokenizer.forward_ids(ids)  # (B,73,D)
+        else:
+            x = self.fen_tokenizer(fen, repetitions)  # (B,73,D)
         bs = x.shape[0]
         x = torch.cat(
             [x, self.act_token.expand(bs, -1, -1), self.val_token.expand(bs, -1, -1)],
@@ -451,16 +519,16 @@ class ChessFormerModel(nn.Module, PyTorchModelHubMixin):
 def load_model(ckpt_path):
     checkpoint = torch.load(ckpt_path)
     model_config = checkpoint["model_config"]
-    model = ChessFormerModel(**model_config)
+    model = PonderaModel(**model_config)
     model.load_state_dict(checkpoint["model_state_dict"])
     return model
 
 
 if __name__ == "__main__":
     checkpoint = torch.load(
-        "./ckpts/chessformer-sl_13.pth", map_location=torch.device("cpu")
+        "./ckpts/pondera-sl_13.pth", map_location=torch.device("cpu")
     )
-    model = ChessFormerModel(**checkpoint["config"])
+    model = PonderaModel(**checkpoint["config"])
     model.load_state_dict(checkpoint["model_state_dict"])
 
     model.push_to_hub("kaupane/ChessFormer-SL")

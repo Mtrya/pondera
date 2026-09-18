@@ -1,4 +1,4 @@
-"""An engine class to provide a universal way to interact with both chessformer and stockfish"""
+"""An engine class to provide a universal way to interact with both pondera and stockfish"""
 
 import math
 import multiprocessing
@@ -21,12 +21,13 @@ from torch.distributions import Categorical
 
 
 @dataclass
-class ChessformerConfig:
-    chessformer: torch.nn.Module = None
+class PonderaConfig:
+    pondera: torch.nn.Module = None
     device: Optional[torch.device] = None
     temperature: float = 0.5
     depth: int = 2
     top_k: int = 8
+    top_p: float = 1.0
     decay_rate: float = 0.6
     max_batch_size: int = 896
 
@@ -94,7 +95,7 @@ def _stockfish_worker(
 
 
 def _compute_repetition_single(board: chess.Board) -> int:
-    """Compute repetition count. Used in _chessformer_move and _batch_chessformer_move"""
+    """Compute repetition count. Used in _pondera_move and _batch_pondera_move"""
 
     transposition_key = board._transposition_key()
     count = 0
@@ -122,19 +123,19 @@ class Engine:
     def __init__(
         self,
         type: str,
-        chessformer_config: Optional[ChessformerConfig] = None,
+        pondera_config: Optional[PonderaConfig] = None,
         stockfish_config: Optional[StockfishConfig] = None,
     ):
         self.type = type
-        if type == "chessformer":
-            if chessformer_config is None:
+        if type == "pondera":
+            if pondera_config is None:
                 raise ValueError(
-                    "ChessformerConfig must be provided for chessformer engine."
+                    "PonderaConfig must be provided for pondera engine."
                 )
 
-            self.config = chessformer_config
-            if self.config.chessformer is None:
-                raise ValueError("ChessFormer model must be provided in config.")
+            self.config = pondera_config
+            if self.config.pondera is None:
+                raise ValueError("Pondera model must be provided in config.")
 
             if self.config.device is None:
                 self.device = torch.device(
@@ -145,7 +146,7 @@ class Engine:
             else:
                 self.device = self.config.device
 
-            self.model = self.config.chessformer
+            self.model = self.config.pondera
             self.model.to(self.device)
             self.model.eval()
 
@@ -153,6 +154,8 @@ class Engine:
                 raise ValueError("Temperature must be greater than 0.")
             if not (self.config.top_k > 0):
                 raise ValueError("Top-k must be greater than 0.")
+            if not (0.0 < self.config.top_p <= 1.0):
+                raise ValueError("Top-p must be in range (0.0, 1.0].")
             if not (self.config.depth >= 0):
                 raise ValueError("Depth must be greater than or equal to 0.")
             if not (0.0 < self.config.decay_rate <= 1.0):
@@ -186,7 +189,7 @@ class Engine:
                 raise ValueError(f"Invalid engine path or engine not found: {e}")
         else:
             raise ValueError(
-                "Invalid engine type. Choose 'chessformer' or 'stockfish'."
+                "Invalid engine type. Choose 'pondera' or 'stockfish'."
             )
 
     def get_invalid_mask(self, boards: List[chess.Board]) -> torch.Tensor:
@@ -232,10 +235,10 @@ class Engine:
             # Fall back to single board computation if multiprocessing fails
             return torch.ones((bs,), dtype=torch.long, device=self.device)
 
-    def _raw_chessformer_move(
+    def _raw_pondera_move(
         self, board: chess.Board, return_perplexity: bool = False
     ) -> Tuple[str, float]:
-        """Get the next move from ChessFormer model with optional tactical verification."""
+        """Get the next move from Pondera model with optional tactical verification."""
         # Get FEN
         fen = board.fen()
 
@@ -282,7 +285,7 @@ class Engine:
     def _search_enhanced_move(
         self, board: chess.Board, return_perplexity: bool = False, verbose: bool = False
     ) -> Tuple[str, float]:
-        """Get move from chessformer using tactical search"""
+        """Get move from pondera using tactical search"""
         # Step 1: Build search tree level by level
         current_boards = [board]  # aggregate board to a list for batch inference
         board_probs = [1]  # the probabilities of getting to this position (estimated)
@@ -512,12 +515,12 @@ class Engine:
         else:
             return move_uci, final_value
 
-    def _chessformer_move(
+    def _pondera_move(
         self, board: chess.Board, return_perplexity: bool = False, verbose: bool = False
     ) -> Tuple[str, float]:
-        """Get move from chessformer with optional search enhance"""
+        """Get move from pondera with optional search enhance"""
         if self.depth == 0:
-            return self._raw_chessformer_move(board, return_perplexity)
+            return self._raw_pondera_move(board, return_perplexity)
         else:
             return self._search_enhanced_move(board, return_perplexity, verbose)
 
@@ -583,10 +586,10 @@ class Engine:
         else:
             return best_move_uci, normalized_score
 
-    def _batch_chessformer_move(
+    def _batch_pondera_move(
         self, boards: List[chess.Board]
     ) -> List[Tuple[str, float]]:
-        """Get the next moves from Chessformer model using batch inference."""
+        """Get the next moves from Pondera model using batch inference."""
         bs = len(boards)
         if bs > self.max_batch_size:
             raise ValueError(
@@ -715,16 +718,16 @@ class Engine:
     ) -> Tuple[str, float]:
         if self.type == "stockfish":
             return self._stockfish_move(board, return_perplexity)
-        elif self.type == "chessformer":
-            return self._chessformer_move(board, return_perplexity)
+        elif self.type == "pondera":
+            return self._pondera_move(board, return_perplexity)
         else:
             raise ValueError(f"Invalid engine type: {self.type}")
 
     def batch_move(self, boards: List[chess.Board]) -> List[Tuple[str, float]]:
         if self.type == "stockfish":
             return self._batch_stockfish_move(boards)
-        elif self.type == "chessformer":
-            return self._batch_chessformer_move(boards)
+        elif self.type == "pondera":
+            return self._batch_pondera_move(boards)
         else:
             raise ValueError(f"Invalid engine type: {self.type}")
 
@@ -732,7 +735,7 @@ class Engine:
         """
         Analyzes the given **single board** position using the engine.
         For Stockfish, returns list of centipawn scores from white's perspective;
-        For ChessFormer, returns list of models's value estimates
+        For Pondera, returns list of models's value estimates
         Returns None if analysis failed.
         """
         if self.type == "stockfish":
@@ -775,7 +778,7 @@ class Engine:
             else:
                 return None
 
-        elif self.type == "chessformer":
+        elif self.type == "pondera":
             fen = board.fen()
             count_tensor = self.compute_repetition([board.copy(stack=True)])
 
@@ -791,20 +794,20 @@ class Engine:
 
 def test_search_enhanced_move(model_path, device):
     """Test the search-enhanced move functionality"""
-    print("\n--- Testing Search-Enhanced ChessFormer ---")
+    print("\n--- Testing Search-Enhanced Pondera ---")
 
     import sys
 
     sys.path.append("./")
     try:
-        from model import ChessFormerModel
+        from model import PonderaModel
     except ImportError:
-        from model import ChessFormerModel
+        from model import PonderaModel
 
     # Load the trained model
     checkpoint = torch.load(model_path, map_location=device)
     config = checkpoint["config"]
-    model = ChessFormerModel(**config)
+    model = PonderaModel(**config)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     model.to(device)
@@ -879,20 +882,20 @@ def test_search_enhanced_move(model_path, device):
         print(
             f"\n--- Test Configuration {i + 1}: Depth={cfg['depth']}, Top-K={cfg['top_k']}, Decay={cfg['decay_rate']}, Temp={cfg['temperature']} ---"
         )
-        chessformer_config = ChessformerConfig(
-            chessformer=model,
+        pondera_config = PonderaConfig(
+            pondera=model,
             device=device,
             temperature=cfg["temperature"],
             depth=cfg["depth"],
             top_k=cfg["top_k"],
             decay_rate=cfg["decay_rate"],
         )
-        engine = Engine(type="chessformer", chessformer_config=chessformer_config)
+        engine = Engine(type="pondera", pondera_config=pondera_config)
 
         for j, board in enumerate(test_positions):
             print(f"\n--- Analyzing Position {j + 1}: {board.fen()} ---")
             try:
-                move, value, perplexity = engine._chessformer_move(
+                move, value, perplexity = engine._pondera_move(
                     board, return_perplexity=True, verbose=True
                 )
                 print(
@@ -906,6 +909,6 @@ def test_search_enhanced_move(model_path, device):
 
 
 if __name__ == "__main__":
-    model_path = "./ckpts/chessformer-sl_06.pth"
+    model_path = "./ckpts/pondera-sl_06.pth"
     device = torch.device("cpu")
     test_search_enhanced_move(model_path, device)

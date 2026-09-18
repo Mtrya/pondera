@@ -1,59 +1,27 @@
-# ChessFormer: Training Chess Models Without MCTS
+# Pondera
 
-A research project exploring the feasibility of training chess-playing neural networks without Monte Carlo Tree Search (MCTS), using pure supervised learning from engine evaluations and self-play reinforcement learning.
+A research project on **search-free chess training**: can a neural network learn to play strong chess without ever running a search algorithm during training — and can "search" itself be internalized into the model's forward computation?
 
-## Overview
+The project combines supervised distillation from Stockfish with reinforcement learning from self-play (no MCTS in the training loop), and studies architectures that allocate computation adaptively (pondering). Inference-time search is treated as an optional, measurable configuration rather than a training component.
 
-ChessFormer investigates whether competitive chess models can be trained using only neural networks, without the traditional search algorithms that power engines like AlphaZero. We explore two main approaches:
+## Status
 
-1. **Supervised Learning (SL)**: Distillation from Stockfish evaluations
-2. **Reinforcement Learning (RL)**: Self-play using Proximal Policy Optimization (PPO)
+**Rebootstrapping.** The v1 model (formerly "ChessFormer", ~100M params, SL-distilled + PPO) established a codebase and initial results, but its evaluation pipeline was broken and its RL stage degraded from the SL checkpoint. Current work:
 
-The project demonstrates both the potential and limitations of search-free chess models, providing valuable insights for future research.
+- Rigorous evaluation infrastructure (fastchess-based Elo ladders vs Stockfish 17.1)
+- A small SL probe to calibrate distilled-policy strength against data scale
+- Literature-driven architecture research (recurrent pondering, auxiliary targets, value distributions)
 
-## Key Findings
+See `notes/` for the working documents (handoff, provisioning, literature survey).
 
-### ChessFormer-SL: Partial Success
+## v1 Architecture (legacy)
 
-- Shows reasonable opening and endgame play
-- Struggles with midgame tactics, leading to frequent blunders
-- Estimated ELO rating: ~1500 (informal assessment)
-- With search enhancement, can occasionally defeat Stockfish
-- Outperforms existing transformer-based chess models trained with next-token prediction
-
-### ChessFormer-RL: Training Challenges
-
-- Encountered significant training instabilities (gradient explosion, noisy rewards)
-- Performance degraded from initial SL checkpoint
-- Highlights the difficulty of RL training for complex strategic games
-
-## Architecture
-
-ChessFormer uses a custom transformer architecture optimized for chess:
-
-- **Size**: 100.7M parameters (20 blocks, 640 hidden size, 8 heads, 1728 intermediate size)
-- **Input**: FEN tokenization with 75-token sequences (64 board positions + 9 metadata tokens + 2 special tokens)
-- **Output**: Policy head (1,969 possible moves) + Value head (position evaluation)
-- **Features**: RMSNorm, SwiGLU FFN, custom FEN tokenizer
-
-### FEN Tokenization Strategy
-
-```markdown
-64 piece tokens + 1 side-to-move + 4 castling rights + 1 en-passant + 
-1 halfmove clock + 1 fullmove number + 1 repetition count = 73 tokens
-+ 2 special tokens (action, value) = 75 total sequence length
-```
+- **Size**: 100.7M parameters (20 blocks, 640 hidden, 8 heads, SwiGLU FFN 1728)
+- **Input**: FEN tokenized into 73 tokens (64 squares + side/castling/en-passant/clocks/repetition) + 2 learned readout tokens
+- **Output**: policy head over 1,969 structurally valid moves + scalar value head
+- **Key constraint**: no search during training; inference used argmax policy or a shallow beam
 
 ## Installation & Setup
-
-This project uses [uv](https://github.com/astral-sh/uv) for dependency management. Make sure you have uv installed first:
-
-```bash
-# Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Then clone the repository and install dependencies:
 
 ```bash
 git clone https://github.com/Mtrya/chess-transformer
@@ -61,130 +29,40 @@ cd chess-transformer
 uv sync
 ```
 
-To run commands within the project environment:
-
-```bash
-# Run a script
-uv run python app.py
-
-# Or activate the virtual environment
-source .venv/bin/activate
-```
-
-### Running the Demo
-
-For the interactive chess application, simply run:
+To run the interactive demo:
 
 ```bash
 uv run python app.py
 ```
 
-It will download model checkpoints from huggingface.
-
-Alternatively, try the [HuggingFace Space demo](https://huggingface.co/spaces/kaupane/Chessformer_Demo) without local setup.
-
-### Training
-
-```bash
-# Supervised Learning
-uv run python train_sl.py
-
-# Reinforcement Learning  
-uv run python train_rl.py
-```
-
-## Training Details
-
-### Dataset
-
-- **Source**: `kaupane/lichess-2023-01-stockfish-annotated`
-- **Training**: 56M positions (depth18 split)
-- **Validation**: depth27 split
-- **Hardware**: RTX 4060Ti 16GB, ~2 weeks training time
-
-### Performance Metrics
-
-| Model | Action Loss | Value Loss | Invalid Loss |
-|-------|-------------|------------|--------------|
-| ChessFormer-SL | 1.6985 | 0.0407 | 0.0303 |
-| ChessFormer-RL(intermediate ChessFormer-SL checkpoint) | 1.8329 | 0.0501 | 0.0484 |
-
-Invalid loss measures probability assigned to illegal moves.
-
-## Technical Insights & Limitations
-
-### Key Challenges Identified
-
-1. **Computational Inefficiency**: Heavy CPU operations (and it's python for-loop) in FEN tokenization during training. Future work should pre-process the entire dataset.
-
-2. **Embedding Competition**: Piece embeddings and positional embeddings are additively combined, potentially competing for representational space. The consistently lower norm of piece embeddings compared to positional embeddings may contribute to tactical blunders (especially free captures).
-
-3. **Scale Limitations**: Current 100.7M parameter model significantly outperforms the smaller 86.6M variant, suggesting benefits from further scaling.
-
-4. **RL Training Instability**: Self-play RL proved challenging due to:
-   - Gradient norm explosion
-   - Noisy reward signals from sparse terminal rewards
-   - Complex action space (1,969 possible moves)
-   - Not optimized hyperparameters
-
-### Architecture Insights
-
-The custom transformer design shows promise but reveals areas for improvement:
-
-- Model benefits from depth more than width
-- Model scaling appears more beneficial than initially expected
-
-## Models Released
-
-- **[ChessFormer-SL](https://huggingface.co/kaupane/ChessFormer-SL)**: Supervised learning checkpoint (~130k steps)
-- **[ChessFormer-RL](https://huggingface.co/kaupane/ChessFormer-RL)**: RL initialization checkpoint (~50k steps)
-
-## Usage Example
+## Usage
 
 ```python
 import torch
-from model import ChessFormerModel
-from huggingface_hub import hf_hub_download
+from model import PonderaModel
 
-# Load model
-model = ChessFormerModel.from_pretrained("kaupane/ChessFormer-SL")
+model = PonderaModel.from_pretrained("kaupane/ChessFormer-SL")  # legacy v1 checkpoint
 model.eval()
 
-# Analyze position
 fens = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"]
 repetitions = torch.tensor([1])
-
 with torch.no_grad():
     move_logits, position_value = model(fens, repetitions)
 ```
 
-### With Chess Engine Interface
+## Legacy v1 results (historical, informal)
 
-```python
-from engine import Engine, ChessformerConfig
-import chess
+These numbers predate the evaluation infrastructure and should be treated as indicative only:
 
-# Create engine
-config = ChessformerConfig(
-    chessformer=model,
-    temperature=0.5,
-    depth=2  # Enable search enhancement
-)
-engine = Engine(type="chessformer", chessformer_config=config)
+| Model | Action Loss | Value Loss | Invalid Loss |
+|-------|-------------|------------|--------------|
+| ChessFormer-SL (v1) | 1.6985 | 0.0407 | 0.0303 |
+| ChessFormer-RL (v1, from SL checkpoint) | 1.8329 | 0.0501 | 0.0484 |
 
-# Play move
-board = chess.Board()
-move_uci, value = engine.move(board)
-print(f"Suggested move: {move_uci}, Value: {value:.3f}")
-```
+- **ChessFormer-SL**: reasonable opening/endgame play, frequent midgame tactical blunders; strength was informally estimated around 1500 Elo but never measured with a working head-to-head pipeline.
+- **ChessFormer-RL**: self-play PPO with sparse terminal rewards degraded from the SL initialization — the key negative result motivating the RL redesign.
 
-## Contributing
+## Models (legacy v1)
 
-This project seeks to set the ball rolling. Contributions addressing the identified limitations are welcome, particularly:
-
-- RL training improvements
-- Alternative tokenization strategies  
-- Scaling experiments
-- Performance benchmarking
-
-*ChessFormer demonstrates both the potential and current limitations of training chess models without traditional search. While not achieving competitive play strength, it's an interesting project, and helped me learn alot about transformer models and reinforcement learning.*
+- [kaupane/ChessFormer-SL](https://huggingface.co/kaupane/ChessFormer-SL): SL checkpoint (~130k steps)
+- [kaupane/ChessFormer-RL](https://huggingface.co/kaupane/ChessFormer-RL): RL initialization checkpoint (~50k steps)

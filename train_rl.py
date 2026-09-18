@@ -1,7 +1,7 @@
 import torch
 
 from chess_core import UCI_MOVE_TO_IDX
-from model import ChessFormerModel
+from model import PonderaModel
 from rl import RLTrainer
 
 
@@ -16,7 +16,7 @@ def train():
         "possible_moves": len(UCI_MOVE_TO_IDX),
         "dtype": torch.float32,
     }
-    model = ChessFormerModel(**model_config)
+    model = PonderaModel(**model_config)
     trainer = RLTrainer(
         model=model,
         learning_rate=1e-5,
@@ -36,9 +36,9 @@ def train():
         log_every_steps=4,
         track_kl=False,  # True for debug use, will be very slow.
         model_config=model_config,
-        experiment_name="chessformer-rl_0",
+        experiment_name="pondera-rl_0",
     )
-    # trainer.resume("./ckpts/chessformer-rl_init.pth", from_sl_checkpoint=True)
+    # trainer.resume("./ckpts/pondera-rl_init.pth", from_sl_checkpoint=True)
     trainer.train()
 
 
