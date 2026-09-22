@@ -11,7 +11,11 @@ def main():
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--resume", type=Path)
-    parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="Stop at this absolute optimizer step, including steps before resume",
+    )
     parser.add_argument("--track", action="store_true", help="Log metrics to SwanLab")
     args = parser.parse_args()
     from pondera.training.supervised import load_config, train

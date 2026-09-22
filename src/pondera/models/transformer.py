@@ -9,7 +9,7 @@ from pondera.chess.mapping import (
     MAX_FULLMOVES,
     MAX_HALFMOVES,
 )
-from pondera.chess.tokenize import encode_fens
+from pondera.chess.tokenize import TOKENIZER_VERSION, encode_fens
 
 
 # --- Tokenizer --- #
@@ -242,8 +242,13 @@ class PonderaModel(nn.Module, PyTorchModelHubMixin):
         dropout: float = 0.00,
         possible_moves: int = len(IDX_TO_UCI_MOVE),  # 1969 structurally valid moves
         dtype=None,
+        tokenizer_version: int = 1,  # Hub baselines without this field use layout 1.
     ):
         super().__init__()
+        if tokenizer_version != TOKENIZER_VERSION:
+            raise ValueError(
+                f"Unsupported model tokenizer version: {tokenizer_version}"
+            )
         self.fen_tokenizer = FENTokenizer(hidden_size, dtype=dtype)
 
         self.act_token = nn.Parameter(

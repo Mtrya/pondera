@@ -32,7 +32,7 @@ pondera-annotate /datasets/positions.parquet --engine stockfish --depth 16 --mul
 
 The source needs `fen`, `next_move`, and `count`. Duplicate FENs are annotated once. Records contain source metadata and a `unit` with `per_depth`, `reached_depth`, and `nodes`. Each depth has `r1` through the available candidate ranks, containing `bm`, `cp`, and `mate`; scores are from White's perspective, with only one of `cp` and `mate` populated. The deepest recorded candidates also contain their principal variation in `pv`. Terminal positions are marked separately. A time limit can truncate the requested depth, so consumers must inspect `reached_depth` and available ranks.
 
-A sidecar manifest identifies the teacher and its configuration. Resuming requires the same configuration and skips recorded FENs. Engine and malformed-input failures propagate instead of silently producing labels. Annotation is a separate offline command and is not called by the training loop.
+A sidecar manifest identifies the teacher and its configuration. Resuming requires the same configuration and skips recorded FENs. An interrupted final record without a newline is discarded and annotated again; malformed complete records raise an error. Engine and malformed-input failures propagate instead of silently producing labels. Annotation is a separate offline command and is not called by the training loop.
 
 ## Train and resume
 
@@ -41,9 +41,9 @@ pondera-train --config configs/supervised.toml --data-dir .local/data/policy --o
 pondera-train --config configs/supervised.toml --data-dir .local/data/policy --output-dir .local/runs/supervised --device cuda --resume .local/runs/supervised/final.pth
 ```
 
-Choose `--device cpu` for CPU execution. `--track` enables SwanLab; local metrics are always written. `--max-steps` stops at an absolute optimizer step without changing the configured schedule. Resume requires the same training configuration and input arrays. Checkpoints store optimizer, scheduler, progress, and random-number state. Partial accumulation groups at an epoch boundary are discarded.
+Choose `--device cpu` for CPU execution. `--track` enables SwanLab; local metrics are always written. `--max-steps` stops at a positive absolute optimizer step without changing the configured schedule: resuming from step 100 with `--max-steps 110` runs 10 more steps, and a limit already reached runs none. Resume requires the same training configuration and input arrays. Checkpoints store optimizer, scheduler, progress, and random-number state. Partial accumulation groups at an epoch boundary are discarded.
 
-New checkpoints use `format_version = 1`, `model_config`, and `model_state_dict`, plus training state when applicable. The inference loader also accepts existing baseline checkpoint files and Hugging Face model directories or repository identifiers.
+New checkpoints use `format_version = 1`, `tokenizer_version`, `model_config`, and `model_state_dict`, plus training state when applicable. Prepared dataset manifests and versioned checkpoints must declare the current tokenizer version; incompatible versions are rejected before training or inference. Hub model configurations also record and validate the tokenizer version. The inference loader accepts existing unversioned baseline checkpoints and Hub configurations as tokenizer version 1, including local directories and repository identifiers.
 
 ## Evaluate
 

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,9 +9,9 @@ import torch
 
 from pondera.chess.mapping import PIECE_TO_IDX, UCI_MOVE_TO_IDX
 from pondera.chess.position import repetition_count
-from pondera.chess.tokenize import encode_fen, encode_fens
+from pondera.chess.tokenize import TOKENIZER_VERSION, encode_fen, encode_fens
 from pondera.inference.policy import pick_move
-from pondera.models.checkpoint import load_model, save_checkpoint
+from pondera.models.checkpoint import load_model, read_checkpoint, save_checkpoint
 from pondera.models.transformer import PonderaModel
 
 CONFIG = {"num_blocks": 1, "hidden_size": 16, "intermediate_size": 32, "num_heads": 2}
@@ -52,6 +53,9 @@ class ModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pth"
             save_checkpoint(path, model, CONFIG)
+            self.assertEqual(
+                read_checkpoint(path)["tokenizer_version"], TOKENIZER_VERSION
+            )
             restored = load_model(path)
             for actual, reference in zip(restored(ids=ids), expected):
                 torch.testing.assert_close(actual, reference, rtol=0, atol=0)
@@ -63,15 +67,48 @@ class ModelTests(unittest.TestCase):
         model = PonderaModel(**CONFIG)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.pth"
-            torch.save({"config": CONFIG, "model_state_dict": model.state_dict()}, path)
-            loaded = load_model(path)
-            for key, value in loaded.state_dict().items():
-                torch.testing.assert_close(value, model.state_dict()[key])
+            for config_key in ("config", "model_config"):
+                with self.subTest(config_key=config_key):
+                    torch.save(
+                        {config_key: CONFIG, "model_state_dict": model.state_dict()},
+                        path,
+                    )
+                    loaded = load_model(path)
+                    for key, value in loaded.state_dict().items():
+                        torch.testing.assert_close(value, model.state_dict()[key])
+
+    def test_checkpoint_tokenizer_version_is_required_and_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.pth"
+            save_checkpoint(path, PonderaModel(**CONFIG), CONFIG)
+            checkpoint = read_checkpoint(path)
+            for version in (None, TOKENIZER_VERSION + 1):
+                with self.subTest(version=version):
+                    invalid = dict(checkpoint)
+                    if version is None:
+                        del invalid["tokenizer_version"]
+                    else:
+                        invalid["tokenizer_version"] = version
+                    torch.save(invalid, path)
+                    with self.assertRaises(ValueError):
+                        load_model(path)
 
     def test_hub_directory_roundtrip(self):
         model = PonderaModel(**CONFIG).eval()
         with tempfile.TemporaryDirectory() as directory:
             model.save_pretrained(directory)
+            loaded = load_model(Path(directory))
+            for key, value in loaded.state_dict().items():
+                torch.testing.assert_close(value, model.state_dict()[key])
+            config_path = Path(directory) / "config.json"
+            config = json.loads(config_path.read_text())
+            self.assertEqual(config["tokenizer_version"], TOKENIZER_VERSION)
+            config["tokenizer_version"] = TOKENIZER_VERSION + 1
+            config_path.write_text(json.dumps(config))
+            with self.assertRaises(ValueError):
+                load_model(Path(directory))
+            del config["tokenizer_version"]
+            config_path.write_text(json.dumps(config))
             loaded = load_model(Path(directory))
             for key, value in loaded.state_dict().items():
                 torch.testing.assert_close(value, model.state_dict()[key])

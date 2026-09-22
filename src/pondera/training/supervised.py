@@ -1,6 +1,7 @@
 """Policy-only supervised training on pre-encoded position arrays."""
 
 import json
+import math
 import time
 import tomllib
 from contextlib import nullcontext
@@ -11,7 +12,6 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
-from pondera.chess.tokenize import TOKENIZER_VERSION
 from pondera.data.positions import TokenizedPositions
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.transformer import PonderaModel
@@ -57,6 +57,14 @@ class TrainConfig:
                 raise ValueError(f"{name} must be positive")
         if self.workers < 0 or self.precision not in {"fp32", "bf16"}:
             raise ValueError("Invalid workers or precision")
+        for name in ("learning_rate", "grad_clip"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError("weight_decay must be finite and non-negative")
+        if not 0 <= self.warmup_ratio <= 1:
+            raise ValueError("warmup_ratio must be between 0 and 1")
 
 
 def load_config(path):
@@ -67,7 +75,9 @@ def load_config(path):
 def train(
     config, data_dir, output_dir, device="cpu", resume=None, max_steps=None, track=False
 ):
-    """Train or resume; max_steps limits this invocation without changing the schedule."""
+    """Train or resume up to an absolute optimizer step without changing the schedule."""
+    if max_steps is not None and max_steps < 1:
+        raise ValueError("max_steps must be positive")
     device = torch.device(device)
     output_dir = Path(output_dir)
     if output_dir.exists() and any(output_dir.iterdir()) and resume is None:
@@ -172,7 +182,6 @@ def train(
             if device.type == "cuda"
             else None,
             tracking_id=tracking_id,
-            tokenizer_version=TOKENIZER_VERSION,
         )
 
     model.train()

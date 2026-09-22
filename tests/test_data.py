@@ -19,10 +19,27 @@ from pondera.data.human import (
 from pondera.data.positions import TokenizedPositions
 from pondera.data.prepare import prepare_dataset
 from pondera.data.stockfish import run
-from pondera.data.storage import CountBuckets, assemble_dataset, load_manifest
+from pondera.data.storage import (
+    CountBuckets,
+    assemble_dataset,
+    load_manifest,
+    write_manifest,
+)
 
 
 class DataTests(unittest.TestCase):
+    def test_failed_manifest_write_preserves_previous_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            original = {"completed": [1, 2]}
+            write_manifest(path, original)
+            with self.assertRaises(TypeError):
+                write_manifest(path, {"completed": [1, 2, 3], "invalid": object()})
+            self.assertEqual(load_manifest(path), original)
+            updated = {"completed": [1, 2, 3]}
+            write_manifest(path, updated)
+            self.assertEqual(load_manifest(path), updated)
+
     @unittest.skipUnless(shutil.which("stockfish"), "Requires Stockfish on PATH")
     def test_stockfish_dataset_pipeline_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:

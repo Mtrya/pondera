@@ -11,6 +11,48 @@ from pondera.data.annotation import AnnotationConfig, annotate_positions
 
 @unittest.skipUnless(shutil.which("stockfish"), "Requires Stockfish on PATH")
 class AnnotationTests(unittest.TestCase):
+    def test_resume_recovers_unterminated_final_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "labels.jsonl"
+            board = chess.Board()
+            records = [{"fen": board.fen()}]
+            board.push_uci("e2e4")
+            records.append({"fen": board.fen()})
+            config = AnnotationConfig(depth=2, multipv=1)
+            annotate_positions(records[:1], output, config)
+            committed = output.read_bytes()
+            for tail in (
+                b'{"fen": "',
+                b'{"note": "\xe4\xb8',
+                json.dumps(records[1]).encode(),
+            ):
+                with self.subTest(tail=tail):
+                    output.write_bytes(committed + tail)
+                    self.assertEqual(annotate_positions(records, output, config), 1)
+                    self.assertTrue(output.read_bytes().startswith(committed))
+                    self.assertEqual(
+                        [
+                            json.loads(line)["fen"]
+                            for line in output.read_bytes().splitlines()
+                        ],
+                        [record["fen"] for record in records],
+                    )
+
+    def test_resume_rejects_malformed_complete_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "labels.jsonl"
+            records = [{"fen": chess.STARTING_FEN}]
+            config = AnnotationConfig(depth=2, multipv=1)
+            annotate_positions(records, output, config)
+            committed = output.read_bytes()
+            for trailing in (b"", committed):
+                with self.subTest(trailing=bool(trailing)):
+                    corrupted = committed + b'{"fen":\n' + trailing
+                    output.write_bytes(corrupted)
+                    with self.assertRaises(json.JSONDecodeError):
+                        annotate_positions(records, output, config)
+                    self.assertEqual(output.read_bytes(), corrupted)
+
     def test_real_annotation_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "labels.jsonl"

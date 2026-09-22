@@ -71,6 +71,22 @@ def _annotate(record, engine, config):
     return result
 
 
+def _completed_fens(output):
+    """Read committed JSONL records, discarding an unterminated final write."""
+    done = set()
+    with output.open("r+b") as handle:
+        while True:
+            start = handle.tell()
+            line = handle.readline()
+            if not line:
+                break
+            if not line.endswith(b"\n"):
+                handle.truncate(start)
+                break
+            done.add(json.loads(line)["fen"])
+    return done
+
+
 def annotate_positions(records, output, config=AnnotationConfig(), workers=1):
     if (
         min(config.depth, config.multipv, config.threads, config.hash_mb, workers) < 1
@@ -86,8 +102,7 @@ def annotate_positions(records, output, config=AnnotationConfig(), workers=1):
     if output.exists():
         if load_manifest(manifest_path) != manifest:
             raise ValueError("Annotation configuration differs from existing output")
-        with output.open() as handle:
-            done = {json.loads(line)["fen"] for line in handle}
+        done = _completed_fens(output)
     else:
         done = set()
         write_manifest(manifest_path, manifest)

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from pondera.chess.tokenize import TOKENIZER_VERSION
 from pondera.models.transformer import PonderaModel
 
 CHECKPOINT_VERSION = 1
@@ -15,6 +16,14 @@ def read_checkpoint(path, device="cpu") -> dict:
     version = checkpoint.get("format_version", CHECKPOINT_VERSION)
     if version != CHECKPOINT_VERSION:
         raise ValueError(f"Unsupported checkpoint version: {version}")
+    # Unversioned baseline checkpoints use the original token layout (version 1).
+    tokenizer_version = checkpoint.get(
+        "tokenizer_version", 1 if "format_version" not in checkpoint else None
+    )
+    if tokenizer_version != TOKENIZER_VERSION:
+        raise ValueError(
+            f"Unsupported checkpoint tokenizer version: {tokenizer_version}"
+        )
     # Existing published baselines used either of these configuration keys.
     if "model_config" not in checkpoint:
         checkpoint["model_config"] = checkpoint["config"]
@@ -28,6 +37,7 @@ def save_checkpoint(path, model, model_config, **training_state) -> None:
     payload = {
         **training_state,
         "format_version": CHECKPOINT_VERSION,
+        "tokenizer_version": TOKENIZER_VERSION,
         "model_config": model_config,
         "model_state_dict": model.state_dict(),
     }
