@@ -1,0 +1,1 @@
+"""Chess components for Pondera."""

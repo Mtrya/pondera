@@ -1,0 +1,5 @@
+# Raw runs belong in local storage; reviewed summaries may be tracked here.
+/raw/
+*.pgn
+*.jsonl
+*.log

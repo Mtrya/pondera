@@ -18,3 +18,9 @@ Pondera 是一个学术探索项目，研究免搜索（将搜索内化进模型
 - 大闭环：research → infra → scaling ladder → infra → hero run →（必要时回到）research。思与学平衡的迭代调研与实验穿插于中间两次 infra pass 与一次 scaling ladder 的每一个环节。
 - 优化第一：infra 优化以 DeepSeek 为标准，善用 profiler，即使是最小的 GPU pipeline 空泡也不容忍。
 - 仓库卫生：工程性/暂时性的脚本和文档不进 git。文档和代码注释不用黑话、内部术语或自己发明的词，不把解释清楚某件事物的责任推卸给外部不可见的指代。
+
+## 目录与公开内容
+
+- 代码与入口归 `src/pondera/`；配置、测试、结果按目录归位，不新增根目录脚本或杂物包。
+- 临时工作与产物归 `.local/`；`docs/` 只提交稳定公开文档，私有记录明确忽略，不强制添加。
+- 所有提交内容须自足且适合公开；遵守[目录职责](docs/architecture.md)，通过 lint、导入边界与行为测试。

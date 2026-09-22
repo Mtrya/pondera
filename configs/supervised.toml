@@ -1,0 +1,21 @@
+seed = 640
+batch_size = 128
+accumulation_steps = 8
+epochs = 2
+learning_rate = 0.0003
+weight_decay = 0.01
+warmup_ratio = 0.03
+grad_clip = 1.0
+workers = 4
+precision = "bf16"
+val_every = 500
+val_positions = 2048
+log_every = 50
+save_every = 2000
+
+[model]
+num_blocks = 20
+hidden_size = 640
+intermediate_size = 1728
+num_heads = 8
+dropout = 0.05
