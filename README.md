@@ -1,68 +1,48 @@
 # Pondera
 
-A research project on **search-free chess training**: can a neural network learn to play strong chess without ever running a search algorithm during training — and can "search" itself be internalized into the model's forward computation?
+Pondera studies search-free chess training and whether a neural model can internalize planning. Playing strength is a research measurement. Training uses no search-based policy improvement; optional inference-time search must be reported separately from search-free inference.
 
-The project combines supervised distillation from Stockfish with reinforcement learning from self-play (no MCTS in the training loop), and studies architectures that allocate computation adaptively (pondering). Inference-time search is treated as an optional, measurable configuration rather than a training component.
+The maintained implementation includes a transformer policy/value baseline, offline position preparation and Stockfish annotation, supervised policy training, a deterministic UCI adapter, and fastchess evaluation. Existing ChessFormer checkpoints remain readable as historical baselines. The current policy trainer optimizes move cross entropy only.
 
-## Status
-
-**Rebootstrapping.** The v1 model (formerly "ChessFormer", ~100M params, SL-distilled + PPO) established a codebase and initial results, but its evaluation pipeline was broken and its RL stage degraded from the SL checkpoint. Current work:
-
-- Rigorous evaluation infrastructure (fastchess-based Elo ladders vs Stockfish 17.1)
-- A small SL probe to calibrate distilled-policy strength against data scale
-- Literature-driven architecture research (recurrent pondering, auxiliary targets, value distributions)
-
-See `notes/` for the working documents (handoff, provisioning, literature survey).
-
-## v1 Architecture (legacy)
-
-- **Size**: 100.7M parameters (20 blocks, 640 hidden, 8 heads, SwiGLU FFN 1728)
-- **Input**: FEN tokenized into 73 tokens (64 squares + side/castling/en-passant/clocks/repetition) + 2 learned readout tokens
-- **Output**: policy head over 1,969 structurally valid moves + scalar value head
-- **Key constraint**: no search during training; inference used argmax policy or a shallow beam
-
-## Installation & Setup
+## Setup
 
 ```bash
-git clone https://github.com/Mtrya/chess-transformer
-cd chess-transformer
-uv sync
+git clone https://github.com/Mtrya/pondera.git
+cd pondera
+uv sync --all-extras --group dev
 ```
 
-To run the interactive demo:
+Python 3.13 or later is required. Stockfish and fastchess are external executables; install them separately and put them on `PATH`, or pass their paths to the corresponding command. A minimal inference installation needs only `uv sync --no-dev`; data processing and training dependencies are available through the `data` and `training` extras.
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `pondera-human` | Extract and aggregate human moves |
+| `pondera-stockfish` | Produce best-move labels from a position dataset |
+| `pondera-publish` | Explicitly upload prepared datasets to Hugging Face |
+| `pondera-prepare` | Encode parquet positions into memory-mapped training arrays |
+| `pondera-annotate` | Record Stockfish scores across depths and final principal variations |
+| `pondera-train` | Train or resume the supervised policy baseline |
+| `pondera-uci` | Serve deterministic legal policy moves over UCI |
+| `pondera-evaluate` | Measure policy loss, accuracy, and illegal-move probability |
+| `pondera-match` | Run paired matches and save results and game records |
+
+Use `uv run <command> --help` for arguments. Training settings live in [configs/supervised.toml](configs/supervised.toml). See [usage](docs/usage.md) for complete examples and data formats, and [architecture](docs/architecture.md) for module boundaries and repository conventions.
+
+## Historical baselines
+
+The existing model has approximately 100.7 million parameters, 20 transformer blocks, 640 hidden dimensions, and a 1,969-action policy head. Its input contains 73 position tokens and two learned readout tokens. Published checkpoints are [ChessFormer-SL](https://huggingface.co/kaupane/ChessFormer-SL) and [ChessFormer-RL](https://huggingface.co/kaupane/ChessFormer-RL).
+
+Measured match results are recorded in the [leaderboard](results/leaderboard.md). These are small-sample comparisons against specified Stockfish depths, not absolute Elo ratings.
+
+## Development
 
 ```bash
-uv run python app.py
+uv run ruff check .
+uv run ruff format --check .
+uv run lint-imports
+uv run python -m unittest discover -s tests -v
 ```
 
-## Usage
-
-```python
-import torch
-from model import PonderaModel
-
-model = PonderaModel.from_pretrained("kaupane/ChessFormer-SL")  # legacy v1 checkpoint
-model.eval()
-
-fens = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"]
-repetitions = torch.tensor([1])
-with torch.no_grad():
-    move_logits, position_value = model(fens, repetitions)
-```
-
-## Legacy v1 results (historical, informal)
-
-These numbers predate the evaluation infrastructure and should be treated as indicative only:
-
-| Model | Action Loss | Value Loss | Invalid Loss |
-|-------|-------------|------------|--------------|
-| ChessFormer-SL (v1) | 1.6985 | 0.0407 | 0.0303 |
-| ChessFormer-RL (v1, from SL checkpoint) | 1.8329 | 0.0501 | 0.0484 |
-
-- **ChessFormer-SL**: reasonable opening/endgame play, frequent midgame tactical blunders; strength was informally estimated around 1500 Elo but never measured with a working head-to-head pipeline.
-- **ChessFormer-RL**: self-play PPO with sparse terminal rewards degraded from the SL initialization — the key negative result motivating the RL redesign.
-
-## Models (legacy v1)
-
-- [kaupane/ChessFormer-SL](https://huggingface.co/kaupane/ChessFormer-SL): SL checkpoint (~130k steps)
-- [kaupane/ChessFormer-RL](https://huggingface.co/kaupane/ChessFormer-RL): RL initialization checkpoint (~50k steps)
+Tests use real models, local datasets, and subprocesses. Stockfish and fastchess integration tests run when their executables are on `PATH`. Public documentation contains stable usage and design information. Session notes, machine-specific instructions, and intermediate work stay untracked.

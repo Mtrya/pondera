@@ -1,0 +1,40 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      OMP_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install CPU dependencies
+        run: |
+          uv venv
+          uv export --frozen --all-extras --group dev --no-hashes --no-emit-project > /tmp/requirements.txt
+          uv pip install --torch-backend cpu -c /tmp/requirements.txt -e '.[data,training]' --group dev
+      - name: Install Stockfish
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y stockfish
+          echo /usr/games >> "$GITHUB_PATH"
+      - name: Validate package and imports
+        run: |
+          uv lock --check
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+          uv run --no-sync lint-imports
+      - name: Run behavioral tests
+        run: uv run --no-sync python -m unittest discover -s tests -v
+      - name: Build distributions
+        run: uv build

@@ -1,0 +1,12 @@
+# Session notes and machine-specific or provisional working documents stay local.
+handoff*.md
+provisioning*.md
+session*.md
+plan*.md
+progress*.md
+scratch*.md
+/private/
+/local/
+/plans/
+/scratch/
+/research/
