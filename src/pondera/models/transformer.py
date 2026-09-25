@@ -249,6 +249,7 @@ class PonderaModel(nn.Module, PyTorchModelHubMixin):
             raise ValueError(
                 f"Unsupported model tokenizer version: {tokenizer_version}"
             )
+        self.tokenizer_version = tokenizer_version
         self.fen_tokenizer = FENTokenizer(hidden_size, dtype=dtype)
 
         self.act_token = nn.Parameter(

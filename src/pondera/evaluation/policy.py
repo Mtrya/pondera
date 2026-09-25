@@ -3,6 +3,7 @@
 import chess
 import torch
 
+from pondera.chess.board_tokens import encode_boards
 from pondera.chess.mapping import UCI_MOVE_TO_IDX
 from pondera.chess.position import legal_move_indices
 from pondera.chess.tokenize import encode_fens
@@ -15,7 +16,9 @@ def evaluate_policy(model, rows, device="cpu", batch_size=128):
 
     def consume(batch):
         fens = [row["fen"] for row in batch]
-        ids = torch.from_numpy(encode_fens(fens)).to(device)
+        encoder = encode_boards if model.tokenizer_version == 2 else encode_fens
+        repetitions = [row.get("repetition", 1) for row in batch]
+        ids = torch.from_numpy(encoder(fens, repetitions)).to(device)
         targets = torch.tensor(
             [UCI_MOVE_TO_IDX[row["next_move"]] for row in batch], device=device
         )

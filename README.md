@@ -1,8 +1,8 @@
 # Pondera
 
-Pondera studies search-free chess training and whether a neural model can internalize planning. Playing strength is a research measurement. Training uses no search-based policy improvement; optional inference-time search must be reported separately from search-free inference.
+Pondera studies search-free chess policies and whether a neural model can internalize planning. Playing strength is a research measurement. The policy executes no explicit search during training or deployment; offline engine supervision and engine feedback for reinforcement learning are allowed.
 
-The maintained implementation includes a transformer policy/value baseline, offline position preparation and Stockfish annotation, supervised policy training, a deterministic UCI adapter, and fastchess evaluation. Existing ChessFormer checkpoints remain readable as historical baselines. The current policy trainer optimizes move cross entropy only.
+The maintained implementation includes lossless square and compact-piece board inputs; base, sequence, recurrent-depth, and combined token backbones; offline position preparation and Stockfish annotation; supervised policy training; a deterministic UCI adapter; and fastchess evaluation. Existing ChessFormer checkpoints remain readable as historical baselines. The current policy trainer optimizes move cross entropy only. Thought-token vocabularies and supervision are separate from the backbone interfaces.
 
 ## Setup
 

@@ -16,6 +16,8 @@ def main():
     parser.add_argument("--train-file", type=Path, action="append")
     parser.add_argument("--val-file", type=Path, action="append")
     parser.add_argument("--train-rows", type=int)
+    parser.add_argument("--val-rows", type=int)
+    parser.add_argument("--tokenizer-version", type=int, choices=[1, 2], default=2)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--output-dir", type=Path, default=Path(".local/data/policy"))
     parser.add_argument("--cache-dir", type=Path, default=Path(".local/data/hub"))
@@ -36,5 +38,13 @@ def main():
         val = download_split(
             args.dataset, args.val_split, args.cache_dir, args.revision
         )
-    result = prepare_dataset(train, val, args.output_dir, args.train_rows, args.workers)
+    result = prepare_dataset(
+        train,
+        val,
+        args.output_dir,
+        args.train_rows,
+        args.workers,
+        args.tokenizer_version,
+        args.val_rows,
+    )
     print(json.dumps(result, indent=2))

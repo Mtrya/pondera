@@ -17,7 +17,9 @@ Pondera is an installable Python package rooted at `src/pondera`. Command entry 
 
 Representation code does not import application layers. Models depend on representation, while training and inference depend on models. Training does not call search, annotation, or evaluation code. Evaluation orchestrates inference and external engines. Import contracts enforce these boundaries.
 
-FEN parsing has one implementation. Model embeddings consume its integer representation, whether callers supply FEN strings or prepared token arrays. A single checkpoint loader serves inference and evaluation; the writer is shared with training. Existing checkpoint configuration keys are accepted to preserve historical baseline evaluation, while new checkpoints use a single versioned format.
+Each versioned FEN format has one encoder shared by offline preparation and runtime inputs. Version 1 preserves historical clipped embeddings; version 2 preserves supplied counters exactly and supports square or compact-piece layouts. Model embeddings consume these integer representations. A single checkpoint loader serves inference and evaluation; the writer is shared with training. Existing checkpoint configuration keys are accepted to preserve historical baseline evaluation, while new checkpoints use a single versioned format.
+
+Token backbones compose attention blocks, repeated cores, deployment controllers, and explicit KV access policies. Board policies attach lossless board embeddings and action/value readouts. Sequence and combined backbones accept embeddings without prescribing thought-token semantics or training-only heads. Their contracts and examples are described in [token backbones](backbones.md).
 
 ## Repository hygiene
 

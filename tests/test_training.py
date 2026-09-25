@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import chess
@@ -113,6 +114,30 @@ class TrainingTests(unittest.TestCase):
                         self.root / "rejected",
                         max_steps=max_steps,
                     )
+
+    def test_resume_can_regroup_microbatches_without_changing_updates(self):
+        small = replace(self.config, model={**self.config.model, "dropout": 0.0})
+        large = replace(small, batch_size=4, accumulation_steps=1)
+        expected = read_checkpoint(train(large, self.data, self.root / "large"))
+        output = self.root / "regrouped"
+        interrupted = train(small, self.data, output, max_steps=1)
+        actual = read_checkpoint(train(large, self.data, output, resume=interrupted))
+        self.assertEqual(actual["step"], expected["step"])
+        self.assertEqual(actual["examples_seen"], expected["examples_seen"])
+        self.assertEqual(actual["next_micro"], expected["next_micro"])
+        self.assertEqual(
+            actual["execution_history"],
+            [
+                {"step": 0, "batch_size": 2, "accumulation_steps": 2},
+                {"step": 1, "batch_size": 4, "accumulation_steps": 1},
+            ],
+        )
+        for key, value in expected["model_state_dict"].items():
+            torch.testing.assert_close(
+                actual["model_state_dict"][key], value, atol=3e-6, rtol=3e-5
+            )
+        with self.assertRaises(ValueError):
+            train(replace(large, batch_size=2), self.data, output, resume=interrupted)
 
 
 class TrainConfigTests(unittest.TestCase):
