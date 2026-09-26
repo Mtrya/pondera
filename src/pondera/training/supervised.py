@@ -22,6 +22,7 @@ from pondera.models.board import pack_board_tokens
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model
 from pondera.training.cost import policy_flops
+from pondera.training.internals import InternalProbe
 from pondera.training.metrics import PolicyMetrics, policy_loss, readout_changes
 
 
@@ -53,6 +54,7 @@ class TrainConfig:
     save_every: int = 2000
     train_flops_budget: float | None = None
     diagnostics: bool = False
+    internals: bool = False
     legal_loss: bool = False
     train_probe_positions: int = 0
 
@@ -78,6 +80,8 @@ class TrainConfig:
             raise ValueError(
                 "Policy diagnostics and legal loss require a base board policy"
             )
+        if self.internals and self.model.get("architecture") != "base":
+            raise ValueError("Internal probes require a base board policy")
         for name in ("learning_rate", "grad_clip"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
@@ -340,6 +344,16 @@ def train(
                 values["generalization/legal_loss_gap"] = (
                     values["val/legal_loss"] - values["train_probe/legal_loss"]
                 )
+        if probe is not None:
+            batch = min(config.batch_size, len(val_data))
+            inputs, _, _ = collate([val_data[i] for i in range(batch)])
+            inputs = {key: value.to(device) for key, value in inputs.items()}
+            with autocast():
+                scalars, arrays = probe.collect(model, inputs)
+            values.update({f"internal/{key}": value for key, value in scalars.items()})
+            artifact = output_dir / "probes" / f"internal-{step:06d}.npz"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(artifact, **arrays)
         return values
 
     def save(name, epoch, micro):
@@ -366,6 +380,11 @@ def train(
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
+    probe = (
+        InternalProbe(model, output_dir / "probes" / "init-embeddings.npz")
+        if config.internals
+        else None
+    )
     val_metrics = {}
     start_time = time.monotonic()
     initial_step = step

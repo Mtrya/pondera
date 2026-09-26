@@ -132,6 +132,7 @@ class TokenBlock(nn.Module):
             if config.geometry == "relative"
             else None
         )
+        self.attention_capture = None
 
     def project(self, normalized, layout: QueryLayout):
         batch, queries, width = normalized.shape
@@ -176,6 +177,8 @@ class TokenBlock(nn.Module):
         if self.geometry is not None:
             bias = self.geometry(query_squares, key_squares).to(q.dtype)
             mask = bias.masked_fill(~mask, float("-inf"))
+        if self.attention_capture is not None:
+            self._capture_attention(q, memory.key, mask, layout.valid)
         attention = (
             F.scaled_dot_product_attention(
                 q,
@@ -194,6 +197,34 @@ class TokenBlock(nn.Module):
             self.ffn(self.norm_ffn(updated)), self.dropout, self.training
         )
         return layout.scatter(updated, x)
+
+    @torch.no_grad()
+    def _capture_attention(self, queries, keys, mask, query_valid):
+        """Per-head attention entropy and peak weight; probe-only path."""
+        scores = queries.float() @ keys.float().transpose(-1, -2)
+        scores = scores / math.sqrt(self.head_size)
+        if mask.dtype == torch.bool:
+            scores = scores.masked_fill(~mask, float("-inf"))
+        else:
+            scores = scores + mask.float()
+        probs = scores.softmax(-1)
+        entropy = -(probs * probs.clamp_min(1e-12).log()).sum(-1)
+        peak = probs.max(-1).values
+        rows = query_valid[:, None, :] & mask.any(-1)
+        if rows.shape[1] == 1:
+            rows = rows.expand_as(entropy)
+        stats = []
+        for head in range(self.heads):
+            selected = rows[:, head]
+            if not selected.any():
+                continue
+            stats.append(
+                (
+                    float(entropy[:, head][selected].mean()),
+                    float(peak[:, head][selected].mean()),
+                )
+            )
+        self.attention_capture.append(stats)
 
 
 def sinusoidal_positions(positions, width, dtype):

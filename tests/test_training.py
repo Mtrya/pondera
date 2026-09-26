@@ -4,6 +4,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import torch
 from teacher_release import play, write_teacher_release
 
@@ -163,6 +164,37 @@ class TrainingTests(unittest.TestCase):
                         self.root / "rejected",
                         max_steps=max_steps,
                     )
+
+    def test_internals_probe_writes_scalars_and_arrays(self):
+        config = replace(self.config, internals=True)
+        output = self.root / "internals"
+        train(config, self.data, output)
+        rows = [
+            json.loads(line)
+            for line in (output / "metrics.jsonl").read_text().splitlines()
+        ]
+        final = rows[-1]
+        self.assertIn("internal/layer_00/residual_rms", final)
+        self.assertIn("internal/layer_00/attention_entropy_mean", final)
+        self.assertIn("internal/layer_00/ffn_dead_fraction", final)
+        self.assertIn("internal/embedding/squares_starved_fraction", final)
+        self.assertIn("internal/drift/embedding", final)
+        probes = output / "probes"
+        self.assertTrue((probes / "init-embeddings.npz").exists())
+        artifacts = sorted(probes.glob("internal-*.npz"))
+        self.assertTrue(artifacts)
+        arrays = np.load(artifacts[-1])
+        self.assertIn("attention_entropy", arrays)
+        self.assertIn("rank_spectrum_00", arrays)
+
+    def test_internals_probe_survives_resume(self):
+        config = replace(self.config, internals=True)
+        output = self.root / "internals-resumed"
+        interrupted = train(config, self.data, output, max_steps=1)
+        train(config, self.data, output, resume=interrupted)
+        final = json.loads((output / "metrics.jsonl").read_text().splitlines()[-1])
+        self.assertTrue(final["training_complete"])
+        self.assertIn("internal/layer_00/residual_rms", final)
 
     def test_resume_can_regroup_microbatches_without_changing_updates(self):
         small = replace(self.config, model={**self.config.model, "dropout": 0.0})
