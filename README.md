@@ -2,7 +2,7 @@
 
 Pondera studies search-free chess policies and whether a neural model can internalize planning. Playing strength is a research measurement. The policy executes no explicit search during training or deployment; offline engine supervision and engine feedback for reinforcement learning are allowed.
 
-The maintained implementation includes lossless square and compact-piece board inputs; base, sequence, recurrent-depth, and combined token backbones; offline position preparation and Stockfish annotation; supervised policy training; a deterministic UCI adapter; and fastchess evaluation. Existing ChessFormer checkpoints remain readable as historical baselines. The current policy trainer optimizes move cross entropy only. Thought-token vocabularies and supervision are separate from the backbone interfaces.
+The maintained implementation includes lossless square and compact-piece board inputs; base, sequence, recurrent-depth, and combined token backbones; offline Stockfish annotation with frozen teacher releases; supervised policy training with analytical FLOPs accounting; a deterministic UCI adapter; and fastchess match evaluation. ChessFormer-era checkpoints remain published on Hugging Face as provenance for the historical baselines recorded in the [leaderboard](results/leaderboard.md); the current codebase implements only the versioned lossless board format.
 
 ## Setup
 
@@ -12,29 +12,17 @@ cd pondera
 uv sync --all-extras --group dev
 ```
 
-Python 3.13 or later is required. Stockfish and fastchess are external executables; install them separately and put them on `PATH`, or pass their paths to the corresponding command. A minimal inference installation needs only `uv sync --no-dev`; data processing and training dependencies are available through the `data` and `training` extras.
+Python 3.13 or later is required. Stockfish and fastchess are external executables; install them separately and put them on `PATH`. A minimal inference installation needs only `uv sync --no-dev`; data processing and training dependencies are available through the `data` and `training` extras.
 
-## Commands
+## Usage
 
-| Command | Purpose |
-|---|---|
-| `pondera-human` | Extract and aggregate human moves |
-| `pondera-stockfish` | Produce best-move labels from a position dataset |
-| `pondera-publish` | Explicitly upload prepared datasets to Hugging Face |
-| `pondera-prepare` | Encode parquet positions into memory-mapped training arrays |
-| `pondera-annotate` | Record Stockfish scores across depths and final principal variations |
-| `pondera-train` | Train or resume the supervised policy baseline |
-| `pondera-uci` | Serve deterministic legal policy moves over UCI |
-| `pondera-evaluate` | Measure policy loss, accuracy, and illegal-move probability |
-| `pondera-match` | Run paired matches and save results and game records |
+The package is a library. Training runs from a TOML configuration:
 
-Use `uv run <command> --help` for arguments. Training settings live in [configs/supervised.toml](configs/supervised.toml). See [usage](docs/usage.md) for complete examples and data formats, and [architecture](docs/architecture.md) for module boundaries and repository conventions.
+```bash
+uv run python -m pondera.training.supervised --config CONFIG.toml --data-dir DATA --output-dir RUN --device cuda
+```
 
-## Historical baselines
-
-The existing model has approximately 100.7 million parameters, 20 transformer blocks, 640 hidden dimensions, and a 1,969-action policy head. Its input contains 73 position tokens and two learned readout tokens. Published checkpoints are [ChessFormer-SL](https://huggingface.co/kaupane/ChessFormer-SL) and [ChessFormer-RL](https://huggingface.co/kaupane/ChessFormer-RL).
-
-Measured match results are recorded in the [leaderboard](results/leaderboard.md). These are small-sample comparisons against specified Stockfish depths, not absolute Elo ratings.
+Experiment configurations live with their run directories; the repository tracks configurations only for published reference runs. See [usage](docs/usage.md) for data formats, teacher releases, and evaluation semantics, and [architecture](docs/architecture.md) for module boundaries and repository conventions.
 
 ## Development
 
