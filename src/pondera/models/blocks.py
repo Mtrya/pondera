@@ -9,7 +9,6 @@ from torch.nn import functional as F
 
 from pondera.models.cache import KVState
 from pondera.models.config import BlockConfig
-from pondera.models.transformer import SwiGLUFFN
 
 
 @dataclass
@@ -84,6 +83,32 @@ class RelativeBoardBias(nn.Module):
         )
         bias = self.embedding(relative).permute(0, 3, 1, 2)
         return bias * pair[:, None, :, :]
+
+
+class SwiGLUFFN(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        dim_feedforward,
+        dropout: float,
+        bias_up: bool = False,
+        bias_gate: bool = False,
+        bias_down: bool = True,
+        dtype=None,
+    ):
+        super().__init__()
+        self.up_proj = nn.Linear(d_model, dim_feedforward, bias=bias_up, dtype=dtype)
+        self.gate_proj = nn.Linear(
+            d_model, dim_feedforward, bias=bias_gate, dtype=dtype
+        )
+        self.down_proj = nn.Linear(
+            dim_feedforward, d_model, bias=bias_down, dtype=dtype
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.up_proj(x) * self.dropout(F.silu(self.gate_proj(x)))
+        return self.down_proj(x)
 
 
 class TokenBlock(nn.Module):

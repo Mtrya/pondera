@@ -36,7 +36,7 @@ class TeacherDataTests(unittest.TestCase):
             write_manifest(manifest, release)
             metadata = prepare_teacher_policy(manifest, root / "encoded", depth=2)
             self.assertEqual(metadata["rows_train"], 1)
-            data = TokenizedPositions(root / "encoded", "train", 2, legal=True)
+            data = TokenizedPositions(root / "encoded", "train", legal=True)
             ids, move, legal = data[0]
             self.assertEqual(decode_board(ids), (chess.STARTING_FEN, 2))
             self.assertEqual(len(legal), 20)

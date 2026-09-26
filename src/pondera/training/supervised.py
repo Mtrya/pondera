@@ -1,5 +1,6 @@
 """Policy-only supervised training on pre-encoded position arrays."""
 
+import argparse
 import hashlib
 import json
 import math
@@ -19,7 +20,7 @@ from pondera.chess.mapping import EMPTY_SQ_IDX
 from pondera.data.positions import TokenizedPositions
 from pondera.models.board import pack_board_tokens
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
-from pondera.models.factory import create_model, model_tokenizer_version
+from pondera.models.factory import create_model
 from pondera.training.cost import policy_flops
 from pondera.training.metrics import PolicyMetrics, policy_loss, readout_changes
 
@@ -99,13 +100,11 @@ class TrainConfig:
 
 @dataclass
 class PolicyCollator:
-    layout: str | None = None
+    layout: str = "squares"
 
     def __call__(self, rows):
         ids = torch.from_numpy(np.stack([row[0] for row in rows]))
-        inputs = (
-            {"ids": ids} if self.layout is None else pack_board_tokens(ids, self.layout)
-        )
+        inputs = pack_board_tokens(ids, self.layout)
         targets = torch.tensor([row[1] for row in rows], dtype=torch.long)
         metadata = {}
         if len(rows[0]) == 3:
@@ -135,15 +134,10 @@ def train(
     torch.manual_seed(config.seed)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
-    tokenizer_version = model_tokenizer_version(config.model)
     need_legal = config.diagnostics or config.legal_loss
-    train_data = TokenizedPositions(
-        data_dir, "train", tokenizer_version, legal=need_legal
-    )
-    val_data = TokenizedPositions(data_dir, "val", tokenizer_version, legal=need_legal)
-    collate = PolicyCollator(
-        config.model.get("layout", "squares") if tokenizer_version == 2 else None
-    )
+    train_data = TokenizedPositions(data_dir, "train", legal=need_legal)
+    val_data = TokenizedPositions(data_dir, "val", legal=need_legal)
+    collate = PolicyCollator(config.model.get("layout", "squares"))
     data_identity = hashlib.sha256(
         json.dumps(train_data.manifest, sort_keys=True).encode()
     ).hexdigest()
@@ -513,3 +507,34 @@ def train(
     if tracker:
         tracker.finish()
     return output_dir / "final.pth"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--data-dir", type=Path, default=Path(".local/data/policy"))
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="Stop at this absolute optimizer step, including steps before resume",
+    )
+    parser.add_argument("--track", action="store_true", help="Log metrics to SwanLab")
+    args = parser.parse_args()
+    print(
+        train(
+            load_config(args.config),
+            args.data_dir,
+            args.output_dir,
+            args.device,
+            args.resume,
+            args.max_steps,
+            args.track,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

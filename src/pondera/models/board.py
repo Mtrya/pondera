@@ -97,9 +97,7 @@ class BoardEmbedding(nn.Module):
 
     def forward(self, ids, positions=None):
         if ids.ndim != 2 or ids.dtype not in {torch.int16, torch.int32, torch.int64}:
-            raise ValueError(
-                "Expected lossless integer board tokens, not legacy uint8 inputs"
-            )
+            raise ValueError("Expected lossless integer board tokens")
         if positions is None:
             if ids.shape[1] < MIN_TOKENS:
                 raise ValueError(

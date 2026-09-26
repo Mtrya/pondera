@@ -4,7 +4,7 @@ import torch
 from huggingface_hub import PyTorchModelHubMixin
 from torch import nn
 
-from pondera.chess.board_tokens import BOARD_TOKENIZER_VERSION, encode_boards
+from pondera.chess.board_tokens import encode_boards
 from pondera.chess.mapping import IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
 from pondera.models.backbones import BaseBackbone, DepthBackbone
 from pondera.models.board import BoardEmbedding, black_to_move
@@ -24,17 +24,13 @@ class BoardPolicyModel(nn.Module, PyTorchModelHubMixin):
         layout="squares",
         geometry="absolute",
         possible_moves=len(IDX_TO_UCI_MOVE),
-        tokenizer_version=BOARD_TOKENIZER_VERSION,
         architecture="base",
         encoding="additive",
         orientation="absolute",
     ):
         super().__init__()
-        if tokenizer_version != BOARD_TOKENIZER_VERSION:
-            raise ValueError("Board policies require lossless tokenizer version 2")
         if architecture not in {"base", "depth"}:
             raise ValueError("Unsupported board-policy architecture")
-        self.tokenizer_version = tokenizer_version
         self.layout = layout
         self.board_embedding = BoardEmbedding(
             hidden_size, layout, encoding, orientation
@@ -154,7 +150,6 @@ class DepthPolicyModel(BoardPolicyModel):
         layout="squares",
         geometry="absolute",
         possible_moves=len(IDX_TO_UCI_MOVE),
-        tokenizer_version=BOARD_TOKENIZER_VERSION,
         cache_policy="matched_fallback",
         architecture="depth",
         encoding="additive",
@@ -172,7 +167,6 @@ class DepthPolicyModel(BoardPolicyModel):
             layout,
             geometry,
             possible_moves,
-            tokenizer_version,
             architecture,
             encoding,
             orientation,

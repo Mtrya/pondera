@@ -1,26 +1,26 @@
 """Explicit model selection for serialized policy configurations."""
 
+from pondera.chess.board_tokens import BOARD_TOKENIZER_VERSION
 from pondera.models.policy import BoardPolicyModel, DepthPolicyModel
-from pondera.models.transformer import PonderaModel
+
+ARCHITECTURES = {"base": BoardPolicyModel, "depth": DepthPolicyModel}
 
 
-def model_tokenizer_version(config):
-    architecture = config.get("architecture", "legacy")
-    if architecture not in {"legacy", "base", "depth"}:
+def model_class(config):
+    architecture = config.get("architecture")
+    if architecture not in ARCHITECTURES:
         raise ValueError(f"Unknown policy architecture: {architecture}")
-    expected = 1 if architecture == "legacy" else 2
-    if config.get("tokenizer_version", expected) != expected:
-        raise ValueError("Model architecture and tokenizer version disagree")
-    return expected
+    # Configurations written before the input format was unified still carry the key.
+    if (
+        config.get("tokenizer_version", BOARD_TOKENIZER_VERSION)
+        != BOARD_TOKENIZER_VERSION
+    ):
+        raise ValueError("Only the lossless board input format is supported")
+    return ARCHITECTURES[architecture]
 
 
 def create_model(config):
-    model_tokenizer_version(config)
     arguments = dict(config)
-    architecture = arguments.pop("architecture", "legacy")
-    constructors = {
-        "legacy": PonderaModel,
-        "base": BoardPolicyModel,
-        "depth": DepthPolicyModel,
-    }
-    return constructors[architecture](**arguments)
+    arguments.pop("architecture", None)
+    arguments.pop("tokenizer_version", None)
+    return model_class(config)(**arguments)

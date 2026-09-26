@@ -4,19 +4,19 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-import chess
-import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
+from teacher_release import play, write_teacher_release
 
-from pondera.chess.board_tokens import encode_boards
-from pondera.chess.position import legal_move_indices
-from pondera.chess.tokenize import TOKENIZER_VERSION
-from pondera.data.prepare import prepare_dataset
+from pondera.chess.board_tokens import BOARD_TOKENIZER_VERSION
 from pondera.data.storage import load_manifest, write_manifest
+from pondera.data.teacher import prepare_teacher_policy
 from pondera.models.checkpoint import read_checkpoint
 from pondera.training.supervised import TrainConfig, train
+
+RUY_LOPEZ = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"]
+# Positions after 1.d4 d5 2.c4 e6, so the validation line is disjoint from the Ruy Lopez line.
+EXCHANGE_START = "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3"
+EXCHANGE_VARIATION = ["b1c3", "g8f6", "c4d5", "e6d5", "g1f3", "b8c6", "f3e5", "c6e5"]
 
 
 class TrainingTests(unittest.TestCase):
@@ -24,6 +24,7 @@ class TrainingTests(unittest.TestCase):
         torch.set_num_threads(1)
         self.config = TrainConfig(
             model={
+                "architecture": "base",
                 "num_blocks": 1,
                 "hidden_size": 16,
                 "intermediate_size": 32,
@@ -43,15 +44,15 @@ class TrainingTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.data = self.root / "data"
-        board = chess.Board()
-        fens = []
-        moves = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"]
-        for move in moves:
-            fens.append(board.fen())
-            board.push_uci(move)
-        source = self.root / "positions.parquet"
-        pq.write_table(pa.table({"fen": fens, "next_move": moves}), source)
-        prepare_dataset([source], [source], self.data)
+        release = write_teacher_release(
+            self.root,
+            {
+                "train": play(RUY_LOPEZ),
+                "val": play(EXCHANGE_VARIATION, start=EXCHANGE_START),
+            },
+            depth=1,
+        )
+        prepare_teacher_policy(release, self.data, depth=1)
 
     def test_resume_matches_uninterrupted_training(self):
         expected = read_checkpoint(train(self.config, self.data, self.root / "full"))
@@ -83,29 +84,9 @@ class TrainingTests(unittest.TestCase):
         )
 
     def test_board_diagnostics_and_legal_loss_resume(self):
-        board = chess.Board()
-        fens, legal = [], []
-        for move in ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"]:
-            fens.append(board.fen())
-            legal.append(legal_move_indices(board))
-            board.push_uci(move)
-        packed = np.full((len(legal), max(map(len, legal))), -1, dtype=np.int16)
-        for index, row in enumerate(legal):
-            packed[index, : len(row)] = row
-        for split in ("train", "val"):
-            np.save(self.data / f"tokens_{split}.npy", encode_boards(fens))
-            np.save(self.data / f"legal_{split}.npy", packed)
-        manifest = load_manifest(self.data / "manifest.json")
-        manifest["tokenizer_version"] = 2
-        write_manifest(self.data / "manifest.json", manifest)
         config = replace(
             self.config,
-            model={
-                **self.config.model,
-                "architecture": "base",
-                "tokenizer_version": 2,
-                "num_blocks": 2,
-            },
+            model={**self.config.model, "architecture": "base", "num_blocks": 2},
             diagnostics=True,
             legal_loss=True,
             train_probe_positions=4,
@@ -137,7 +118,7 @@ class TrainingTests(unittest.TestCase):
     def test_training_rejects_unversioned_or_incompatible_data(self):
         path = self.data / "manifest.json"
         manifest = load_manifest(path)
-        for version in (None, TOKENIZER_VERSION + 1):
+        for version in (None, BOARD_TOKENIZER_VERSION + 1):
             with self.subTest(version=version):
                 invalid = dict(manifest)
                 if version is None:
@@ -155,10 +136,22 @@ class TrainingTests(unittest.TestCase):
         output = self.root / "resumed"
         path = train(self.config, self.data, output, max_steps=1)
         checkpoint = read_checkpoint(path)
-        checkpoint["tokenizer_version"] = TOKENIZER_VERSION + 1
-        torch.save(checkpoint, path)
-        with self.assertRaises(ValueError):
-            train(self.config, self.data, output, resume=path)
+        for corruption in (
+            {"format_version": None},
+            {"format_version": 2},
+            {"tokenizer_version": 1},
+            {"model_config": None},
+        ):
+            with self.subTest(corruption=corruption):
+                invalid = dict(checkpoint)
+                for key, value in corruption.items():
+                    if value is None:
+                        del invalid[key]
+                    else:
+                        invalid[key] = value
+                torch.save(invalid, path)
+                with self.assertRaises(ValueError):
+                    train(self.config, self.data, output, resume=path)
 
     def test_nonpositive_step_limit_is_rejected(self):
         for max_steps in (0, -1):

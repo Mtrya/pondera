@@ -5,14 +5,13 @@ from pathlib import Path
 
 import chess
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
+from teacher_release import play, write_teacher_release
 
 from pondera.chess.board_tokens import PAD, decode_board, encode_board, encode_boards
 from pondera.chess.mapping import EMPTY_SQ_IDX, UCI_MOVE_TO_IDX
 from pondera.data.positions import TokenizedPositions
-from pondera.data.prepare import prepare_dataset
+from pondera.data.teacher import prepare_teacher_policy
 from pondera.inference.policy import pick_move
 from pondera.models.board import black_to_move, pack_board_tokens, reflect_board_tokens
 from pondera.models.checkpoint import load_model, read_checkpoint, save_checkpoint
@@ -190,6 +189,8 @@ class BoardModelTests(unittest.TestCase):
                         chess.Move.from_uci(pick_move(restored, chess.Board())),
                         chess.Board().legal_moves,
                     )
+                    mate = chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")
+                    self.assertEqual(pick_move(restored, mate), "0000")
                     hub = Path(directory) / "hub"
                     model.save_pretrained(hub)
                     torch.testing.assert_close(
@@ -213,12 +214,10 @@ class BoardModelTests(unittest.TestCase):
                 load_model(Path(directory) / "hub")(ids=ids)[0], model(ids=ids)[0]
             )
 
-    def test_real_parquet_lossless_training_budget_and_resume(self):
+    def test_teacher_encoded_training_budget_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fens, moves = [], []
-            board = chess.Board()
-            for move in [
+            moves = [
                 "e2e4",
                 "e7e5",
                 "g1f3",
@@ -227,21 +226,28 @@ class BoardModelTests(unittest.TestCase):
                 "a7a6",
                 "b5a4",
                 "g8f6",
-            ]:
-                fens.append(board.fen())
-                moves.append(move)
-                board.push_uci(move)
+            ]
+            line = play(moves, repetitions=list(range(1, 9)))
+            fens = [fen for fen, _, _ in line]
             fens[-1] = " ".join(fens[-1].split()[:4]) + " 130 400"
-            source = root / "source.parquet"
-            pq.write_table(
-                pa.table(
-                    {"fen": fens, "next_move": moves, "repetition": list(range(1, 9))}
-                ),
-                source,
+            train_records = [
+                (fen, move, repetition)
+                for fen, (_, move, repetition) in zip(fens, line)
+            ]
+            # Start the validation line after 1.d4 d5 2.c4 e6 to keep it disjoint.
+            val_records = play(
+                ["b1c3", "g8f6"],
+                start="rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3",
             )
             data = root / "data"
-            prepare_dataset([source], [source], data, tokenizer_version=2)
-            dataset = TokenizedPositions(data, "train", 2)
+            prepare_teacher_policy(
+                write_teacher_release(
+                    root, {"train": train_records, "val": val_records}, depth=1
+                ),
+                data,
+                depth=1,
+            )
+            dataset = TokenizedPositions(data, "train")
             self.assertEqual(decode_board(dataset.tokens[-1]), (fens[-1], 8))
             self.assertEqual(int(dataset.moves[-1]), UCI_MOVE_TO_IDX[moves[-1]])
             config = TrainConfig(

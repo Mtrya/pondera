@@ -82,7 +82,7 @@ def run_match(
         + shlex.join(
             [
                 "-m",
-                "pondera.cli.uci",
+                "pondera.inference.uci",
                 "--checkpoint",
                 str(checkpoint),
                 "--device",
