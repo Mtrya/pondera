@@ -25,3 +25,6 @@ htmlcov/
 *.log
 .env
 .env.*
+
+# Machine-specific platform asset contract (managed per machine).
+/INSPIRE.md
