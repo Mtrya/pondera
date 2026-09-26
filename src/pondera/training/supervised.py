@@ -15,11 +15,13 @@ from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
 from pondera.chess.board_tokens import PAD
+from pondera.chess.mapping import EMPTY_SQ_IDX
 from pondera.data.positions import TokenizedPositions
 from pondera.models.board import pack_board_tokens
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model, model_tokenizer_version
 from pondera.training.cost import policy_flops
+from pondera.training.metrics import PolicyMetrics, policy_loss, readout_changes
 
 
 @dataclass
@@ -49,6 +51,9 @@ class TrainConfig:
     log_every: int = 50
     save_every: int = 2000
     train_flops_budget: float | None = None
+    diagnostics: bool = False
+    legal_loss: bool = False
+    train_probe_positions: int = 0
 
     def __post_init__(self):
         for name in (
@@ -64,6 +69,14 @@ class TrainConfig:
                 raise ValueError(f"{name} must be positive")
         if self.workers < 0 or self.precision not in {"fp32", "bf16"}:
             raise ValueError("Invalid workers or precision")
+        if self.train_probe_positions < 0:
+            raise ValueError("train_probe_positions must be non-negative")
+        if (self.diagnostics or self.legal_loss) and self.model.get(
+            "architecture"
+        ) != "base":
+            raise ValueError(
+                "Policy diagnostics and legal loss require a base board policy"
+            )
         for name in ("learning_rate", "grad_clip"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
@@ -94,7 +107,13 @@ class PolicyCollator:
             {"ids": ids} if self.layout is None else pack_board_tokens(ids, self.layout)
         )
         targets = torch.tensor([row[1] for row in rows], dtype=torch.long)
-        return inputs, targets
+        metadata = {}
+        if len(rows[0]) == 3:
+            metadata = {
+                "legal": torch.from_numpy(np.stack([row[2] for row in rows])).long(),
+                "pieces": (ids[:, :64] != EMPTY_SQ_IDX).sum(-1),
+            }
+        return inputs, targets, metadata
 
 
 def load_config(path):
@@ -117,8 +136,11 @@ def train(
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
     tokenizer_version = model_tokenizer_version(config.model)
-    train_data = TokenizedPositions(data_dir, "train", tokenizer_version)
-    val_data = TokenizedPositions(data_dir, "val", tokenizer_version)
+    need_legal = config.diagnostics or config.legal_loss
+    train_data = TokenizedPositions(
+        data_dir, "train", tokenizer_version, legal=need_legal
+    )
+    val_data = TokenizedPositions(data_dir, "val", tokenizer_version, legal=need_legal)
     collate = PolicyCollator(
         config.model.get("layout", "squares") if tokenizer_version == 2 else None
     )
@@ -260,27 +282,71 @@ def train(
         )
 
     @torch.no_grad()
-    def validate():
+    def evaluate(data, indices, prefix, artifact=None):
         model.eval()
         correct = torch.zeros((), dtype=torch.long, device=device)
         loss_sum = torch.zeros((), device=device)
         count = 0
-        limit = min(config.val_positions, len(val_data))
+        observations = PolicyMetrics() if config.diagnostics else None
+        internal = {}
         with autocast():
-            for start in range(0, limit, config.batch_size):
-                end = min(start + config.batch_size, limit)
-                inputs, targets = collate([val_data[i] for i in range(start, end)])
+            for start in range(0, len(indices), config.batch_size):
+                selected = indices[start : start + config.batch_size]
+                inputs, targets, metadata = collate([data[i] for i in selected])
                 targets = targets.to(device)
-                logits, _ = model(
-                    **{key: value.to(device) for key, value in inputs.items()}
-                )
+                inputs = {key: value.to(device) for key, value in inputs.items()}
+                if observations is not None and start == 0 and prefix == "val":
+                    logits, _, output = model(
+                        **inputs, return_backbone=True, capture=True
+                    )
+                    internal = readout_changes(output)
+                    del output
+                else:
+                    logits, _ = model(**inputs)
                 loss_sum += torch.nn.functional.cross_entropy(
                     logits.float(), targets, reduction="sum"
                 )
                 correct += (logits.argmax(-1) == targets).sum()
                 count += len(targets)
+                if observations is not None:
+                    observations.update(
+                        logits,
+                        targets,
+                        metadata["legal"].to(device),
+                        metadata["pieces"].to(device),
+                    )
         model.train()
-        return {"val/top1": correct.item() / count, "val/loss": loss_sum.item() / count}
+        values = {"top1": correct.item() / count, "loss": loss_sum.item() / count}
+        if observations is not None:
+            values.update(observations.result(artifact))
+        return {
+            **{f"{prefix}/{key}": value for key, value in values.items()},
+            **{f"internal/{key}": value for key, value in internal.items()},
+        }
+
+    def validate():
+        values = evaluate(
+            val_data,
+            range(min(config.val_positions, len(val_data))),
+            "val",
+            output_dir / "probes" / f"val-{step:06d}.npz",
+        )
+        if config.train_probe_positions:
+            indices = np.linspace(
+                0,
+                len(train_data) - 1,
+                min(config.train_probe_positions, len(train_data)),
+                dtype=int,
+            )
+            values.update(evaluate(train_data, indices, "train_probe"))
+            values["generalization/loss_gap"] = (
+                values["val/loss"] - values["train_probe/loss"]
+            )
+            if config.diagnostics:
+                values["generalization/legal_loss_gap"] = (
+                    values["val/legal_loss"] - values["train_probe/legal_loss"]
+                )
+        return values
 
     def save(name, epoch, micro):
         save_checkpoint(
@@ -336,7 +402,7 @@ def train(
                 ),
             )
             loss_sum = torch.zeros((), device=device)
-            for micro, (inputs, targets) in enumerate(loader):
+            for micro, (inputs, targets, metadata) in enumerate(loader):
                 if micro >= steps_per_epoch * config.accumulation_steps:
                     break
                 if epoch == start_epoch and micro < next_micro:
@@ -352,15 +418,19 @@ def train(
                             for key, value in inputs.items()
                         }
                     )
-                    loss = torch.nn.functional.cross_entropy(
-                        logits.float(), targets.to(device, non_blocking=True)
+                    loss = policy_loss(
+                        logits.float(),
+                        targets.to(device, non_blocking=True),
+                        metadata["legal"].to(device, non_blocking=True)
+                        if config.legal_loss
+                        else None,
                     )
                 (loss / config.accumulation_steps).backward()
                 loss_sum += loss.detach()
                 if (micro + 1) % config.accumulation_steps:
                     continue
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), config.grad_clip
+                    model.parameters(), config.grad_clip, error_if_nonfinite=True
                 )
                 optimizer.step()
                 scheduler.step()
@@ -386,6 +456,12 @@ def train(
                         if config.model.get("architecture") == "base"
                         else None,
                         "train/examples": examples_seen,
+                        "train/data_passes": examples_seen / len(train_data),
+                        "train/schedule_progress": min(
+                            1.0, consumed_flops / config.train_flops_budget
+                        )
+                        if config.train_flops_budget
+                        else step / total_steps,
                         "model/parameters": trainable_parameters,
                         "elapsed_seconds": time.monotonic() - start_time,
                         "memory/peak_allocated_bytes": torch.cuda.max_memory_allocated(
@@ -417,6 +493,11 @@ def train(
     final_metrics = {
         "step": step,
         "final": True,
+        "training_complete": step >= total_steps
+        or (
+            config.train_flops_budget is not None
+            and consumed_flops >= config.train_flops_budget
+        ),
         "train/theoretical_flops": consumed_flops
         if config.model.get("architecture") == "base"
         else None,

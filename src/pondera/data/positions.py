@@ -11,7 +11,9 @@ from pondera.chess.tokenize import TOKEN_COUNT, TOKENIZER_VERSION
 
 
 class TokenizedPositions(Dataset):
-    def __init__(self, directory, split, tokenizer_version=TOKENIZER_VERSION):
+    def __init__(
+        self, directory, split, tokenizer_version=TOKENIZER_VERSION, legal=False
+    ):
         directory = Path(directory)
         with (directory / "manifest.json").open(encoding="utf-8") as handle:
             manifest = json.load(handle)
@@ -33,9 +35,19 @@ class TokenizedPositions(Dataset):
         if not expected:
             raise ValueError("Token array does not match its declared format")
         self.manifest = manifest
+        self.legal = None
+        if legal:
+            self.legal = np.load(directory / f"legal_{split}.npy", mmap_mode="r")
+            if (
+                self.legal.ndim != 2
+                or len(self.legal) != len(self.moves)
+                or self.legal.dtype != np.int16
+            ):
+                raise ValueError("Legal action array does not match the examples")
 
     def __len__(self):
         return len(self.moves)
 
     def __getitem__(self, index):
-        return self.tokens[index].copy(), int(self.moves[index])
+        row = self.tokens[index].copy(), int(self.moves[index])
+        return row if self.legal is None else (*row, self.legal[index].copy())

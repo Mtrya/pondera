@@ -14,7 +14,7 @@ from pondera.chess.mapping import EMPTY_SQ_IDX, UCI_MOVE_TO_IDX
 from pondera.data.positions import TokenizedPositions
 from pondera.data.prepare import prepare_dataset
 from pondera.inference.policy import pick_move
-from pondera.models.board import pack_board_tokens
+from pondera.models.board import black_to_move, pack_board_tokens, reflect_board_tokens
 from pondera.models.checkpoint import load_model, read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model
 from pondera.training.cost import policy_flops
@@ -62,6 +62,87 @@ class BoardModelTests(unittest.TestCase):
             valid = packed["ids"][i] != PAD
             restored[packed["positions"][i, valid]] = packed["ids"][i, valid]
             self.assertEqual(decode_board(restored), (fen, 1))
+
+    def test_orientation_is_reversible_and_matches_chess_mirror(self):
+        fens = [
+            "r3k2r/8/8/8/3pP3/8/8/R3K2R b Kq e3 130 400",
+            "7k/8/8/8/8/8/p7/7K b - - 0 80",
+            chess.STARTING_FEN,
+        ]
+        ids = torch.from_numpy(encode_boards(fens, [3, 2, 1]))
+        for layout in ("squares", "pieces"):
+            packed = pack_board_tokens(ids, layout)
+            black = black_to_move(**packed)
+            changed, positions = reflect_board_tokens(**packed, reflected=black)
+            recovered, recovered_positions = reflect_board_tokens(
+                changed, positions, black
+            )
+            torch.testing.assert_close(recovered, packed["ids"])
+            torch.testing.assert_close(recovered_positions, packed["positions"])
+            for index, fen in enumerate(fens):
+                restored = torch.full_like(ids[index], PAD)
+                restored[:64] = EMPTY_SQ_IDX
+                valid = changed[index] != PAD
+                restored[positions[index, valid]] = changed[index, valid]
+                transformed, repetition = decode_board(restored)
+                expected = chess.Board(fen)
+                if expected.turn == chess.BLACK:
+                    expected = expected.mirror()
+                parts = expected.fen(en_passant="fen").split()
+                parts[1] = fen.split()[1]
+                self.assertEqual(transformed, " ".join(parts))
+                self.assertEqual(repetition, [3, 2, 1][index])
+
+    def test_joint_embeddings_and_oriented_policy_roundtrip(self):
+        fens = [
+            chess.STARTING_FEN,
+            "r3k2r/8/8/8/3pP3/8/8/R3K2R b Kq e3 130 400",
+            "7k/8/8/8/8/8/p7/7K b - - 0 80",
+        ]
+        ids = torch.from_numpy(encode_boards(fens))
+        for encoding in ("additive", "joint"):
+            config = {
+                **CONFIG,
+                "encoding": encoding,
+                "orientation": "side_to_move",
+                "layout": "pieces",
+            }
+            model = create_model(config).eval()
+            packed = pack_board_tokens(ids, "pieces")
+            logits, _ = model(**packed)
+            torch.testing.assert_close(logits, model(ids=ids)[0])
+            order = torch.arange(packed["ids"].shape[1] - 1, -1, -1)
+            torch.testing.assert_close(
+                logits, model(**{k: v[:, order] for k, v in packed.items()})[0]
+            )
+            reflected = model.reflected_actions
+            torch.testing.assert_close(
+                reflected[reflected], torch.arange(len(reflected))
+            )
+            for index, fen in enumerate(fens):
+                board = chess.Board(fen)
+                actual = {
+                    int(reflected[UCI_MOVE_TO_IDX[m.uci()]]) for m in board.legal_moves
+                }
+                expected = {
+                    UCI_MOVE_TO_IDX[m.uci()] for m in board.mirror().legal_moves
+                }
+                self.assertEqual(actual, expected)
+            hidden, valid, squares = model.embed(**packed)
+            output = model.backbone(hidden, valid=valid, squares=squares)
+            canonical_logits = model.act_proj(output.hidden[:, -2])
+            torch.testing.assert_close(logits[0], canonical_logits[0])
+            torch.testing.assert_close(logits[1:], canonical_logits[1:, reflected])
+            logits.square().mean().backward()
+            self.assertGreater(
+                float(model.board_embedding.squares.weight.grad.abs().sum()), 0
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "policy.pth"
+                save_checkpoint(path, model, config)
+                torch.testing.assert_close(
+                    load_model(path)(ids=ids)[0], logits, rtol=0, atol=0
+                )
 
     def test_policy_gradients_padding_and_checkpoint_roundtrip(self):
         fens = [chess.STARTING_FEN, "7k/Q7/8/8/8/8/8/K7 b - - 129 999"]

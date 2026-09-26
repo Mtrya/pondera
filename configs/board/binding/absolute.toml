@@ -1,0 +1,28 @@
+seed = 640
+batch_size = 512
+accumulation_steps = 1
+epochs = 4
+learning_rate = 0.0003
+weight_decay = 0.01
+warmup_ratio = 0.03
+grad_clip = 1.0
+workers = 4
+precision = "bf16"
+val_every = 256
+val_positions = 8192
+log_every = 50
+save_every = 256
+diagnostics = true
+legal_loss = false
+train_probe_positions = 2048
+
+[model]
+architecture = "base"
+tokenizer_version = 2
+layout = "squares"
+geometry = "absolute"
+num_blocks = 8
+hidden_size = 512
+intermediate_size = 1536
+num_heads = 8
+dropout = 0.0

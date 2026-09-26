@@ -1,9 +1,13 @@
 """Offline Stockfish annotations with scores at each completed search depth."""
 
 import json
+import math
+import shutil
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from hashlib import file_digest, sha256
 from pathlib import Path
 from threading import local
 
@@ -20,46 +24,77 @@ class AnnotationConfig:
     multipv: int = 5
     threads: int = 1
     hash_mb: int = 64
-    max_time: float = 15.0
+    max_time: float | None = None
 
 
 def analyse(engine, board, config: AnnotationConfig) -> dict:
     by_depth = {}
+    completed = {}
+    expected = min(config.multipv, board.legal_moves.count())
     nodes = None
+    reported_depth = 0
     with engine.analysis(
         board,
         chess.engine.Limit(depth=config.depth, time=config.max_time),
         multipv=config.multipv,
+        game=object(),
+        options={"UCI_ShowWDL": True},
     ) as stream:
         for info in stream:
+            nodes = info.get("nodes", nodes)
             if "depth" not in info or not info.get("pv") or "score" not in info:
                 continue
-            score = info["score"].white()
-            by_depth.setdefault(info["depth"], {})[info.get("multipv", 1)] = {
+            depth, rank = info["depth"], info.get("multipv", 1)
+            reported_depth = max(reported_depth, depth)
+            ranks = by_depth.setdefault(depth, {})
+            if rank == 1:
+                ranks.clear()
+            if info.get("lowerbound") or info.get("upperbound"):
+                ranks.pop(rank, None)
+                continue
+            score = info["score"].pov(board.turn)
+            wdl = info["wdl"].pov(board.turn)
+            ranks[rank] = {
                 "bm": info["pv"][0].uci(),
                 "cp": score.score(),
                 "mate": score.mate(),
                 "pv": [move.uci() for move in info["pv"]],
+                "wdl": [wdl.wins, wdl.draws, wdl.losses],
+                "value": (wdl.wins - wdl.losses) / wdl.total(),
             }
-            nodes = info.get("nodes", nodes)
-    reached = max(by_depth, default=0)
-    per_depth = []
-    for depth, ranks in sorted(by_depth.items()):
-        row = {"d": depth}
-        for rank, entry in sorted(ranks.items()):
-            row[f"r{rank}"] = {
-                key: value
-                for key, value in entry.items()
-                if key != "pv" or depth == reached
-            }
-        per_depth.append(row)
-    return {"per_depth": per_depth, "reached_depth": reached, "nodes": nodes}
+            if (
+                set(ranks) == set(range(1, expected + 1))
+                and len({entry["bm"] for entry in ranks.values()}) == expected
+            ):
+                completed[depth] = {
+                    "d": depth,
+                    **{f"r{k}": value for k, value in sorted(ranks.items())},
+                }
+    return {
+        "per_depth": [row for _, row in sorted(completed.items())],
+        "reached_depth": max(completed, default=0),
+        "reported_depth": reported_depth,
+        "requested_depth_completed": config.depth in completed,
+        "incomplete_depths": sorted(set(by_depth) - set(completed)),
+        "expected_candidates": expected,
+        "nodes": nodes,
+    }
+
+
+def _position_id(record):
+    position = [record["fen"], record.get("repetition", 1)]
+    return sha256(json.dumps(position).encode()).hexdigest()
 
 
 def _annotate(record, engine, config):
     board = chess.Board(record["fen"])
+    if not board.is_valid():
+        raise ValueError(f"Invalid position: {record['fen']}")
     result = {
         **record,
+        "position_id": _position_id(record),
+        "root_player": "white" if board.turn else "black",
+        "repetition": record.get("repetition", 1),
         "pieces": chess.popcount(board.occupied),
         "fullmove": board.fullmove_number,
     }
@@ -83,14 +118,16 @@ def _completed_fens(output):
             if not line.endswith(b"\n"):
                 handle.truncate(start)
                 break
-            done.add(json.loads(line)["fen"])
+            done.add(_position_id(json.loads(line)))
     return done
 
 
 def annotate_positions(records, output, config=AnnotationConfig(), workers=1):
-    if (
-        min(config.depth, config.multipv, config.threads, config.hash_mb, workers) < 1
-        or config.max_time <= 0
+    if min(
+        config.depth, config.multipv, config.threads, config.hash_mb, workers
+    ) < 1 or (
+        config.max_time is not None
+        and (not math.isfinite(config.max_time) or config.max_time <= 0)
     ):
         raise ValueError("Annotation limits and worker count must be positive")
     output = Path(output)
@@ -98,7 +135,21 @@ def annotate_positions(records, output, config=AnnotationConfig(), workers=1):
     manifest_path = output.with_suffix(".manifest.json")
     with chess.engine.SimpleEngine.popen_uci(config.engine) as engine:
         identity = dict(engine.id)
-    manifest = {"format_version": 1, "teacher": identity, "config": asdict(config)}
+        defaults = {name: option.default for name, option in engine.options.items()}
+    engine_path = Path(shutil.which(config.engine) or config.engine).resolve()
+    with engine_path.open("rb") as handle:
+        checksum = file_digest(handle, "sha256").hexdigest()
+    manifest = {
+        "format_version": 2,
+        "teacher": identity,
+        "engine_sha256": checksum,
+        "engine_defaults": defaults,
+        "config": asdict(config),
+        "score_perspective": "root_player",
+        "value_scale": "(wdl_wins - wdl_losses) / wdl_total",
+        "history": "FEN only; no preceding game moves supplied to the teacher",
+        "search_state": "new game for every position",
+    }
     if output.exists():
         if load_manifest(manifest_path) != manifest:
             raise ValueError("Annotation configuration differs from existing output")
@@ -106,11 +157,14 @@ def annotate_positions(records, output, config=AnnotationConfig(), workers=1):
     else:
         done = set()
         write_manifest(manifest_path, manifest)
-    pending = []
-    for record in records:
-        if record["fen"] not in done:
-            pending.append(record)
-            done.add(record["fen"])
+
+    def pending():
+        for record in records:
+            key = _position_id(record)
+            if key not in done:
+                done.add(key)
+                yield record
+
     engines = []
     worker = local()
 
@@ -121,14 +175,27 @@ def annotate_positions(records, output, config=AnnotationConfig(), workers=1):
             worker.engine.configure({"Threads": config.threads, "Hash": config.hash_mb})
         return _annotate(record, worker.engine, config)
 
+    count = 0
     try:
         # Each worker owns a Stockfish process; Python threads only coordinate I/O.
         with ThreadPoolExecutor(max_workers=workers) as pool:
             with output.open("a") as handle:
-                for record in pool.map(annotate, pending):
+                # Bound queued work and memory while preserving deterministic order.
+                iterator = iter(pending())
+                futures = deque()
+                for _ in range(2 * workers):
+                    record = next(iterator, None)
+                    if record is not None:
+                        futures.append(pool.submit(annotate, record))
+                while futures:
+                    record = futures.popleft().result()
                     handle.write(json.dumps(record) + "\n")
                     handle.flush()
+                    count += 1
+                    following = next(iterator, None)
+                    if following is not None:
+                        futures.append(pool.submit(annotate, following))
     finally:
         for engine in engines:
             engine.quit()
-    return len(pending)
+    return count

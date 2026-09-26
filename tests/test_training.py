@@ -1,13 +1,17 @@
+import json
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
 import chess
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
+from pondera.chess.board_tokens import encode_boards
+from pondera.chess.position import legal_move_indices
 from pondera.chess.tokenize import TOKENIZER_VERSION
 from pondera.data.prepare import prepare_dataset
 from pondera.data.storage import load_manifest, write_manifest
@@ -77,6 +81,58 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(
             actual["scheduler_state_dict"], expected["scheduler_state_dict"]
         )
+
+    def test_board_diagnostics_and_legal_loss_resume(self):
+        board = chess.Board()
+        fens, legal = [], []
+        for move in ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"]:
+            fens.append(board.fen())
+            legal.append(legal_move_indices(board))
+            board.push_uci(move)
+        packed = np.full((len(legal), max(map(len, legal))), -1, dtype=np.int16)
+        for index, row in enumerate(legal):
+            packed[index, : len(row)] = row
+        for split in ("train", "val"):
+            np.save(self.data / f"tokens_{split}.npy", encode_boards(fens))
+            np.save(self.data / f"legal_{split}.npy", packed)
+        manifest = load_manifest(self.data / "manifest.json")
+        manifest["tokenizer_version"] = 2
+        write_manifest(self.data / "manifest.json", manifest)
+        config = replace(
+            self.config,
+            model={
+                **self.config.model,
+                "architecture": "base",
+                "tokenizer_version": 2,
+                "num_blocks": 2,
+            },
+            diagnostics=True,
+            legal_loss=True,
+            train_probe_positions=4,
+        )
+        expected = read_checkpoint(
+            train(config, self.data, self.root / "diagnostic-full")
+        )
+        output = self.root / "diagnostic-resumed"
+        interrupted = train(config, self.data, output, max_steps=1)
+        partial = json.loads((output / "metrics.jsonl").read_text().splitlines()[-1])
+        self.assertFalse(partial["training_complete"])
+        actual = read_checkpoint(train(config, self.data, output, resume=interrupted))
+        for key, value in expected["model_state_dict"].items():
+            torch.testing.assert_close(
+                actual["model_state_dict"][key], value, rtol=0, atol=0
+            )
+        final = json.loads((output / "metrics.jsonl").read_text().splitlines()[-1])
+        self.assertTrue(final["training_complete"])
+        self.assertEqual(final["val/positions"], 8)
+        self.assertAlmostEqual(
+            final["val/loss"],
+            final["val/legal_loss"] + final["val/legality_penalty"],
+            places=5,
+        )
+        self.assertIn("internal/layer_2/move_relative_change", final)
+        self.assertIn("generalization/legal_loss_gap", final)
+        self.assertTrue((output / "probes" / "val-000004.npz").exists())
 
     def test_training_rejects_unversioned_or_incompatible_data(self):
         path = self.data / "manifest.json"

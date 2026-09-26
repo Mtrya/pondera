@@ -5,9 +5,9 @@ from huggingface_hub import PyTorchModelHubMixin
 from torch import nn
 
 from pondera.chess.board_tokens import BOARD_TOKENIZER_VERSION, encode_boards
-from pondera.chess.mapping import IDX_TO_UCI_MOVE
+from pondera.chess.mapping import IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
 from pondera.models.backbones import BaseBackbone, DepthBackbone
-from pondera.models.board import BoardEmbedding
+from pondera.models.board import BoardEmbedding, black_to_move
 from pondera.models.config import BlockConfig, CoreConfig
 
 
@@ -26,6 +26,8 @@ class BoardPolicyModel(nn.Module, PyTorchModelHubMixin):
         possible_moves=len(IDX_TO_UCI_MOVE),
         tokenizer_version=BOARD_TOKENIZER_VERSION,
         architecture="base",
+        encoding="additive",
+        orientation="absolute",
     ):
         super().__init__()
         if tokenizer_version != BOARD_TOKENIZER_VERSION:
@@ -34,7 +36,37 @@ class BoardPolicyModel(nn.Module, PyTorchModelHubMixin):
             raise ValueError("Unsupported board-policy architecture")
         self.tokenizer_version = tokenizer_version
         self.layout = layout
-        self.board_embedding = BoardEmbedding(hidden_size, layout)
+        self.board_embedding = BoardEmbedding(
+            hidden_size, layout, encoding, orientation
+        )
+        self.orientation = orientation
+        if orientation == "side_to_move":
+            if possible_moves != len(IDX_TO_UCI_MOVE):
+                raise ValueError(
+                    "Side-to-move orientation requires the full action vocabulary"
+                )
+
+            def reflect_move(move):
+                if move == "<claim_draw>":
+                    return move
+                return (
+                    move[0]
+                    + str(9 - int(move[1]))
+                    + move[2]
+                    + str(9 - int(move[3]))
+                    + move[4:]
+                )
+
+            self.register_buffer(
+                "reflected_actions",
+                torch.tensor(
+                    [
+                        UCI_MOVE_TO_IDX[reflect_move(IDX_TO_UCI_MOVE[i])]
+                        for i in range(possible_moves)
+                    ]
+                ),
+                persistent=False,
+            )
         self.act_token = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
         self.val_token = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
         self.act_proj = nn.Linear(hidden_size, possible_moves)
@@ -96,8 +128,14 @@ class BoardPolicyModel(nn.Module, PyTorchModelHubMixin):
         elif repetition_limits is not None:
             raise ValueError("A base policy has no repetition limits")
         output = self.backbone(hidden, **kwargs)
+        logits = self.act_proj(output.hidden[:, -2])
+        if self.orientation == "side_to_move":
+            reflected = black_to_move(ids, positions).to(logits.device)
+            logits = torch.where(
+                reflected[:, None], logits[:, self.reflected_actions], logits
+            )
         predictions = (
-            self.act_proj(output.hidden[:, -2]),
+            logits,
             self.val_proj(output.hidden[:, -1]),
         )
         return (*predictions, output) if return_backbone else predictions
@@ -119,6 +157,8 @@ class DepthPolicyModel(BoardPolicyModel):
         tokenizer_version=BOARD_TOKENIZER_VERSION,
         cache_policy="matched_fallback",
         architecture="depth",
+        encoding="additive",
+        orientation="absolute",
     ):
         groups = [
             CoreConfig(**value) if isinstance(value, dict) else value for value in cores
@@ -134,5 +174,7 @@ class DepthPolicyModel(BoardPolicyModel):
             possible_moves,
             tokenizer_version,
             architecture,
+            encoding,
+            orientation,
         )
         self.backbone = DepthBackbone(self.backbone.block_config, groups, cache_policy)

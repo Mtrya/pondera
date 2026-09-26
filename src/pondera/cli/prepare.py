@@ -11,6 +11,10 @@ def main():
         "--dataset", help="Hugging Face repository; alternative to local parquet files"
     )
     parser.add_argument("--revision", default="main")
+    parser.add_argument(
+        "--teacher-release", type=Path, help="Frozen annotation release manifest"
+    )
+    parser.add_argument("--teacher-depth", type=int, default=16)
     parser.add_argument("--train-split", default="stockfish_train")
     parser.add_argument("--val-split", default="stockfish_val")
     parser.add_argument("--train-file", type=Path, action="append")
@@ -22,6 +26,30 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=Path(".local/data/policy"))
     parser.add_argument("--cache-dir", type=Path, default=Path(".local/data/hub"))
     args = parser.parse_args()
+    if args.teacher_release:
+        if (
+            args.dataset
+            or args.train_file
+            or args.val_file
+            or args.train_rows
+            or args.val_rows
+        ):
+            parser.error(
+                "Teacher releases cannot be combined with dataset or row selection options"
+            )
+        if args.tokenizer_version != 2:
+            parser.error("Teacher releases require the lossless tokenizer")
+        from pondera.data.teacher import prepare_teacher_policy
+
+        print(
+            json.dumps(
+                prepare_teacher_policy(
+                    args.teacher_release, args.output_dir, args.teacher_depth
+                ),
+                indent=2,
+            )
+        )
+        return
     if args.dataset and (args.train_file or args.val_file):
         parser.error("Choose a dataset repository or local files")
     if not args.dataset and not (args.train_file and args.val_file):
