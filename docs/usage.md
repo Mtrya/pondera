@@ -1,6 +1,6 @@
 # Usage and data formats
 
-Pondera is a library. Training and UCI serving have `python -m` entry points; annotation, teacher-release preparation, and match evaluation are library functions that experiment run scripts compose. Paths are supplied explicitly or default to `.local/` beneath the working directory. Engine executables are resolved from `PATH` unless a path is supplied. The examples assume the data and training extras are installed.
+Pondera is a library. Training and UCI serving have `python -m` entry points; annotation, teacher-release preparation, and match evaluation are library functions that experiment run scripts compose. Paths are supplied explicitly or default to `.local/` beneath the working directory. Engine executables are resolved from `PATH` unless a path is supplied. The examples assume the training extra is installed.
 
 ## Annotate positions
 
