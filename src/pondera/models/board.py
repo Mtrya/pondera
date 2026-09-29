@@ -72,7 +72,12 @@ def reflect_board_tokens(ids, positions, reflected):
 
 class BoardEmbedding(nn.Module):
     def __init__(
-        self, hidden_size, layout="squares", encoding="additive", orientation="absolute"
+        self,
+        hidden_size,
+        layout="squares",
+        encoding="additive",
+        orientation="absolute",
+        geometry="absolute",
     ):
         super().__init__()
         if layout not in {"squares", "pieces"}:
@@ -82,16 +87,42 @@ class BoardEmbedding(nn.Module):
             "side_to_move",
         }:
             raise ValueError("Unknown board encoding or orientation")
+        if geometry not in {"absolute", "relative", "sin2d", "rope2d"}:
+            raise ValueError("Unknown board geometry")
+        if encoding == "joint" and geometry in {"sin2d", "rope2d"}:
+            raise ValueError("Joint binding carries its own square identity")
         self.layout = layout
         self.encoding = encoding
         self.orientation = orientation
+        self.geometry = geometry
         offset = 13 if encoding == "joint" else 0
         self.tokens = nn.Embedding(
             VOCAB_SIZE - offset, hidden_size, padding_idx=PAD - offset
         )
-        self.squares = nn.Embedding(13 * 64 if encoding == "joint" else 64, hidden_size)
+        if encoding == "joint" or geometry in {"absolute", "relative"}:
+            self.squares = nn.Embedding(
+                13 * 64 if encoding == "joint" else 64, hidden_size
+            )
+        elif geometry == "sin2d":
+            files = sinusoidal_positions(
+                torch.arange(8), (hidden_size + 1) // 2, torch.float32
+            )
+            ranks = sinusoidal_positions(
+                torch.arange(8), hidden_size // 2, torch.float32
+            )
+            grid = torch.cat(
+                (
+                    files[:, None, :].expand(8, 8, -1),
+                    ranks[None, :, :].expand(8, 8, -1),
+                ),
+                dim=-1,
+            )[:, :, :hidden_size]
+            self.register_buffer(
+                "squares_fixed", grid.reshape(64, hidden_size), persistent=False
+            )
         nn.init.normal_(self.tokens.weight, std=0.02)
-        nn.init.normal_(self.squares.weight, std=0.02)
+        if hasattr(self, "squares"):
+            nn.init.normal_(self.squares.weight, std=0.02)
         with torch.no_grad():
             self.tokens.weight[PAD - offset].zero_()
 
@@ -117,6 +148,12 @@ class BoardEmbedding(nn.Module):
             spatial = self.squares(
                 (squares.clamp_min(0) * 13 + ids.long().clamp(0, 12))
             )
+        elif self.geometry == "sin2d":
+            content = self.tokens(ids.long())
+            spatial = self.squares_fixed[squares.clamp_min(0)].to(content.dtype)
+        elif self.geometry == "rope2d":
+            content = self.tokens(ids.long())
+            spatial = 0
         else:
             content = self.tokens(ids.long())
             spatial = self.squares(squares.clamp_min(0))

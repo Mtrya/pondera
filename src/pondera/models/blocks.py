@@ -85,6 +85,55 @@ class RelativeBoardBias(nn.Module):
         return bias * pair[:, None, :, :]
 
 
+class Rope2D(nn.Module):
+    """Two-dimensional rotary position embedding over board squares.
+
+    Head channels split into a file half and a rank half, each rotated by the
+    corresponding coordinate. Non-board tokens (square index -1) get the
+    identity rotation from a dedicated table row.
+    """
+
+    def __init__(self, head_size):
+        super().__init__()
+        if head_size % 4:
+            raise ValueError("2D rotary embedding needs head_size divisible by 4")
+        pairs = head_size // 4
+        frequencies = torch.exp(
+            torch.arange(pairs, dtype=torch.float32) * (-math.log(10000.0) / pairs)
+        )
+        angles = torch.arange(8, dtype=torch.float32)[:, None] * frequencies[None, :]
+        files = torch.arange(64) % 8
+        ranks = torch.arange(64) // 8
+        cosine = torch.cat((angles.cos()[files], angles.cos()[ranks]), dim=-1)
+        sine = torch.cat((angles.sin()[files], angles.sin()[ranks]), dim=-1)
+        cosine = torch.cat((cosine, torch.ones(1, head_size // 2)))
+        sine = torch.cat((sine, torch.zeros(1, head_size // 2)))
+        self.register_buffer("cosine", cosine, persistent=False)
+        self.register_buffer("sine", sine, persistent=False)
+
+    def forward(self, x, squares):
+        index = squares.masked_fill(squares < 0, 64)
+        c = self.cosine[index].unsqueeze(1).to(x.dtype)
+        s = self.sine[index].unsqueeze(1).to(x.dtype)
+        half = x.shape[-1] // 2
+        rotated = []
+        for part, angles_c, angles_s in (
+            (x[..., :half], c[..., : half // 2], s[..., : half // 2]),
+            (x[..., half:], c[..., half // 2 :], s[..., half // 2 :]),
+        ):
+            first, second = part[..., : half // 2], part[..., half // 2 :]
+            rotated.append(
+                torch.cat(
+                    (
+                        first * angles_c - second * angles_s,
+                        first * angles_s + second * angles_c,
+                    ),
+                    dim=-1,
+                )
+            )
+        return torch.cat(rotated, dim=-1)
+
+
 class SwiGLUFFN(nn.Module):
     def __init__(
         self,
@@ -132,6 +181,7 @@ class TokenBlock(nn.Module):
             if config.geometry == "relative"
             else None
         )
+        self.rope = Rope2D(self.head_size) if config.geometry == "rope2d" else None
         self.attention_capture = None
 
     def project(self, normalized, layout: QueryLayout):
@@ -171,6 +221,10 @@ class TokenBlock(nn.Module):
             .view(batch, queries, self.heads, self.head_size)
             .transpose(1, 2)
         )
+        key, value = memory.key, memory.value
+        if self.rope is not None:
+            q = self.rope(q, query_squares)
+            key = self.rope(key, key_squares)
         mask = attention_mask(
             query_positions, memory.valid.shape[1], prefix_length, memory.valid
         )
@@ -178,12 +232,12 @@ class TokenBlock(nn.Module):
             bias = self.geometry(query_squares, key_squares).to(q.dtype)
             mask = bias.masked_fill(~mask, float("-inf"))
         if self.attention_capture is not None:
-            self._capture_attention(q, memory.key, mask, layout.valid)
+            self._capture_attention(q, key, mask, layout.valid)
         attention = (
             F.scaled_dot_product_attention(
                 q,
-                memory.key,
-                memory.value,
+                key,
+                value,
                 attn_mask=mask,
                 dropout_p=self.dropout if self.training else 0.0,
             )

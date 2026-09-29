@@ -143,7 +143,60 @@ class BoardModelTests(unittest.TestCase):
                     load_model(path)(ids=ids)[0], logits, rtol=0, atol=0
                 )
 
-    def test_policy_gradients_padding_and_checkpoint_roundtrip(self):
+    def test_planar_geometry_variants(self):
+        from pondera.models.blocks import Rope2D
+
+        # Rotary invariant: the rotated dot product depends only on the
+        # per-axis displacement, not on the absolute squares.
+        rope = Rope2D(8)
+        torch.manual_seed(0)
+        q = torch.randn(1, 1, 1, 8)
+        k = torch.randn(1, 1, 1, 8)
+
+        def score(query_square, key_square):
+            squares = torch.tensor([[query_square]])
+            rq = rope(q, squares)
+            rk = rope(k, torch.tensor([[key_square]]))
+            return float(rq @ rk.transpose(-1, -2))
+
+        # a1=0 -> file = index % 8, rank = index // 8 (same convention as the encoder)
+        def square(rank, file):
+            return rank * 8 + file
+
+        pairs = [
+            ((square(0, 0), square(1, 1)), (square(2, 2), square(3, 3))),  # (+1, +1)
+            ((square(1, 0), square(3, 2)), (square(3, 1), square(5, 3))),  # (+2, +2)
+            ((square(7, 7), square(4, 4)), (square(7, 6), square(4, 3))),  # (-3, -3)
+        ]
+        for (q1, k1), (q2, k2) in pairs:
+            self.assertAlmostEqual(score(q1, k1), score(q2, k2), places=5)
+        # Non-board tokens (square -1) must get the identity rotation.
+        arbitrary = torch.randn(2, 3, 5, 8)
+        offboard = torch.full((2, 5), -1, dtype=torch.long)
+        torch.testing.assert_close(rope(arbitrary, offboard), arbitrary)
+
+        ids = torch.from_numpy(encode_boards([chess.STARTING_FEN]))
+        baseline = create_model(CONFIG)
+        for geometry in ("sin2d", "rope2d"):
+            model = create_model({**CONFIG, "geometry": geometry}).eval()
+            self.assertFalse(hasattr(model.board_embedding, "squares"))
+            logits, _ = model(ids=ids)
+            self.assertEqual(logits.shape[1], len(UCI_MOVE_TO_IDX))
+            self.assertTrue(torch.isfinite(logits).all())
+            logits.square().mean().backward()
+            self.assertGreater(
+                float(model.board_embedding.tokens.weight.grad.abs().sum()), 0
+            )
+        self.assertTrue(hasattr(baseline.board_embedding, "squares"))
+        # The fixed 2D grid is a frozen contract: identical across instances.
+        first = create_model({**CONFIG, "geometry": "sin2d"})
+        second = create_model({**CONFIG, "geometry": "sin2d"})
+        torch.testing.assert_close(
+            first.board_embedding.squares_fixed, second.board_embedding.squares_fixed
+        )
+        with self.assertRaises(ValueError):
+            create_model({**CONFIG, "geometry": "rope2d", "encoding": "joint"})
+
         fens = [chess.STARTING_FEN, "7k/Q7/8/8/8/8/8/K7 b - - 129 999"]
         ids = torch.from_numpy(encode_boards(fens))
         for layout, geometry in [

@@ -17,7 +17,12 @@ class BlockConfig:
             raise ValueError("Block dimensions must be positive")
         if self.hidden_size % self.num_heads:
             raise ValueError("hidden_size must be divisible by num_heads")
-        if not 0 <= self.dropout < 1 or self.geometry not in {"absolute", "relative"}:
+        if not 0 <= self.dropout < 1 or self.geometry not in {
+            "absolute",
+            "relative",
+            "sin2d",
+            "rope2d",
+        }:
             raise ValueError("Invalid dropout or geometry")
 
 
