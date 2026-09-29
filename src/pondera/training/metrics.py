@@ -22,33 +22,6 @@ def policy_loss(logits, targets, legal=None):
     ).mean()
 
 
-def factored_nll(factors, targets, tables):
-    """Per-position teacher-move NLL under the factorized readout.
-
-    tables = (MOVE_FROM, MOVE_TO, MOVE_PROMO) as device tensors indexed by
-    move id; to/promo entries of -1 (claim_draw) mask their factors out.
-    """
-    from_logits, to_logits, promo_logits = factors
-    move_from, move_to, move_promo = tables
-    f = move_from[targets]
-    t = move_to[targets]
-    p = move_promo[targets]
-    nll = -from_logits.float().log_softmax(-1).gather(1, f[:, None]).squeeze(1)
-    has_move = (t >= 0).float()
-    nll = nll - has_move * (
-        to_logits.float().log_softmax(-1).gather(1, t.clamp_min(0)[:, None]).squeeze(1)
-        + promo_logits.float()
-        .log_softmax(-1)
-        .gather(1, p.clamp_min(0)[:, None])
-        .squeeze(1)
-    )
-    return nll
-
-
-def factored_policy_loss(factors, targets, tables):
-    return factored_nll(factors, targets, tables).mean()
-
-
 class PolicyMetrics:
     """Retain per-position observations for slices, calibration and paired probes."""
 
@@ -56,7 +29,7 @@ class PolicyMetrics:
         self.batches = []
 
     @torch.no_grad()
-    def update(self, logits, targets, legal, pieces, nll=None):
+    def update(self, logits, targets, legal, pieces):
         logits = logits.float()
         raw_z = logits.logsumexp(-1)
         restricted = legal_logits(logits, legal)
@@ -73,10 +46,7 @@ class PolicyMetrics:
         )
         self.batches.append(
             {
-                # For factored readouts the headline per-move NLL comes from the
-                # factor decomposition; raw_z on materialized log-probs then
-                # measures the mass on structurally valid combinations.
-                "loss": nll.detach() if nll is not None else raw_z - target,
+                "loss": raw_z - target,
                 "legal_loss": legal_z - target,
                 "legality_penalty": raw_z - legal_z,
                 "legal_mass": (legal_z - raw_z).exp(),
@@ -94,11 +64,6 @@ class PolicyMetrics:
                 "prediction": prediction,
                 "legal_prediction": legal_prediction,
                 "legal_count": (legal >= 0).sum(-1),
-                **(
-                    {"factor_valid_mass": raw_z.exp()}
-                    if nll is not None
-                    else {}
-                ),
             }
         )
 
@@ -123,7 +88,6 @@ class PolicyMetrics:
             "confidence",
             "legal_confidence",
             "entropy",
-            "factor_valid_mass",
         )
         result = {
             name: float(arrays[name].mean()) for name in names if name in arrays
@@ -153,12 +117,9 @@ class PolicyMetrics:
 
 
 @torch.no_grad()
-def readout_changes(output, move_tokens=1):
+def readout_changes(output):
     """Relative move-state changes between successive physical layer exits."""
-    states = [
-        readout.hidden[:, -1 - move_tokens : -1].flatten(1).float()
-        for readout in output.readouts
-    ]
+    states = [readout.hidden[:, -2].float() for readout in output.readouts]
     return {
         f"layer_{index}/move_relative_change": float(
             (

@@ -53,10 +53,6 @@ def join_states(states: list[KVState]) -> KVState:
 class BackboneCache:
     owner: int
     prefix_length: int
-    squares: torch.Tensor
+    length: int
     # Physical (core, layer) -> chunks -> executed repetitions within each chunk.
     histories: dict[tuple[int, int], list[list[KVState]]]
-
-    @property
-    def length(self):
-        return self.squares.shape[1]

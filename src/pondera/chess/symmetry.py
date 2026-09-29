@@ -16,7 +16,7 @@ from functools import lru_cache
 
 import numpy as np
 
-from pondera.chess.board_tokens import CASTLING, EN_PASSANT, SIDE
+from pondera.chess.tokens import CASTLING, EN_PASSANT, SIDE
 from pondera.chess.mapping import (
     EMPTY_SQ_IDX,
     IDX_TO_SQUARE,

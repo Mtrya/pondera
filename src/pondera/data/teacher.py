@@ -8,7 +8,7 @@ from pathlib import Path
 import chess
 import numpy as np
 
-from pondera.chess.board_tokens import PAD, encode_board
+from pondera.chess.tokens import PAD, encode_board
 from pondera.chess.mapping import UCI_MOVE_TO_IDX
 from pondera.chess.position import legal_move_indices
 from pondera.data.storage import load_manifest, write_manifest

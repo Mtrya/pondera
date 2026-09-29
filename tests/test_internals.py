@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from pondera.chess.board_tokens import encode_boards
+from pondera.chess.tokens import encode_boards
 from pondera.models.board import pack_board_tokens
 from pondera.models.policy import BoardPolicyModel
 from pondera.training.internals import InternalProbe, effective_rank
@@ -24,7 +24,7 @@ def tiny_model():
 
 def probe_inputs(batch=2):
     ids = torch.from_numpy(encode_boards([START] * batch))
-    return pack_board_tokens(ids, "squares")
+    return pack_board_tokens(ids)
 
 
 class AttentionCaptureTests(unittest.TestCase):
@@ -49,13 +49,13 @@ class AttentionCaptureTests(unittest.TestCase):
         with torch.no_grad():
             model(**probe_inputs())
         block.attention_capture = None
-        # Zero keys make every score zero, so attention is uniform over the 81
-        # valid tokens: 79 board/metadata tokens plus the act and value tokens.
+        # Zero keys make every score zero, so attention is uniform over the 49
+        # valid tokens: 32 pieces plus 15 metadata plus the act and value tokens.
         (stats,) = capture
         self.assertEqual(len(stats), 2)
         for entropy, peak in stats:
-            self.assertAlmostEqual(entropy, math.log(81), places=3)
-            self.assertAlmostEqual(peak, 1 / 81, places=4)
+            self.assertAlmostEqual(entropy, math.log(49), places=3)
+            self.assertAlmostEqual(peak, 1 / 49, places=4)
 
 
 class EffectiveRankTests(unittest.TestCase):
@@ -96,7 +96,10 @@ class EmbeddingDriftTests(unittest.TestCase):
             model.board_embedding.squares.weight[3] += 0.5
         scalars, _ = probe.collect(model, probe_inputs())
         probe.close()
-        self.assertAlmostEqual(scalars["embedding/squares_starved_fraction"], 63 / 64)
+        # The joint (square, piece) table has 13 * 64 = 832 rows.
+        self.assertAlmostEqual(
+            scalars["embedding/squares_starved_fraction"], 831 / 832
+        )
         self.assertGreater(scalars["drift/embedding"], 0.0)
 
 

@@ -1,4 +1,4 @@
-"""Portable SDPA blocks with optional board geometry and active-query packing."""
+"""Portable SDPA blocks with active-query packing."""
 
 import math
 from dataclasses import dataclass
@@ -63,77 +63,6 @@ def attention_mask(query_positions, key_length, prefix_length, key_valid):
     return accessible[:, None, :, :] & key_valid[:, None, None, :]
 
 
-class RelativeBoardBias(nn.Module):
-    """A learned bias per head and signed (file, rank) displacement."""
-
-    def __init__(self, heads):
-        super().__init__()
-        self.embedding = nn.Embedding.from_pretrained(
-            torch.zeros(15 * 15, heads), freeze=False
-        )
-
-    def forward(self, query_squares, key_squares):
-        q, k = query_squares[:, :, None], key_squares[:, None, :]
-        pair = (q >= 0) & (k >= 0)
-        relative = (
-            (k.clamp_min(0) // 8 - q.clamp_min(0) // 8 + 7) * 15
-            + k.clamp_min(0) % 8
-            - q.clamp_min(0) % 8
-            + 7
-        )
-        bias = self.embedding(relative).permute(0, 3, 1, 2)
-        return bias * pair[:, None, :, :]
-
-
-class Rope2D(nn.Module):
-    """Two-dimensional rotary position embedding over board squares.
-
-    Head channels split into a file half and a rank half, each rotated by the
-    corresponding coordinate. Non-board tokens (square index -1) get the
-    identity rotation from a dedicated table row.
-    """
-
-    def __init__(self, head_size):
-        super().__init__()
-        if head_size % 4:
-            raise ValueError("2D rotary embedding needs head_size divisible by 4")
-        pairs = head_size // 4
-        frequencies = torch.exp(
-            torch.arange(pairs, dtype=torch.float32) * (-math.log(10000.0) / pairs)
-        )
-        angles = torch.arange(8, dtype=torch.float32)[:, None] * frequencies[None, :]
-        files = torch.arange(64) % 8
-        ranks = torch.arange(64) // 8
-        cosine = torch.cat((angles.cos()[files], angles.cos()[ranks]), dim=-1)
-        sine = torch.cat((angles.sin()[files], angles.sin()[ranks]), dim=-1)
-        cosine = torch.cat((cosine, torch.ones(1, head_size // 2)))
-        sine = torch.cat((sine, torch.zeros(1, head_size // 2)))
-        self.register_buffer("cosine", cosine, persistent=False)
-        self.register_buffer("sine", sine, persistent=False)
-
-    def forward(self, x, squares):
-        index = squares.masked_fill(squares < 0, 64)
-        c = self.cosine[index].unsqueeze(1).to(x.dtype)
-        s = self.sine[index].unsqueeze(1).to(x.dtype)
-        half = x.shape[-1] // 2
-        rotated = []
-        for part, angles_c, angles_s in (
-            (x[..., :half], c[..., : half // 2], s[..., : half // 2]),
-            (x[..., half:], c[..., half // 2 :], s[..., half // 2 :]),
-        ):
-            first, second = part[..., : half // 2], part[..., half // 2 :]
-            rotated.append(
-                torch.cat(
-                    (
-                        first * angles_c - second * angles_s,
-                        first * angles_s + second * angles_c,
-                    ),
-                    dim=-1,
-                )
-            )
-        return torch.cat(rotated, dim=-1)
-
-
 class SwiGLUFFN(nn.Module):
     def __init__(
         self,
@@ -176,12 +105,6 @@ class TokenBlock(nn.Module):
         self.ffn = SwiGLUFFN(
             config.hidden_size, config.intermediate_size, config.dropout
         )
-        self.geometry = (
-            RelativeBoardBias(config.num_heads)
-            if config.geometry == "relative"
-            else None
-        )
-        self.rope = Rope2D(self.head_size) if config.geometry == "rope2d" else None
         self.attention_capture = None
 
     def project(self, normalized, layout: QueryLayout):
@@ -212,8 +135,6 @@ class TokenBlock(nn.Module):
         memory,
         query_positions,
         prefix_length,
-        query_squares,
-        key_squares,
     ):
         batch, queries, width = normalized.shape
         q = (
@@ -222,15 +143,9 @@ class TokenBlock(nn.Module):
             .transpose(1, 2)
         )
         key, value = memory.key, memory.value
-        if self.rope is not None:
-            q = self.rope(q, query_squares)
-            key = self.rope(key, key_squares)
         mask = attention_mask(
             query_positions, memory.valid.shape[1], prefix_length, memory.valid
         )
-        if self.geometry is not None:
-            bias = self.geometry(query_squares, key_squares).to(q.dtype)
-            mask = bias.masked_fill(~mask, float("-inf"))
         if self.attention_capture is not None:
             self._capture_attention(q, key, mask, layout.valid)
         attention = (
@@ -257,10 +172,7 @@ class TokenBlock(nn.Module):
         """Per-head attention entropy and peak weight; probe-only path."""
         scores = queries.float() @ keys.float().transpose(-1, -2)
         scores = scores / math.sqrt(self.head_size)
-        if mask.dtype == torch.bool:
-            scores = scores.masked_fill(~mask, float("-inf"))
-        else:
-            scores = scores + mask.float()
+        scores = scores.masked_fill(~mask, float("-inf"))
         probs = scores.softmax(-1)
         entropy = -(probs * probs.clamp_min(1e-12).log()).sum(-1)
         peak = probs.max(-1).values

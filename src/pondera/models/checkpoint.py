@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from huggingface_hub import hf_hub_download
 
-from pondera.chess.board_tokens import BOARD_TOKENIZER_VERSION
+from pondera.chess.tokens import CHESS_TOKENIZER_VERSION
 from pondera.models.factory import create_model, model_class
 
 CHECKPOINT_VERSION = 1
@@ -19,7 +19,7 @@ def read_checkpoint(path, device="cpu") -> dict:
         raise ValueError(
             f"Unsupported checkpoint format version: {checkpoint.get('format_version')}"
         )
-    if checkpoint.get("tokenizer_version") != BOARD_TOKENIZER_VERSION:
+    if checkpoint.get("tokenizer_version") != CHESS_TOKENIZER_VERSION:
         raise ValueError(
             "Unsupported checkpoint input format version: "
             f"{checkpoint.get('tokenizer_version')}"
@@ -36,7 +36,7 @@ def save_checkpoint(path, model, model_config, **training_state) -> None:
     payload = {
         **training_state,
         "format_version": CHECKPOINT_VERSION,
-        "tokenizer_version": BOARD_TOKENIZER_VERSION,
+        "tokenizer_version": CHESS_TOKENIZER_VERSION,
         "model_config": model_config,
         "model_state_dict": model.state_dict(),
     }

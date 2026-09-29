@@ -2,7 +2,7 @@
 
 Inputs are embeddings; token meaning and training-only prediction heads belong
 to callers. Causal callers also supply sequence-position information in those
-embeddings. Board geometry is optional and never changes the causal mask.
+embeddings.
 """
 
 from dataclasses import dataclass, field
@@ -68,7 +68,6 @@ class RepeatedCore(nn.Module):
 @dataclass
 class Execution:
     valid: torch.Tensor
-    squares: torch.Tensor
     prefix_length: int | None
     offset: int = 0
     past: BackboneCache | None = None
@@ -129,9 +128,6 @@ class TokenBackbone(nn.Module):
         active = valid
         counts = torch.zeros_like(valid, dtype=torch.long)
         histories = [[] for _ in core.layers]
-        key_squares = execution.squares
-        if execution.past is not None:
-            key_squares = torch.cat((execution.past.squares, key_squares), dim=1)
         for repetition in range(config.max_repetitions):
             if repetition == 0 or (config.mode == "fixed" and not variable_limits):
                 layout = QueryLayout.full(active)
@@ -147,7 +143,6 @@ class TokenBackbone(nn.Module):
                 conditioned = layout.gather(x) + core.iteration.weight[repetition]
                 x = layout.scatter(conditioned, x)
             query_positions = layout.indices + execution.offset
-            query_squares = execution.squares.gather(1, layout.indices)
             for layer_index, layer in enumerate(core.layers):
                 normalized = layer.norm_attention(layout.gather(x))
                 history = histories[layer_index]
@@ -168,8 +163,6 @@ class TokenBackbone(nn.Module):
                     join_states(states),
                     query_positions,
                     execution.prefix_length,
-                    query_squares,
-                    key_squares,
                 )
                 if execution.capture:
                     execution.readouts.append(
@@ -200,7 +193,6 @@ class TokenBackbone(nn.Module):
         x,
         *,
         valid=None,
-        squares=None,
         prefix_length=None,
         cache=None,
         return_cache=False,
@@ -217,16 +209,11 @@ class TokenBackbone(nn.Module):
             )
         if valid is None:
             valid = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
-        if squares is None:
-            squares = torch.full(x.shape[:2], -1, dtype=torch.long, device=x.device)
-        if (
-            valid.shape != x.shape[:2]
-            or valid.dtype != torch.bool
-            or squares.shape != valid.shape
-        ):
-            raise ValueError("Invalid token mask or square coordinates")
+        if valid.shape != x.shape[:2] or valid.dtype != torch.bool:
+            raise ValueError("Invalid token mask")
         if cache is not None:
-            if cache.owner != id(self) or cache.squares.shape[0] != x.shape[0]:
+            first = next(iter(cache.histories.values()))[0][0]
+            if cache.owner != id(self) or first.key.shape[0] != x.shape[0]:
                 raise ValueError("Cache belongs to another backbone or batch")
             if cache.prefix_length != prefix_length:
                 raise ValueError("The board prefix cannot change during decoding")
@@ -238,7 +225,6 @@ class TokenBackbone(nn.Module):
             raise ValueError("Supply one repetition-limit tensor per core")
         execution = Execution(
             valid,
-            squares,
             prefix_length,
             0 if cache is None else cache.length,
             cache,
@@ -251,11 +237,11 @@ class TokenBackbone(nn.Module):
             counts.append(count)
         output_cache = None
         if return_cache:
-            all_squares = (
-                squares if cache is None else torch.cat((cache.squares, squares), dim=1)
-            )
             output_cache = BackboneCache(
-                id(self), prefix_length, all_squares, execution.histories
+                id(self),
+                prefix_length,
+                execution.offset + x.shape[1],
+                execution.histories,
             )
         hidden = self.final_norm(x).masked_fill(~valid.unsqueeze(-1), 0)
         return BackboneOutput(
@@ -273,8 +259,8 @@ class BaseBackbone(TokenBackbone):
     def __init__(self, block: BlockConfig, num_layers: int):
         super().__init__(block, [CoreConfig(layers=num_layers)], "matched_fallback")
 
-    def forward(self, tokens, *, valid=None, squares=None, capture=False):
-        return self._run(tokens, valid=valid, squares=squares, capture=capture)
+    def forward(self, tokens, *, valid=None, capture=False):
+        return self._run(tokens, valid=valid, capture=capture)
 
 
 class DepthBackbone(TokenBackbone):
@@ -289,12 +275,11 @@ class DepthBackbone(TokenBackbone):
         super().__init__(block, cores, cache_policy)
 
     def forward(
-        self, tokens, *, valid=None, squares=None, capture=False, repetition_limits=None
+        self, tokens, *, valid=None, capture=False, repetition_limits=None
     ):
         return self._run(
             tokens,
             valid=valid,
-            squares=squares,
             capture=capture,
             repetition_limits=repetition_limits,
         )
@@ -309,7 +294,6 @@ class CausalBackbone(TokenBackbone):
         prefix_length,
         *,
         valid=None,
-        squares=None,
         capture=False,
         repetition_limits=None,
         return_cache=False,
@@ -319,7 +303,6 @@ class CausalBackbone(TokenBackbone):
         return self._run(
             tokens,
             valid=valid,
-            squares=squares,
             prefix_length=prefix_length,
             capture=capture,
             repetition_limits=repetition_limits,
@@ -337,14 +320,12 @@ class CausalBackbone(TokenBackbone):
         cache: BackboneCache,
         *,
         valid=None,
-        squares=None,
         capture=False,
         repetition_limits=None,
     ):
         return self._run(
             tokens,
             valid=valid,
-            squares=squares,
             prefix_length=cache.prefix_length,
             cache=cache,
             return_cache=True,

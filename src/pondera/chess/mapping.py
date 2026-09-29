@@ -157,32 +157,3 @@ def generate_structurally_valid_move_map() -> Dict[str, int]:
 UCI_MOVE_TO_IDX = generate_structurally_valid_move_map()
 IDX_TO_UCI_MOVE = {v: k for k, v in UCI_MOVE_TO_IDX.items()}
 
-
-# --- Factored move readout (from-square / to-square / promotion) --- #
-# Promotion classes: none=0, then UCI suffix order q/r/b/n.
-PROMO_TO_IDX: Dict[str, int] = {"": 0, "q": 1, "r": 2, "b": 3, "n": 4}
-# The from-head carries one extra slot (index 64) for <claim_draw>; to/promo
-# are masked out for it (sentinel -1).
-CLAIM_DRAW_FROM = 64
-FROM_VOCAB = 65
-TO_VOCAB = 64
-PROMO_VOCAB = len(PROMO_TO_IDX)
-
-
-def _move_factors():
-    from_squares, to_squares, promos = [], [], []
-    for move in IDX_TO_UCI_MOVE.values():
-        if move == "<claim_draw>":
-            from_squares.append(CLAIM_DRAW_FROM)
-            to_squares.append(-1)
-            promos.append(-1)
-            continue
-        from_squares.append(_ALG_TO_IDX[move[:2]])
-        to_squares.append(_ALG_TO_IDX[move[2:4]])
-        promos.append(PROMO_TO_IDX[move[4:]])
-    return tuple(from_squares), tuple(to_squares), tuple(promos)
-
-
-MOVE_FROM, MOVE_TO, MOVE_PROMO = _move_factors()
-# Rank flip (the side_to_move canonicalization) on a square index: s -> s ^ 56.
-REFLECTED_SQUARE: Tuple[int, ...] = tuple(square ^ 56 for square in range(64))

@@ -15,7 +15,7 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 
 Representation code does not import application layers. Models depend on representation, while training and inference depend on models. Training does not call search, annotation, or evaluation code. Evaluation orchestrates inference and external engines. Data and evaluation do not import training. Import contracts enforce these boundaries.
 
-The board tokenizer has one lossless format shared by offline teacher-release preparation and runtime inputs. It preserves supplied counters exactly and supports square or compact-piece layouts. Model embeddings consume these integer representations. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
+The board tokenizer has one lossless format shared by offline teacher-release preparation and runtime inputs, and it preserves supplied counters exactly. Model embeddings pack the tokens into a compact layout that drops empty squares while retaining every occupied square's original coordinate. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
 
 Token backbones compose attention blocks, repeated cores, deployment controllers, and explicit KV access policies. Board policies attach lossless board embeddings and action/value readouts. Sequence and combined backbones accept embeddings without prescribing thought-token semantics or training-only heads. Their contracts and examples are described in [token backbones](backbones.md).
 

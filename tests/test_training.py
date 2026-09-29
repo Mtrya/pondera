@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from teacher_release import play, write_teacher_release
 
-from pondera.chess.board_tokens import BOARD_TOKENIZER_VERSION
+from pondera.chess.tokens import CHESS_TOKENIZER_VERSION
 from pondera.data.storage import load_manifest, write_manifest
 from pondera.data.teacher import prepare_teacher_policy
 from pondera.models.checkpoint import read_checkpoint
@@ -119,7 +119,7 @@ class TrainingTests(unittest.TestCase):
     def test_training_rejects_unversioned_or_incompatible_data(self):
         path = self.data / "manifest.json"
         manifest = load_manifest(path)
-        for version in (None, BOARD_TOKENIZER_VERSION + 1):
+        for version in (None, CHESS_TOKENIZER_VERSION + 1):
             with self.subTest(version=version):
                 invalid = dict(manifest)
                 if version is None:

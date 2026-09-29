@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from teacher_release import play, write_teacher_release
 
-from pondera.chess.board_tokens import PAD, decode_board, encode_board, encode_boards
+from pondera.chess.tokens import PAD, decode_board, encode_board, encode_boards
 from pondera.chess.mapping import EMPTY_SQ_IDX, UCI_MOVE_TO_IDX
 from pondera.data.positions import TokenizedPositions
 from pondera.data.teacher import prepare_teacher_policy
@@ -53,7 +53,7 @@ class BoardModelTests(unittest.TestCase):
     def test_piece_packing_preserves_coordinates_and_metadata(self):
         fens = [chess.STARTING_FEN, "7k/Q7/8/8/8/8/8/K7 b - - 129 999"]
         ids = torch.from_numpy(encode_boards(fens))
-        packed = pack_board_tokens(ids, "pieces")
+        packed = pack_board_tokens(ids)
         self.assertLess(packed["ids"].shape[1], ids.shape[1])
         for i, fen in enumerate(fens):
             restored = torch.full_like(ids[i], PAD)
@@ -69,28 +69,27 @@ class BoardModelTests(unittest.TestCase):
             chess.STARTING_FEN,
         ]
         ids = torch.from_numpy(encode_boards(fens, [3, 2, 1]))
-        for layout in ("squares", "pieces"):
-            packed = pack_board_tokens(ids, layout)
-            black = black_to_move(**packed)
-            changed, positions = reflect_board_tokens(**packed, reflected=black)
-            recovered, recovered_positions = reflect_board_tokens(
-                changed, positions, black
-            )
-            torch.testing.assert_close(recovered, packed["ids"])
-            torch.testing.assert_close(recovered_positions, packed["positions"])
-            for index, fen in enumerate(fens):
-                restored = torch.full_like(ids[index], PAD)
-                restored[:64] = EMPTY_SQ_IDX
-                valid = changed[index] != PAD
-                restored[positions[index, valid]] = changed[index, valid]
-                transformed, repetition = decode_board(restored)
-                expected = chess.Board(fen)
-                if expected.turn == chess.BLACK:
-                    expected = expected.mirror()
-                parts = expected.fen(en_passant="fen").split()
-                parts[1] = fen.split()[1]
-                self.assertEqual(transformed, " ".join(parts))
-                self.assertEqual(repetition, [3, 2, 1][index])
+        packed = pack_board_tokens(ids)
+        black = black_to_move(**packed)
+        changed, positions = reflect_board_tokens(**packed, reflected=black)
+        recovered, recovered_positions = reflect_board_tokens(
+            changed, positions, black
+        )
+        torch.testing.assert_close(recovered, packed["ids"])
+        torch.testing.assert_close(recovered_positions, packed["positions"])
+        for index, fen in enumerate(fens):
+            restored = torch.full_like(ids[index], PAD)
+            restored[:64] = EMPTY_SQ_IDX
+            valid = changed[index] != PAD
+            restored[positions[index, valid]] = changed[index, valid]
+            transformed, repetition = decode_board(restored)
+            expected = chess.Board(fen)
+            if expected.turn == chess.BLACK:
+                expected = expected.mirror()
+            parts = expected.fen(en_passant="fen").split()
+            parts[1] = fen.split()[1]
+            self.assertEqual(transformed, " ".join(parts))
+            self.assertEqual(repetition, [3, 2, 1][index])
 
     def test_joint_embeddings_and_oriented_policy_roundtrip(self):
         fens = [
@@ -99,201 +98,48 @@ class BoardModelTests(unittest.TestCase):
             "7k/8/8/8/8/8/p7/7K b - - 0 80",
         ]
         ids = torch.from_numpy(encode_boards(fens))
-        for encoding in ("additive", "joint"):
-            config = {
-                **CONFIG,
-                "encoding": encoding,
-                "orientation": "side_to_move",
-                "layout": "pieces",
-            }
-            model = create_model(config).eval()
-            packed = pack_board_tokens(ids, "pieces")
-            logits, _ = model(**packed)
-            torch.testing.assert_close(logits, model(ids=ids)[0])
-            order = torch.arange(packed["ids"].shape[1] - 1, -1, -1)
-            torch.testing.assert_close(
-                logits, model(**{k: v[:, order] for k, v in packed.items()})[0]
-            )
-            reflected = model.reflected_actions
-            torch.testing.assert_close(
-                reflected[reflected], torch.arange(len(reflected))
-            )
-            for index, fen in enumerate(fens):
-                board = chess.Board(fen)
-                actual = {
-                    int(reflected[UCI_MOVE_TO_IDX[m.uci()]]) for m in board.legal_moves
-                }
-                expected = {
-                    UCI_MOVE_TO_IDX[m.uci()] for m in board.mirror().legal_moves
-                }
-                self.assertEqual(actual, expected)
-            hidden, valid, squares = model.embed(**packed)
-            output = model.backbone(hidden, valid=valid, squares=squares)
-            canonical_logits = model.act_proj(output.hidden[:, -2])
-            torch.testing.assert_close(logits[0], canonical_logits[0])
-            torch.testing.assert_close(logits[1:], canonical_logits[1:, reflected])
-            logits.square().mean().backward()
-            self.assertGreater(
-                float(model.board_embedding.squares.weight.grad.abs().sum()), 0
-            )
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "policy.pth"
-                save_checkpoint(path, model, config)
-                torch.testing.assert_close(
-                    load_model(path)(ids=ids)[0], logits, rtol=0, atol=0
-                )
-
-    def test_planar_geometry_variants(self):
-        from pondera.models.blocks import Rope2D
-
-        # Rotary invariant: the rotated dot product depends only on the
-        # per-axis displacement, not on the absolute squares.
-        rope = Rope2D(8)
-        torch.manual_seed(0)
-        q = torch.randn(1, 1, 1, 8)
-        k = torch.randn(1, 1, 1, 8)
-
-        def score(query_square, key_square):
-            squares = torch.tensor([[query_square]])
-            rq = rope(q, squares)
-            rk = rope(k, torch.tensor([[key_square]]))
-            return float(rq @ rk.transpose(-1, -2))
-
-        # a1=0 -> file = index % 8, rank = index // 8 (same convention as the encoder)
-        def square(rank, file):
-            return rank * 8 + file
-
-        pairs = [
-            ((square(0, 0), square(1, 1)), (square(2, 2), square(3, 3))),  # (+1, +1)
-            ((square(1, 0), square(3, 2)), (square(3, 1), square(5, 3))),  # (+2, +2)
-            ((square(7, 7), square(4, 4)), (square(7, 6), square(4, 3))),  # (-3, -3)
-        ]
-        for (q1, k1), (q2, k2) in pairs:
-            self.assertAlmostEqual(score(q1, k1), score(q2, k2), places=5)
-        # Non-board tokens (square -1) must get the identity rotation.
-        arbitrary = torch.randn(2, 3, 5, 8)
-        offboard = torch.full((2, 5), -1, dtype=torch.long)
-        torch.testing.assert_close(rope(arbitrary, offboard), arbitrary)
-
-        ids = torch.from_numpy(encode_boards([chess.STARTING_FEN]))
-        baseline = create_model(CONFIG)
-        for geometry in ("sin2d", "rope2d"):
-            model = create_model({**CONFIG, "geometry": geometry}).eval()
-            self.assertFalse(hasattr(model.board_embedding, "squares"))
-            logits, _ = model(ids=ids)
-            self.assertEqual(logits.shape[1], len(UCI_MOVE_TO_IDX))
-            self.assertTrue(torch.isfinite(logits).all())
-            logits.square().mean().backward()
-            self.assertGreater(
-                float(model.board_embedding.tokens.weight.grad.abs().sum()), 0
-            )
-        self.assertTrue(hasattr(baseline.board_embedding, "squares"))
-        # The fixed 2D grid is a frozen contract: identical across instances.
-        first = create_model({**CONFIG, "geometry": "sin2d"})
-        second = create_model({**CONFIG, "geometry": "sin2d"})
+        config = dict(CONFIG)
+        model = create_model(config).eval()
+        packed = pack_board_tokens(ids)
+        logits, _ = model(**packed)
+        torch.testing.assert_close(logits, model(ids=ids)[0])
+        order = torch.arange(packed["ids"].shape[1] - 1, -1, -1)
         torch.testing.assert_close(
-            first.board_embedding.squares_fixed, second.board_embedding.squares_fixed
+            logits, model(**{k: v[:, order] for k, v in packed.items()})[0]
         )
-        with self.assertRaises(ValueError):
-            create_model({**CONFIG, "geometry": "rope2d", "encoding": "joint"})
-
-        fens = [chess.STARTING_FEN, "7k/Q7/8/8/8/8/8/K7 b - - 129 999"]
-        ids = torch.from_numpy(encode_boards(fens))
-        for layout, geometry in [
-            ("squares", "absolute"),
-            ("squares", "relative"),
-            ("pieces", "relative"),
-        ]:
-            with self.subTest(layout=layout, geometry=geometry):
-                config = {**CONFIG, "layout": layout, "geometry": geometry}
-                model = create_model(config).eval()
-                expected = model(ids=ids)
-                packed = pack_board_tokens(ids, layout)
-                padded = torch.cat(
-                    (ids, torch.full((2, 4), PAD, dtype=ids.dtype)), dim=1
-                )
-                torch.testing.assert_close(model(**packed)[0], expected[0])
-                torch.testing.assert_close(model(ids=padded)[0], expected[0])
-                loss = torch.nn.functional.cross_entropy(
-                    expected[0], torch.tensor([0, 1])
-                )
-                loss.backward()
-                self.assertGreater(
-                    float(model.board_embedding.tokens.weight.grad.abs().sum()), 0
-                )
-                if geometry == "relative":
-                    self.assertGreater(
-                        float(
-                            model.backbone.cores[0]
-                            .layers[0]
-                            .geometry.embedding.weight.grad.abs()
-                            .sum()
-                        ),
-                        0,
-                    )
-                with tempfile.TemporaryDirectory() as directory:
-                    path = Path(directory) / "model.pth"
-                    save_checkpoint(path, model, config)
-                    restored = load_model(path)
-                    torch.testing.assert_close(
-                        restored(ids=ids)[0], expected[0], rtol=0, atol=0
-                    )
-                    self.assertIn(
-                        chess.Move.from_uci(pick_move(restored, chess.Board())),
-                        chess.Board().legal_moves,
-                    )
-                    mate = chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")
-                    self.assertEqual(pick_move(restored, mate), "0000")
-                    hub = Path(directory) / "hub"
-                    model.save_pretrained(hub)
-                    torch.testing.assert_close(
-                        load_model(hub)(ids=ids)[0], expected[0], rtol=0, atol=0
-                    )
-
-    def test_broadcast_metadata_injection(self):
-        from pondera.chess.board_tokens import SIDE
-
-        fens = [
-            chess.STARTING_FEN,
-            "r3k2r/8/8/8/3pP3/8/8/R3K2R b Kq e3 130 400",
-            "7k/8/8/8/8/8/p7/7K b - - 0 80",
-        ]
-        ids = torch.from_numpy(encode_boards(fens))
-        model = create_model(
-            {**CONFIG, "layout": "pieces", "metadata": "broadcast"}
-        ).eval()
-        board = model.board_embedding
-        packed = pack_board_tokens(ids, "pieces")
-        out = board(**packed)
-        # Metadata tokens leave the valid sequence: exactly the non-empty
-        # squares survive (piece counts per FEN: 32, 8, 3).
-        for i, count in enumerate((32, 8, 3)):
-            self.assertEqual(int(out.valid[i].sum()), count)
-        self.assertTrue((out.hidden[~out.valid] == 0).all())
-        # Every surviving token carries metadata: flipping the side flag
-        # changes all of them.
-        flipped = ids.clone()
-        flipped[:, 64] = 2 * SIDE + 1 - flipped[:, 64]
-        out_flipped = board(**pack_board_tokens(flipped, "pieces"))
-        self.assertTrue((out.hidden[out.valid] != out_flipped.hidden[out.valid]).all())
-        # Metadata reaches the logits: identical placement with and without
-        # castling rights must score differently.
-        pair = torch.from_numpy(
-            encode_boards(
-                [
-                    "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
-                    "r3k2r/8/8/8/8/8/8/R3K2R w - - 0 1",
-                ]
-            )
+        reflected = model.reflected_actions
+        torch.testing.assert_close(
+            reflected[reflected], torch.arange(len(reflected))
         )
-        logits, _ = model(ids=pair)
-        self.assertFalse(torch.allclose(logits[0], logits[1]))
+        for index, fen in enumerate(fens):
+            board = chess.Board(fen)
+            actual = {
+                int(reflected[UCI_MOVE_TO_IDX[m.uci()]]) for m in board.legal_moves
+            }
+            expected = {
+                UCI_MOVE_TO_IDX[m.uci()] for m in board.mirror().legal_moves
+            }
+            self.assertEqual(actual, expected)
+        hidden, valid = model.embed(**packed)
+        output = model.backbone(hidden, valid=valid)
+        canonical_logits = model.act_proj(output.hidden[:, -2])
+        torch.testing.assert_close(logits[0], canonical_logits[0])
+        torch.testing.assert_close(logits[1:], canonical_logits[1:, reflected])
         logits.square().mean().backward()
         self.assertGreater(
-            float(model.board_embedding.tokens.weight.grad.abs().sum()), 0
+            float(model.board_embedding.squares.weight.grad.abs().sum()), 0
         )
-        with self.assertRaises(ValueError):
-            create_model({**CONFIG, "metadata": "film"})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "policy.pth"
+            save_checkpoint(path, model, config)
+            restored = load_model(path)
+            torch.testing.assert_close(restored(ids=ids)[0], logits, rtol=0, atol=0)
+            self.assertIn(
+                chess.Move.from_uci(pick_move(restored, chess.Board())),
+                chess.Board().legal_moves,
+            )
+            mate = chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")
+            self.assertEqual(pick_move(restored, mate), "0000")
 
     def test_depth_policy_serialization(self):
         config = {key: value for key, value in CONFIG.items() if key != "num_blocks"}
@@ -349,7 +195,7 @@ class BoardModelTests(unittest.TestCase):
             self.assertEqual(decode_board(dataset.tokens[-1]), (fens[-1], 8))
             self.assertEqual(int(dataset.moves[-1]), UCI_MOVE_TO_IDX[moves[-1]])
             config = TrainConfig(
-                model={**CONFIG, "layout": "pieces", "dropout": 0.1},
+                model={**CONFIG, "dropout": 0.1},
                 batch_size=2,
                 accumulation_steps=2,
                 epochs=3,

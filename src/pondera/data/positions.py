@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from torch.utils.data import Dataset
 
-from pondera.chess.board_tokens import BOARD_TOKENIZER_VERSION, MIN_TOKENS
+from pondera.chess.tokens import CHESS_TOKENIZER_VERSION, MIN_TOKENS
 
 
 class TokenizedPositions(Dataset):
@@ -15,7 +15,7 @@ class TokenizedPositions(Dataset):
         with (directory / "manifest.json").open(encoding="utf-8") as handle:
             manifest = json.load(handle)
         version = manifest.get("tokenizer_version")
-        if version != BOARD_TOKENIZER_VERSION:
+        if version != CHESS_TOKENIZER_VERSION:
             raise ValueError(f"Unsupported dataset tokenizer version: {version}")
         self.tokens = np.load(directory / f"tokens_{split}.npy", mmap_mode="r")
         self.moves = np.load(directory / f"moves_{split}.npy", mmap_mode="r")

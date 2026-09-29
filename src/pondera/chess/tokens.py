@@ -1,10 +1,17 @@
-"""Lossless FEN tokens, with arbitrary-size counters encoded as byte digits.
+"""Lossless FEN tokens and the unified chess token vocabulary.
 
-The first 64 entries are squares a1 through h8. Typed metadata follows them:
-side, four castling flags, en passant, and three delimited integer fields.
-This format represents FEN plus a supplied repetition count, not game history.
+The first 64 entries of a board encoding are squares a1 through h8. Typed
+metadata follows them: side, four castling flags, en passant, and three
+delimited integer fields. This format represents FEN plus a supplied
+repetition count, not game history.
+
+CHESS_TOKENIZER extends the board format into one shared id space: board
+tokens keep their historical ids, followed by blocks for the move vocabulary,
+value bins, and mate distances. Sequence models consume and emit this unified
+space; the fixed-depth board policy keeps its dedicated action head.
 """
 
+import bisect
 from collections.abc import Sequence
 
 import numpy as np
@@ -13,11 +20,14 @@ from pondera.chess.mapping import (
     EMPTY_SQ_IDX,
     IDX_TO_PIECE,
     IDX_TO_SQUARE,
+    IDX_TO_UCI_MOVE,
     PIECE_TO_IDX,
     SQUARE_TO_IDX,
 )
 
-BOARD_TOKENIZER_VERSION = 2
+# The version pins the serialized board-token format recorded in data
+# manifests and checkpoints; extending the unified id space does not change it.
+CHESS_TOKENIZER_VERSION = 2
 SIDE = 13
 CASTLING = 15
 EN_PASSANT = 23
@@ -27,6 +37,91 @@ END = 347
 PAD = 348
 VOCAB_SIZE = 349
 MIN_TOKENS = 79
+
+# Unified id space. Board tokens occupy 0..VOCAB_SIZE-1; later blocks follow
+# without gaps and extend append-only.
+MOVE = VOCAB_SIZE
+VALUE = MOVE + len(IDX_TO_UCI_MOVE)
+MATE_WIN = VALUE + 20
+MATE_LOSS = MATE_WIN + 29
+CHESS_VOCAB_SIZE = MATE_LOSS + 31
+
+# Value bins, frozen on the pinned teacher release (pooled candidate ranks,
+# non-mate WDL-derived values in [-1, 1]): bin 0 and bin 19 are the -1 and +1
+# atoms; the interior bins are equiprobable with (lo, hi] membership.
+VALUE_BIN_BOUNDARIES = (
+    -0.9995,
+    -0.9935,
+    -0.9495,
+    -0.7525,
+    -0.4055,
+    -0.1665,
+    -0.0685,
+    -0.0265,
+    -0.0065,
+    -0.0005,
+    0.0045,
+    0.0185,
+    0.0485,
+    0.1125,
+    0.2795,
+    0.6245,
+    0.9145,
+    0.9915,
+    0.9995,
+)
+# Mass-weighted mean of each bin on the same frozen fit: the MSE-optimal decode.
+VALUE_BIN_REPRESENTATIVES = (
+    -1.0,
+    -0.9975466656545338,
+    -0.9778050997401598,
+    -0.869374566711709,
+    -0.5802287566316574,
+    -0.27132291636100436,
+    -0.11024468967970123,
+    -0.0449997169102215,
+    -0.014999041330398631,
+    -0.0031977730105220144,
+    0.000901943418371388,
+    0.010669587162031527,
+    0.03184649072259998,
+    0.07566960512966994,
+    0.18261132375456368,
+    0.4405164642839585,
+    0.7900643834679745,
+    0.9648939514177877,
+    0.997022958525894,
+    1.0,
+)
+# Frozen mate coverage of the pinned teacher data; distance 0 is reserved for
+# the terminal position after perspective normalization.
+MATE_WIN_MAX = 28
+MATE_LOSS_MAX = 30
+
+
+def value_bin(value: float) -> int:
+    """Assign a WDL-derived scalar in [-1, 1] to its frozen bin."""
+    if not -1.0 <= value <= 1.0:
+        raise ValueError("Teacher values lie in [-1, 1]")
+    return bisect.bisect_left(VALUE_BIN_BOUNDARIES, value)
+
+
+def mate_token(distance: int, win: bool) -> int:
+    """Token id for a mate announcement from the moving side's perspective."""
+    if not 0 <= distance <= (MATE_WIN_MAX if win else MATE_LOSS_MAX):
+        raise ValueError("Mate distance outside the frozen coverage")
+    return (MATE_WIN if win else MATE_LOSS) + distance
+
+
+def decode_value_token(token: int) -> float:
+    """Decode a value or mate token to a scalar; mate distance decodes to +-1."""
+    if VALUE <= token < VALUE + len(VALUE_BIN_REPRESENTATIVES):
+        return VALUE_BIN_REPRESENTATIVES[token - VALUE]
+    if MATE_WIN <= token <= MATE_WIN + MATE_WIN_MAX:
+        return 1.0
+    if MATE_LOSS <= token <= MATE_LOSS + MATE_LOSS_MAX:
+        return -1.0
+    raise ValueError(f"Not a value token: {token}")
 
 
 def encode_board(fen: str, repetition: int = 1) -> np.ndarray:

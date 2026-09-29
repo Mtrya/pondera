@@ -79,7 +79,6 @@ class BackboneTests(unittest.TestCase):
             CoreConfig(1, RepetitionConfig(max_repetitions=2)),
         ]
         x = torch.randn(2, 7, 16)
-        squares = torch.tensor([[0, 7, 56, -1, -1, -1, -1]]).expand(2, -1)
         valid = torch.tensor([[True] * 7, [True, True, False, True, True, True, True]])
         limits = [
             torch.tensor([[2, 4, 1, 2, 4, 3, 1], [4, 1, 3, 2, 1, 4, 3]]),
@@ -87,19 +86,10 @@ class BackboneTests(unittest.TestCase):
         ]
         for policy in ("matched_fallback", "first", "matched_only"):
             with self.subTest(policy=policy):
-                model = CombinedBackbone(
-                    BlockConfig(16, 32, 2, geometry="relative"), cores, policy
-                ).eval()
-                with torch.no_grad():
-                    for core in model.cores:
-                        for layer in core.layers:
-                            layer.geometry.embedding.weight.normal_(0, 0.2)
-                full = model(
-                    x, 3, squares=squares, valid=valid, repetition_limits=limits
-                )
+                model = CombinedBackbone(self.block, cores, policy).eval()
+                full = model(x, 3, valid=valid, repetition_limits=limits)
                 output = model.prefill(
                     x[:, :3],
-                    squares=squares[:, :3],
                     valid=valid[:, :3],
                     repetition_limits=[v[:, :3] for v in limits],
                 )

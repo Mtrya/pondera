@@ -4,7 +4,7 @@ import chess
 import numpy as np
 import torch
 
-from pondera.chess.board_tokens import decode_board, encode_boards
+from pondera.chess.tokens import decode_board, encode_boards
 from pondera.chess.mapping import IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
 from pondera.chess.symmetry import (
     NUM_TRANSFORMS,
@@ -88,7 +88,7 @@ class SymmetryCollatorTests(unittest.TestCase):
 
     def test_mirror_mode_is_deterministic_given_torch_seed(self):
         rows = self.rows()
-        collate = PolicyCollator("pieces", "mirror")
+        collate = PolicyCollator("mirror")
         torch.manual_seed(640)
         first_inputs, first_targets, first_meta = collate(rows)
         torch.manual_seed(640)
@@ -99,8 +99,8 @@ class SymmetryCollatorTests(unittest.TestCase):
 
     def test_none_mode_leaves_everything_untouched(self):
         rows = self.rows()
-        plain_inputs, plain_targets, plain_meta = PolicyCollator("pieces")(rows)
-        none_inputs, none_targets, none_meta = PolicyCollator("pieces", "none")(rows)
+        plain_inputs, plain_targets, plain_meta = PolicyCollator()(rows)
+        none_inputs, none_targets, none_meta = PolicyCollator("none")(rows)
         torch.testing.assert_close(plain_inputs["ids"], none_inputs["ids"])
         torch.testing.assert_close(plain_targets, none_targets)
         torch.testing.assert_close(plain_meta["legal"], none_meta["legal"])

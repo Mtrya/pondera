@@ -16,6 +16,8 @@ The board tokenizer produces `int16` arrays padded to the longest encoded positi
 
 Move arrays contain `int16` indices into the 1,969-action vocabulary, including the historical draw-claim action. UCI emits board moves only and leaves draw adjudication to the match runner. Manifests include the tokenizer version and array checksums.
 
+Beyond board encodings, `pondera.chess.tokens` defines one shared id space (CHESS_TOKENIZER) for sequence models: board tokens occupy their historical ids, followed by the 1,969 move tokens, 20 value-bin tokens, and mate-distance tokens (win 0–28, loss 0–30; distance 0 is reserved). Value bins freeze an equiprobable partition of teacher WDL-derived scores in [-1, 1] with dedicated bins for the -1 and +1 atoms; a bin token decodes to its frozen mass-weighted mean, and a mate token decodes to ±1 regardless of distance. The tokenizer version pins the serialized board-token format; extending the id space does not change it. The fixed-depth board policy keeps its dedicated action head and does not consume the move block.
+
 ## Train and resume
 
 ```bash
@@ -27,7 +29,7 @@ Choose `--device cpu` for CPU execution. `--track` enables SwanLab; local metric
 
 Microbatch size and gradient accumulation may be regrouped on resume when their product stays unchanged. The trainer converts the saved position cursor to the new microbatch size and preserves example order, optimizer updates, and the learning-rate schedule. Other configuration changes remain rejected. `execution.json` and checkpoint `execution_history` record regrouping. Floating-point reductions and dropout execution can differ after regrouping, so bitwise equivalence is not guaranteed.
 
-Checkpoints use `format_version = 1` with `tokenizer_version`, `model_config`, and `model_state_dict`, plus training state when applicable. Model, dataset, and checkpoint tokenizer versions must agree. Model configuration selects `architecture = "base"` or `"depth"` for the lossless board policies; `layout = "squares"` or `"pieces"` controls board tokens, and `geometry = "absolute"` or `"relative"` controls spatial attention.
+Checkpoints use `format_version = 1` with `tokenizer_version`, `model_config`, and `model_state_dict`, plus training state when applicable. Model, dataset, and checkpoint tokenizer versions must agree. Model configuration selects `architecture = "base"` or `"depth"` for the lossless board policies. Configurations recorded before the board representation settled may still carry the retired representation keys; they load only when the recorded values match the settled choices.
 
 For policy comparisons, `train_flops_budget` stops training after the first complete optimizer step reaching the specified analytical budget. The warmup and cosine schedule use consumed FLOPs rather than step count. Choose enough `epochs` to reach the budget; `--max-steps` still permits an intentional interruption. Metrics and checkpoints record consumed training FLOPs and examples, and resume checks the dataset manifest identity. The convention counts dense matrix multiplies, with multiply-add equal to two FLOPs and logical token lengths excluding padding; scalar operations and optimizer updates are excluded. Validation is outside the training budget. Runtime and memory are diagnostic measurements, not alignment criteria. See [token backbones](backbones.md) for architecture and execution contracts.
 

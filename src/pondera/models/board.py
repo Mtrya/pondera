@@ -1,11 +1,11 @@
-"""Square and compact-piece inputs, shared by all token backbones."""
+"""Compact-piece board inputs with joint square-piece embeddings."""
 
 from dataclasses import dataclass
 
 import torch
 from torch import nn
 
-from pondera.chess.board_tokens import (
+from pondera.chess.tokens import (
     CASTLING,
     EN_PASSANT,
     MIN_TOKENS,
@@ -17,14 +17,10 @@ from pondera.chess.mapping import EMPTY_SQ_IDX
 from pondera.models.blocks import sinusoidal_positions
 
 
-def pack_board_tokens(ids, layout="squares"):
-    """Prepare a CPU batch before device transfer; retain original square IDs."""
-    if layout not in {"squares", "pieces"}:
-        raise ValueError("Unknown board layout")
+def pack_board_tokens(ids):
+    """Drop padding and empty squares; positions retain the original token IDs."""
     positions = torch.arange(ids.shape[1], device=ids.device).expand_as(ids)
-    keep = ids != PAD
-    if layout == "pieces":
-        keep = keep & ((positions >= 64) | (ids != EMPTY_SQ_IDX))
+    keep = (ids != PAD) & ((positions >= 64) | (ids != EMPTY_SQ_IDX))
     width = int(keep.sum(1).max())
     order = torch.argsort(~keep, dim=1, stable=True)[:, :width]
     valid = keep.gather(1, order)
@@ -38,7 +34,6 @@ def pack_board_tokens(ids, layout="squares"):
 class BoardEmbeddings:
     hidden: torch.Tensor
     valid: torch.Tensor
-    squares: torch.Tensor
 
 
 def black_to_move(ids, positions=None):
@@ -71,64 +66,16 @@ def reflect_board_tokens(ids, positions, reflected):
 
 
 class BoardEmbedding(nn.Module):
-    def __init__(
-        self,
-        hidden_size,
-        layout="squares",
-        encoding="additive",
-        orientation="absolute",
-        geometry="absolute",
-        metadata="tokens",
-    ):
+    """Joint (square, piece) embeddings; metadata tokens carry sinusoidal positions."""
+
+    def __init__(self, hidden_size):
         super().__init__()
-        if layout not in {"squares", "pieces"}:
-            raise ValueError("Unknown board layout")
-        if encoding not in {"additive", "joint"} or orientation not in {
-            "absolute",
-            "side_to_move",
-        }:
-            raise ValueError("Unknown board encoding or orientation")
-        if geometry not in {"absolute", "relative", "sin2d", "rope2d"}:
-            raise ValueError("Unknown board geometry")
-        if metadata not in {"tokens", "broadcast"}:
-            raise ValueError("Unknown metadata injection")
-        if encoding == "joint" and geometry in {"sin2d", "rope2d"}:
-            raise ValueError("Joint binding carries its own square identity")
-        self.layout = layout
-        self.encoding = encoding
-        self.orientation = orientation
-        self.geometry = geometry
-        self.metadata = metadata
-        offset = 13 if encoding == "joint" else 0
-        self.tokens = nn.Embedding(
-            VOCAB_SIZE - offset, hidden_size, padding_idx=PAD - offset
-        )
-        if encoding == "joint" or geometry in {"absolute", "relative"}:
-            self.squares = nn.Embedding(
-                13 * 64 if encoding == "joint" else 64, hidden_size
-            )
-        elif geometry == "sin2d":
-            files = sinusoidal_positions(
-                torch.arange(8), (hidden_size + 1) // 2, torch.float32
-            )
-            ranks = sinusoidal_positions(
-                torch.arange(8), hidden_size // 2, torch.float32
-            )
-            grid = torch.cat(
-                (
-                    files[:, None, :].expand(8, 8, -1),
-                    ranks[None, :, :].expand(8, 8, -1),
-                ),
-                dim=-1,
-            )[:, :, :hidden_size]
-            self.register_buffer(
-                "squares_fixed", grid.reshape(64, hidden_size), persistent=False
-            )
+        self.tokens = nn.Embedding(VOCAB_SIZE - 13, hidden_size, padding_idx=PAD - 13)
+        self.squares = nn.Embedding(13 * 64, hidden_size)
         nn.init.normal_(self.tokens.weight, std=0.02)
-        if hasattr(self, "squares"):
-            nn.init.normal_(self.squares.weight, std=0.02)
+        nn.init.normal_(self.squares.weight, std=0.02)
         with torch.no_grad():
-            self.tokens.weight[PAD - offset].zero_()
+            self.tokens.weight[PAD - 13].zero_()
 
     def forward(self, ids, positions=None):
         if ids.ndim != 2 or ids.dtype not in {torch.int16, torch.int32, torch.int64}:
@@ -138,47 +85,18 @@ class BoardEmbedding(nn.Module):
                 raise ValueError(
                     "Unpacked inputs must contain a complete lossless board"
                 )
-            packed = pack_board_tokens(ids, self.layout)
+            packed = pack_board_tokens(ids)
             ids, positions = packed["ids"], packed["positions"]
-        if self.orientation == "side_to_move":
-            ids, positions = reflect_board_tokens(
-                ids, positions, black_to_move(ids, positions)
-            )
+        ids, positions = reflect_board_tokens(
+            ids, positions, black_to_move(ids, positions)
+        )
         valid = ids != PAD
         board = (positions < 64) & valid
         squares = positions.masked_fill(~board, -1)
-        if self.encoding == "joint":
-            content = self.tokens((ids.long() - 13).clamp_min(0))
-            spatial = self.squares(
-                (squares.clamp_min(0) * 13 + ids.long().clamp(0, 12))
-            )
-        elif self.geometry == "sin2d":
-            content = self.tokens(ids.long())
-            spatial = self.squares_fixed[squares.clamp_min(0)].to(content.dtype)
-        elif self.geometry == "rope2d":
-            content = self.tokens(ids.long())
-            spatial = 0
-        else:
-            content = self.tokens(ids.long())
-            spatial = self.squares(squares.clamp_min(0))
-        if self.metadata == "broadcast":
-            broadcast = (content * ((positions >= 64) & valid).unsqueeze(-1)).sum(
-                1, keepdim=True
-            )
-            if self.encoding == "joint":
-                hidden = torch.where(board.unsqueeze(-1), spatial + broadcast, content)
-            else:
-                hidden = content + torch.where(board.unsqueeze(-1), spatial + broadcast, 0.0)
-            valid = valid & board
-            return BoardEmbeddings(hidden.masked_fill(~valid.unsqueeze(-1), 0), valid, squares)
+        content = self.tokens((ids.long() - 13).clamp_min(0))
+        spatial = self.squares(squares.clamp_min(0) * 13 + ids.long().clamp(0, 12))
         metadata_position = sinusoidal_positions(
             (positions - 64).clamp_min(0), content.shape[-1], content.dtype
         )
-        hidden = (
-            torch.where(board.unsqueeze(-1), spatial, content + metadata_position)
-            if self.encoding == "joint"
-            else content + torch.where(board.unsqueeze(-1), spatial, metadata_position)
-        )
-        return BoardEmbeddings(
-            hidden.masked_fill(~valid.unsqueeze(-1), 0), valid, squares
-        )
+        hidden = torch.where(board.unsqueeze(-1), spatial, content + metadata_position)
+        return BoardEmbeddings(hidden.masked_fill(~valid.unsqueeze(-1), 0), valid)

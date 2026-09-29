@@ -8,7 +8,7 @@ from pathlib import Path
 import chess
 from teacher_release import play, write_teacher_release
 
-from pondera.chess.board_tokens import decode_board
+from pondera.chess.tokens import decode_board
 from pondera.chess.mapping import UCI_MOVE_TO_IDX
 from pondera.data.annotation import AnnotationConfig, annotate_positions
 from pondera.data.positions import TokenizedPositions
