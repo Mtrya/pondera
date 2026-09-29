@@ -6,12 +6,30 @@ from hashlib import file_digest
 from pathlib import Path
 
 import chess
+from teacher_release import play, write_teacher_release
 
 from pondera.chess.board_tokens import decode_board
+from pondera.chess.mapping import UCI_MOVE_TO_IDX
 from pondera.data.annotation import AnnotationConfig, annotate_positions
 from pondera.data.positions import TokenizedPositions
 from pondera.data.storage import write_manifest
 from pondera.data.teacher import prepare_teacher_policy
+
+
+class TeacherReleaseShapeTests(unittest.TestCase):
+    def test_val_only_release_encodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = play(["e2e4", "e7e5"])
+            manifest = write_teacher_release(root, {"train": [], "val": records})
+            metadata = prepare_teacher_policy(manifest, root / "encoded", depth=1)
+            self.assertEqual(metadata["rows_train"], 0)
+            self.assertEqual(metadata["rows_val"], 2)
+            data = TokenizedPositions(root / "encoded", "val", legal=True)
+            ids, move, legal = data[0]
+            self.assertEqual(decode_board(ids), (chess.STARTING_FEN, 1))
+            self.assertEqual(move, UCI_MOVE_TO_IDX["e2e4"])
+            self.assertEqual(len(legal), 20)
 
 
 @unittest.skipUnless(shutil.which("stockfish"), "Requires Stockfish on PATH")

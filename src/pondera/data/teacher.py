@@ -97,7 +97,11 @@ def prepare_teacher_policy(release_path, output_dir, depth=16):
             if count != shard["rows"]:
                 raise ValueError(f"Source row count mismatch: {path}")
         if not tokens:
-            raise ValueError(f"No eligible examples in {split}")
+            if release["files"][split]:
+                raise ValueError(f"No eligible examples in {split}")
+            metadata[f"rows_{split}"] = 0
+            metadata["excluded"][split] = dict(excluded)
+            continue
         if split == "val":
             validation_keys = seen
         for name, rows, padding in [("tokens", tokens, PAD), ("legal", legal_rows, -1)]:

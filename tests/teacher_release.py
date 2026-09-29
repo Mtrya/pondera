@@ -29,6 +29,9 @@ def write_teacher_release(root, splits, depth=1):
     root = Path(root)
     release = {"format_version": 2, "files": {}}
     for split, records in splits.items():
+        if not records:
+            release["files"][split] = []
+            continue
         path = root / f"{split}.jsonl"
         with path.open("w", encoding="utf-8") as handle:
             for fen, move, repetition in records:
