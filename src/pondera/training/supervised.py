@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
 from pondera.chess.board_tokens import PAD
-from pondera.chess.mapping import EMPTY_SQ_IDX
+from pondera.chess.mapping import EMPTY_SQ_IDX, MOVE_FROM, MOVE_PROMO, MOVE_TO
 from pondera.chess.symmetry import NUM_TRANSFORMS, apply_to_legal, apply_to_moves, apply_to_tokens
 from pondera.data.positions import TokenizedPositions
 from pondera.models.board import pack_board_tokens
@@ -24,7 +24,13 @@ from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model
 from pondera.training.cost import policy_flops
 from pondera.training.internals import InternalProbe
-from pondera.training.metrics import PolicyMetrics, policy_loss, readout_changes
+from pondera.training.metrics import (
+    PolicyMetrics,
+    factored_nll,
+    factored_policy_loss,
+    policy_loss,
+    readout_changes,
+)
 
 
 @dataclass
@@ -168,6 +174,12 @@ def train(
         )
     total_steps = steps_per_epoch * config.epochs
     model = create_model(config.model).to(device)
+    factor_tables = None
+    if getattr(model, "readout", "single") == "factored":
+        factor_tables = tuple(
+            torch.tensor(table, device=device)
+            for table in (MOVE_FROM, MOVE_TO, MOVE_PROMO)
+        )
     trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     consumed_flops = 0.0
     examples_seen = 0
@@ -308,16 +320,29 @@ def train(
                 inputs, targets, metadata = collate([data[i] for i in selected])
                 targets = targets.to(device)
                 inputs = {key: value.to(device) for key, value in inputs.items()}
+                nll = None
                 if observations is not None and start == 0 and prefix == "val":
-                    logits, _, output = model(
-                        **inputs, return_backbone=True, capture=True
+                    predictions, _, output = model(
+                        **inputs,
+                        return_backbone=True,
+                        return_factors=True,
+                        capture=True,
                     )
-                    internal = readout_changes(output)
+                    internal = readout_changes(output, model.move_tokens)
                     del output
                 else:
-                    logits, _ = model(**inputs)
-                loss_sum += torch.nn.functional.cross_entropy(
-                    logits.float(), targets, reduction="sum"
+                    predictions, _ = model(**inputs, return_factors=True)
+                if factor_tables is None:
+                    logits = predictions
+                else:
+                    nll = factored_nll(predictions, targets, factor_tables)
+                    logits = model.move_log_probs(predictions)
+                loss_sum += (
+                    nll.sum()
+                    if nll is not None
+                    else torch.nn.functional.cross_entropy(
+                        logits.float(), targets, reduction="sum"
+                    )
                 )
                 correct += (logits.argmax(-1) == targets).sum()
                 count += len(targets)
@@ -327,6 +352,7 @@ def train(
                         targets,
                         metadata["legal"].to(device),
                         metadata["pieces"].to(device),
+                        nll=nll,
                     )
         model.train()
         values = {"top1": correct.item() / count, "loss": loss_sum.item() / count}
@@ -440,19 +466,33 @@ def train(
                     consumed_flops += float(policy_flops(config.model, lengths).sum())
                 examples_seen += len(targets)
                 with autocast():
-                    logits, _ = model(
-                        **{
-                            key: value.to(device, non_blocking=True)
-                            for key, value in inputs.items()
-                        }
-                    )
-                    loss = policy_loss(
-                        logits.float(),
-                        targets.to(device, non_blocking=True),
-                        metadata["legal"].to(device, non_blocking=True)
-                        if config.legal_loss
-                        else None,
-                    )
+                    if factor_tables is None:
+                        logits, _ = model(
+                            **{
+                                key: value.to(device, non_blocking=True)
+                                for key, value in inputs.items()
+                            }
+                        )
+                        loss = policy_loss(
+                            logits.float(),
+                            targets.to(device, non_blocking=True),
+                            metadata["legal"].to(device, non_blocking=True)
+                            if config.legal_loss
+                            else None,
+                        )
+                    else:
+                        factors, _ = model(
+                            **{
+                                key: value.to(device, non_blocking=True)
+                                for key, value in inputs.items()
+                            },
+                            return_factors=True,
+                        )
+                        loss = factored_policy_loss(
+                            factors,
+                            targets.to(device, non_blocking=True),
+                            factor_tables,
+                        )
                 (loss / config.accumulation_steps).backward()
                 loss_sum += loss.detach()
                 if (micro + 1) % config.accumulation_steps:
