@@ -250,6 +250,51 @@ class BoardModelTests(unittest.TestCase):
                         load_model(hub)(ids=ids)[0], expected[0], rtol=0, atol=0
                     )
 
+    def test_broadcast_metadata_injection(self):
+        from pondera.chess.board_tokens import SIDE
+
+        fens = [
+            chess.STARTING_FEN,
+            "r3k2r/8/8/8/3pP3/8/8/R3K2R b Kq e3 130 400",
+            "7k/8/8/8/8/8/p7/7K b - - 0 80",
+        ]
+        ids = torch.from_numpy(encode_boards(fens))
+        model = create_model(
+            {**CONFIG, "layout": "pieces", "metadata": "broadcast"}
+        ).eval()
+        board = model.board_embedding
+        packed = pack_board_tokens(ids, "pieces")
+        out = board(**packed)
+        # Metadata tokens leave the valid sequence: exactly the non-empty
+        # squares survive (piece counts per FEN: 32, 8, 3).
+        for i, count in enumerate((32, 8, 3)):
+            self.assertEqual(int(out.valid[i].sum()), count)
+        self.assertTrue((out.hidden[~out.valid] == 0).all())
+        # Every surviving token carries metadata: flipping the side flag
+        # changes all of them.
+        flipped = ids.clone()
+        flipped[:, 64] = 2 * SIDE + 1 - flipped[:, 64]
+        out_flipped = board(**pack_board_tokens(flipped, "pieces"))
+        self.assertTrue((out.hidden[out.valid] != out_flipped.hidden[out.valid]).all())
+        # Metadata reaches the logits: identical placement with and without
+        # castling rights must score differently.
+        pair = torch.from_numpy(
+            encode_boards(
+                [
+                    "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+                    "r3k2r/8/8/8/8/8/8/R3K2R w - - 0 1",
+                ]
+            )
+        )
+        logits, _ = model(ids=pair)
+        self.assertFalse(torch.allclose(logits[0], logits[1]))
+        logits.square().mean().backward()
+        self.assertGreater(
+            float(model.board_embedding.tokens.weight.grad.abs().sum()), 0
+        )
+        with self.assertRaises(ValueError):
+            create_model({**CONFIG, "metadata": "film"})
+
     def test_depth_policy_serialization(self):
         config = {key: value for key, value in CONFIG.items() if key != "num_blocks"}
         config.update(

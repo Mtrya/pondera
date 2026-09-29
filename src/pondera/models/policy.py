@@ -27,13 +27,14 @@ class BoardPolicyModel(nn.Module, PyTorchModelHubMixin):
         architecture="base",
         encoding="additive",
         orientation="absolute",
+        metadata="tokens",
     ):
         super().__init__()
         if architecture not in {"base", "depth"}:
             raise ValueError("Unsupported board-policy architecture")
         self.layout = layout
         self.board_embedding = BoardEmbedding(
-            hidden_size, layout, encoding, orientation, geometry
+            hidden_size, layout, encoding, orientation, geometry, metadata
         )
         self.orientation = orientation
         if orientation == "side_to_move":

@@ -78,6 +78,7 @@ class BoardEmbedding(nn.Module):
         encoding="additive",
         orientation="absolute",
         geometry="absolute",
+        metadata="tokens",
     ):
         super().__init__()
         if layout not in {"squares", "pieces"}:
@@ -89,12 +90,15 @@ class BoardEmbedding(nn.Module):
             raise ValueError("Unknown board encoding or orientation")
         if geometry not in {"absolute", "relative", "sin2d", "rope2d"}:
             raise ValueError("Unknown board geometry")
+        if metadata not in {"tokens", "broadcast"}:
+            raise ValueError("Unknown metadata injection")
         if encoding == "joint" and geometry in {"sin2d", "rope2d"}:
             raise ValueError("Joint binding carries its own square identity")
         self.layout = layout
         self.encoding = encoding
         self.orientation = orientation
         self.geometry = geometry
+        self.metadata = metadata
         offset = 13 if encoding == "joint" else 0
         self.tokens = nn.Embedding(
             VOCAB_SIZE - offset, hidden_size, padding_idx=PAD - offset
@@ -157,6 +161,16 @@ class BoardEmbedding(nn.Module):
         else:
             content = self.tokens(ids.long())
             spatial = self.squares(squares.clamp_min(0))
+        if self.metadata == "broadcast":
+            broadcast = (content * ((positions >= 64) & valid).unsqueeze(-1)).sum(
+                1, keepdim=True
+            )
+            if self.encoding == "joint":
+                hidden = torch.where(board.unsqueeze(-1), spatial + broadcast, content)
+            else:
+                hidden = content + torch.where(board.unsqueeze(-1), spatial + broadcast, 0.0)
+            valid = valid & board
+            return BoardEmbeddings(hidden.masked_fill(~valid.unsqueeze(-1), 0), valid, squares)
         metadata_position = sinusoidal_positions(
             (positions - 64).clamp_min(0), content.shape[-1], content.dtype
         )
