@@ -17,6 +17,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from pondera.chess.board_tokens import PAD
 from pondera.chess.mapping import EMPTY_SQ_IDX
+from pondera.chess.symmetry import NUM_TRANSFORMS, apply_to_legal, apply_to_moves, apply_to_tokens
 from pondera.data.positions import TokenizedPositions
 from pondera.models.board import pack_board_tokens
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
@@ -57,6 +58,7 @@ class TrainConfig:
     internals: bool = False
     legal_loss: bool = False
     train_probe_positions: int = 0
+    symmetry: str = "none"
 
     def __post_init__(self):
         for name in (
@@ -74,6 +76,8 @@ class TrainConfig:
             raise ValueError("Invalid workers or precision")
         if self.train_probe_positions < 0:
             raise ValueError("train_probe_positions must be non-negative")
+        if self.symmetry != "none" and self.symmetry != "mirror":
+            raise ValueError("symmetry must be none or mirror")
         if (self.diagnostics or self.legal_loss) and self.model.get(
             "architecture"
         ) != "base":
@@ -105,18 +109,26 @@ class TrainConfig:
 @dataclass
 class PolicyCollator:
     layout: str = "squares"
+    symmetry: str = "none"
 
     def __call__(self, rows):
-        ids = torch.from_numpy(np.stack([row[0] for row in rows]))
-        inputs = pack_board_tokens(ids, self.layout)
-        targets = torch.tensor([row[1] for row in rows], dtype=torch.long)
+        ids = np.stack([row[0] for row in rows])
+        targets = np.asarray([row[1] for row in rows], dtype=np.int64)
+        legal = np.stack([row[2] for row in rows]) if len(rows[0]) == 3 else None
+        if self.symmetry == "mirror":
+            draws = torch.randint(NUM_TRANSFORMS, (len(rows),)).numpy()
+            ids = apply_to_tokens(ids, draws)
+            targets = apply_to_moves(targets, draws)
+            if legal is not None:
+                legal = apply_to_legal(legal, draws)
+        inputs = pack_board_tokens(torch.from_numpy(ids), self.layout)
         metadata = {}
-        if len(rows[0]) == 3:
+        if legal is not None:
             metadata = {
-                "legal": torch.from_numpy(np.stack([row[2] for row in rows])).long(),
-                "pieces": (ids[:, :64] != EMPTY_SQ_IDX).sum(-1),
+                "legal": torch.from_numpy(legal).long(),
+                "pieces": torch.from_numpy(ids[:, :64] != EMPTY_SQ_IDX).sum(-1),
             }
-        return inputs, targets, metadata
+        return inputs, torch.from_numpy(targets), metadata
 
 
 def load_config(path):
@@ -142,6 +154,9 @@ def train(
     train_data = TokenizedPositions(data_dir, "train", legal=need_legal)
     val_data = TokenizedPositions(data_dir, "val", legal=need_legal)
     collate = PolicyCollator(config.model.get("layout", "squares"))
+    train_collate = PolicyCollator(
+        config.model.get("layout", "squares"), config.symmetry
+    )
     data_identity = hashlib.sha256(
         json.dumps(train_data.manifest, sort_keys=True).encode()
     ).hexdigest()
@@ -407,7 +422,7 @@ def train(
                 drop_last=True,
                 pin_memory=device.type == "cuda",
                 generator=torch.Generator().manual_seed(config.seed + epoch),
-                collate_fn=collate,
+                collate_fn=train_collate,
                 **(
                     {"persistent_workers": True, "prefetch_factor": 4}
                     if config.workers
