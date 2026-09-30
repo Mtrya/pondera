@@ -54,3 +54,37 @@ def write_teacher_release(root, splits, depth=1):
     manifest = root / "release.json"
     write_manifest(manifest, release)
     return manifest
+
+
+def depth_row(fen, ranks):
+    """One release row with per-depth rank-1 labels: (depth, move, mate, value)."""
+    return {
+        "fen": fen,
+        "repetition": 1,
+        "unit": {
+            "per_depth": [
+                {"d": depth, "r1": {"bm": move, "mate": mate, "value": value}}
+                for depth, move, mate, value in ranks
+            ]
+        },
+    }
+
+
+def write_depth_release(root, splits):
+    """Write a version-2 release whose rows carry complete per-depth labels."""
+    root = Path(root)
+    release = {"format_version": 2, "files": {}}
+    for split, rows in splits.items():
+        path = root / f"{split}.jsonl"
+        with path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+        write_manifest(path.with_suffix(".manifest.json"), {"format_version": 2})
+        with path.open("rb") as handle:
+            digest = file_digest(handle, "sha256").hexdigest()
+        release["files"][split] = [
+            {"path": str(path), "sha256": digest, "rows": len(rows)}
+        ]
+    manifest = root / "release.json"
+    write_manifest(manifest, release)
+    return manifest
