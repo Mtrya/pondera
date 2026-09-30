@@ -171,7 +171,6 @@ def train(
     supervision = exit_teacher_depths(
         exits_per_forward, config.schedule, config.teacher_depth
     )
-    supervised_count = sum(depth is not None for depth in supervision)
     consumed_flops = 0.0
     examples_seen = 0
     optimizer = torch.optim.AdamW(
@@ -474,7 +473,7 @@ def train(
                     continue
                 lengths = (inputs["ids"] != PAD).sum(1).numpy()
                 consumed_flops += float(
-                    depth_flops(config.model, lengths, supervised_count).sum()
+                    depth_flops(config.model, lengths, exits_per_forward).sum()
                 )
                 examples_seen += config.batch_size
                 with autocast():

@@ -31,18 +31,18 @@ def policy_flops(config, lengths, *, training=True):
     return (3 if training else 1) * (trunk + policy) + value
 
 
-def depth_flops(config, lengths, supervised_exits, *, training=True):
+def depth_flops(config, lengths, head_exits, *, training=True):
     """FLOPs for recurrent-depth policies under the policy_flops conventions.
 
     Trunk layers execute once per core repetition (fixed limits); the shared
-    vocabulary head applies at every supervised exit on the two readout
+    vocabulary head applies at every computed exit on the two readout
     positions. Controllers, reinjection, and iteration embeddings are excluded
     as per-token vector arithmetic.
     """
     if config.get("architecture") != "depth":
         raise ValueError("This FLOP convention is defined for the depth policy")
-    if supervised_exits < 1:
-        raise ValueError("At least one exit must be supervised")
+    if head_exits < 1:
+        raise ValueError("At least one exit must apply the head")
     lengths = np.asarray(lengths, dtype=np.float64) + 2  # Action and value readouts.
     width, intermediate = config["hidden_size"], config["intermediate_size"]
     layers = sum(
@@ -54,5 +54,5 @@ def depth_flops(config, lengths, supervised_exits, *, training=True):
         + 6 * lengths * width * intermediate
         + 4 * lengths**2 * width
     )
-    head = supervised_exits * 2 * (2 * width * CHESS_VOCAB_SIZE)
+    head = head_exits * 2 * (2 * width * CHESS_VOCAB_SIZE)
     return (3 if training else 1) * (trunk + head)

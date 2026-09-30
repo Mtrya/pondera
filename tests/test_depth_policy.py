@@ -82,11 +82,11 @@ class DepthFlopsTests(unittest.TestCase):
             "cores": [{"layers": 2, "repetition": {"max_repetitions": 3}}],
         }
         self.assertEqual(
-            float(depth_flops(config, [10], supervised_exits=3)[0]), 2653056.0
+            float(depth_flops(config, [10], head_exits=3)[0]), 2653056.0
         )
         self.assertEqual(
             float(
-                depth_flops(config, [10], supervised_exits=3, training=False)[0]
+                depth_flops(config, [10], head_exits=3, training=False)[0]
             ),
             884352.0,
         )
