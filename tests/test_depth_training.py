@@ -117,6 +117,23 @@ class DepthTrainingTests(unittest.TestCase):
         # Two supervised exits yield exactly one pair; cosine lies in [-1, 1].
         self.assertTrue(-1.0 <= final["internal/grad_cosine_exit_1_2"] <= 1.0)
 
+    def test_adapter_lr_scale_forms_a_separate_param_group(self):
+        config = replace(
+            self.config,
+            model={**self.config.model, "exit_adapter": True},
+            exit_adapter_lr_scale=0.1,
+        )
+        output = self.root / "lr-scale"
+        checkpoint = read_checkpoint(train(config, self.data, output))
+        groups = checkpoint["optimizer_state_dict"]["param_groups"]
+        # Contract: adapters train at lr x scale, everything else at lr.
+        self.assertEqual(len(groups), 2)
+        self.assertAlmostEqual(groups[1]["initial_lr"] / groups[0]["initial_lr"], 0.1)
+
+    def test_adapter_lr_scale_requires_adapters(self):
+        with self.assertRaises(ValueError):
+            replace(self.config, exit_adapter_lr_scale=0.5)
+
     def test_config_validation(self):
         with self.assertRaises(ValueError):
             replace(self.config, schedule="curriculum")

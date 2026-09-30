@@ -140,8 +140,15 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
     trailing readout positions as the fixed-depth policy. Exits are the core
     repetition boundaries in execution order; the final answer is the last exit.
     With exit_adapter enabled, each exit additionally passes through its own
-    residual single-layer adapter before the shared head.
+    single-layer adapter before the shared head. exit_adapter_mode selects how
+    the adapter output is assembled with the normed state: "residual" adds it,
+    "replace" lets the adapter take over, "gated" scales it with a per-exit
+    learnable scalar starting at zero. exit_adapter_init "zero" zero-initializes
+    the adapter so a residual or gated adapter starts as exact identity.
     """
+
+    ADAPTER_MODES = ("residual", "replace", "gated")
+    ADAPTER_INITS = ("default", "zero")
 
     def __init__(
         self,
@@ -154,6 +161,8 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
         cache_policy="matched_fallback",
         architecture="depth",
         exit_adapter=False,
+        exit_adapter_mode="residual",
+        exit_adapter_init="default",
     ):
         super().__init__()
         if architecture != "depth":
@@ -162,6 +171,16 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
             raise ValueError(
                 "Side-to-move orientation requires the full action vocabulary"
             )
+        if exit_adapter_mode not in self.ADAPTER_MODES:
+            raise ValueError(f"Unknown adapter assembly: {exit_adapter_mode}")
+        if exit_adapter_init not in self.ADAPTER_INITS:
+            raise ValueError(f"Unknown adapter init: {exit_adapter_init}")
+        if not exit_adapter and (
+            exit_adapter_mode != "residual" or exit_adapter_init != "default"
+        ):
+            raise ValueError("Adapter options require exit_adapter")
+        if exit_adapter_mode == "replace" and exit_adapter_init == "zero":
+            raise ValueError("A zero-initialized replace adapter erases the state")
         self.board_embedding = BoardEmbedding(hidden_size)
         self.register_buffer(
             "reflected_actions", _reflection_table(), persistent=False
@@ -175,14 +194,32 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
         block = BlockConfig(hidden_size, intermediate_size, num_heads, dropout)
         self.backbone = DepthBackbone(block, groups, cache_policy)
         num_exits = sum(core.repetition.max_repetitions for core in groups)
-        self.exit_adapters = (
-            nn.ModuleList(
+        self.exit_adapter_mode = exit_adapter_mode
+        if exit_adapter:
+            self.exit_adapters = nn.ModuleList(
                 nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.GELU())
                 for _ in range(num_exits)
             )
-            if exit_adapter
-            else None
-        )
+            if exit_adapter_init == "zero":
+                for adapter in self.exit_adapters:
+                    nn.init.zeros_(adapter[0].weight)
+                    nn.init.zeros_(adapter[0].bias)
+            self.exit_adapter_gates = (
+                nn.ParameterList(nn.Parameter(torch.zeros(())) for _ in range(num_exits))
+                if exit_adapter_mode == "gated"
+                else None
+            )
+        else:
+            self.exit_adapters = None
+            self.exit_adapter_gates = None
+
+    def _adapt(self, index, state):
+        adapter = self.exit_adapters[index](state)
+        if self.exit_adapter_mode == "replace":
+            return adapter
+        if self.exit_adapter_mode == "gated":
+            return state + self.exit_adapter_gates[index] * adapter
+        return state + adapter
 
     def embed(self, ids, positions=None):
         device = self.act_token.device
@@ -242,7 +279,7 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
         reflected = black_to_move(ids, positions).to(output.hidden.device)
         state = output.hidden[:, -2:]
         if self.exit_adapters is not None:
-            state = state + self.exit_adapters[-1](state)
+            state = self._adapt(len(self.exit_adapters) - 1, state)
         move, value = self._predict(state, reflected)
         return (move, value, output) if return_backbone else (move, value)
 
@@ -264,7 +301,7 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
             normed = self.backbone.final_norm(readout.hidden)
             state = normed[:, -2:]
             if self.exit_adapters is not None:
-                state = state + self.exit_adapters[len(exits)](state)
+                state = self._adapt(len(exits), state)
             move, value = self._predict(state, reflected)
             exits.append(ExitPrediction(move, value, readout.active[:, -2]))
         return exits, output

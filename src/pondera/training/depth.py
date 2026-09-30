@@ -68,6 +68,7 @@ class DepthTrainConfig:
     internals: bool = False
     train_probe_positions: int = 0
     conflict_probe: bool = False
+    exit_adapter_lr_scale: float = 1.0
 
     def __post_init__(self):
         if self.model.get("architecture") != "depth":
@@ -98,6 +99,13 @@ class DepthTrainConfig:
             raise ValueError("weight_decay must be finite and non-negative")
         if not math.isfinite(self.value_weight) or self.value_weight < 0:
             raise ValueError("value_weight must be finite and non-negative")
+        if (
+            not math.isfinite(self.exit_adapter_lr_scale)
+            or self.exit_adapter_lr_scale <= 0
+        ):
+            raise ValueError("exit_adapter_lr_scale must be finite and positive")
+        if self.exit_adapter_lr_scale != 1.0 and not self.model.get("exit_adapter"):
+            raise ValueError("exit_adapter_lr_scale requires an adapter-equipped model")
         if not 0 <= self.warmup_ratio <= 1:
             raise ValueError("warmup_ratio must be between 0 and 1")
         if self.train_flops_budget is not None and (
@@ -174,8 +182,29 @@ def train(
     )
     consumed_flops = 0.0
     examples_seen = 0
+    adapter_parameters = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if name.startswith("exit_adapter")
+    ]
+    if adapter_parameters and config.exit_adapter_lr_scale != 1.0:
+        parameter_groups = [
+            {
+                "params": [
+                    parameter
+                    for name, parameter in model.named_parameters()
+                    if not name.startswith("exit_adapter")
+                ]
+            },
+            {
+                "params": adapter_parameters,
+                "lr": config.learning_rate * config.exit_adapter_lr_scale,
+            },
+        ]
+    else:
+        parameter_groups = model.parameters()
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        parameter_groups,
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
         fused=True if device.type == "cuda" else None,
@@ -393,7 +422,7 @@ def train(
         shared = [
             parameter
             for name, parameter in model.named_parameters()
-            if not name.startswith("exit_adapters")
+            if not name.startswith("exit_adapter")
         ]
         gradients = []
         with autocast():

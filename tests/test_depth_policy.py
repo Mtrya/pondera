@@ -107,6 +107,64 @@ class DepthExitAdapterTests(unittest.TestCase):
         self.assertIsNone(create_model(CONFIG).exit_adapters)
 
 
+class DepthAdapterVariantTests(unittest.TestCase):
+    def setUp(self):
+        torch.set_num_threads(1)
+        self.ids = torch.from_numpy(encode_boards([chess.STARTING_FEN]))
+
+    def test_zero_init_residual_is_exact_identity(self):
+        # Invariant: zero-initialized residual adapters pass the state through
+        # untouched, so at init the model matches the adapter-free model built
+        # under the same seed (adapters are constructed last).
+        torch.manual_seed(640)
+        plain = create_model(CONFIG).eval()
+        torch.manual_seed(640)
+        adapted = create_model(
+            dict(CONFIG, exit_adapter=True, exit_adapter_init="zero")
+        ).eval()
+        torch.testing.assert_close(adapted(ids=self.ids)[0], plain(ids=self.ids)[0])
+
+    def test_gated_adapter_is_exact_identity_at_init(self):
+        torch.manual_seed(640)
+        plain = create_model(CONFIG).eval()
+        torch.manual_seed(640)
+        gated = create_model(
+            dict(CONFIG, exit_adapter=True, exit_adapter_mode="gated")
+        ).eval()
+        torch.testing.assert_close(gated(ids=self.ids)[0], plain(ids=self.ids)[0])
+        self.assertEqual(len(gated.exit_adapter_gates), 3)
+
+    def test_replace_mode_roundtrip(self):
+        config = dict(CONFIG, exit_adapter=True, exit_adapter_mode="replace")
+        model = create_model(config).eval()
+        exits, _ = model.forward_exits(ids=self.ids)
+        move, value = model(ids=self.ids)
+        torch.testing.assert_close(exits[-1].move_logits, move)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "replace.pth"
+            save_checkpoint(path, model, config)
+            torch.testing.assert_close(
+                load_model(path)(ids=self.ids)[0], model(ids=self.ids)[0]
+            )
+
+    def test_invalid_adapter_combinations_rejected(self):
+        with self.assertRaises(ValueError):
+            create_model(dict(CONFIG, exit_adapter_mode="gated"))
+        with self.assertRaises(ValueError):
+            create_model(
+                dict(
+                    CONFIG,
+                    exit_adapter=True,
+                    exit_adapter_mode="replace",
+                    exit_adapter_init="zero",
+                )
+            )
+        with self.assertRaises(ValueError):
+            create_model(
+                dict(CONFIG, exit_adapter=True, exit_adapter_mode="prepend")
+            )
+
+
 class DepthFlopsTests(unittest.TestCase):
     def test_hand_derived_literal(self):
         # Effective layers: 2 layers x 3 repetitions = 6. Length 10 + 2 readouts = 12.
