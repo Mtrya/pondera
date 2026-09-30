@@ -69,6 +69,44 @@ class DepthPolicyTests(unittest.TestCase):
             )
 
 
+ADAPTER_CONFIG = dict(CONFIG, exit_adapter=True)
+
+
+class DepthExitAdapterTests(unittest.TestCase):
+    def setUp(self):
+        torch.set_num_threads(1)
+        self.model = create_model(ADAPTER_CONFIG).eval()
+        self.ids = torch.from_numpy(
+            encode_boards(
+                [
+                    chess.STARTING_FEN,
+                    "r3k2r/8/8/3pP3/8/8/8/R3K2R b Kq e3 130 400",
+                ]
+            )
+        )
+
+    def test_one_adapter_per_core_exit(self):
+        # Contract: exits follow core repetition boundaries, one adapter each.
+        self.assertEqual(len(self.model.exit_adapters), 3)
+
+    def test_final_exit_matches_the_fast_path(self):
+        exits, _ = self.model.forward_exits(ids=self.ids)
+        move, value = self.model(ids=self.ids)
+        torch.testing.assert_close(exits[-1].move_logits, move)
+        torch.testing.assert_close(exits[-1].value_logits, value)
+
+    def test_serialization_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "adapter.pth"
+            save_checkpoint(path, self.model, ADAPTER_CONFIG)
+            torch.testing.assert_close(
+                load_model(path)(ids=self.ids)[0], self.model(ids=self.ids)[0]
+            )
+
+    def test_adapters_default_off(self):
+        self.assertIsNone(create_model(CONFIG).exit_adapters)
+
+
 class DepthFlopsTests(unittest.TestCase):
     def test_hand_derived_literal(self):
         # Effective layers: 2 layers x 3 repetitions = 6. Length 10 + 2 readouts = 12.

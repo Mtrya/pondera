@@ -109,6 +109,14 @@ class DepthTrainingTests(unittest.TestCase):
         self.assertIn("internal/layer_00/residual_rms", final)
         self.assertIn("val/legal_top1", final)
 
+    def test_conflict_probe_reports_pairwise_cosines(self):
+        config = replace(self.config, schedule="uniform", conflict_probe=True)
+        output = self.root / "conflict"
+        train(config, self.data, output)
+        final = self.final_metrics(output)
+        # Two supervised exits yield exactly one pair; cosine lies in [-1, 1].
+        self.assertTrue(-1.0 <= final["internal/grad_cosine_exit_1_2"] <= 1.0)
+
     def test_config_validation(self):
         with self.assertRaises(ValueError):
             replace(self.config, schedule="curriculum")

@@ -67,6 +67,7 @@ class DepthTrainConfig:
     diagnostics: bool = False
     internals: bool = False
     train_probe_positions: int = 0
+    conflict_probe: bool = False
 
     def __post_init__(self):
         if self.model.get("architecture") != "depth":
@@ -296,8 +297,8 @@ def train(
             else nullcontext()
         )
 
-    def exit_losses(exits, targets):
-        """Per-exit masked means; equal weight across supervised exits."""
+    def exit_loss_terms(exits, targets):
+        """Per-supervised-exit combined losses and masked-mean details."""
         if len(exits) != len(supervision):
             raise ValueError(
                 "Executed exits differ from the supervision map; adaptive "
@@ -323,6 +324,11 @@ def train(
             losses.append(move_mean + config.value_weight * value_mean)
             details[f"exit_{index}/move_loss"] = move_mean
             details[f"exit_{index}/value_loss"] = value_mean
+        return losses, details
+
+    def exit_losses(exits, targets):
+        """Mean of the supervised exit losses; equal weight across exits."""
+        losses, details = exit_loss_terms(exits, targets)
         return torch.stack(losses).mean(), details
 
     @torch.no_grad()
@@ -377,6 +383,38 @@ def train(
             values.update({f"internal/{key}": value for key, value in internal.items()})
         return values
 
+    def conflict_metrics():
+        """Pairwise cosine similarity of per-exit gradients on shared parameters."""
+        model.eval()
+        batch = min(config.batch_size, len(val_data))
+        inputs, targets = collate([val_data[i] for i in range(batch)])
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+        targets = {key: value.to(device) for key, value in targets.items()}
+        shared = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if not name.startswith("exit_adapters")
+        ]
+        gradients = []
+        with autocast():
+            exits, _ = model.forward_exits(**inputs)
+            losses, _ = exit_loss_terms(exits, targets)
+            for loss in losses:
+                grads = torch.autograd.grad(loss, shared, retain_graph=True)
+                gradients.append(
+                    torch.cat([grad.detach().float().reshape(-1) for grad in grads])
+                )
+        model.train()
+        metrics = {}
+        for first in range(len(gradients)):
+            for second in range(first + 1, len(gradients)):
+                metrics[f"grad_cosine_exit_{first + 1}_{second + 1}"] = float(
+                    torch.nn.functional.cosine_similarity(
+                        gradients[first], gradients[second], dim=0
+                    )
+                )
+        return metrics
+
     def validate():
         values = evaluate(
             val_data,
@@ -394,6 +432,10 @@ def train(
             final_key = f"exit_{exits_per_forward}/move_loss"
             values["generalization/loss_gap"] = (
                 values[f"val/{final_key}"] - values[f"train_probe/{final_key}"]
+            )
+        if config.conflict_probe:
+            values.update(
+                {f"internal/{key}": value for key, value in conflict_metrics().items()}
             )
         if probe is not None:
             batch = min(config.batch_size, len(val_data))

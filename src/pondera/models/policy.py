@@ -139,6 +139,8 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
     MOVE segment, the value readout its VALUE/MATE segment; both sit at the same
     trailing readout positions as the fixed-depth policy. Exits are the core
     repetition boundaries in execution order; the final answer is the last exit.
+    With exit_adapter enabled, each exit additionally passes through its own
+    residual single-layer adapter before the shared head.
     """
 
     def __init__(
@@ -151,6 +153,7 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
         possible_moves=len(IDX_TO_UCI_MOVE),
         cache_policy="matched_fallback",
         architecture="depth",
+        exit_adapter=False,
     ):
         super().__init__()
         if architecture != "depth":
@@ -171,6 +174,15 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
         ]
         block = BlockConfig(hidden_size, intermediate_size, num_heads, dropout)
         self.backbone = DepthBackbone(block, groups, cache_policy)
+        num_exits = sum(core.repetition.max_repetitions for core in groups)
+        self.exit_adapters = (
+            nn.ModuleList(
+                nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.GELU())
+                for _ in range(num_exits)
+            )
+            if exit_adapter
+            else None
+        )
 
     def embed(self, ids, positions=None):
         device = self.act_token.device
@@ -228,7 +240,10 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
             repetition_limits=repetition_limits,
         )
         reflected = black_to_move(ids, positions).to(output.hidden.device)
-        move, value = self._predict(output.hidden[:, -2:], reflected)
+        state = output.hidden[:, -2:]
+        if self.exit_adapters is not None:
+            state = state + self.exit_adapters[-1](state)
+        move, value = self._predict(state, reflected)
         return (move, value, output) if return_backbone else (move, value)
 
     def forward_exits(self, *, ids, positions=None, repetition_limits=None):
@@ -247,6 +262,9 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
             if readout.layer != last_layers[readout.core]:
                 continue
             normed = self.backbone.final_norm(readout.hidden)
-            move, value = self._predict(normed[:, -2:], reflected)
+            state = normed[:, -2:]
+            if self.exit_adapters is not None:
+                state = state + self.exit_adapters[len(exits)](state)
+            move, value = self._predict(state, reflected)
             exits.append(ExitPrediction(move, value, readout.active[:, -2]))
         return exits, output
