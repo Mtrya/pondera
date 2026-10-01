@@ -45,7 +45,7 @@ class TokenizedPositions(Dataset):
 class DepthPositions(Dataset):
     """Board tokens with per-depth rank-1 teacher targets (kind=teacher-depth)."""
 
-    def __init__(self, directory, split, legal=False):
+    def __init__(self, directory, split, legal=False, board_aux=False):
         directory = Path(directory)
         with (directory / "manifest.json").open(encoding="utf-8") as handle:
             manifest = json.load(handle)
@@ -82,6 +82,21 @@ class DepthPositions(Dataset):
             self.legal = np.load(directory / f"legal_{split}.npy", mmap_mode="r")
             if self.legal.ndim != 2 or len(self.legal) != rows:
                 raise ValueError("Legal action array does not match the examples")
+        self.aux_after = self.aux_changed = None
+        if board_aux:
+            if not manifest.get("board_aux"):
+                raise ValueError("Dataset was not encoded with board aux targets")
+            self.aux_after = np.load(directory / f"aux_after_{split}.npy", mmap_mode="r")
+            self.aux_changed = np.load(
+                directory / f"aux_changed_{split}.npy", mmap_mode="r"
+            )
+            if (
+                self.aux_after.shape != (rows, depth_count, 64)
+                or self.aux_after.dtype != np.uint8
+                or self.aux_changed.shape != (rows, depth_count, 64)
+                or self.aux_changed.dtype != np.bool_
+            ):
+                raise ValueError("Board aux arrays do not match the examples")
 
     def __len__(self):
         return len(self.tokens)
@@ -93,4 +108,8 @@ class DepthPositions(Dataset):
             self.value_tokens[index].copy(),
             self.values[index].copy(),
         )
-        return row if self.legal is None else (*row, self.legal[index].copy())
+        if self.legal is not None:
+            row = (*row, self.legal[index].copy())
+        if self.aux_after is not None:
+            row = (*row, self.aux_after[index].copy(), self.aux_changed[index].copy())
+        return row

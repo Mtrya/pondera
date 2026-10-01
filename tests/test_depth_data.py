@@ -13,7 +13,7 @@ from pondera.chess.tokens import (
     VALUE,
     decode_board,
 )
-from pondera.chess.mapping import UCI_MOVE_TO_IDX
+from pondera.chess.mapping import EMPTY_SQ_IDX, PIECE_TO_IDX, UCI_MOVE_TO_IDX
 from pondera.data.positions import DepthPositions
 from pondera.data.teacher import prepare_teacher_depth
 
@@ -114,6 +114,88 @@ class DepthEncodingTests(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest))
         with self.assertRaises(ValueError):
             DepthPositions(self.data, "val")
+
+
+def canonical_classes(board, black_to_move):
+    """Square-content classes in the given orientation, from python-chess alone.
+
+    Independent source for the aux encoder: python-chess applies the move and
+    mirrors the board; the class ids come from the frozen PIECE_TO_IDX contract.
+    Orientation follows the pre-move side to move, matching the input encoding.
+    """
+    if black_to_move:
+        board = board.mirror()
+    classes = np.full(64, EMPTY_SQ_IDX, dtype=np.uint8)
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece is not None:
+            classes[square] = PIECE_TO_IDX[piece.symbol()]
+    return classes
+
+
+class DepthBoardAuxTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        # Special-move coverage: ep capture, O-O, promotion, black to move.
+        # The two lines share no position keys (the encoder keeps first occurrences).
+        lines = [
+            play(["e2e4", "a7a6", "e4e5", "d7d5", "e5d6"]),
+            play(["d2d4", "d7d5", "g1f3", "g8f6", "e2e3", "e7e6", "f1d3", "f8d6", "e1g1"])[1:],
+            [("8/P7/8/8/8/8/k6K/8 w - - 0 1", "a7a8q", 1)],
+            [("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1", "e8g8", 1)],
+        ]
+        self.records = [record for line in lines for record in line]
+        rows = [
+            depth_row(fen, [(1, move, None, 0.0), (2, move, None, 0.0)])
+            for fen, move, _ in self.records
+        ]
+        val_rows = [
+            depth_row(fen, [(1, move, None, 0.0), (2, move, None, 0.0)])
+            for fen, move, _ in play(EXCHANGE_MOVES, start=EXCHANGE_START)
+        ]
+        release = write_depth_release(self.root, {"train": rows, "val": val_rows})
+        self.data = self.root / "encoded"
+        prepare_teacher_depth(release, self.data, max_depth=2, board_aux=True)
+
+    def test_after_boards_match_python_chess(self):
+        dataset = DepthPositions(self.data, "train", board_aux=True)
+        for index, (fen, move, _) in enumerate(self.records):
+            black = chess.Board(fen).turn == chess.BLACK
+            expected_current = canonical_classes(chess.Board(fen), black)
+            after_board = chess.Board(fen)
+            after_board.push_uci(move)
+            expected_after = canonical_classes(after_board, black)
+            for depth in (0, 1):
+                np.testing.assert_array_equal(
+                    dataset.aux_after[index, depth], expected_after
+                )
+                np.testing.assert_array_equal(
+                    dataset.aux_changed[index, depth],
+                    expected_after != expected_current,
+                )
+
+    def test_dataset_guardrails(self):
+        dataset = DepthPositions(self.data, "train", board_aux=True)
+        self.assertEqual(len(dataset[0]), 6)
+        self.assertEqual(dataset.aux_after.shape, (len(self.records), 2, 64))
+        self.assertEqual(dataset.aux_changed.dtype, np.bool_)
+        other = self.root / "plain"
+        release = write_depth_release(
+            self.root,
+            {
+                "train": [
+                    depth_row(self.records[0][0], [(1, self.records[0][1], None, 0.0)])
+                ],
+                "val": [
+                    depth_row(self.records[1][0], [(1, self.records[1][1], None, 0.0)])
+                ],
+            },
+        )
+        prepare_teacher_depth(release, other, max_depth=1)
+        with self.assertRaises(ValueError):
+            DepthPositions(other, "train", board_aux=True)
 
 
 if __name__ == "__main__":

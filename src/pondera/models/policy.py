@@ -12,7 +12,7 @@ from pondera.chess.tokens import (
     VALUE,
     encode_boards,
 )
-from pondera.chess.mapping import IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
+from pondera.chess.mapping import EMPTY_SQ_IDX, IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
 from pondera.models.backbones import BaseBackbone, DepthBackbone
 from pondera.models.board import BoardEmbedding, black_to_move
 from pondera.models.config import BlockConfig, CoreConfig
@@ -130,6 +130,8 @@ class ExitPrediction:
     move_logits: torch.Tensor
     value_logits: torch.Tensor
     active: torch.Tensor
+    board_logits: torch.Tensor | None = None
+    active_board: torch.Tensor | None = None
 
 
 class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
@@ -145,6 +147,9 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
     "replace" lets the adapter take over, "gated" scales it with a per-exit
     learnable scalar starting at zero. exit_adapter_init "zero" zero-initializes
     the adapter so a residual or gated adapter starts as exact identity.
+    With board_aux, a shared 13-class head additionally reads every sequence
+    position at each exit, predicting the square contents after replaying the
+    exit's teacher move (a training-time auxiliary; the fast path ignores it).
     """
 
     ADAPTER_MODES = ("residual", "replace", "gated")
@@ -163,6 +168,7 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
         exit_adapter=False,
         exit_adapter_mode="residual",
         exit_adapter_init="default",
+        board_aux=False,
     ):
         super().__init__()
         if architecture != "depth":
@@ -212,6 +218,9 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
         else:
             self.exit_adapters = None
             self.exit_adapter_gates = None
+        self.board_aux_head = (
+            nn.Linear(hidden_size, EMPTY_SQ_IDX + 1) if board_aux else None
+        )
 
     def _adapt(self, index, state):
         adapter = self.exit_adapters[index](state)
@@ -303,5 +312,16 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
             if self.exit_adapters is not None:
                 state = self._adapt(len(exits), state)
             move, value = self._predict(state, reflected)
-            exits.append(ExitPrediction(move, value, readout.active[:, -2]))
+            board_logits = (
+                self.board_aux_head(normed) if self.board_aux_head is not None else None
+            )
+            exits.append(
+                ExitPrediction(
+                    move,
+                    value,
+                    readout.active[:, -2],
+                    board_logits,
+                    readout.active[:, :-2] if board_logits is not None else None,
+                )
+            )
         return exits, output

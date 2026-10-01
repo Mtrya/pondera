@@ -134,6 +134,38 @@ class DepthTrainingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             replace(self.config, exit_adapter_lr_scale=0.5)
 
+    def test_value_mse_and_board_aux_metrics(self):
+        aux_data = self.root / "data-aux"
+        release = write_depth_release(
+            self.root,
+            {
+                "train": depth_line(RUY_LOPEZ),
+                "val": depth_line(EXCHANGE_MOVES, start=EXCHANGE_START),
+            },
+        )
+        prepare_teacher_depth(release, aux_data, max_depth=2, board_aux=True)
+        config = replace(
+            self.config,
+            model={**self.config.model, "board_aux": True},
+            schedule="uniform",
+            value_loss="ce_mse",
+            board_aux_weight=1.0,
+        )
+        output = self.root / "shaped"
+        train(config, aux_data, output)
+        final = self.final_metrics(output)
+        for exit_index in (1, 2):
+            # Values and bin expectations lie in [-1, 1], so squared error <= 4.
+            self.assertTrue(0.0 <= final[f"val/exit_{exit_index}/value_mse"] <= 4.0)
+            self.assertTrue(final[f"val/exit_{exit_index}/board_aux_changed"] >= 0.0)
+            self.assertTrue(final[f"val/exit_{exit_index}/board_aux_unchanged"] >= 0.0)
+
+    def test_shaped_loss_config_validation(self):
+        with self.assertRaises(ValueError):
+            replace(self.config, value_loss="mse")
+        with self.assertRaises(ValueError):
+            replace(self.config, board_aux_weight=1.0)
+
     def test_config_validation(self):
         with self.assertRaises(ValueError):
             replace(self.config, schedule="curriculum")

@@ -16,7 +16,7 @@ from pondera.chess.tokens import (
     mate_token,
     value_bin,
 )
-from pondera.chess.mapping import UCI_MOVE_TO_IDX
+from pondera.chess.mapping import EMPTY_SQ_IDX, UCI_MOVE_TO_IDX
 from pondera.chess.position import legal_move_indices
 from pondera.data.storage import load_manifest, write_manifest
 
@@ -150,13 +150,67 @@ def _depth_targets(row, max_depth):
     return moves, value_tokens, values
 
 
-def prepare_teacher_depth(release_path, output_dir, max_depth=16):
+def _after_board(current, board, move):
+    """Absolute square-content classes after pushing move on the pre-push board."""
+    after = current.copy()
+    moving = after[move.from_square]
+    after[move.from_square] = EMPTY_SQ_IDX
+    if move.promotion:
+        after[move.to_square] = (move.promotion - 1) + (0 if moving < 6 else 6)
+    else:
+        after[move.to_square] = moving
+    if board.is_en_passant(move):
+        after[move.to_square + (-8 if board.turn else 8)] = EMPTY_SQ_IDX
+    if board.is_castling(move):
+        if move.to_square > move.from_square:
+            rook_from, rook_to = move.from_square + 3, move.from_square + 1
+        else:
+            rook_from, rook_to = move.from_square - 4, move.from_square - 1
+        after[rook_to] = after[rook_from]
+        after[rook_from] = EMPTY_SQ_IDX
+    return after
+
+
+def _canonical(array, black_to_move):
+    """Square-content classes in side-to-move orientation (rank mirror + color swap)."""
+    if not black_to_move:
+        return array
+    mirrored = array[np.arange(64) ^ 56]
+    return np.where(mirrored < 12, (mirrored + 6) % 12, mirrored).astype(np.uint8)
+
+
+def _board_aux(row, max_depth):
+    """Canonical after-content and changed masks, one per teacher depth, or None."""
+    snapshots = {entry["d"]: entry["r1"] for entry in row["unit"]["per_depth"]}
+    if any(depth not in snapshots for depth in range(1, max_depth + 1)):
+        return None
+    board = chess.Board(row["fen"])
+    current_absolute = np.full(64, EMPTY_SQ_IDX, dtype=np.uint8)
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece is not None:
+            current_absolute[square] = (piece.piece_type - 1) + (0 if piece.color else 6)
+    black = board.turn == chess.BLACK
+    current = _canonical(current_absolute, black)
+    after_rows, changed_rows = [], []
+    for depth in range(1, max_depth + 1):
+        move = chess.Move.from_uci(snapshots[depth]["bm"])
+        after = _canonical(_after_board(current_absolute, board, move), black)
+        after_rows.append(after)
+        changed_rows.append(after != current)
+    return np.stack(after_rows), np.stack(changed_rows)
+
+
+def prepare_teacher_depth(release_path, output_dir, max_depth=16, board_aux=False):
     """Encode per-depth rank-1 teacher targets for recurrent-depth training.
 
     Same source verification as prepare_teacher_policy. Rows must complete every
     depth in 1..max_depth; terminal and partially annotated rows are counted and
     excluded. Value targets are unified-vocabulary token ids; the unquantized
     teacher value is kept alongside (+-1 on mate rows, matching the token decode).
+    With board_aux, each row additionally carries the canonical square-content
+    classes after replaying that depth's teacher move, plus the changed-square
+    mask against the current canonical board (horizon-1 future placement).
     """
     release_path, output_dir = Path(release_path), Path(output_dir)
     release = load_manifest(release_path)
@@ -171,6 +225,7 @@ def prepare_teacher_depth(release_path, output_dir, max_depth=16):
         "tokenizer_version": CHESS_TOKENIZER_VERSION,
         "teacher_depth": max_depth,
         "depths": list(range(1, max_depth + 1)),
+        "board_aux": board_aux,
         "release_sha256": _checksum(release_path),
         "position_key": "first four FEN fields",
         "legal_actions": "board moves; draw adjudication is external",
@@ -180,6 +235,7 @@ def prepare_teacher_depth(release_path, output_dir, max_depth=16):
     teacher = None
     for split in ["val", "train"]:
         tokens, moves, value_tokens, values, legal_rows = [], [], [], [], []
+        aux_after_rows, aux_changed_rows = [], []
         seen = set()
         excluded = Counter()
         for shard in release["files"][split]:
@@ -223,6 +279,10 @@ def prepare_teacher_depth(release_path, output_dir, max_depth=16):
                     value_tokens.append(targets[1])
                     values.append(targets[2])
                     legal_rows.append(legal)
+                    if board_aux:
+                        aux = _board_aux(row, max_depth)
+                        aux_after_rows.append(aux[0])
+                        aux_changed_rows.append(aux[1])
             if count != shard["rows"]:
                 raise ValueError(f"Source row count mismatch: {path}")
         if not tokens:
@@ -257,6 +317,11 @@ def prepare_teacher_depth(release_path, output_dir, max_depth=16):
         np.save(
             output_dir / f"depth_values_{split}.npy", np.asarray(values, dtype=np.float32)
         )
+        if board_aux:
+            np.save(output_dir / f"aux_after_{split}.npy", np.stack(aux_after_rows))
+            np.save(
+                output_dir / f"aux_changed_{split}.npy", np.stack(aux_changed_rows)
+            )
         metadata[f"rows_{split}"] = len(tokens)
         metadata["excluded"][split] = dict(excluded)
     metadata["teacher"] = teacher

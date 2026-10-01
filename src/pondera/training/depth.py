@@ -3,8 +3,11 @@
 Follows the supervised.py training skeleton (resume, schedule, tracking) under
 the depth contract: targets are per-depth rank-1 teacher labels, supervision
 lands on core repetition exits chosen by the schedule, and each supervised exit
-contributes an equally weighted masked mean of move CE plus value CE. This
-trainer intentionally duplicates the supervised.py boilerplate instead of
+contributes an equally weighted masked mean of move CE plus value CE. Optional
+additions per exit: a value MSE term (expectation over the value bins against
+the unquantized teacher value, mate rows excluded) and a horizon-1 future
+placement auxiliary (changed/unchanged square CE averaged with equal weight).
+This trainer intentionally duplicates the supervised.py boilerplate instead of
 sharing it: the two data and model contracts evolve independently.
 """
 
@@ -23,9 +26,9 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
-from pondera.chess.tokens import PAD, VALUE
+from pondera.chess.tokens import PAD, VALUE, VALUE_BIN_REPRESENTATIVES
 from pondera.data.positions import DepthPositions
-from pondera.models.board import pack_board_tokens
+from pondera.models.board import black_to_move, pack_board_tokens
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model
 from pondera.training.cost import depth_flops
@@ -49,6 +52,9 @@ class DepthTrainConfig:
     schedule: str = "final_only"
     teacher_depth: int = 16
     value_weight: float = 1.0
+    value_loss: str = "ce"
+    value_mse_weight: float = 1.0
+    board_aux_weight: float = 0.0
     seed: int = 640
     batch_size: int = 128
     accumulation_steps: int = 8
@@ -99,6 +105,14 @@ class DepthTrainConfig:
             raise ValueError("weight_decay must be finite and non-negative")
         if not math.isfinite(self.value_weight) or self.value_weight < 0:
             raise ValueError("value_weight must be finite and non-negative")
+        if self.value_loss not in {"ce", "ce_mse"}:
+            raise ValueError(f"Unknown value loss: {self.value_loss}")
+        if not math.isfinite(self.value_mse_weight) or self.value_mse_weight <= 0:
+            raise ValueError("value_mse_weight must be finite and positive")
+        if not math.isfinite(self.board_aux_weight) or self.board_aux_weight < 0:
+            raise ValueError("board_aux_weight must be finite and non-negative")
+        if self.board_aux_weight > 0 and not self.model.get("board_aux"):
+            raise ValueError("board_aux_weight requires a board_aux-equipped model")
         if (
             not math.isfinite(self.exit_adapter_lr_scale)
             or self.exit_adapter_lr_scale <= 0
@@ -117,6 +131,7 @@ class DepthTrainConfig:
 @dataclass
 class DepthCollator:
     legal: bool = False
+    board_aux: bool = False
 
     def __call__(self, rows):
         inputs = pack_board_tokens(torch.from_numpy(np.stack([row[0] for row in rows])))
@@ -125,11 +140,21 @@ class DepthCollator:
             "value_tokens": torch.from_numpy(
                 np.stack([row[2] for row in rows])
             ).long(),
+            "values": torch.from_numpy(np.stack([row[3] for row in rows])).float(),
         }
+        cursor = 4
         if self.legal:
             targets["legal"] = torch.from_numpy(
-                np.stack([row[4] for row in rows])
+                np.stack([row[cursor] for row in rows])
             ).long()
+            cursor += 1
+        if self.board_aux:
+            targets["aux_after"] = torch.from_numpy(
+                np.stack([row[cursor] for row in rows])
+            ).long()
+            targets["aux_changed"] = torch.from_numpy(
+                np.stack([row[cursor + 1] for row in rows])
+            )
         return inputs, targets
 
 
@@ -156,11 +181,16 @@ def train(
     torch.manual_seed(config.seed)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
-    train_data = DepthPositions(data_dir, "train", legal=config.diagnostics)
-    val_data = DepthPositions(data_dir, "val", legal=config.diagnostics)
+    board_aux = config.board_aux_weight > 0
+    train_data = DepthPositions(
+        data_dir, "train", legal=config.diagnostics, board_aux=board_aux
+    )
+    val_data = DepthPositions(
+        data_dir, "val", legal=config.diagnostics, board_aux=board_aux
+    )
     if config.teacher_depth > len(train_data.depths):
         raise ValueError("Teacher depth exceeds the encoded target depths")
-    collate = DepthCollator(config.diagnostics)
+    collate = DepthCollator(config.diagnostics, board_aux)
     data_identity = hashlib.sha256(
         json.dumps(train_data.manifest, sort_keys=True).encode()
     ).hexdigest()
@@ -326,7 +356,28 @@ def train(
             else nullcontext()
         )
 
-    def exit_loss_terms(exits, targets):
+    bin_centers = torch.tensor(VALUE_BIN_REPRESENTATIVES, device=device)
+    bin_count = len(VALUE_BIN_REPRESENTATIVES)
+
+    def board_aux_terms(exit_, inputs, targets, teacher):
+        """Changed/unchanged masked CE of the future-placement readout."""
+        ids, positions = inputs["ids"], inputs["positions"]
+        width = positions.shape[1]
+        black = black_to_move(ids, positions)
+        canonical = torch.where(black[:, None], positions ^ 56, positions).clamp(max=63)
+        after = targets["aux_after"][:, teacher - 1].gather(1, canonical)
+        changed = targets["aux_changed"][:, teacher - 1].gather(1, canonical)
+        board_slots = (positions < 64) & (ids != PAD) & exit_.active_board
+        logits = exit_.board_logits[:, :width].float()
+        ce = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]), after.reshape(-1), reduction="none"
+        ).reshape(after.shape)
+        return (
+            _masked_mean(ce, board_slots & changed),
+            _masked_mean(ce, board_slots & ~changed),
+        )
+
+    def exit_loss_terms(exits, inputs, targets):
         """Per-supervised-exit combined losses and masked-mean details."""
         if len(exits) != len(supervision):
             raise ValueError(
@@ -350,14 +401,36 @@ def train(
             )
             move_mean = _masked_mean(move, active)
             value_mean = _masked_mean(value, active)
-            losses.append(move_mean + config.value_weight * value_mean)
+            terms = move_mean + config.value_weight * value_mean
             details[f"exit_{index}/move_loss"] = move_mean
             details[f"exit_{index}/value_loss"] = value_mean
+            if config.value_loss == "ce_mse":
+                expectation = (
+                    exit_.value_logits[..., :bin_count].float().softmax(-1)
+                    * bin_centers
+                ).sum(-1)
+                is_bin = (
+                    targets["value_tokens"][:, teacher - 1] - VALUE
+                ) < bin_count
+                mse = (expectation - targets["values"][:, teacher - 1].float()) ** 2
+                mse_mean = _masked_mean(mse, active * is_bin.float())
+                terms = terms + config.value_mse_weight * mse_mean
+                details[f"exit_{index}/value_mse"] = mse_mean
+            if board_aux:
+                changed_mean, unchanged_mean = board_aux_terms(
+                    exit_, inputs, targets, teacher
+                )
+                terms = terms + config.board_aux_weight * (
+                    changed_mean + unchanged_mean
+                ) / 2
+                details[f"exit_{index}/board_aux_changed"] = changed_mean
+                details[f"exit_{index}/board_aux_unchanged"] = unchanged_mean
+            losses.append(terms)
         return losses, details
 
-    def exit_losses(exits, targets):
+    def exit_losses(exits, inputs, targets):
         """Mean of the supervised exit losses; equal weight across exits."""
-        losses, details = exit_loss_terms(exits, targets)
+        losses, details = exit_loss_terms(exits, inputs, targets)
         return torch.stack(losses).mean(), details
 
     @torch.no_grad()
@@ -377,7 +450,7 @@ def train(
                 }
                 inputs = {key: value.to(device) for key, value in inputs.items()}
                 exits, output = model.forward_exits(**inputs)
-                _, details = exit_losses(exits, targets)
+                _, details = exit_losses(exits, inputs, targets)
                 for key, value in details.items():
                     per_exit[key] = per_exit.get(key, 0.0) + float(value) * len(
                         selected
@@ -427,7 +500,7 @@ def train(
         gradients = []
         with autocast():
             exits, _ = model.forward_exits(**inputs)
-            losses, _ = exit_loss_terms(exits, targets)
+            losses, _ = exit_loss_terms(exits, inputs, targets)
             for loss in losses:
                 grads = torch.autograd.grad(loss, shared, retain_graph=True)
                 gradients.append(
@@ -547,15 +620,15 @@ def train(
                     depth_flops(config.model, lengths, exits_per_forward).sum()
                 )
                 examples_seen += config.batch_size
+                device_inputs = {
+                    key: value.to(device, non_blocking=True)
+                    for key, value in inputs.items()
+                }
                 with autocast():
-                    exits, _ = model.forward_exits(
-                        **{
-                            key: value.to(device, non_blocking=True)
-                            for key, value in inputs.items()
-                        }
-                    )
+                    exits, _ = model.forward_exits(**device_inputs)
                     loss, _ = exit_losses(
                         exits,
+                        device_inputs,
                         {
                             key: value.to(device, non_blocking=True)
                             for key, value in targets.items()
