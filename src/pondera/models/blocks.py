@@ -119,8 +119,8 @@ class TokenBlock(nn.Module):
             -1, self.heads, -1, self.head_size
         )
         shape = (batch, self.heads, layout.full_length, self.head_size)
-        key = normalized.new_zeros(shape).scatter(2, index, kv[0])
-        value = normalized.new_zeros(shape).scatter(2, index, kv[1])
+        key = kv.new_zeros(shape).scatter(2, index, kv[0])
+        value = kv.new_zeros(shape).scatter(2, index, kv[1])
         valid = torch.zeros(
             batch, layout.full_length, device=normalized.device, dtype=torch.bool
         )

@@ -269,6 +269,21 @@ class RepetitionLimitTests(unittest.TestCase):
                     truncated[index].value_logits, full[index].value_logits
                 )
 
+    def test_truncated_exits_match_full_run_prefix_under_autocast(self):
+        # The sparse KV path mixes autocast dtypes; the prefix invariant must
+        # hold there too (this is the training configuration).
+        with torch.autocast("cpu", torch.bfloat16):
+            full, _ = self.model.forward_exits(ids=self.ids)
+            for k in (1, 2, 3):
+                truncated, _ = self.model.forward_exits(
+                    ids=self.ids, repetition_limit=k
+                )
+                self.assertEqual(len(truncated), k)
+                for index in range(k):
+                    torch.testing.assert_close(
+                        truncated[index].move_logits, full[index].move_logits
+                    )
+
     def test_scalar_and_per_token_limits_are_mutually_exclusive(self):
         with self.assertRaises(ValueError):
             self.model.forward_exits(
