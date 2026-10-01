@@ -223,6 +223,58 @@ class DepthFlopsTests(unittest.TestCase):
             884352.0,
         )
 
+    def test_repetitions_override_scales_trunk(self):
+        # Same per-layer cost 70656 as above. Override to 2 executed repetitions:
+        # trunk 2*2*70656 = 282624; head 2 exits x 2 positions x 2*16*2398 = 306944.
+        # Training: 3*(282624+306944) = 1768704. Override equal to the configured
+        # maximum must reproduce the un-overridden value exactly.
+        config = {
+            "architecture": "depth",
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "cores": [{"layers": 2, "repetition": {"max_repetitions": 3}}],
+        }
+        self.assertEqual(
+            float(depth_flops(config, [10], head_exits=2, repetitions=2)[0]),
+            1768704.0,
+        )
+        self.assertEqual(
+            float(depth_flops(config, [10], head_exits=3, repetitions=3)[0]),
+            float(depth_flops(config, [10], head_exits=3)[0]),
+        )
+
+
+class RepetitionLimitTests(unittest.TestCase):
+    def setUp(self):
+        torch.set_num_threads(1)
+        self.model = create_model(CONFIG).eval()
+        self.ids = torch.from_numpy(encode_boards([chess.STARTING_FEN]))
+
+    def test_truncated_exits_match_full_run_prefix(self):
+        # Invariant: stopping after k repetitions must reproduce the first k
+        # exits of the untruncated run — the truncation path and the full path
+        # are two sources for the same computation.
+        full, _ = self.model.forward_exits(ids=self.ids)
+        self.assertEqual(len(full), 3)
+        for k in (1, 2, 3):
+            truncated, _ = self.model.forward_exits(
+                ids=self.ids, repetition_limit=k
+            )
+            self.assertEqual(len(truncated), k)
+            for index in range(k):
+                torch.testing.assert_close(
+                    truncated[index].move_logits, full[index].move_logits
+                )
+                torch.testing.assert_close(
+                    truncated[index].value_logits, full[index].value_logits
+                )
+
+    def test_scalar_and_per_token_limits_are_mutually_exclusive(self):
+        with self.assertRaises(ValueError):
+            self.model.forward_exits(
+                ids=self.ids, repetition_limit=1, repetition_limits=[None]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

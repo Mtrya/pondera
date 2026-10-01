@@ -292,9 +292,22 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
         move, value = self._predict(state, reflected)
         return (move, value, output) if return_backbone else (move, value)
 
-    def forward_exits(self, *, ids, positions=None, repetition_limits=None):
-        """Every core-exit prediction in execution order, for multi-exit training."""
+    def forward_exits(
+        self, *, ids, positions=None, repetition_limits=None, repetition_limit=None
+    ):
+        """Every core-exit prediction in execution order, for multi-exit training.
+
+        repetition_limit truncates the whole batch after that many repetitions
+        per core (sampled-repetition training); repetition_limits is the
+        per-token form for finer-grained control. They are mutually exclusive.
+        """
         hidden, valid = self.embed(ids, positions)
+        if repetition_limit is not None:
+            if repetition_limits is not None:
+                raise ValueError("Supply either repetition_limit or repetition_limits")
+            repetition_limits = [
+                torch.full_like(valid, repetition_limit, dtype=torch.long)
+            ]
         output = self.backbone(
             hidden,
             valid=valid,

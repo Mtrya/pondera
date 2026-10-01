@@ -9,7 +9,7 @@ from teacher_release import depth_row, play, write_depth_release
 
 from pondera.data.teacher import prepare_teacher_depth
 from pondera.models.checkpoint import read_checkpoint
-from pondera.training.depth import DepthTrainConfig, train
+from pondera.training.depth import DepthTrainConfig, stratified_repetitions, train
 
 RUY_LOPEZ = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"]
 EXCHANGE_START = "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3"
@@ -182,6 +182,60 @@ class DepthTrainingTests(unittest.TestCase):
                 self.config,
                 model={"architecture": "base", "num_blocks": 1, "hidden_size": 16,
                        "intermediate_size": 32, "num_heads": 2},
+            )
+
+    def test_stratified_repetitions_contract(self):
+        # Contract: each value in 1..max appears equally often (±1), covering
+        # every value, deterministic for a given seed.
+        schedule = stratified_repetitions(37, 5, 640)
+        self.assertEqual(len(schedule), 37)
+        self.assertEqual(sorted(set(schedule)), [1, 2, 3, 4, 5])
+        counts = [schedule.count(value) for value in range(1, 6)]
+        self.assertLessEqual(max(counts) - min(counts), 1)
+        self.assertEqual(schedule, stratified_repetitions(37, 5, 640))
+
+    def test_sampled_repetition_training(self):
+        sampled_dir = self.root / "run-sampled"
+        train(
+            replace(
+                self.config, sample_repetitions=True, teacher_depths=[1, 2]
+            ),
+            self.data,
+            sampled_dir,
+        )
+        final = self.final_metrics(sampled_dir)
+        self.assertTrue(final["training_complete"])
+        rows = [
+            json.loads(line)
+            for line in (sampled_dir / "metrics.jsonl").read_text().splitlines()
+        ]
+        sampled = {row["train/repetitions"] for row in rows if "train/repetitions" in row}
+        self.assertTrue(sampled <= {1, 2} and sampled)
+        # Executed-FLOPs contract: sampling K in {1,2} executes on average 1.5
+        # repetitions where the identical unsampled run executes 2, so the
+        # sampled run's consumed budget must come in lower.
+        fixed_dir = self.root / "run-fixed"
+        train(
+            replace(self.config, teacher_depths=[1, 2]), self.data, fixed_dir
+        )
+        self.assertLess(
+            final["train/theoretical_flops"],
+            self.final_metrics(fixed_dir)["train/theoretical_flops"],
+        )
+
+    def test_teacher_depths_validation(self):
+        with self.assertRaises(ValueError):
+            replace(self.config, teacher_depths=[])
+        with self.assertRaises(ValueError):
+            replace(self.config, teacher_depths=[1, 99])
+        with self.assertRaises(ValueError):
+            replace(self.config, teacher_depths=[1, "2"])
+        # One depth per exit: the fixture model has two exits, three are given.
+        with self.assertRaises(ValueError):
+            train(
+                replace(self.config, teacher_depths=[1, 2, 1]),
+                self.data,
+                self.root / "bad",
             )
 
 

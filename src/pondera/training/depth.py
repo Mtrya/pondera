@@ -75,12 +75,26 @@ class DepthTrainConfig:
     train_probe_positions: int = 0
     conflict_probe: bool = False
     exit_adapter_lr_scale: float = 1.0
+    teacher_depths: list | None = None
+    sample_repetitions: bool = False
 
     def __post_init__(self):
         if self.model.get("architecture") != "depth":
             raise ValueError("Depth training requires a depth-architecture model")
         if self.schedule not in SCHEDULES:
             raise ValueError(f"Unknown supervision schedule: {self.schedule}")
+        if self.teacher_depths is not None and (
+            not isinstance(self.teacher_depths, list)
+            or not self.teacher_depths
+            or any(
+                not isinstance(depth, int) or not 1 <= depth <= self.teacher_depth
+                for depth in self.teacher_depths
+            )
+        ):
+            raise ValueError(
+                "teacher_depths must be a nonempty list of ints within "
+                "[1, teacher_depth]"
+            )
         for name in (
             "batch_size",
             "accumulation_steps",
@@ -167,6 +181,23 @@ def load_config(path):
         return DepthTrainConfig(**tomllib.load(handle))
 
 
+def stratified_repetitions(batches, max_repetitions, seed):
+    """Per-microbatch repetition counts: each value equally often (±1), shuffled.
+
+    Stratification keeps every epoch's executed-FLOPs mean at the midpoint of
+    1..max_repetitions exactly, rather than only in expectation.
+    """
+    if batches < 1 or max_repetitions < 1:
+        raise ValueError("Batch count and max repetitions must be positive")
+    base, remainder = divmod(batches, max_repetitions)
+    counts = [
+        base + (1 if index < remainder else 0) for index in range(max_repetitions)
+    ]
+    schedule = np.repeat(np.arange(1, max_repetitions + 1), counts)
+    np.random.default_rng(seed).shuffle(schedule)
+    return schedule.tolist()
+
+
 def train(
     config, data_dir, output_dir, device="cpu", resume=None, max_steps=None, track=False
 ):
@@ -207,9 +238,14 @@ def train(
         core.get("repetition", {}).get("max_repetitions", 1)
         for core in config.model["cores"]
     )
-    supervision = exit_teacher_depths(
-        exits_per_forward, config.schedule, config.teacher_depth
-    )
+    if config.teacher_depths is not None:
+        if len(config.teacher_depths) != exits_per_forward:
+            raise ValueError("teacher_depths must supply one depth per exit")
+        supervision = list(config.teacher_depths)
+    else:
+        supervision = exit_teacher_depths(
+            exits_per_forward, config.schedule, config.teacher_depth
+        )
     consumed_flops = 0.0
     examples_seen = 0
     adapter_parameters = [
@@ -377,15 +413,12 @@ def train(
             _masked_mean(ce, board_slots & ~changed),
         )
 
-    def exit_loss_terms(exits, inputs, targets):
+    def exit_loss_terms(exits, inputs, targets, teachers):
         """Per-supervised-exit combined losses and masked-mean details."""
-        if len(exits) != len(supervision):
-            raise ValueError(
-                "Executed exits differ from the supervision map; adaptive "
-                "repetition modes are not handled by this trainer yet"
-            )
+        if len(exits) != len(teachers):
+            raise ValueError("Executed exits differ from the supervision map")
         losses, details = [], {}
-        for index, (exit_, teacher) in enumerate(zip(exits, supervision), 1):
+        for index, (exit_, teacher) in enumerate(zip(exits, teachers), 1):
             if teacher is None:
                 continue
             active = exit_.active.float()
@@ -428,9 +461,9 @@ def train(
             losses.append(terms)
         return losses, details
 
-    def exit_losses(exits, inputs, targets):
+    def exit_losses(exits, inputs, targets, teachers):
         """Mean of the supervised exit losses; equal weight across exits."""
-        losses, details = exit_loss_terms(exits, inputs, targets)
+        losses, details = exit_loss_terms(exits, inputs, targets, teachers)
         return torch.stack(losses).mean(), details
 
     @torch.no_grad()
@@ -450,7 +483,7 @@ def train(
                 }
                 inputs = {key: value.to(device) for key, value in inputs.items()}
                 exits, output = model.forward_exits(**inputs)
-                _, details = exit_losses(exits, inputs, targets)
+                _, details = exit_losses(exits, inputs, targets, supervision)
                 for key, value in details.items():
                     per_exit[key] = per_exit.get(key, 0.0) + float(value) * len(
                         selected
@@ -500,7 +533,7 @@ def train(
         gradients = []
         with autocast():
             exits, _ = model.forward_exits(**inputs)
-            losses, _ = exit_loss_terms(exits, inputs, targets)
+            losses, _ = exit_loss_terms(exits, inputs, targets, supervision)
             for loss in losses:
                 grads = torch.autograd.grad(loss, shared, retain_graph=True)
                 gradients.append(
@@ -610,14 +643,29 @@ def train(
                 ),
             )
             loss_sum = torch.zeros((), device=device)
+            sampled = (
+                stratified_repetitions(
+                    steps_per_epoch * config.accumulation_steps,
+                    exits_per_forward,
+                    config.seed + epoch,
+                )
+                if config.sample_repetitions
+                else None
+            )
             for micro, (inputs, targets) in enumerate(loader):
                 if micro >= steps_per_epoch * config.accumulation_steps:
                     break
                 if epoch == start_epoch and micro < next_micro:
                     continue
+                repetitions = sampled[micro] if sampled is not None else None
                 lengths = (inputs["ids"] != PAD).sum(1).numpy()
                 consumed_flops += float(
-                    depth_flops(config.model, lengths, exits_per_forward).sum()
+                    depth_flops(
+                        config.model,
+                        lengths,
+                        repetitions or exits_per_forward,
+                        repetitions=repetitions,
+                    ).sum()
                 )
                 examples_seen += config.batch_size
                 device_inputs = {
@@ -625,7 +673,9 @@ def train(
                     for key, value in inputs.items()
                 }
                 with autocast():
-                    exits, _ = model.forward_exits(**device_inputs)
+                    exits, _ = model.forward_exits(
+                        **device_inputs, repetition_limit=repetitions
+                    )
                     loss, _ = exit_losses(
                         exits,
                         device_inputs,
@@ -633,6 +683,7 @@ def train(
                             key: value.to(device, non_blocking=True)
                             for key, value in targets.items()
                         },
+                        supervision[:repetitions] if repetitions else supervision,
                     )
                 (loss / config.accumulation_steps).backward()
                 loss_sum += loss.detach()
@@ -657,6 +708,11 @@ def train(
                         "train/loss": (loss_sum / config.accumulation_steps).item(),
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/grad_norm": grad_norm.item(),
+                        **(
+                            {"train/repetitions": repetitions}
+                            if repetitions is not None
+                            else {}
+                        ),
                         "train/pos_per_s": (step - initial_step)
                         * config.batch_size
                         * config.accumulation_steps
