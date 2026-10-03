@@ -6,8 +6,8 @@ LINE segment per teacher candidate (LINE, up to ten PV moves, evaluation) and
 closes with the same FINAL segment. Moves are stored in the black-to-move
 canonical orientation, so a black-to-move root has every PV move rank-reflected;
 evaluations keep the teacher's root-player sign. Segment bounds are ordered
-[start, end) pairs whose last entry is the FINAL segment and whose unused slots
-are (-1, -1); the collator reorders only the leading LINE segments.
+[start, end) pairs: the last used entry is the FINAL segment, unused slots are
+(-1, -1), and the collator reorders only the leading LINE segments.
 """
 
 from dataclasses import dataclass

@@ -119,8 +119,9 @@ class SequencePositions(Dataset):
     """Board tokens with an encoded sequence trace (kind=teacher-sequence).
 
     Rows are (boards, trace tokens, trace length, segment bounds). Bounds are
-    ordered [start, end) pairs whose last entry is the FINAL segment; padding is
-    (-1, -1) and only the leading LINE segments may be reordered.
+    ordered [start, end) pairs whose last used entry is the FINAL segment;
+    unused slots are (-1, -1) and only the leading LINE segments may be
+    reordered.
     """
 
     def __init__(self, directory, split):
