@@ -113,6 +113,24 @@ def candidate_row(fen, candidates, depth=16, repetition=1):
     }
 
 
+def candidate_entries(board, count=3, plies=12):
+    """(bm, pv, mate, value) teacher candidates with replayed first-legal PVs."""
+    entries = []
+    for index, move in enumerate(
+        sorted(board.legal_moves, key=lambda m: m.uci())[:count]
+    ):
+        pv, replay, current = [], board.copy(), move
+        for _ in range(plies):
+            pv.append(current.uci())
+            replay.push(current)
+            legal = sorted(replay.legal_moves, key=lambda m: m.uci())
+            if not legal:
+                break
+            current = legal[0]
+        entries.append((pv[0], pv, 3 if index == 0 else None, 0.5))
+    return entries
+
+
 def write_sequence_dataset(root, splits, level="level15", depth=16):
     """Write a teacher-sequence dataset directory mirroring the published layout."""
     root = Path(root)
@@ -134,7 +152,10 @@ def write_sequence_dataset(root, splits, level="level15", depth=16):
             board_array[index, : len(board)] = board
         encoded = [
             encode_trace(
-                depth_snapshot(row, depth), row["fen"].split()[1] == "b", level
+                depth_snapshot(row, depth),
+                row["fen"].split()[1] == "b",
+                level,
+                board=chess.Board(row["fen"]),
             )
             for row in rows
         ]

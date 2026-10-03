@@ -1,33 +1,56 @@
-"""Sequence trace targets: candidate lines and the final answer as tokens.
+"""Sequence trace targets: candidate lines, board snapshots, and the answer.
 
 A trace is a canonical program over the unified chess vocabulary. Level 0 holds
 the answer alone (FINAL, best move, evaluation, END); level 1.5 prefixes one
 LINE segment per teacher candidate (LINE, up to ten PV moves, evaluation) and
-closes with the same FINAL segment. Moves are stored in the black-to-move
-canonical orientation, so a black-to-move root has every PV move rank-reflected;
-evaluations keep the teacher's root-player sign. Segment bounds are ordered
-[start, end) pairs: the last used entry is the FINAL segment, unused slots are
-(-1, -1), and the collator reorders only the leading LINE segments.
+closes with the same FINAL segment. Levels s2e and s2r3 additionally interleave
+explicit board snapshots inside every LINE: s2e at the end of each line, s2r3
+after every third move and at the end.
+
+Moves are stored in the black-to-move canonical orientation, so a black-to-move
+root has every PV move rank-reflected; evaluations keep the teacher's
+root-player sign. A snapshot is the joint (square, piece) run in a1..h8 scan
+order followed by the board metadata block (side, castling, en passant) without
+counters, and it is emitted in the same canonical frame: pieces rank-mirrored
+and color-swapped for a black-to-move root, side token in the root frame's
+naming, which the mirror leaves unchanged. Snapshots carry rule truth replayed
+with python-chess, so their side, castling, and en-passant fields follow the
+pushed PV rather than the root.
+
+Segment bounds are ordered [start, end) pairs: the last used entry is the FINAL
+segment, unused slots are (-1, -1), and the collator reorders only the leading
+LINE segments, each whole line with its snapshots.
 """
 
 from dataclasses import dataclass
 
+import chess
+
 from pondera.chess.mapping import IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.tokens import (
+    CASTLING,
+    CHESS_VOCAB_SIZE,
+    EN_PASSANT,
     END,
     FINAL,
     LINE,
     MOVE,
     PAD,
+    SIDE,
+    SNAPSHOT,
     VALUE,
+    decode_snapshot_token,
     mate_token,
+    snapshot_token,
     value_bin,
 )
 
 LEVEL0 = "level0"
 LEVEL15 = "level15"
-LEVELS = (LEVEL0, LEVEL15)
+S2E = "s2e"
+S2R3 = "s2r3"
+LEVELS = (LEVEL0, LEVEL15, S2E, S2R3)
 
 # Teacher ranks in presented order; MultiPV four leaves the tail absent.
 CANDIDATE_RANKS = ("r1", "r2", "r3", "r4")
@@ -35,15 +58,36 @@ CANDIDATE_RANKS = ("r1", "r2", "r3", "r4")
 # PV truncation of a LINE segment, in plies.
 PV_LIMIT = 10
 
+# Snapshot cadence of the s2r3 level, in plies.
+SNAPSHOT_INTERVAL = 3
+
+# Metadata fields of one snapshot run, in order after the piece tokens.
+SNAPSHOT_METADATA = 6
+
 
 @dataclass(frozen=True)
 class Segment:
-    """One parsed trace segment in the trace orientation."""
+    """One parsed trace segment in the trace orientation.
+
+    snapshots holds (moves_before, token run) pairs for the board snapshots
+    carried by the segment, in the order they were emitted.
+    """
 
     kind: str
     moves: tuple
     evaluation: int
     terminated: bool
+    snapshots: tuple = ()
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """Decoded board snapshot: occupied squares plus its metadata fields."""
+
+    pieces: tuple
+    side_black: bool
+    castling: tuple
+    ep: int
 
 
 def is_move_token(token: int) -> bool:
@@ -52,6 +96,20 @@ def is_move_token(token: int) -> bool:
 
 def is_eval_token(token: int) -> bool:
     return VALUE <= token < LINE
+
+
+def is_snapshot_token(token: int) -> bool:
+    return SNAPSHOT <= token < CHESS_VOCAB_SIZE
+
+
+def is_snapshot_metadata(token: int) -> bool:
+    """A board-metadata id, only legal inside a snapshot's trailing block."""
+    return SIDE <= token <= EN_PASSANT + 64
+
+
+def piece_code(piece) -> int:
+    """Board-encoding piece code of a python-chess piece (0..11, no empty)."""
+    return (piece.piece_type - 1) + (0 if piece.color else 6)
 
 
 def depth_snapshot(row, depth=16):
@@ -93,26 +151,119 @@ def max_segments(level):
     return 1 if level == LEVEL0 else 1 + len(CANDIDATE_RANKS)
 
 
-def encode_trace(snapshot, black, level):
+def canonical_board(board, mirror):
+    """The position in the trace's canonical frame (ranks flipped on a mirror).
+
+    python-chess's mirror also flips the side to move; the snapshot's side token
+    is taken from the root frame separately, so the flip is irrelevant here.
+    """
+    return board.mirror() if mirror else board.copy()
+
+
+def snapshot_pieces(board):
+    """Occupied (square, piece code) pairs of a position in a1..h8 scan order."""
+    return tuple(
+        sorted(
+            (square, piece_code(piece)) for square, piece in board.piece_map().items()
+        )
+    )
+
+
+def snapshot_run(board, side_black):
+    """Snapshot token run of a position already in the canonical frame.
+
+    side_black is the side to move in the root frame, which the canonical mirror
+    leaves unchanged, matching the board prefix's side-token convention.
+    """
+    tokens = [snapshot_token(square, piece) for square, piece in snapshot_pieces(board)]
+    tokens.append(SIDE + side_black)
+    rights = (
+        board.has_kingside_castling_rights(chess.WHITE),
+        board.has_queenside_castling_rights(chess.WHITE),
+        board.has_kingside_castling_rights(chess.BLACK),
+        board.has_queenside_castling_rights(chess.BLACK),
+    )
+    tokens.extend(CASTLING + 2 * index + int(flag) for index, flag in enumerate(rights))
+    tokens.append(EN_PASSANT + (board.ep_square if board.ep_square is not None else 64))
+    return tokens
+
+
+def snapshot_of(board, mirror):
+    """Snapshot token run of a true position in the trace's canonical frame."""
+    return snapshot_run(canonical_board(board, mirror), board.turn == chess.BLACK)
+
+
+def decode_snapshot(tokens) -> Snapshot:
+    """Decode one snapshot token run; raises when the run is malformed."""
+    pieces, index = [], 0
+    while index < len(tokens) and is_snapshot_token(tokens[index]):
+        pieces.append(decode_snapshot_token(int(tokens[index])))
+        index += 1
+    if not pieces:
+        raise ValueError("A snapshot needs at least one piece token")
+    if any(
+        square >= next_square
+        for (square, _), (next_square, _) in zip(pieces, pieces[1:])
+    ):
+        raise ValueError("Snapshot squares must increase in scan order")
+    metadata = [int(token) for token in tokens[index : index + SNAPSHOT_METADATA]]
+    if len(metadata) != SNAPSHOT_METADATA:
+        raise ValueError("Snapshot metadata is truncated")
+    if metadata[0] not in (SIDE, SIDE + 1):
+        raise ValueError("Invalid snapshot side token")
+    castling = tuple(metadata[1 + field] - CASTLING - 2 * field for field in range(4))
+    if any(flag not in (0, 1) for flag in castling):
+        raise ValueError("Invalid snapshot castling token")
+    ep = metadata[5] - EN_PASSANT
+    if not 0 <= ep <= 64:
+        raise ValueError("Invalid snapshot en-passant token")
+    return Snapshot(tuple(pieces), metadata[0] == SIDE + 1, castling, ep)
+
+
+def snapshot_positions(level, moves):
+    """Move counts after which a LINE segment of this level carries a snapshot."""
+    if level == S2E:
+        return (moves,) if moves else ()
+    return tuple(range(SNAPSHOT_INTERVAL, moves + 1, SNAPSHOT_INTERVAL)) + (
+        (moves,) if moves % SNAPSHOT_INTERVAL else ()
+    )
+
+
+def encode_trace(snapshot, black, level, board=None):
     """Encode one depth snapshot into trace tokens and ordered segment bounds.
 
     The FINAL segment always uses the rank-1 move and evaluation directly; the
     LINE segments carry the candidates in teacher rank order (training reorders
-    them) with PVs truncated to PV_LIMIT plies.
+    them) with PVs truncated to PV_LIMIT plies. Levels s2e and s2r3 additionally
+    interleave board snapshots and require the root position as a python-chess
+    board, which supplies the rule truth for every snapshot point.
     """
     if level not in LEVELS:
         raise ValueError(f"Unknown trace level: {level}")
+    if level in (S2E, S2R3) and board is None:
+        raise ValueError("Snapshot levels need the root position")
     ranked = candidates(snapshot)
     if not ranked:
         raise ValueError("Depth snapshot carries no candidate ranks")
     tokens, bounds = [], []
-    if level == LEVEL15:
+    if level != LEVEL0:
         for candidate in ranked:
+            moves = [move_token(move, black) for move in candidate["pv"][:PV_LIMIT]]
             start = len(tokens)
             tokens.append(LINE)
-            tokens.extend(
-                move_token(move, black) for move in candidate["pv"][:PV_LIMIT]
-            )
+            if level in (S2E, S2R3):
+                if not moves:
+                    raise ValueError("Snapshot levels need at least one PV move")
+                replay = canonical_board(board, black)
+                due = set(snapshot_positions(level, len(moves)))
+                for number, move in enumerate(moves, 1):
+                    tokens.append(move)
+                    replay.push_uci(IDX_TO_UCI_MOVE[move - MOVE])
+                    if number in due:
+                        side_black = black if number % 2 == 0 else not black
+                        tokens.extend(snapshot_run(replay, side_black))
+            else:
+                tokens.extend(moves)
             tokens.append(evaluation_token(candidate))
             bounds.append((start, len(tokens)))
     start = len(tokens)
@@ -126,6 +277,33 @@ def encode_trace(snapshot, black, level):
     )
     bounds.append((start, len(tokens)))
     return tokens, bounds
+
+
+def read_snapshot(values, index):
+    """Read one snapshot run at index; returns (run, next index, error tag)."""
+    start, squares = index, []
+    while index < len(values) and is_snapshot_token(values[index]):
+        squares.append(decode_snapshot_token(values[index])[0])
+        index += 1
+    if not squares:
+        return (), index, "snapshot_without_pieces"
+    if any(square >= next_square for square, next_square in zip(squares, squares[1:])):
+        return (), index, "snapshot_square_order"
+    metadata = values[index : index + SNAPSHOT_METADATA]
+    if len(metadata) < SNAPSHOT_METADATA or not all(
+        is_snapshot_metadata(token) for token in metadata
+    ):
+        return (), index, "snapshot_truncated"
+    if metadata[0] not in (SIDE, SIDE + 1):
+        return (), index, "snapshot_side"
+    for field, token in enumerate(metadata[1:5]):
+        if token - CASTLING - 2 * field not in (0, 1):
+            return (), index, "snapshot_castling"
+    return (
+        tuple(values[start : index + SNAPSHOT_METADATA]),
+        index + SNAPSHOT_METADATA,
+        None,
+    )
 
 
 def parse_trace(tokens):
@@ -142,10 +320,20 @@ def parse_trace(tokens):
         token = values[index]
         if token == LINE:
             index += 1
-            moves = []
-            while index < len(values) and is_move_token(values[index]):
-                moves.append(values[index])
-                index += 1
+            moves, snapshots = [], []
+            while index < len(values):
+                if is_move_token(values[index]):
+                    moves.append(values[index])
+                    index += 1
+                elif is_snapshot_token(values[index]):
+                    run, index, error = read_snapshot(values, index)
+                    if error is not None:
+                        break
+                    snapshots.append((len(moves), run))
+                else:
+                    break
+            if error is not None:
+                break
             if not moves:
                 error = "line_without_move"
                 break
@@ -155,7 +343,9 @@ def parse_trace(tokens):
             if not is_eval_token(values[index]):
                 error = "line_missing_evaluation"
                 break
-            segments.append(Segment("line", tuple(moves), values[index], False))
+            segments.append(
+                Segment("line", tuple(moves), values[index], False, tuple(snapshots))
+            )
             index += 1
         elif token == FINAL:
             index += 1

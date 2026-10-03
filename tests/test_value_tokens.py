@@ -8,6 +8,7 @@ from pondera.chess.tokens import (
     MATE_LOSS,
     MATE_WIN,
     MOVE,
+    SNAPSHOT,
     VALUE,
     VALUE_BIN_BOUNDARIES,
     VALUE_BIN_REPRESENTATIVES,
@@ -75,14 +76,17 @@ class UnifiedVocabularyTests(unittest.TestCase):
         self.assertEqual(MATE_LOSS, MATE_WIN + 29)
         self.assertEqual(LINE, MATE_LOSS + 31)
         self.assertEqual(FINAL, LINE + 1)
-        self.assertEqual(CHESS_VOCAB_SIZE, FINAL + 1)
+        self.assertEqual(SNAPSHOT, FINAL + 1)
+        self.assertEqual(CHESS_VOCAB_SIZE, SNAPSHOT + 12 * 64)
 
     def test_trace_tokens_extend_the_frozen_space_append_only(self):
         # The last frozen unified id is 2397 (the deepest mate-loss distance);
-        # LINE and FINAL take the two following ids, so no earlier id moves.
+        # LINE and FINAL take the two following ids and the 768 snapshot ids
+        # follow them, so no earlier id moves.
         self.assertEqual(MATE_LOSS + 30, 2397)
-        self.assertEqual((LINE, FINAL, CHESS_VOCAB_SIZE), (2398, 2399, 2400))
-        for token in (LINE, FINAL):
+        self.assertEqual((LINE, FINAL, SNAPSHOT), (2398, 2399, 2400))
+        self.assertEqual(CHESS_VOCAB_SIZE, 3168)
+        for token in (LINE, FINAL, SNAPSHOT, CHESS_VOCAB_SIZE - 1):
             with self.assertRaises(ValueError):
                 decode_value_token(token)
 

@@ -48,7 +48,13 @@ MATE_LOSS = MATE_WIN + 29
 # answer; END closes both a board counter field and a trace.
 LINE = MATE_LOSS + 31
 FINAL = LINE + 1
-CHESS_VOCAB_SIZE = FINAL + 1
+# Explicit board snapshots inside a trace: joint (square, piece) tokens over
+# the twelve pieces of the board encoding, square-major in a1..h8 scan order.
+# Empty squares carry no token; the metadata block that follows reuses the
+# board-token side, castling, and en-passant ids.
+SNAPSHOT = FINAL + 1
+SNAPSHOT_PIECES = 12
+CHESS_VOCAB_SIZE = SNAPSHOT + SNAPSHOT_PIECES * 64
 
 # Value bins, frozen on the pinned teacher release (pooled candidate ranks,
 # non-mate WDL-derived values in [-1, 1]): bin 0 and bin 19 are the -1 and +1
@@ -101,6 +107,22 @@ VALUE_BIN_REPRESENTATIVES = (
 # the terminal position after perspective normalization.
 MATE_WIN_MAX = 28
 MATE_LOSS_MAX = 30
+
+
+def snapshot_token(square: int, piece: int) -> int:
+    """Joint token id of one occupied square in a board snapshot."""
+    if not 0 <= square < 64:
+        raise ValueError("Snapshot squares lie in 0..63")
+    if not 0 <= piece < SNAPSHOT_PIECES:
+        raise ValueError("Snapshot pieces exclude the empty square")
+    return SNAPSHOT + square * SNAPSHOT_PIECES + piece
+
+
+def decode_snapshot_token(token: int) -> tuple[int, int]:
+    """Recover the (square, piece) pair of a snapshot token id."""
+    if not SNAPSHOT <= token < CHESS_VOCAB_SIZE:
+        raise ValueError(f"Not a snapshot token: {token}")
+    return divmod(token - SNAPSHOT, SNAPSHOT_PIECES)
 
 
 def value_bin(value: float) -> int:

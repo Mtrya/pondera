@@ -5,7 +5,12 @@ from pathlib import Path
 import chess
 import numpy as np
 import torch
-from teacher_release import candidate_row, play, write_sequence_dataset
+from teacher_release import (
+    candidate_entries,
+    candidate_row,
+    play,
+    write_sequence_dataset,
+)
 
 from pondera.chess.mapping import IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
 from pondera.chess.symmetry import move_permutations, reflect_uci
@@ -45,24 +50,6 @@ FENS = [chess.STARTING_FEN, BLACK_TO_MOVE, EXCHANGE_START]
 # Parsed from the frozen teacher contract: value 0.5 lies in bin 15, the +-1
 # atoms are bins 19 and 0, and mate distances offset their block base.
 BIN_OF_0_5 = 15
-
-
-def candidate_entries(board, count=3, plies=12):
-    """(bm, pv, mate, value) teacher candidates with replayed first-legal PVs."""
-    entries = []
-    for index, move in enumerate(
-        sorted(board.legal_moves, key=lambda m: m.uci())[:count]
-    ):
-        pv, replay, current = [], board.copy(), move
-        for _ in range(plies):
-            pv.append(current.uci())
-            replay.push(current)
-            legal = sorted(replay.legal_moves, key=lambda m: m.uci())
-            if not legal:
-                break
-            current = legal[0]
-        entries.append((pv[0], pv, 3 if index == 0 else None, 0.5))
-    return entries
 
 
 def replay_board(board, black):
