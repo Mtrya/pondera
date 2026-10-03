@@ -7,8 +7,8 @@ import numpy as np
 import torch
 from teacher_release import candidate_row, play, write_sequence_dataset
 
-from pondera.chess.mapping import IDX_TO_UCI_MOVE
-from pondera.chess.symmetry import reflect_uci
+from pondera.chess.mapping import IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
+from pondera.chess.symmetry import move_permutations, reflect_uci
 from pondera.chess.tokens import (
     END,
     FINAL,
@@ -31,6 +31,7 @@ from pondera.data.trace import (
     is_eval_token,
     is_move_token,
     max_segments,
+    move_token,
     parse_trace,
 )
 from pondera.training.sequence import SequenceCollator
@@ -163,6 +164,14 @@ class TraceEncodingTests(unittest.TestCase):
         replay = board.mirror()
         for move in expected:
             replay.push_uci(move)
+
+    def test_encoder_reflection_matches_the_policy_action_table(self):
+        # The encoding frame and the policy's action permutation must be the
+        # same transform, since both move black-to-move data into one frame.
+        for uci in ("e2e4", "a7a5", "e7e8q", "g1f3", "e1g1", "<claim_draw>"):
+            expected = int(move_permutations()[1][UCI_MOVE_TO_IDX[uci]])
+            self.assertEqual(move_token(uci, True) - MOVE, expected)
+            self.assertEqual(move_token(uci, False), MOVE + UCI_MOVE_TO_IDX[uci])
 
     def test_parse_reports_broken_programs(self):
         move, evaluation = MOVE + 7, VALUE + 5
