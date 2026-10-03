@@ -1,9 +1,17 @@
 """Explicit model selection for serialized policy configurations."""
 
 from pondera.chess.tokens import CHESS_TOKENIZER_VERSION
-from pondera.models.policy import BoardPolicyModel, DepthPolicyModel
+from pondera.models.policy import (
+    BoardPolicyModel,
+    DepthPolicyModel,
+    SequencePolicyModel,
+)
 
-ARCHITECTURES = {"base": BoardPolicyModel, "depth": DepthPolicyModel}
+ARCHITECTURES = {
+    "base": BoardPolicyModel,
+    "depth": DepthPolicyModel,
+    "sequence": SequencePolicyModel,
+}
 
 # Keys written by configurations predating the settled representation. Loading
 # stays possible only when the recorded values match the settled choices.

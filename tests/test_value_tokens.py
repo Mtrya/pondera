@@ -3,6 +3,8 @@ import unittest
 from pondera.chess.mapping import IDX_TO_UCI_MOVE
 from pondera.chess.tokens import (
     CHESS_VOCAB_SIZE,
+    FINAL,
+    LINE,
     MATE_LOSS,
     MATE_WIN,
     MOVE,
@@ -63,7 +65,7 @@ class ValueBinTests(unittest.TestCase):
 
 
 class UnifiedVocabularyTests(unittest.TestCase):
-    """Frozen id layout: board tokens, then moves, value bins, mate distances."""
+    """Frozen id layout: board tokens, moves, values, mate distances, trace."""
 
     def test_frozen_offsets(self):
         self.assertEqual(MOVE, 349)
@@ -71,7 +73,18 @@ class UnifiedVocabularyTests(unittest.TestCase):
         self.assertEqual(VALUE, 349 + len(IDX_TO_UCI_MOVE))
         self.assertEqual(MATE_WIN, VALUE + 20)
         self.assertEqual(MATE_LOSS, MATE_WIN + 29)
-        self.assertEqual(CHESS_VOCAB_SIZE, MATE_LOSS + 31)
+        self.assertEqual(LINE, MATE_LOSS + 31)
+        self.assertEqual(FINAL, LINE + 1)
+        self.assertEqual(CHESS_VOCAB_SIZE, FINAL + 1)
+
+    def test_trace_tokens_extend_the_frozen_space_append_only(self):
+        # The last frozen unified id is 2397 (the deepest mate-loss distance);
+        # LINE and FINAL take the two following ids, so no earlier id moves.
+        self.assertEqual(MATE_LOSS + 30, 2397)
+        self.assertEqual((LINE, FINAL, CHESS_VOCAB_SIZE), (2398, 2399, 2400))
+        for token in (LINE, FINAL):
+            with self.assertRaises(ValueError):
+                decode_value_token(token)
 
     def test_mate_tokens_cover_the_frozen_distances(self):
         self.assertEqual(mate_token(0, win=True), MATE_WIN)

@@ -44,7 +44,11 @@ MOVE = VOCAB_SIZE
 VALUE = MOVE + len(IDX_TO_UCI_MOVE)
 MATE_WIN = VALUE + 20
 MATE_LOSS = MATE_WIN + 29
-CHESS_VOCAB_SIZE = MATE_LOSS + 31
+# Sequence trace delimiters: LINE opens a candidate line, FINAL opens the
+# answer; END closes both a board counter field and a trace.
+LINE = MATE_LOSS + 31
+FINAL = LINE + 1
+CHESS_VOCAB_SIZE = FINAL + 1
 
 # Value bins, frozen on the pinned teacher release (pooled candidate ranks,
 # non-mate WDL-derived values in [-1, 1]): bin 0 and bin 19 are the -1 and +1

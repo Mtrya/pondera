@@ -7,7 +7,11 @@ from pondera.models.backbones import (
     SequenceBackbone,
 )
 from pondera.models.config import BlockConfig, CoreConfig, RepetitionConfig
-from pondera.models.policy import BoardPolicyModel, DepthPolicyModel
+from pondera.models.policy import (
+    BoardPolicyModel,
+    DepthPolicyModel,
+    SequencePolicyModel,
+)
 
 __all__ = [
     "BaseBackbone",
@@ -19,4 +23,5 @@ __all__ = [
     "RepetitionConfig",
     "BoardPolicyModel",
     "DepthPolicyModel",
+    "SequencePolicyModel",
 ]

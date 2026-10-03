@@ -37,6 +37,22 @@ _CASTLING_SOURCE = (2, 3, 0, 1)
 MIRROR_PERMUTATION = np.arange(64) ^ _MIRROR_SHIFT
 
 
+def reflect_uci(move: str) -> str:
+    """Rank-mirror a UCI move, the move transform of the black-to-move mirror.
+
+    Move geometry commutes with the board mirror, so a legal move of a
+    black-to-move root maps to a legal move of its mirrored board; the draw
+    claim pseudo-move is not a board move and stays fixed.
+    """
+    if move == "<claim_draw>":
+        return move
+    return (
+        IDX_TO_SQUARE[SQUARE_TO_IDX[move[:2]] ^ _MIRROR_SHIFT]
+        + IDX_TO_SQUARE[SQUARE_TO_IDX[move[2:4]] ^ _MIRROR_SHIFT]
+        + move[4:]
+    )
+
+
 @lru_cache(maxsize=1)
 def move_permutations():
     """Map every move-vocabulary index through each transform."""
@@ -44,16 +60,7 @@ def move_permutations():
     tables = np.empty((NUM_TRANSFORMS, size), dtype=np.int64)
     tables[0] = np.arange(size)
     for index in range(size):
-        uci = IDX_TO_UCI_MOVE[index]
-        if uci == "<claim_draw>":
-            tables[1, index] = index
-            continue
-        mapped = (
-            IDX_TO_SQUARE[SQUARE_TO_IDX[uci[:2]] ^ _MIRROR_SHIFT]
-            + IDX_TO_SQUARE[SQUARE_TO_IDX[uci[2:4]] ^ _MIRROR_SHIFT]
-            + uci[4:]
-        )
-        tables[1, index] = UCI_MOVE_TO_IDX[mapped]
+        tables[1, index] = UCI_MOVE_TO_IDX[reflect_uci(IDX_TO_UCI_MOVE[index])]
     return tables
 
 

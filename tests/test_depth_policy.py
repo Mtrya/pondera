@@ -205,8 +205,8 @@ class DepthFlopsTests(unittest.TestCase):
     def test_hand_derived_literal(self):
         # Effective layers: 2 layers x 3 repetitions = 6. Length 10 + 2 readouts = 12.
         # Per layer: 8*12*16^2 + 6*12*16*32 + 4*12^2*16 = 24576+36864+9216 = 70656.
-        # Trunk: 6*70656 = 423936. Head: 3 exits x 2 positions x 2*16*2398 = 460416.
-        # Training: 3*(423936+460416) = 2653056; evaluation: 884352.
+        # Trunk: 6*70656 = 423936. Head: 3 exits x 2 positions x 2*16*2400 = 460800.
+        # Training: 3*(423936+460800) = 2654208; evaluation: 884736.
         config = {
             "architecture": "depth",
             "hidden_size": 16,
@@ -214,19 +214,19 @@ class DepthFlopsTests(unittest.TestCase):
             "cores": [{"layers": 2, "repetition": {"max_repetitions": 3}}],
         }
         self.assertEqual(
-            float(depth_flops(config, [10], head_exits=3)[0]), 2653056.0
+            float(depth_flops(config, [10], head_exits=3)[0]), 2654208.0
         )
         self.assertEqual(
             float(
                 depth_flops(config, [10], head_exits=3, training=False)[0]
             ),
-            884352.0,
+            884736.0,
         )
 
     def test_repetitions_override_scales_trunk(self):
         # Same per-layer cost 70656 as above. Override to 2 executed repetitions:
-        # trunk 2*2*70656 = 282624; head 2 exits x 2 positions x 2*16*2398 = 306944.
-        # Training: 3*(282624+306944) = 1768704. Override equal to the configured
+        # trunk 2*2*70656 = 282624; head 2 exits x 2 positions x 2*16*2400 = 307200.
+        # Training: 3*(282624+307200) = 1769472. Override equal to the configured
         # maximum must reproduce the un-overridden value exactly.
         config = {
             "architecture": "depth",
@@ -236,7 +236,7 @@ class DepthFlopsTests(unittest.TestCase):
         }
         self.assertEqual(
             float(depth_flops(config, [10], head_exits=2, repetitions=2)[0]),
-            1768704.0,
+            1769472.0,
         )
         self.assertEqual(
             float(depth_flops(config, [10], head_exits=3, repetitions=3)[0]),

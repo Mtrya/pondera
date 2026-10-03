@@ -8,36 +8,23 @@ from torch import nn
 
 from pondera.chess.tokens import (
     CHESS_VOCAB_SIZE,
+    LINE,
     MOVE,
+    PAD,
     VALUE,
     encode_boards,
 )
-from pondera.chess.mapping import EMPTY_SQ_IDX, IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
-from pondera.models.backbones import BaseBackbone, DepthBackbone
+from pondera.chess.mapping import EMPTY_SQ_IDX, IDX_TO_UCI_MOVE
+from pondera.chess.symmetry import move_permutations
+from pondera.models.backbones import BaseBackbone, DepthBackbone, SequenceBackbone
+from pondera.models.blocks import sinusoidal_positions
 from pondera.models.board import BoardEmbedding, black_to_move
 from pondera.models.config import BlockConfig, CoreConfig
 
 
 def _reflection_table():
     """Action-permutation undoing the black-to-move rank reflection."""
-
-    def reflect_move(move):
-        if move == "<claim_draw>":
-            return move
-        return (
-            move[0]
-            + str(9 - int(move[1]))
-            + move[2]
-            + str(9 - int(move[3]))
-            + move[4:]
-        )
-
-    return torch.tensor(
-        [
-            UCI_MOVE_TO_IDX[reflect_move(IDX_TO_UCI_MOVE[i])]
-            for i in range(len(IDX_TO_UCI_MOVE))
-        ]
-    )
+    return torch.tensor(move_permutations()[1])
 
 
 class BoardPolicyModel(nn.Module, PyTorchModelHubMixin):
@@ -254,7 +241,7 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
     def _predict(self, state, reflected):
         logits = self.head(state)
         move = logits[..., 0, MOVE : MOVE + len(IDX_TO_UCI_MOVE)]
-        value = logits[..., 1, VALUE:]
+        value = logits[..., 1, VALUE:LINE]
         move = torch.where(
             reflected[:, None], move[:, self.reflected_actions], move
         )
@@ -338,3 +325,133 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
                 )
             )
         return exits, output
+
+
+def sequence_target_positions(board_lengths, trace_width, board_width):
+    """Absolute positions whose hidden state predicts each trace target token.
+
+    The first trace token is predicted from the last valid packed board
+    position; every later trace token is predicted from the preceding trace
+    position. Padded trace slots get in-range indices and are ignored through
+    the loss mask.
+    """
+    index = torch.arange(trace_width, device=board_lengths.device)
+    return torch.where(
+        index[None, :] == 0,
+        (board_lengths - 1)[:, None],
+        board_width + index[None, :] - 1,
+    )
+
+
+class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
+    """Board prefix with bidirectional attention followed by a causal trace.
+
+    The board prefix packs to its batch-maximum width and is embedded by
+    BoardEmbedding; padded board slots stay invisible keys, so no sample attends
+    to another sample's padding. Trace tokens carry their own embedding plus
+    sinusoidal positions. The head spans the unified vocabulary and reads the
+    whole sequence; supervision follows the shifted trace contract in
+    sequence_target_positions. Generation prefills the board, then decodes one
+    token at a time from the cached prefix.
+    """
+
+    def __init__(
+        self,
+        num_blocks,
+        hidden_size,
+        intermediate_size,
+        num_heads,
+        dropout=0.0,
+        architecture="sequence",
+    ):
+        super().__init__()
+        if architecture != "sequence":
+            raise ValueError("Unsupported board-policy architecture")
+        self.board_embedding = BoardEmbedding(hidden_size)
+        self.trace_embedding = nn.Embedding(
+            CHESS_VOCAB_SIZE, hidden_size, padding_idx=PAD
+        )
+        nn.init.normal_(self.trace_embedding.weight, std=0.02)
+        with torch.no_grad():
+            self.trace_embedding.weight[PAD].zero_()
+        self.head = nn.Linear(hidden_size, CHESS_VOCAB_SIZE)
+        block = BlockConfig(hidden_size, intermediate_size, num_heads, dropout)
+        self.backbone = SequenceBackbone(block, num_blocks)
+
+    def _trace_embeddings(self, trace_ids, trace_positions, dtype):
+        if trace_positions is None:
+            trace_positions = torch.arange(trace_ids.shape[1], device=trace_ids.device)
+        return self.trace_embedding(trace_ids.long()) + sinusoidal_positions(
+            trace_positions, self.trace_embedding.embedding_dim, dtype
+        )
+
+    def sequence(self, ids, positions=None, trace_ids=None, trace_positions=None):
+        """Backbone output over the packed board prefix and the trace suffix."""
+        board = self.board_embedding(ids, positions)
+        hidden, valid = board.hidden, board.valid
+        if trace_ids is not None:
+            trace = self._trace_embeddings(
+                trace_ids, trace_positions, board.hidden.dtype
+            )
+            hidden = torch.cat((hidden, trace), dim=1)
+            valid = torch.cat((valid, trace_ids != PAD), dim=1)
+        board_width = board.hidden.shape[1]
+        output = self.backbone(hidden, board_width, valid=valid)
+        return board, hidden, valid, board_width, output
+
+    def forward(
+        self,
+        ids=None,
+        positions=None,
+        trace_ids=None,
+        *,
+        return_backbone=False,
+        trace_positions=None,
+    ):
+        if ids is None:
+            raise ValueError("Sequence policies consume encoded board tokens")
+        _, _, _, _, output = self.sequence(ids, positions, trace_ids, trace_positions)
+        logits = self.head(output.hidden)
+        return (logits, output) if return_backbone else logits
+
+    def trace_logits(self, ids, positions=None, trace_ids=None):
+        """Logits at the supervision position of every trace target token."""
+        if trace_ids is None:
+            raise ValueError("Trace supervision needs trace tokens")
+        _, _, valid, board_width, output = self.sequence(ids, positions, trace_ids)
+        target = sequence_target_positions(
+            valid[:, :board_width].sum(1), trace_ids.shape[1], board_width
+        )
+        selected = output.hidden.gather(
+            1, target.unsqueeze(-1).expand(-1, -1, output.hidden.shape[-1])
+        )
+        return self.head(selected)
+
+    @torch.no_grad()
+    def prefill(self, ids, positions=None):
+        """Cache the board prefix; returns the logits predicting the first token."""
+        if self.training:
+            raise ValueError("Generation requires evaluation mode")
+        board = self.board_embedding(ids, positions)
+        output = self.backbone.prefill(board.hidden, valid=board.valid)
+        last = board.valid.sum(1) - 1
+        hidden = output.hidden.gather(
+            1, last[:, None, None].expand(-1, 1, output.hidden.shape[-1])
+        )
+        return self.head(hidden.squeeze(1)), output.cache
+
+    @torch.no_grad()
+    def decode(self, tokens, cache):
+        """Append trace tokens to a cached prefix; returns next-token logits."""
+        if self.training:
+            raise ValueError("Generation requires evaluation mode")
+        positions = torch.arange(tokens.shape[1], device=tokens.device) + (
+            cache.length - cache.prefix_length
+        )
+        hidden = self.trace_embedding(tokens.long()) + sinusoidal_positions(
+            positions,
+            self.trace_embedding.embedding_dim,
+            self.trace_embedding.weight.dtype,
+        )
+        output = self.backbone.decode(hidden, cache, valid=tokens != PAD)
+        return self.head(output.hidden[:, -1]), output.cache
