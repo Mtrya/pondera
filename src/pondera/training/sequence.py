@@ -373,6 +373,10 @@ def train(
                 loss_sum += loss.detach()
                 if (micro + 1) % config.accumulation_steps:
                     continue
+                squares_grad = model.board_embedding.squares.weight.grad
+                squares_grad_norm = (
+                    None if squares_grad is None else squares_grad.norm().item()
+                )
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), config.grad_clip, error_if_nonfinite=True
                 )
@@ -394,6 +398,7 @@ def train(
                         "train/loss": (loss_sum / config.accumulation_steps).item(),
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/grad_norm": grad_norm.item(),
+                        "train/board_squares_grad_norm": squares_grad_norm,
                         "train/rows_per_s": (step - initial_step)
                         * config.batch_size
                         * config.accumulation_steps

@@ -19,10 +19,12 @@ from pondera.chess.tokens import (
     EN_PASSANT,
     LINE,
     MOVE,
+    PAD,
     SIDE,
     SNAPSHOT,
     VALUE,
     decode_snapshot_token,
+    encode_boards,
     snapshot_token,
 )
 from pondera.data.positions import SequencePositions
@@ -42,7 +44,7 @@ from pondera.data.trace import (
 )
 from pondera.models.board import pack_board_tokens
 from pondera.models.factory import create_model
-from pondera.training.sequence import SequenceCollator
+from pondera.training.sequence import SequenceCollator, trace_loss
 
 RUY_LOPEZ = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"]
 BLACK_TO_MOVE = play(RUY_LOPEZ)[1][0]
@@ -239,6 +241,94 @@ class SnapshotEncodingTests(unittest.TestCase):
             encode_trace(depth_snapshot(row), False, "level2")
 
 
+class SnapshotTyingTests(unittest.TestCase):
+    """Snapshot tokens and board pieces read one shared embedding table."""
+
+    def setUp(self):
+        torch.set_num_threads(1)
+        torch.manual_seed(11)
+        self.model = create_model(
+            {
+                "architecture": "sequence",
+                "num_blocks": 1,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_heads": 4,
+                "dropout": 0.0,
+            }
+        ).eval()
+        self.ids = torch.from_numpy(encode_boards([chess.STARTING_FEN]))
+        self.packed = pack_board_tokens(self.ids)
+        self.positions = self.packed["positions"][0].tolist()
+        self.pieces = snapshot_pieces(chess.Board(chess.STARTING_FEN))
+
+    def test_snapshot_tokens_embed_as_the_board_square_table(self):
+        # The board path embeds an occupied square from the joint table with no
+        # positional term; a snapshot token of the same (square, piece) must add
+        # only the trace's position sinusoid, which at position 0 is the frozen
+        # sin(0)=0, cos(0)=1 sequence.
+        board_hidden = self.model.board_embedding(
+            self.packed["ids"], self.packed["positions"]
+        ).hidden[0]
+        tokens = torch.tensor(
+            [[snapshot_token(*pair) for pair in self.pieces]], dtype=torch.int16
+        )
+        _, hidden, _, width, _ = self.model.sequence(
+            self.ids,
+            trace_ids=tokens,
+            trace_positions=torch.zeros(tokens.shape[1], dtype=torch.long),
+        )
+        trace_hidden = hidden[0, width:]
+        sinusoid = torch.tensor([0.0, 1.0] * (trace_hidden.shape[1] // 2))
+        for index, (square, piece) in enumerate(self.pieces):
+            expected = board_hidden[self.positions.index(square)] + sinusoid
+            torch.testing.assert_close(trace_hidden[index], expected, rtol=0, atol=0)
+
+    def test_trace_tokens_below_the_snapshot_block_keep_their_own_table(self):
+        # Checkpoint compatibility: ids below the snapshot block embed exactly
+        # as the trained table always did, with no contribution from the board.
+        tokens = torch.tensor([[LINE, MOVE + 5, SNAPSHOT - 1]], dtype=torch.int16)
+        _, hidden, _, width, _ = self.model.sequence(
+            self.ids,
+            trace_ids=tokens,
+            trace_positions=torch.zeros(tokens.shape[1], dtype=torch.long),
+        )
+        sinusoid = torch.tensor(
+            [0.0, 1.0] * (self.model.trace_embedding.embedding_dim // 2)
+        )
+        expected = self.model.trace_embedding(tokens.long()) + sinusoid
+        torch.testing.assert_close(hidden[:, width:], expected, rtol=0, atol=0)
+
+    def test_snapshot_gradients_update_the_board_square_table(self):
+        model = self.model.train()
+        square, piece = self.pieces[8]
+        index = self.positions.index(square)
+        before = (
+            model.board_embedding(self.packed["ids"], self.packed["positions"])
+            .hidden[0, index]
+            .clone()
+        )
+        token = torch.tensor([[snapshot_token(square, piece)]], dtype=torch.int16)
+        _, hidden, _, width, _ = model.sequence(self.ids, trace_ids=token)
+        hidden[:, width:].sum().backward()
+        squares = model.board_embedding.squares.weight
+        self.assertIsNotNone(squares.grad)
+        grad = squares.grad.clone()
+        # The snapshot writes gradient into exactly its own square table row and
+        # nothing into the base trace table.
+        self.assertTrue(torch.all(grad[square * 13 + piece] == 1))
+        self.assertEqual(int(torch.count_nonzero(grad)), squares.shape[1])
+        base_grad = model.trace_embedding.weight.grad
+        self.assertTrue(base_grad is None or not base_grad.any())
+        # One optimizer step through the snapshot path moves what the board path
+        # reads: the two paths share the parameters, not just their values.
+        torch.optim.SGD(model.parameters(), lr=0.5).step()
+        after = model.board_embedding(
+            self.packed["ids"], self.packed["positions"]
+        ).hidden[0, index]
+        torch.testing.assert_close(after, before - 0.5, rtol=0, atol=0)
+
+
 class SnapshotOrderTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -305,7 +395,7 @@ class SnapshotOrderTests(unittest.TestCase):
             }
         ).eval()
         board, trace, length, _ = SequencePositions(self.data, "val")[0]
-        self.assertEqual(model.trace_embedding.num_embeddings, CHESS_VOCAB_SIZE)
+        self.assertEqual(model.trace_embedding.num_embeddings, SNAPSHOT)
         stored = trace[:length]
         self.assertGreater(int((stored >= SNAPSHOT).sum()), 0)
         ids = torch.from_numpy(np.stack([board, board]))
@@ -316,6 +406,43 @@ class SnapshotOrderTests(unittest.TestCase):
         segments, error = parse_trace(stored.tolist())
         self.assertIsNone(error)
         self.assertTrue(all(segment.snapshots for segment in segments[:-1]))
+
+    def test_snapshot_traces_train_and_generate_through_the_shared_table(self):
+        torch.set_num_threads(1)
+        torch.manual_seed(23)
+        model = create_model(
+            {
+                "architecture": "sequence",
+                "num_blocks": 1,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_heads": 4,
+                "dropout": 0.0,
+            }
+        )
+        row = SequencePositions(self.data, "val")[0]
+        batch = SequenceCollator(shuffle=False)([row])
+        loss, _, mask = trace_loss(model, batch)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(int(mask.sum()), 0)
+        loss.backward()
+        squares_grad = model.board_embedding.squares.weight.grad
+        self.assertIsNotNone(squares_grad)
+        self.assertGreater(float(squares_grad.norm()), 0)
+        # The cached generation path walks the same snapshot tokens: prefill plus
+        # one-token decode must reproduce the teacher-forced logits exactly.
+        model.eval()
+        trace = batch["trace_ids"][:1]
+        length = int((trace != PAD).sum())
+        self.assertGreater(int((trace >= SNAPSHOT).sum()), 0)
+        forced = model.trace_logits(
+            batch["ids"][:1], batch["positions"][:1], trace[:, :length]
+        )
+        first, cache = model.prefill(batch["ids"][:1], batch["positions"][:1])
+        torch.testing.assert_close(first[0], forced[0, 0])
+        for index in range(length - 1):
+            step, cache = model.decode(trace[:, index : index + 1], cache)
+            torch.testing.assert_close(step[0], forced[0, index + 1])
 
 
 if __name__ == "__main__":

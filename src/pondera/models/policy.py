@@ -11,6 +11,8 @@ from pondera.chess.tokens import (
     LINE,
     MOVE,
     PAD,
+    SNAPSHOT,
+    SNAPSHOT_PIECES,
     VALUE,
     encode_boards,
 )
@@ -349,8 +351,10 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
     The board prefix packs to its batch-maximum width and is embedded by
     BoardEmbedding; padded board slots stay invisible keys, so no sample attends
     to another sample's padding. Trace tokens carry their own embedding plus
-    sinusoidal positions. The head spans the unified vocabulary and reads the
-    whole sequence; supervision follows the shifted trace contract in
+    sinusoidal positions, except snapshot tokens, which share the board's joint
+    (square, piece) table: reading a board and writing a snapshot use one set of
+    parameters. The head spans the unified vocabulary and reads the whole
+    sequence; supervision follows the shifted trace contract in
     sequence_target_positions. Generation prefills the board, then decodes one
     token at a time from the cached prefix.
     """
@@ -368,9 +372,9 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
         if architecture != "sequence":
             raise ValueError("Unsupported board-policy architecture")
         self.board_embedding = BoardEmbedding(hidden_size)
-        self.trace_embedding = nn.Embedding(
-            CHESS_VOCAB_SIZE, hidden_size, padding_idx=PAD
-        )
+        # Rows below the snapshot block; snapshot ids read the board's joint
+        # table through _trace_embeddings instead of a second copy of it.
+        self.trace_embedding = nn.Embedding(SNAPSHOT, hidden_size, padding_idx=PAD)
         nn.init.normal_(self.trace_embedding.weight, std=0.02)
         with torch.no_grad():
             self.trace_embedding.weight[PAD].zero_()
@@ -379,9 +383,27 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
         self.backbone = SequenceBackbone(block, num_blocks)
 
     def _trace_embeddings(self, trace_ids, trace_positions, dtype):
+        """Trace embeddings, with snapshot rows tied to the board square table.
+
+        Snapshot token SNAPSHOT + square * 12 + piece reads row
+        square * 13 + piece of board_embedding.squares, so the same parameters
+        embed a piece on a square whether the model reads a board or writes a
+        snapshot, and snapshot supervision updates that table.
+        """
         if trace_positions is None:
             trace_positions = torch.arange(trace_ids.shape[1], device=trace_ids.device)
-        return self.trace_embedding(trace_ids.long()) + sinusoidal_positions(
+        ids = trace_ids.long()
+        snapshot = ids >= SNAPSHOT
+        offset = ids - SNAPSHOT
+        square, piece = offset // SNAPSHOT_PIECES, offset % SNAPSHOT_PIECES
+        # The board table keeps one extra row per square for the empty square.
+        stride = SNAPSHOT_PIECES + 1
+        shared = self.board_embedding.squares(
+            (square * stride + piece).clamp(0, stride * 64 - 1)
+        )
+        base = self.trace_embedding(ids.clamp(max=SNAPSHOT - 1))
+        content = torch.where(snapshot.unsqueeze(-1), shared, base)
+        return content + sinusoidal_positions(
             trace_positions, self.trace_embedding.embedding_dim, dtype
         )
 
@@ -448,10 +470,8 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
         positions = torch.arange(tokens.shape[1], device=tokens.device) + (
             cache.length - cache.prefix_length
         )
-        hidden = self.trace_embedding(tokens.long()) + sinusoidal_positions(
-            positions,
-            self.trace_embedding.embedding_dim,
-            self.trace_embedding.weight.dtype,
+        hidden = self._trace_embeddings(
+            tokens, positions, self.trace_embedding.weight.dtype
         )
         output = self.backbone.decode(hidden, cache, valid=tokens != PAD)
         return self.head(output.hidden[:, -1]), output.cache
