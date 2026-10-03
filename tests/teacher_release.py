@@ -5,8 +5,11 @@ from hashlib import file_digest
 from pathlib import Path
 
 import chess
+import numpy as np
 
+from pondera.chess.tokens import PAD, encode_board
 from pondera.data.storage import write_manifest
+from pondera.data.trace import PV_LIMIT, depth_snapshot, encode_trace, max_segments
 
 
 def play(moves, repetitions=None, start=chess.STARTING_FEN):
@@ -88,3 +91,74 @@ def write_depth_release(root, splits):
     manifest = root / "release.json"
     write_manifest(manifest, release)
     return manifest
+
+
+def candidate_row(fen, candidates, depth=16, repetition=1):
+    """One release row whose depth snapshot carries ranked candidates.
+
+    candidates is a list of (bm, pv, mate, value) in teacher rank order.
+    """
+    snapshot = {"d": depth}
+    for index, (bm, pv, mate, value) in enumerate(candidates, 1):
+        snapshot[f"r{index}"] = {
+            "bm": bm,
+            "pv": list(pv),
+            "mate": mate,
+            "value": value,
+        }
+    return {
+        "fen": fen,
+        "repetition": repetition,
+        "unit": {"per_depth": [snapshot]},
+    }
+
+
+def write_sequence_dataset(root, splits, level="level15", depth=16):
+    """Write a teacher-sequence dataset directory mirroring the published layout."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "format_version": 1,
+        "kind": "teacher-sequence",
+        "level": level,
+        "tokenizer_version": 2,
+        "teacher_depth": depth,
+        "pv_limit": PV_LIMIT,
+        "max_lines": max_segments(level),
+    }
+    for split, rows in splits.items():
+        boards = [encode_board(row["fen"], row.get("repetition", 1)) for row in rows]
+        width = max(len(board) for board in boards)
+        board_array = np.full((len(rows), width), PAD, dtype=np.int16)
+        for index, board in enumerate(boards):
+            board_array[index, : len(board)] = board
+        encoded = [
+            encode_trace(
+                depth_snapshot(row, depth), row["fen"].split()[1] == "b", level
+            )
+            for row in rows
+        ]
+        trace_width = max(len(tokens) for tokens, _ in encoded)
+        trace_array = np.full((len(rows), trace_width), PAD, dtype=np.int16)
+        length_array = np.zeros(len(rows), dtype=np.int16)
+        bound_array = np.full((len(rows), max_segments(level), 2), -1, dtype=np.int16)
+        for index, (tokens, bounds) in enumerate(encoded):
+            trace_array[index, : len(tokens)] = tokens
+            length_array[index] = len(tokens)
+            for slot, (start, end) in enumerate(bounds):
+                bound_array[index, slot] = (start, end)
+        for name, array in (
+            ("board_tokens", board_array),
+            ("trace_tokens", trace_array),
+            ("trace_len", length_array),
+            ("line_bounds", bound_array),
+        ):
+            np.save(root / f"{name}_{split}.npy", array)
+        manifest[f"rows_{split}"] = len(rows)
+        manifest[f"t_max_{split}"] = trace_width
+    manifest["files"] = {}
+    for path in sorted(root.glob("*.npy")):
+        with path.open("rb") as handle:
+            manifest["files"][path.name] = file_digest(handle, "sha256").hexdigest()
+    write_manifest(root / "manifest.json", manifest)
+    return root

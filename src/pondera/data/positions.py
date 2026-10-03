@@ -113,3 +113,65 @@ class DepthPositions(Dataset):
         if self.aux_after is not None:
             row = (*row, self.aux_after[index].copy(), self.aux_changed[index].copy())
         return row
+
+
+class SequencePositions(Dataset):
+    """Board tokens with an encoded sequence trace (kind=teacher-sequence).
+
+    Rows are (boards, trace tokens, trace length, segment bounds). Bounds are
+    ordered [start, end) pairs whose last entry is the FINAL segment; padding is
+    (-1, -1) and only the leading LINE segments may be reordered.
+    """
+
+    def __init__(self, directory, split):
+        directory = Path(directory)
+        with (directory / "manifest.json").open(encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if manifest.get("kind") != "teacher-sequence":
+            raise ValueError("Not a sequence trace dataset")
+        if manifest.get("tokenizer_version") != CHESS_TOKENIZER_VERSION:
+            raise ValueError(
+                f"Unsupported dataset tokenizer version: {manifest.get('tokenizer_version')}"
+            )
+        self.level = manifest["level"]
+        self.tokens = np.load(directory / f"board_tokens_{split}.npy", mmap_mode="r")
+        self.trace = np.load(directory / f"trace_tokens_{split}.npy", mmap_mode="r")
+        self.trace_len = np.load(directory / f"trace_len_{split}.npy", mmap_mode="r")
+        self.line_bounds = np.load(
+            directory / f"line_bounds_{split}.npy", mmap_mode="r"
+        )
+        rows = len(self.tokens)
+        if (
+            self.tokens.ndim != 2
+            or self.tokens.dtype != np.int16
+            or self.tokens.shape[1] < MIN_TOKENS
+        ):
+            raise ValueError("Board token array does not match its declared format")
+        if (
+            self.trace.ndim != 2
+            or self.trace.dtype != np.int16
+            or self.trace.shape[0] != rows
+        ):
+            raise ValueError("Trace token array does not match its examples")
+        if self.trace_len.shape != (rows,) or self.trace_len.dtype != np.int16:
+            raise ValueError("Trace lengths do not match their examples")
+        if (
+            self.line_bounds.ndim != 3
+            or self.line_bounds.shape[0] != rows
+            or self.line_bounds.shape[2] != 2
+            or self.line_bounds.shape[1] != manifest["max_lines"]
+            or self.line_bounds.dtype != np.int16
+        ):
+            raise ValueError("Segment bounds do not match their examples")
+        self.manifest = manifest
+
+    def __len__(self):
+        return len(self.tokens)
+
+    def __getitem__(self, index):
+        return (
+            self.tokens[index].copy(),
+            self.trace[index].copy(),
+            int(self.trace_len[index]),
+            self.line_bounds[index].copy(),
+        )
