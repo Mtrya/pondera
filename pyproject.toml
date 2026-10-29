@@ -27,6 +27,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "pondera.evaluation" = ["*.epd"]
+"pondera.chess" = ["*.txt"]
 
 [tool.ruff]
 src = ["src"]

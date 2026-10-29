@@ -1,6 +1,13 @@
 import unittest
 
-from pondera.chess.tokens import (
+from pondera.chess.codec import (
+    VALUE_BIN_BOUNDARIES,
+    VALUE_BIN_REPRESENTATIVES,
+    decode_value_token,
+    mate_token,
+    value_bin,
+)
+from pondera.chess.vocabulary import (
     BOARD_TOKENS,
     CASTLING,
     CHESS_VOCAB_SIZE,
@@ -18,11 +25,6 @@ from pondera.chess.tokens import (
     REPETITION,
     SIDE,
     VALUE,
-    VALUE_BIN_BOUNDARIES,
-    VALUE_BIN_REPRESENTATIVES,
-    decode_value_token,
-    mate_token,
-    value_bin,
 )
 
 

@@ -12,18 +12,19 @@ from teacher_release import (
     write_sequence_dataset,
 )
 
-from pondera.chess.mapping import IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
+from pondera.chess.codec import encode_board
 from pondera.chess.symmetry import move_permutations, reflect_uci
-from pondera.chess.tokens import (
+from pondera.chess.vocabulary import (
     END,
     FINAL,
+    IDX_TO_UCI_MOVE,
     LINE,
     MATE_LOSS,
     MATE_WIN,
     MOVE,
     PAD,
+    UCI_MOVE_TO_IDX,
     VALUE,
-    encode_board,
 )
 from pondera.data.positions import SequencePositions
 from pondera.data.trace import (

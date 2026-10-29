@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from huggingface_hub import hf_hub_download
 
-from pondera.chess.tokens import CHESS_TOKENIZER_VERSION
+from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
 from pondera.models.factory import create_model, model_class
 
 CHECKPOINT_VERSION = 1

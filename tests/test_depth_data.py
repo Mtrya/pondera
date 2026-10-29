@@ -7,13 +7,14 @@ import chess
 import numpy as np
 from teacher_release import depth_row, play, write_depth_release
 
-from pondera.chess.tokens import (
+from pondera.chess.codec import decode_board
+from pondera.chess.domain import EMPTY_SQ_IDX, PIECE_TO_IDX
+from pondera.chess.vocabulary import (
     MATE_LOSS,
     MATE_WIN,
+    UCI_MOVE_TO_IDX,
     VALUE,
-    decode_board,
 )
-from pondera.chess.mapping import EMPTY_SQ_IDX, PIECE_TO_IDX, UCI_MOVE_TO_IDX
 from pondera.data.positions import DepthPositions
 from pondera.data.teacher import prepare_teacher_depth
 

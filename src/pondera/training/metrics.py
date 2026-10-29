@@ -13,15 +13,6 @@ def legal_logits(logits, legal):
     )
 
 
-def policy_loss(logits, targets, legal=None):
-    if legal is None:
-        return torch.nn.functional.cross_entropy(logits.float(), targets)
-    return (
-        legal_logits(logits, legal).logsumexp(-1)
-        - logits.float().gather(1, targets[:, None]).squeeze(1)
-    ).mean()
-
-
 class PolicyMetrics:
     """Retain per-position observations for slices, calibration and paired probes."""
 

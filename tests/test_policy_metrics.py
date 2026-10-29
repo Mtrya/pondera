@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from pondera.training.metrics import PolicyMetrics, policy_loss
+from pondera.training.metrics import PolicyMetrics
 
 
 class PolicyMetricsTests(unittest.TestCase):
@@ -38,15 +38,3 @@ class PolicyMetricsTests(unittest.TestCase):
             self.assertEqual(result["pieces_2_10/positions"], 1)
             self.assertEqual(result["pieces_11_20/positions"], 0)
             self.assertTrue(all(math.isfinite(value) for value in result.values()))
-
-    def test_legal_loss_excludes_illegal_action_gradients(self):
-        logits = torch.tensor([[3.0, 1.0, 2.0]], requires_grad=True)
-        targets = torch.tensor([1])
-        legal = torch.tensor([[1, 2, -1]])
-        loss = policy_loss(logits, targets, legal)
-        expected = torch.nn.functional.cross_entropy(logits[:, 1:], torch.tensor([0]))
-        torch.testing.assert_close(loss, expected)
-        loss.backward()
-        self.assertEqual(logits.grad[0, 0], 0)
-        self.assertLess(logits.grad[0, 1], 0)
-        self.assertGreater(logits.grad[0, 2], 0)

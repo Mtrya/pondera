@@ -12,8 +12,8 @@ from teacher_release import (
     write_sequence_dataset,
 )
 
-from pondera.chess.mapping import IDX_TO_UCI_MOVE
-from pondera.chess.tokens import (
+from pondera.chess.codec import encode_board
+from pondera.chess.vocabulary import (
     BOARD_PIECES,
     BOARD_TOKENS,
     CASTLING,
@@ -21,12 +21,12 @@ from pondera.chess.tokens import (
     EN_PASSANT,
     END,
     FINAL,
+    IDX_TO_UCI_MOVE,
     LINE,
     MOVE,
     PAD,
     SIDE,
     VALUE,
-    encode_board,
 )
 from pondera.data.positions import SequencePositions
 from pondera.data.trace import (

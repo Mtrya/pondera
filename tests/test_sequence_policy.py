@@ -6,7 +6,8 @@ import chess
 import torch
 from teacher_release import candidate_row, play
 
-from pondera.chess.tokens import (
+from pondera.chess.codec import encode_boards
+from pondera.chess.vocabulary import (
     CHESS_VOCAB_SIZE,
     END,
     FINAL,
@@ -14,7 +15,6 @@ from pondera.chess.tokens import (
     MOVE,
     PAD,
     VALUE,
-    encode_boards,
 )
 from pondera.data.trace import LEVEL15, depth_snapshot, encode_trace
 from pondera.models.checkpoint import load_model, save_checkpoint

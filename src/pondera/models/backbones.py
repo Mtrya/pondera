@@ -1,4 +1,4 @@
-"""Base, causal sequence, and recurrent depth token backbones.
+"""Shared execution primitives plus the recurrent-depth and causal backbones.
 
 Inputs are embeddings; token meaning and training-only prediction heads belong
 to callers. Causal callers also supply sequence-position information in those
@@ -57,7 +57,7 @@ class Execution:
 
 
 class TokenBackbone(nn.Module):
-    """Shared execution primitives, composed by the three public backbones."""
+    """Shared execution primitives, composed by the depth and causal backbones."""
 
     def __init__(self, block, cores, cache_policy):
         super().__init__()
@@ -173,16 +173,6 @@ class TokenBackbone(nn.Module):
             tuple(execution.readouts),
             output_cache,
         )
-
-
-class BaseBackbone(TokenBackbone):
-    """A fixed-depth, fully bidirectional transformer."""
-
-    def __init__(self, block: BlockConfig, num_layers: int):
-        super().__init__(block, [CoreConfig(layers=num_layers)], "matched_fallback")
-
-    def forward(self, tokens, *, valid=None, capture=False):
-        return self._run(tokens, valid=valid, capture=capture)
 
 
 class DepthBackbone(TokenBackbone):

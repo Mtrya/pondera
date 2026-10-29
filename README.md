@@ -2,7 +2,7 @@
 
 Pondera studies search-free chess policies and whether a neural model can internalize planning. Playing strength is a research measurement. The policy executes no explicit search during training or deployment; offline engine supervision and engine feedback for reinforcement learning are allowed.
 
-The maintained implementation includes lossless sparse board atoms; base, sequence, recurrent-depth, and combined token backbones; offline Stockfish annotation with frozen teacher releases; supervised policy training with analytical FLOPs accounting; a deterministic UCI adapter; and fastchess match evaluation. ChessFormer-era checkpoints remain published on Hugging Face as provenance for the historical baselines recorded in the [leaderboard](results/leaderboard.md); the current codebase implements only the versioned lossless board format.
+The maintained implementation includes lossless sparse board atoms; recurrent-depth and causal-sequence token backbones; offline Stockfish annotation with frozen teacher releases; supervised policy training with analytical FLOPs accounting; a deterministic UCI adapter; and fastchess match evaluation. ChessFormer-era checkpoints remain published on Hugging Face as provenance for the historical baselines recorded in the [leaderboard](results/leaderboard.md); the current codebase implements only the versioned lossless board format.
 
 ## Setup
 
@@ -19,7 +19,7 @@ Python 3.13 or later is required. Stockfish and fastchess are external executabl
 The package is a library. Training runs from a TOML configuration:
 
 ```bash
-uv run python -m pondera.training.supervised --config CONFIG.toml --data-dir DATA --output-dir RUN --device cuda
+uv run python -m pondera.training.depth --config CONFIG.toml --data-dir DATA --output-dir RUN --device cuda
 ```
 
 Experiment configurations live with their run directories; the repository tracks configurations only for published reference runs. See [usage](docs/usage.md) for data formats, teacher releases, and evaluation semantics, and [architecture](docs/architecture.md) for module boundaries and repository conventions.

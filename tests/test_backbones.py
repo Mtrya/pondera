@@ -4,7 +4,6 @@ import torch
 from torch import nn
 
 from pondera.models import (
-    BaseBackbone,
     BlockConfig,
     CoreConfig,
     DepthBackbone,
@@ -102,7 +101,7 @@ class BackboneTests(unittest.TestCase):
 
     def test_padding_invariance(self):
         cores = [CoreConfig(2, RepetitionConfig(max_repetitions=3))]
-        for model in (BaseBackbone(self.block, 2), DepthBackbone(self.block, cores)):
+        for model in (DepthBackbone(self.block, cores),):
             x = torch.randn(2, 4, 16)
             expected = model(x).hidden
             padded = torch.cat((x, torch.randn(2, 3, 16)), 1)

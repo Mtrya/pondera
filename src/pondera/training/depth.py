@@ -26,12 +26,12 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
-from pondera.chess.tokens import (
+from pondera.chess.codec import VALUE_BIN_REPRESENTATIVES
+from pondera.chess.vocabulary import (
     BOARD_PIECES,
     BOARD_TOKENS,
     PAD,
     VALUE,
-    VALUE_BIN_REPRESENTATIVES,
 )
 from pondera.data.positions import DepthPositions
 from pondera.models.board import black_to_move
@@ -676,9 +676,7 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument(
-        "--data-dir", type=Path, default=Path(".local/data/depth-study/encoded-full")
-    )
+    parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--resume", type=Path)

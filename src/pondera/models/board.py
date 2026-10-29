@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from pondera.chess.symmetry import TOKEN_MIRROR
-from pondera.chess.tokens import BOARD_VOCAB_SIZE, PAD, SIDE
+from pondera.chess.vocabulary import BOARD_VOCAB_SIZE, PAD, SIDE
 
 _MIRROR = torch.from_numpy(TOKEN_MIRROR)
 

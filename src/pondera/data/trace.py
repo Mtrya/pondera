@@ -26,9 +26,9 @@ from dataclasses import dataclass
 
 import chess
 
-from pondera.chess.mapping import IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
+from pondera.chess.codec import mate_token, value_bin
 from pondera.chess.symmetry import reflect_uci
-from pondera.chess.tokens import (
+from pondera.chess.vocabulary import (
     BOARD_PIECES,
     BOARD_TOKENS,
     CASTLING,
@@ -36,13 +36,13 @@ from pondera.chess.tokens import (
     END,
     FINAL,
     HALFMOVE,
+    IDX_TO_UCI_MOVE,
     LINE,
     MOVE,
     PAD,
     SIDE,
+    UCI_MOVE_TO_IDX,
     VALUE,
-    mate_token,
-    value_bin,
 )
 
 LEVEL0 = "level0"

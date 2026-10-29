@@ -5,8 +5,8 @@ from pathlib import Path
 import chess
 import torch
 
-from pondera.chess.tokens import encode_boards
-from pondera.chess.mapping import UCI_MOVE_TO_IDX
+from pondera.chess.codec import encode_boards
+from pondera.chess.vocabulary import UCI_MOVE_TO_IDX
 from pondera.models.checkpoint import load_model, save_checkpoint
 from pondera.models.factory import create_model
 from pondera.training.cost import depth_flops

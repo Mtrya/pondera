@@ -3,9 +3,9 @@
 import chess
 import torch
 
-from pondera.chess.tokens import encode_board
-from pondera.chess.mapping import IDX_TO_UCI_MOVE
-from pondera.chess.position import legal_move_indices, repetition_count
+from pondera.chess.codec import encode_board, legal_move_indices
+from pondera.chess.domain import repetition_count
+from pondera.chess.vocabulary import IDX_TO_UCI_MOVE
 
 
 @torch.inference_mode()

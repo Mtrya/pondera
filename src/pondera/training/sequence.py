@@ -27,7 +27,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
-from pondera.chess.tokens import PAD
+from pondera.chess.vocabulary import PAD
 from pondera.data.positions import SequencePositions
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model
@@ -447,9 +447,7 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument(
-        "--data-dir", type=Path, default=Path(".local/data/sequence-study/s1-level15")
-    )
+    parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--resume", type=Path)

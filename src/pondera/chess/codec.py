@@ -1,4 +1,4 @@
-"""Self-contained chess atoms and the unified token vocabulary.
+"""Conversions between chess states and the unified vocabulary ids.
 
 A board encoding is the set of occupied squares as joint (square, piece) atoms
 in a1..h8 scan order, followed by eight metadata atoms: side to move, four
@@ -8,60 +8,42 @@ encoding is lossless for the first five FEN fields. The fullmove counter is
 not encoded, so decoding restores the FEN modulo that counter; repetition
 counts above four share the top atom.
 
-CHESS_TOKENIZER extends the board format into one shared id space: board and
-metadata atoms, then blocks for the move vocabulary, value bins, mate
-distances, and trace delimiters. Sequence models consume and emit this unified
-space; the fixed-depth board policy keeps its dedicated action head.
+The id layout itself lives in `pondera.chess.vocabulary`; this module only
+converts. Value-bin boundaries and representatives are the numeric semantics
+of the value segment, frozen on the pinned teacher release.
 """
 
 import bisect
 from collections.abc import Sequence
 
+import chess
 import numpy as np
 
-from pondera.chess.mapping import (
+from pondera.chess.domain import (
     EMPTY_SQ_IDX,
     IDX_TO_PIECE,
     IDX_TO_SQUARE,
-    IDX_TO_UCI_MOVE,
     PIECE_TO_IDX,
     SQUARE_TO_IDX,
 )
+from pondera.chess.vocabulary import (
+    BOARD_PIECES,
+    CASTLING,
+    EN_PASSANT,
+    HALFMOVE,
+    MATE_LOSS,
+    MATE_WIN,
+    META_END,
+    PAD,
+    REPETITION,
+    SIDE,
+    UCI_MOVE_TO_IDX,
+    VALUE,
+)
 
-# The version pins the serialized board-token format recorded in data
-# manifests and checkpoints.
-CHESS_TOKENIZER_VERSION = 3
-
-# Board atoms: square * 12 + piece over a1..h8 and the twelve moved pieces.
-BOARD_PIECES = 12
-BOARD_TOKENS = 64 * BOARD_PIECES
-# One encoded position has at most 32 piece atoms and 8 metadata atoms; the
-# dataset guardrail allows headroom above that bound.
+# Dataset guardrail: one encoded position has at most 32 piece atoms and 8
+# metadata atoms; the guard allows headroom above that bound.
 BOARD_TOKENS_MAX = 42
-
-# Metadata atoms, all self-contained: every id names one field value.
-META = BOARD_TOKENS
-SIDE = META  # SIDE + int(black to move)
-CASTLING = SIDE + 2  # CASTLING + 2 * right + flag, rights ordered K Q k q
-EN_PASSANT = CASTLING + 8  # EN_PASSANT + square, or 64 for no square
-HALFMOVE = EN_PASSANT + 65  # HALFMOVE + halfmove clock, 0..100
-REPETITION = HALFMOVE + 101  # REPETITION + min(count, 5) - 1
-META_END = REPETITION + 4
-BOARD_VOCAB_SIZE = META_END + 1
-
-# Unified id space. Later blocks follow without gaps.
-MOVE = META_END + 1
-VALUE = MOVE + len(IDX_TO_UCI_MOVE)
-MATE_WIN = VALUE + 20
-MATE_LOSS = MATE_WIN + 29
-# Trace delimiters: PAD fills unused array slots, END closes a trace, LINE
-# opens a candidate line, and FINAL opens the answer.
-DELIM = MATE_LOSS + 31
-PAD = DELIM
-END = DELIM + 1
-LINE = DELIM + 2
-FINAL = DELIM + 3
-CHESS_VOCAB_SIZE = DELIM + 4
 
 # Value bins, frozen on the pinned teacher release (pooled candidate ranks,
 # non-mate WDL-derived values in [-1, 1]): bin 0 and bin 19 are the -1 and +1
@@ -141,6 +123,11 @@ def decode_value_token(token: int) -> float:
     raise ValueError(f"Not a value token: {token}")
 
 
+def legal_move_indices(board: chess.Board) -> list[int]:
+    """Board moves only; draw adjudication belongs to the game runner."""
+    return sorted(UCI_MOVE_TO_IDX[move.uci()] for move in board.legal_moves)
+
+
 def encode_board(fen: str, repetition: int = 1) -> np.ndarray:
     """Encode a FEN as occupied-square atoms plus self-contained metadata.
 
@@ -207,7 +194,7 @@ def decode_board(tokens: Sequence[int]) -> tuple[str, int]:
         values.pop()
     squares = [EMPTY_SQ_IDX] * 64
     index = 0
-    while index < len(values) and values[index] < META:
+    while index < len(values) and values[index] < SIDE:
         square, piece = divmod(values[index], BOARD_PIECES)
         if squares[square] != EMPTY_SQ_IDX:
             raise ValueError("Duplicate board square atom")

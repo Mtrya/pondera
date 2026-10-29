@@ -3,8 +3,8 @@ import unittest
 
 import torch
 
-from pondera.chess.tokens import encode_boards
-from pondera.models.policy import BoardPolicyModel
+from pondera.chess.codec import encode_boards
+from pondera.models.policy import DepthPolicyModel
 from pondera.training.internals import InternalProbe, effective_rank
 
 START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -12,8 +12,8 @@ START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
 def tiny_model():
     torch.manual_seed(640)
-    return BoardPolicyModel(
-        num_blocks=1,
+    return DepthPolicyModel(
+        cores=[{"layers": 1, "repetition": {"max_repetitions": 1}}],
         hidden_size=16,
         intermediate_size=32,
         num_heads=2,

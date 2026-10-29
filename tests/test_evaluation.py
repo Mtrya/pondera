@@ -13,8 +13,8 @@ from pondera.models.checkpoint import save_checkpoint
 from pondera.models.factory import create_model
 
 CONFIG = {
-    "architecture": "base",
-    "num_blocks": 1,
+    "architecture": "depth",
+    "cores": [{"layers": 1, "repetition": {"max_repetitions": 1}}],
     "hidden_size": 16,
     "intermediate_size": 32,
     "num_heads": 2,

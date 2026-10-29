@@ -1,6 +1,6 @@
 # Token backbones
 
-`pondera.models` exposes three token-processing modules. `BaseBackbone` has a fixed stack with bidirectional attention. `SequenceBackbone` has a bidirectional board prefix and causal thought suffix. `DepthBackbone` refines a fixed token set through independently repeated cores. They return computed hidden states, repetition counts, and optional intermediate readouts. Inputs are embeddings; callers supply thought-position information together with thought embeddings.
+`pondera.models` exposes two token-processing modules. `SequenceBackbone` has a bidirectional board prefix and causal thought suffix. `DepthBackbone` refines a fixed token set through independently repeated cores. They return computed hidden states, repetition counts, and optional intermediate readouts. Inputs are embeddings; callers supply thought-position information together with thought embeddings.
 
 ```python
 from pondera.models import BlockConfig, CoreConfig, DepthBackbone, RepetitionConfig
@@ -38,6 +38,6 @@ In evaluation mode, `prefill(board_embeddings)` returns a cache; `decode(new_emb
 
 ## Board policies
 
-`BoardPolicyModel` combines `BoardEmbedding`, `BaseBackbone`, and shared action/value readouts. `DepthPolicyModel` uses the same board and output interfaces with `DepthBackbone`; its shared vocabulary head is read at every core exit, and the final exit is the deployed answer. Board inputs are sparse sets of self-contained `(square, piece)` atoms embedded by one learned table: empty squares carry no token, and the atom id already names the square, so the prefix adds no separate positional term. Black-to-move positions are canonicalized by rank reflection, and logits are reflected back to the absolute orientation. The action readout is a single token over the full move vocabulary. The representation study behind these choices is summarized in [board representation](research/board-representation.md) and [move readout](research/move-readout.md).
+`DepthPolicyModel` pairs `BoardEmbedding` with `DepthBackbone`; its shared vocabulary head is read at every core exit, and the final exit is the deployed answer. Board inputs are sparse sets of self-contained `(square, piece)` atoms embedded by one learned table: empty squares carry no token, and the atom id already names the square, so the prefix adds no separate positional term. Black-to-move positions are canonicalized by rank reflection, and logits are reflected back to the absolute orientation. The action readout is a single token over the full move vocabulary. The representation study behind these choices is summarized in [board representation](research/board-representation.md) and [move readout](research/move-readout.md).
 
-`pondera.training.cost.policy_flops` defines the dense-matmul accounting convention used by the trainer, including attention, projections, FFNs, and the action/value projections. Sequence token vocabulary, feedback, termination-symbol encoding, and supervision objectives are deliberately not specified by these modules.
+`pondera.training.cost.depth_flops` defines the dense-matmul accounting convention used by the trainer, including attention, projections, FFNs, and the shared vocabulary head at every computed exit. Sequence token vocabulary, feedback, termination-symbol encoding, and supervision objectives are deliberately not specified by these modules.

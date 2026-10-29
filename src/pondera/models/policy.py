@@ -6,16 +6,17 @@ import torch
 from huggingface_hub import PyTorchModelHubMixin
 from torch import nn
 
-from pondera.chess.mapping import EMPTY_SQ_IDX, IDX_TO_UCI_MOVE
+from pondera.chess.codec import encode_boards
+from pondera.chess.domain import EMPTY_SQ_IDX
 from pondera.chess.symmetry import move_permutations
-from pondera.chess.tokens import (
+from pondera.chess.vocabulary import (
     CHESS_VOCAB_SIZE,
+    IDX_TO_UCI_MOVE,
     MOVE,
     PAD,
     VALUE,
-    encode_boards,
 )
-from pondera.models.backbones import BaseBackbone, DepthBackbone, SequenceBackbone
+from pondera.models.backbones import DepthBackbone, SequenceBackbone
 from pondera.models.blocks import sinusoidal_positions
 from pondera.models.board import (
     BoardEmbedding,
@@ -28,81 +29,6 @@ from pondera.models.config import BlockConfig, CoreConfig
 def _reflection_table():
     """Action-permutation undoing the black-to-move rank reflection."""
     return torch.tensor(move_permutations()[1])
-
-
-class BoardPolicyModel(nn.Module, PyTorchModelHubMixin):
-    """Fixed-depth policy with a single-token move readout over the full vocabulary."""
-
-    def __init__(
-        self,
-        num_blocks,
-        hidden_size,
-        intermediate_size,
-        num_heads,
-        dropout=0.0,
-        possible_moves=len(IDX_TO_UCI_MOVE),
-        architecture="base",
-    ):
-        super().__init__()
-        if architecture not in {"base", "depth"}:
-            raise ValueError("Unsupported board-policy architecture")
-        self.board_embedding = BoardEmbedding(hidden_size)
-        if possible_moves != len(IDX_TO_UCI_MOVE):
-            raise ValueError(
-                "Side-to-move orientation requires the full action vocabulary"
-            )
-        self.register_buffer("reflected_actions", _reflection_table(), persistent=False)
-        self.val_token = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
-        self.val_proj = nn.Linear(hidden_size, 1)
-        self.act_token = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
-        self.act_proj = nn.Linear(hidden_size, possible_moves)
-        block = BlockConfig(hidden_size, intermediate_size, num_heads, dropout)
-        self.backbone = BaseBackbone(block, num_blocks)
-
-    def embed(self, ids):
-        device = self.val_token.device
-        ids = ids.to(device)
-        board = self.board_embedding(ids)
-        batch = ids.shape[0]
-        hidden = torch.cat(
-            (
-                board.hidden,
-                self.act_token.expand(batch, -1, -1),
-                self.val_token.expand(batch, -1, -1),
-            ),
-            dim=1,
-        )
-        valid = torch.cat(
-            (board.valid, torch.ones(batch, 2, device=device, dtype=torch.bool)),
-            dim=1,
-        )
-        return hidden, valid
-
-    def forward(
-        self,
-        fen=None,
-        repetitions=None,
-        *,
-        ids=None,
-        return_backbone=False,
-        capture=False,
-    ):
-        if ids is None:
-            reps = (
-                repetitions.tolist()
-                if isinstance(repetitions, torch.Tensor)
-                else repetitions
-            )
-            ids = torch.from_numpy(encode_boards(fen, reps))
-        hidden, valid = self.embed(ids)
-        output = self.backbone(hidden, valid=valid, capture=capture)
-        logits = self.act_proj(output.hidden[:, -2])
-        value = self.val_proj(output.hidden[:, -1])
-        reflected = black_to_move(ids).to(logits.device)
-        logits = torch.where(
-            reflected[:, None], logits[:, self.reflected_actions], logits
-        )
-        return (logits, value, output) if return_backbone else (logits, value)
 
 
 @dataclass

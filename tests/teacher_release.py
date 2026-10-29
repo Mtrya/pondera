@@ -7,7 +7,8 @@ from pathlib import Path
 import chess
 import numpy as np
 
-from pondera.chess.tokens import CHESS_TOKENIZER_VERSION, PAD, encode_board
+from pondera.chess.codec import encode_board
+from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION, PAD
 from pondera.data.storage import write_manifest
 from pondera.data.trace import PV_LIMIT, depth_snapshot, encode_trace, max_segments
 
