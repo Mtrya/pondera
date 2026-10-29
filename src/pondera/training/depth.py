@@ -26,9 +26,15 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
-from pondera.chess.tokens import PAD, VALUE, VALUE_BIN_REPRESENTATIVES
+from pondera.chess.tokens import (
+    BOARD_PIECES,
+    BOARD_TOKENS,
+    PAD,
+    VALUE,
+    VALUE_BIN_REPRESENTATIVES,
+)
 from pondera.data.positions import DepthPositions
-from pondera.models.board import black_to_move, pack_board_tokens
+from pondera.models.board import black_to_move
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model
 from pondera.training.cost import depth_flops
@@ -138,12 +144,10 @@ class DepthCollator:
     board_aux: bool = False
 
     def __call__(self, rows):
-        inputs = pack_board_tokens(torch.from_numpy(np.stack([row[0] for row in rows])))
+        inputs = {"ids": torch.from_numpy(np.stack([row[0] for row in rows]))}
         targets = {
             "moves": torch.from_numpy(np.stack([row[1] for row in rows])).long(),
-            "value_tokens": torch.from_numpy(
-                np.stack([row[2] for row in rows])
-            ).long(),
+            "value_tokens": torch.from_numpy(np.stack([row[2] for row in rows])).long(),
             "values": torch.from_numpy(np.stack([row[3] for row in rows])).float(),
         }
         cursor = 4
@@ -349,13 +353,14 @@ def train(
 
     def board_aux_terms(exit_, inputs, targets, teacher):
         """Changed/unchanged masked CE of the future-placement readout."""
-        ids, positions = inputs["ids"], inputs["positions"]
-        width = positions.shape[1]
-        black = black_to_move(ids, positions)
-        canonical = torch.where(black[:, None], positions ^ 56, positions).clamp(max=63)
+        ids = inputs["ids"]
+        width = ids.shape[1]
+        black = black_to_move(ids)
+        squares = (ids.long() // BOARD_PIECES).clamp(max=63)
+        canonical = torch.where(black[:, None], squares ^ 56, squares)
         after = targets["aux_after"][:, teacher - 1].gather(1, canonical)
         changed = targets["aux_changed"][:, teacher - 1].gather(1, canonical)
-        board_slots = (positions < 64) & (ids != PAD) & exit_.active_board
+        board_slots = (ids < BOARD_TOKENS) & exit_.active_board
         logits = exit_.board_logits[:, :width].float()
         ce = torch.nn.functional.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), after.reshape(-1), reduction="none"
@@ -394,9 +399,7 @@ def train(
                     exit_.value_logits[..., :bin_count].float().softmax(-1)
                     * bin_centers
                 ).sum(-1)
-                is_bin = (
-                    targets["value_tokens"][:, teacher - 1] - VALUE
-                ) < bin_count
+                is_bin = (targets["value_tokens"][:, teacher - 1] - VALUE) < bin_count
                 mse = (expectation - targets["values"][:, teacher - 1].float()) ** 2
                 mse_mean = _masked_mean(mse, active * is_bin.float())
                 terms = terms + config.value_mse_weight * mse_mean
@@ -405,9 +408,10 @@ def train(
                 changed_mean, unchanged_mean = board_aux_terms(
                     exit_, inputs, targets, teacher
                 )
-                terms = terms + config.board_aux_weight * (
-                    changed_mean + unchanged_mean
-                ) / 2
+                terms = (
+                    terms
+                    + config.board_aux_weight * (changed_mean + unchanged_mean) / 2
+                )
                 details[f"exit_{index}/board_aux_changed"] = changed_mean
                 details[f"exit_{index}/board_aux_unchanged"] = unchanged_mean
             losses.append(terms)
@@ -430,9 +434,7 @@ def train(
             for start in range(0, len(indices), config.batch_size):
                 selected = indices[start : start + config.batch_size]
                 inputs, targets = collate([data[i] for i in selected])
-                targets = {
-                    key: value.to(device) for key, value in targets.items()
-                }
+                targets = {key: value.to(device) for key, value in targets.items()}
                 inputs = {key: value.to(device) for key, value in inputs.items()}
                 exits, output = model.forward_exits(**inputs)
                 _, details = exit_losses(exits, inputs, targets, supervision)
@@ -450,21 +452,20 @@ def train(
                         final.move_logits,
                         targets["moves"][:, -1],
                         targets["legal"],
-                        (inputs["ids"] != PAD)
-                        .logical_and(inputs["positions"] < 64)
-                        .sum(-1),
+                        (inputs["ids"] < BOARD_TOKENS).sum(-1),
                     )
                 if config.internals and prefix == "val" and start == 0:
                     internal = readout_changes(output)
                 del exits, output
         model.train()
-        values = {
-            f"{prefix}/{key}": total / count for key, total in per_exit.items()
-        }
+        values = {f"{prefix}/{key}": total / count for key, total in per_exit.items()}
         values[f"{prefix}/final_move_top1"] = final_correct.item() / count
         if observations is not None:
             values.update(
-                {f"{prefix}/{key}": value for key, value in observations.result(artifact).items()}
+                {
+                    f"{prefix}/{key}": value
+                    for key, value in observations.result(artifact).items()
+                }
             )
         if prefix == "val":
             values.update({f"internal/{key}": value for key, value in internal.items()})
@@ -675,7 +676,9 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--data-dir", type=Path, default=Path(".local/data/depth-study/encoded-full"))
+    parser.add_argument(
+        "--data-dir", type=Path, default=Path(".local/data/depth-study/encoded-full")
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--resume", type=Path)

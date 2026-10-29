@@ -78,7 +78,10 @@ class DepthEncodingTests(unittest.TestCase):
         for index, row in enumerate(self.train_rows[:4]):
             fen = row["fen"]
             move = row["unit"]["per_depth"][0]["r1"]["bm"]
-            self.assertEqual(decode_board(dataset.tokens[index]), (fen, 1))
+            decoded, repetition = decode_board(dataset.tokens[index])
+            self.assertEqual(decoded.split()[:5], fen.split()[:5])
+            self.assertEqual(decoded.split()[5], "1")
+            self.assertEqual(repetition, 1)
             self.assertEqual(int(dataset.moves[index, 0]), UCI_MOVE_TO_IDX[move])
             # d1 value 0.5 -> bin 15; d2 mate +3 -> MATE_WIN_3.
             self.assertEqual(int(dataset.value_tokens[index, 0]), VALUE + BIN_OF_0_5)
@@ -142,7 +145,9 @@ class DepthBoardAuxTests(unittest.TestCase):
         # The two lines share no position keys (the encoder keeps first occurrences).
         lines = [
             play(["e2e4", "a7a6", "e4e5", "d7d5", "e5d6"]),
-            play(["d2d4", "d7d5", "g1f3", "g8f6", "e2e3", "e7e6", "f1d3", "f8d6", "e1g1"])[1:],
+            play(
+                ["d2d4", "d7d5", "g1f3", "g8f6", "e2e3", "e7e6", "f1d3", "f8d6", "e1g1"]
+            )[1:],
             [("8/P7/8/8/8/8/k6K/8 w - - 0 1", "a7a8q", 1)],
             [("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1", "e8g8", 1)],
         ]

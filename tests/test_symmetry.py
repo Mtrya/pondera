@@ -16,7 +16,7 @@ from pondera.training.supervised import PolicyCollator
 
 FENS = [
     chess.STARTING_FEN,
-    "r3k2r/8/8/8/3pP3/8/8/R3K2R b Kq e3 130 400",
+    "r3k2r/8/8/8/3pP3/8/8/R3K2R b Kq e3 99 400",
     "r3k2r/8/8/8/8/8/8/R3K2R w KQkq h6 0 12",
     "8/2P5/8/8/4k3/8/6p1/4K3 w - - 0 1",
     "4k3/8/8/2pP4/8/8/8/4K3 b - c6 5 30",
@@ -35,7 +35,12 @@ class SymmetryTokenTests(unittest.TestCase):
             expected = chess.Board(fen)
             if transforms[index]:
                 expected = expected.mirror()
-            self.assertEqual(transformed, expected.fen(en_passant="fen"))
+            parts = expected.fen(en_passant="fen").split()
+            # The side atom is not mirrored and the fullmove counter is not
+            # encoded; every other field must match python-chess exactly.
+            parts[1] = fen.split()[1]
+            parts[5] = "1"
+            self.assertEqual(transformed, " ".join(parts))
             self.assertEqual(repetition, [1, 2, 3, 1, 2, 3][index])
 
     def test_mirror_is_an_involution(self):

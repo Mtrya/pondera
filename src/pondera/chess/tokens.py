@@ -1,13 +1,16 @@
-"""Lossless FEN tokens and the unified chess token vocabulary.
+"""Self-contained chess atoms and the unified token vocabulary.
 
-The first 64 entries of a board encoding are squares a1 through h8. Typed
-metadata follows them: side, four castling flags, en passant, and three
-delimited integer fields. This format represents FEN plus a supplied
-repetition count, not game history.
+A board encoding is the set of occupied squares as joint (square, piece) atoms
+in a1..h8 scan order, followed by eight metadata atoms: side to move, four
+castling rights, en passant, halfmove clock, and repetition count. Every atom
+is one complete statement; an empty square is the absence of an atom. The
+encoding is lossless for the first five FEN fields. The fullmove counter is
+not encoded, so decoding restores the FEN modulo that counter; repetition
+counts above four share the top atom.
 
-CHESS_TOKENIZER extends the board format into one shared id space: board
-tokens keep their historical ids, followed by blocks for the move vocabulary,
-value bins, and mate distances. Sequence models consume and emit this unified
+CHESS_TOKENIZER extends the board format into one shared id space: board and
+metadata atoms, then blocks for the move vocabulary, value bins, mate
+distances, and trace delimiters. Sequence models consume and emit this unified
 space; the fixed-depth board policy keeps its dedicated action head.
 """
 
@@ -26,35 +29,39 @@ from pondera.chess.mapping import (
 )
 
 # The version pins the serialized board-token format recorded in data
-# manifests and checkpoints; extending the unified id space does not change it.
-CHESS_TOKENIZER_VERSION = 2
-SIDE = 13
-CASTLING = 15
-EN_PASSANT = 23
-COUNTER = 88
-BYTE = 91
-END = 347
-PAD = 348
-VOCAB_SIZE = 349
-MIN_TOKENS = 79
+# manifests and checkpoints.
+CHESS_TOKENIZER_VERSION = 3
 
-# Unified id space. Board tokens occupy 0..VOCAB_SIZE-1; later blocks follow
-# without gaps and extend append-only.
-MOVE = VOCAB_SIZE
+# Board atoms: square * 12 + piece over a1..h8 and the twelve moved pieces.
+BOARD_PIECES = 12
+BOARD_TOKENS = 64 * BOARD_PIECES
+# One encoded position has at most 32 piece atoms and 8 metadata atoms; the
+# dataset guardrail allows headroom above that bound.
+BOARD_TOKENS_MAX = 42
+
+# Metadata atoms, all self-contained: every id names one field value.
+META = BOARD_TOKENS
+SIDE = META  # SIDE + int(black to move)
+CASTLING = SIDE + 2  # CASTLING + 2 * right + flag, rights ordered K Q k q
+EN_PASSANT = CASTLING + 8  # EN_PASSANT + square, or 64 for no square
+HALFMOVE = EN_PASSANT + 65  # HALFMOVE + halfmove clock, 0..100
+REPETITION = HALFMOVE + 101  # REPETITION + min(count, 5) - 1
+META_END = REPETITION + 4
+BOARD_VOCAB_SIZE = META_END + 1
+
+# Unified id space. Later blocks follow without gaps.
+MOVE = META_END + 1
 VALUE = MOVE + len(IDX_TO_UCI_MOVE)
 MATE_WIN = VALUE + 20
 MATE_LOSS = MATE_WIN + 29
-# Sequence trace delimiters: LINE opens a candidate line, FINAL opens the
-# answer; END closes both a board counter field and a trace.
-LINE = MATE_LOSS + 31
-FINAL = LINE + 1
-# Explicit board snapshots inside a trace: joint (square, piece) tokens over
-# the twelve pieces of the board encoding, square-major in a1..h8 scan order.
-# Empty squares carry no token; the metadata block that follows reuses the
-# board-token side, castling, and en-passant ids.
-SNAPSHOT = FINAL + 1
-SNAPSHOT_PIECES = 12
-CHESS_VOCAB_SIZE = SNAPSHOT + SNAPSHOT_PIECES * 64
+# Trace delimiters: PAD fills unused array slots, END closes a trace, LINE
+# opens a candidate line, and FINAL opens the answer.
+DELIM = MATE_LOSS + 31
+PAD = DELIM
+END = DELIM + 1
+LINE = DELIM + 2
+FINAL = DELIM + 3
+CHESS_VOCAB_SIZE = DELIM + 4
 
 # Value bins, frozen on the pinned teacher release (pooled candidate ranks,
 # non-mate WDL-derived values in [-1, 1]): bin 0 and bin 19 are the -1 and +1
@@ -109,22 +116,6 @@ MATE_WIN_MAX = 28
 MATE_LOSS_MAX = 30
 
 
-def snapshot_token(square: int, piece: int) -> int:
-    """Joint token id of one occupied square in a board snapshot."""
-    if not 0 <= square < 64:
-        raise ValueError("Snapshot squares lie in 0..63")
-    if not 0 <= piece < SNAPSHOT_PIECES:
-        raise ValueError("Snapshot pieces exclude the empty square")
-    return SNAPSHOT + square * SNAPSHOT_PIECES + piece
-
-
-def decode_snapshot_token(token: int) -> tuple[int, int]:
-    """Recover the (square, piece) pair of a snapshot token id."""
-    if not SNAPSHOT <= token < CHESS_VOCAB_SIZE:
-        raise ValueError(f"Not a snapshot token: {token}")
-    return divmod(token - SNAPSHOT, SNAPSHOT_PIECES)
-
-
 def value_bin(value: float) -> int:
     """Assign a WDL-derived scalar in [-1, 1] to its frozen bin."""
     if not -1.0 <= value <= 1.0:
@@ -151,7 +142,13 @@ def decode_value_token(token: int) -> float:
 
 
 def encode_board(fen: str, repetition: int = 1) -> np.ndarray:
-    """Encode the semantic contents of a standard-chess FEN without clipping."""
+    """Encode a FEN as occupied-square atoms plus self-contained metadata.
+
+    The fullmove counter is not part of the vocabulary; callers keep the
+    source FEN when it matters. Halfmove clocks outside 0..100 and repetition
+    counts above five cannot be represented and are rejected or shared with
+    the top repetition atom respectively.
+    """
     placement, side, castling, ep, halfmove, fullmove = fen.split()
     rows = placement.split("/")
     if len(rows) != 8 or side not in {"w", "b"}:
@@ -177,87 +174,108 @@ def encode_board(fen: str, repetition: int = 1) -> np.ndarray:
         raise ValueError("Expected standard-chess castling rights")
     if ep != "-" and ep not in SQUARE_TO_IDX:
         raise ValueError("Invalid en-passant square")
-    counts = (int(halfmove), int(fullmove), int(repetition))
-    if counts[0] < 0 or counts[1] < 1 or counts[2] < 1 or repetition != counts[2]:
-        raise ValueError("Invalid halfmove, fullmove, or repetition count")
-    tokens = squares + [SIDE + (side == "b")]
+    halfmove_count, fullmove_count = int(halfmove), int(fullmove)
+    if not 0 <= halfmove_count <= 100:
+        raise ValueError("Halfmove clock must lie in 0..100")
+    if fullmove_count < 1 or repetition < 1:
+        raise ValueError("Invalid fullmove or repetition count")
+    tokens = [
+        square * BOARD_PIECES + piece
+        for square, piece in enumerate(squares)
+        if piece != EMPTY_SQ_IDX
+    ]
+    tokens.append(SIDE + (side == "b"))
     tokens.extend(
-        CASTLING + 2 * i + (right in castling) for i, right in enumerate("KQkq")
+        CASTLING + 2 * index + (right in castling) for index, right in enumerate("KQkq")
     )
     tokens.append(EN_PASSANT + (64 if ep == "-" else SQUARE_TO_IDX[ep]))
-    for field, value in enumerate(counts):
-        tokens.append(COUNTER + field)
-        digits = value.to_bytes(max(1, (value.bit_length() + 7) // 8), "little")
-        tokens.extend(BYTE + digit for digit in digits)
-        tokens.append(END)
+    tokens.append(HALFMOVE + halfmove_count)
+    tokens.append(REPETITION + min(repetition, 5) - 1)
     return np.asarray(tokens, dtype=np.int16)
 
 
 def decode_board(tokens: Sequence[int]) -> tuple[str, int]:
-    """Recover a canonical FEN and exact repetition count from encoded tokens."""
+    """Recover the FEN (fullmove fixed to 1) and the repetition atom.
+
+    Board atoms are order-independent; duplicate square atoms and malformed
+    metadata raise. Metadata atoms are identified by their own ids, so a
+    mirrored row, whose castling atoms move between fields, still decodes.
+    Counts above four decode as the shared top atom, five.
+    """
     values = [int(value) for value in tokens]
     while values and values[-1] == PAD:
         values.pop()
-    if len(values) < MIN_TOKENS or any(not 0 <= v <= 12 for v in values[:64]):
-        raise ValueError("Invalid board token sequence")
+    squares = [EMPTY_SQ_IDX] * 64
+    index = 0
+    while index < len(values) and values[index] < META:
+        square, piece = divmod(values[index], BOARD_PIECES)
+        if squares[square] != EMPTY_SQ_IDX:
+            raise ValueError("Duplicate board square atom")
+        squares[square] = piece
+        index += 1
+    if not any(piece != EMPTY_SQ_IDX for piece in squares):
+        raise ValueError("A board encoding needs at least one piece atom")
+    metadata = values[index:]
+    if len(metadata) != 8:
+        raise ValueError("A board encoding needs eight metadata atoms")
+    side = [token for token in metadata if token in (SIDE, SIDE + 1)]
+    castling = [token for token in metadata if CASTLING <= token < EN_PASSANT]
+    ep = [token for token in metadata if EN_PASSANT <= token < HALFMOVE]
+    halfmove = [token for token in metadata if HALFMOVE <= token < REPETITION]
+    repetition = [token for token in metadata if REPETITION <= token <= META_END]
+    if len(side) != 1:
+        raise ValueError("Invalid side atom")
+    flags = {}
+    for token in castling:
+        field, flag = divmod(token - CASTLING, 2)
+        if field in flags:
+            raise ValueError("Duplicate castling atom")
+        flags[field] = flag
+    if len(flags) != 4:
+        raise ValueError("Missing castling atom")
+    present = ["KQkq"[field] for field in range(4) if flags[field]]
+    if len(ep) != 1 or len(halfmove) != 1 or len(repetition) != 1:
+        raise ValueError("Missing or repeated metadata atom")
+    ep_square = ep[0] - EN_PASSANT
+    halfmove_count = halfmove[0] - HALFMOVE
+    repetition_count = repetition[0] - REPETITION
+    if not 0 <= ep_square <= 64:
+        raise ValueError("Invalid en-passant atom")
+    if not 0 <= halfmove_count <= 100:
+        raise ValueError("Invalid halfmove atom")
+    if not 0 <= repetition_count < 5:
+        raise ValueError("Invalid repetition atom")
     rows = []
     for rank in range(7, -1, -1):
         text, empty = "", 0
-        for piece in values[rank * 8 : (rank + 1) * 8]:
+        for piece in squares[rank * 8 : (rank + 1) * 8]:
             if piece == EMPTY_SQ_IDX:
                 empty += 1
             else:
                 text += (str(empty) if empty else "") + IDX_TO_PIECE[piece]
                 empty = 0
         rows.append(text + (str(empty) if empty else ""))
-    if values[64] not in (SIDE, SIDE + 1):
-        raise ValueError("Invalid side token")
-    rights = ""
-    for i, right in enumerate("KQkq"):
-        flag = values[65 + i] - CASTLING - 2 * i
-        if flag not in (0, 1):
-            raise ValueError("Invalid castling token")
-        if flag:
-            rights += right
-    ep = values[69] - EN_PASSANT
-    if not 0 <= ep <= 64:
-        raise ValueError("Invalid en-passant token")
-    cursor, counts = 70, []
-    for field in range(3):
-        if cursor >= len(values) or values[cursor] != COUNTER + field:
-            raise ValueError("Missing counter field")
-        cursor += 1
-        digits = []
-        while cursor < len(values) and BYTE <= values[cursor] < BYTE + 256:
-            digits.append(values[cursor] - BYTE)
-            cursor += 1
-        if not digits or cursor >= len(values) or values[cursor] != END:
-            raise ValueError("Invalid counter digits")
-        counts.append(int.from_bytes(bytes(digits), "little"))
-        cursor += 1
-    if cursor != len(values) or counts[1] < 1 or counts[2] < 1:
-        raise ValueError("Invalid trailing tokens or counter value")
     fen = " ".join(
         [
             "/".join(rows),
-            "w" if values[64] == SIDE else "b",
-            rights or "-",
-            "-" if ep == 64 else IDX_TO_SQUARE[ep],
-            str(counts[0]),
-            str(counts[1]),
+            "w" if side[0] == SIDE else "b",
+            "".join(present) or "-",
+            "-" if ep_square == 64 else IDX_TO_SQUARE[ep_square],
+            str(halfmove_count),
+            "1",
         ]
     )
-    return fen, counts[2]
+    return fen, repetition_count + 1
 
 
 def encode_boards(fens, repetitions=None) -> np.ndarray:
-    """Pad a batch to its longest lossless representation."""
+    """Pad a batch to its longest encoded position."""
     if repetitions is None:
         repetitions = [1] * len(fens)
     if len(fens) != len(repetitions):
         raise ValueError("Each FEN needs a repetition count")
     rows = [encode_board(fen, rep) for fen, rep in zip(fens, repetitions)]
-    width = max((len(row) for row in rows), default=MIN_TOKENS)
+    width = max((len(row) for row in rows), default=0)
     result = np.full((len(rows), width), PAD, dtype=np.int16)
     for i, row in enumerate(rows):
         result[i, : len(row)] = row

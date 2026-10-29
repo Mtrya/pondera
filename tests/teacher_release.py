@@ -7,7 +7,7 @@ from pathlib import Path
 import chess
 import numpy as np
 
-from pondera.chess.tokens import PAD, encode_board
+from pondera.chess.tokens import CHESS_TOKENIZER_VERSION, PAD, encode_board
 from pondera.data.storage import write_manifest
 from pondera.data.trace import PV_LIMIT, depth_snapshot, encode_trace, max_segments
 
@@ -139,7 +139,7 @@ def write_sequence_dataset(root, splits, level="level15", depth=16):
         "format_version": 1,
         "kind": "teacher-sequence",
         "level": level,
-        "tokenizer_version": 2,
+        "tokenizer_version": CHESS_TOKENIZER_VERSION,
         "teacher_depth": depth,
         "pv_limit": PV_LIMIT,
         "max_lines": max_segments(level),

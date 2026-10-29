@@ -9,13 +9,13 @@ after every third move and at the end.
 
 Moves are stored in the black-to-move canonical orientation, so a black-to-move
 root has every PV move rank-reflected; evaluations keep the teacher's
-root-player sign. A snapshot is the joint (square, piece) run in a1..h8 scan
-order followed by the board metadata block (side, castling, en passant) without
-counters, and it is emitted in the same canonical frame: pieces rank-mirrored
-and color-swapped for a black-to-move root, side token in the root frame's
-naming, which the mirror leaves unchanged. Snapshots carry rule truth replayed
-with python-chess, so their side, castling, and en-passant fields follow the
-pushed PV rather than the root.
+root-player sign. A snapshot is a run of board atoms in a1..h8 scan order (the
+same ids a board prefix uses) followed by six metadata atoms (side, castling,
+en passant) without counters, and it is emitted in the same canonical frame:
+pieces rank-mirrored and color-swapped for a black-to-move root, side atom in
+the root frame's naming, which the mirror leaves unchanged. Snapshots carry
+rule truth replayed with python-chess, so their side, castling, and en-passant
+fields follow the pushed PV rather than the root.
 
 Segment bounds are ordered [start, end) pairs: the last used entry is the FINAL
 segment, unused slots are (-1, -1), and the collator reorders only the leading
@@ -29,20 +29,19 @@ import chess
 from pondera.chess.mapping import IDX_TO_UCI_MOVE, UCI_MOVE_TO_IDX
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.tokens import (
+    BOARD_PIECES,
+    BOARD_TOKENS,
     CASTLING,
-    CHESS_VOCAB_SIZE,
     EN_PASSANT,
     END,
     FINAL,
+    HALFMOVE,
     LINE,
     MOVE,
     PAD,
     SIDE,
-    SNAPSHOT,
     VALUE,
-    decode_snapshot_token,
     mate_token,
-    snapshot_token,
     value_bin,
 )
 
@@ -95,11 +94,11 @@ def is_move_token(token: int) -> bool:
 
 
 def is_eval_token(token: int) -> bool:
-    return VALUE <= token < LINE
+    return VALUE <= token < PAD
 
 
-def is_snapshot_token(token: int) -> bool:
-    return SNAPSHOT <= token < CHESS_VOCAB_SIZE
+def is_board_token(token: int) -> bool:
+    return 0 <= token < BOARD_TOKENS
 
 
 def is_snapshot_metadata(token: int) -> bool:
@@ -175,7 +174,7 @@ def snapshot_run(board, side_black):
     side_black is the side to move in the root frame, which the canonical mirror
     leaves unchanged, matching the board prefix's side-token convention.
     """
-    tokens = [snapshot_token(square, piece) for square, piece in snapshot_pieces(board)]
+    tokens = [square * BOARD_PIECES + piece for square, piece in snapshot_pieces(board)]
     tokens.append(SIDE + side_black)
     rights = (
         board.has_kingside_castling_rights(chess.WHITE),
@@ -194,30 +193,46 @@ def snapshot_of(board, mirror):
 
 
 def decode_snapshot(tokens) -> Snapshot:
-    """Decode one snapshot token run; raises when the run is malformed."""
+    """Decode one snapshot token run; raises when the run is malformed.
+
+    Metadata atoms are self-contained and identified by their ids, so their
+    order inside the six-atom block is not significant.
+    """
     pieces, index = [], 0
-    while index < len(tokens) and is_snapshot_token(tokens[index]):
-        pieces.append(decode_snapshot_token(int(tokens[index])))
+    while index < len(tokens) and is_board_token(tokens[index]):
+        pieces.append(divmod(int(tokens[index]), BOARD_PIECES))
         index += 1
     if not pieces:
-        raise ValueError("A snapshot needs at least one piece token")
+        raise ValueError("A snapshot needs at least one piece atom")
     if any(
         square >= next_square
         for (square, _), (next_square, _) in zip(pieces, pieces[1:])
     ):
         raise ValueError("Snapshot squares must increase in scan order")
     metadata = [int(token) for token in tokens[index : index + SNAPSHOT_METADATA]]
-    if len(metadata) != SNAPSHOT_METADATA:
+    if len(metadata) != SNAPSHOT_METADATA or not all(
+        is_snapshot_metadata(token) for token in metadata
+    ):
         raise ValueError("Snapshot metadata is truncated")
-    if metadata[0] not in (SIDE, SIDE + 1):
+    side = [token for token in metadata if token in (SIDE, SIDE + 1)]
+    castling_tokens = [token for token in metadata if CASTLING <= token < EN_PASSANT]
+    ep_tokens = [token for token in metadata if EN_PASSANT <= token < HALFMOVE]
+    if len(side) != 1:
         raise ValueError("Invalid snapshot side token")
-    castling = tuple(metadata[1 + field] - CASTLING - 2 * field for field in range(4))
-    if any(flag not in (0, 1) for flag in castling):
+    flags = {}
+    for token in castling_tokens:
+        field, flag = divmod(token - CASTLING, 2)
+        if field in flags:
+            raise ValueError("Invalid snapshot castling token")
+        flags[field] = flag
+    if len(flags) != 4 or len(ep_tokens) != 1:
         raise ValueError("Invalid snapshot castling token")
-    ep = metadata[5] - EN_PASSANT
-    if not 0 <= ep <= 64:
-        raise ValueError("Invalid snapshot en-passant token")
-    return Snapshot(tuple(pieces), metadata[0] == SIDE + 1, castling, ep)
+    return Snapshot(
+        tuple(pieces),
+        side[0] == SIDE + 1,
+        tuple(flags[field] for field in range(4)),
+        ep_tokens[0] - EN_PASSANT,
+    )
 
 
 def snapshot_positions(level, moves):
@@ -282,8 +297,8 @@ def encode_trace(snapshot, black, level, board=None):
 def read_snapshot(values, index):
     """Read one snapshot run at index; returns (run, next index, error tag)."""
     start, squares = index, []
-    while index < len(values) and is_snapshot_token(values[index]):
-        squares.append(decode_snapshot_token(values[index])[0])
+    while index < len(values) and is_board_token(values[index]):
+        squares.append(values[index] // BOARD_PIECES)
         index += 1
     if not squares:
         return (), index, "snapshot_without_pieces"
@@ -294,11 +309,15 @@ def read_snapshot(values, index):
         is_snapshot_metadata(token) for token in metadata
     ):
         return (), index, "snapshot_truncated"
-    if metadata[0] not in (SIDE, SIDE + 1):
+    side = [token for token in metadata if token in (SIDE, SIDE + 1)]
+    if len(side) != 1:
         return (), index, "snapshot_side"
-    for field, token in enumerate(metadata[1:5]):
-        if token - CASTLING - 2 * field not in (0, 1):
-            return (), index, "snapshot_castling"
+    fields = [
+        (token - CASTLING) // 2 for token in metadata if CASTLING <= token < EN_PASSANT
+    ]
+    ep = [token for token in metadata if EN_PASSANT <= token < HALFMOVE]
+    if len(fields) != 4 or len(set(fields)) != 4 or len(ep) != 1:
+        return (), index, "snapshot_castling"
     return (
         tuple(values[start : index + SNAPSHOT_METADATA]),
         index + SNAPSHOT_METADATA,
@@ -325,7 +344,7 @@ def parse_trace(tokens):
                 if is_move_token(values[index]):
                     moves.append(values[index])
                     index += 1
-                elif is_snapshot_token(values[index]):
+                elif is_board_token(values[index]):
                     run, index, error = read_snapshot(values, index)
                     if error is not None:
                         break

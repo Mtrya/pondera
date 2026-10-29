@@ -2,7 +2,7 @@
 
 Pondera studies search-free chess policies and whether a neural model can internalize planning. Playing strength is a research measurement. The policy executes no explicit search during training or deployment; offline engine supervision and engine feedback for reinforcement learning are allowed.
 
-The maintained implementation includes lossless square and compact-piece board inputs; base, sequence, recurrent-depth, and combined token backbones; offline Stockfish annotation with frozen teacher releases; supervised policy training with analytical FLOPs accounting; a deterministic UCI adapter; and fastchess match evaluation. ChessFormer-era checkpoints remain published on Hugging Face as provenance for the historical baselines recorded in the [leaderboard](results/leaderboard.md); the current codebase implements only the versioned lossless board format.
+The maintained implementation includes lossless sparse board atoms; base, sequence, recurrent-depth, and combined token backbones; offline Stockfish annotation with frozen teacher releases; supervised policy training with analytical FLOPs accounting; a deterministic UCI adapter; and fastchess match evaluation. ChessFormer-era checkpoints remain published on Hugging Face as provenance for the historical baselines recorded in the [leaderboard](results/leaderboard.md); the current codebase implements only the versioned lossless board format.
 
 ## Setup
 

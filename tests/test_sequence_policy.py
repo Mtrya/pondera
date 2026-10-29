@@ -17,7 +17,6 @@ from pondera.chess.tokens import (
     encode_boards,
 )
 from pondera.data.trace import LEVEL15, depth_snapshot, encode_trace
-from pondera.models.board import pack_board_tokens
 from pondera.models.checkpoint import load_model, save_checkpoint
 from pondera.models.factory import create_model
 
@@ -83,12 +82,21 @@ class SequencePolicyTests(unittest.TestCase):
         different = self.model.trace_logits(other, trace_ids=trace)
         self.assertFalse(torch.allclose(reference[0, 0], different[0, 0]))
 
+    def test_prefix_is_a_position_free_set(self):
+        # The prefix carries no positional term: permuting its atoms cannot
+        # change any trace prediction.
+        trace = trace_of(chess.STARTING_FEN)
+        reference = self.model.trace_logits(self.ids[:1], trace_ids=trace)
+        order = torch.randperm(self.ids.shape[1])
+        permuted = self.model.trace_logits(self.ids[:1, order], trace_ids=trace)
+        torch.testing.assert_close(permuted, reference)
+
     def test_prefill_and_decode_reproduce_the_teacher_forced_targets(self):
         trace = trace_of(chess.STARTING_FEN)
         forced = self.model.trace_logits(self.ids[:1], trace_ids=trace)
         first, cache = self.model.prefill(self.ids[:1])
         torch.testing.assert_close(first[0], forced[0, 0])
-        width = pack_board_tokens(self.ids[:1])["ids"].shape[1]
+        width = self.ids.shape[1]
         self.assertEqual(cache.prefix_length, width)
         for index in range(trace.shape[1] - 1):
             step, cache = self.model.decode(trace[:, index : index + 1], cache)

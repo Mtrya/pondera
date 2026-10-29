@@ -177,7 +177,7 @@ class TrainingTests(unittest.TestCase):
         self.assertIn("internal/layer_00/residual_rms", final)
         self.assertIn("internal/layer_00/attention_entropy_mean", final)
         self.assertIn("internal/layer_00/ffn_dead_fraction", final)
-        self.assertIn("internal/embedding/squares_starved_fraction", final)
+        self.assertIn("internal/embedding/tokens_starved_fraction", final)
         self.assertIn("internal/drift/embedding", final)
         probes = output / "probes"
         self.assertTrue((probes / "init-embeddings.npz").exists())

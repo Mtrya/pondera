@@ -42,7 +42,7 @@ def prepare_teacher_policy(release_path, output_dir, depth=16):
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
         "format_version": 1,
-        "tokenizer_version": 2,
+        "tokenizer_version": CHESS_TOKENIZER_VERSION,
         "teacher_depth": depth,
         "release_sha256": _checksum(release_path),
         "position_key": "first four FEN fields",
@@ -189,7 +189,9 @@ def _board_aux(row, max_depth):
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece is not None:
-            current_absolute[square] = (piece.piece_type - 1) + (0 if piece.color else 6)
+            current_absolute[square] = (piece.piece_type - 1) + (
+                0 if piece.color else 6
+            )
     black = board.turn == chess.BLACK
     current = _canonical(current_absolute, black)
     after_rows, changed_rows = [], []
@@ -315,13 +317,12 @@ def prepare_teacher_depth(release_path, output_dir, max_depth=16, board_aux=Fals
             np.asarray(value_tokens, dtype=np.int16),
         )
         np.save(
-            output_dir / f"depth_values_{split}.npy", np.asarray(values, dtype=np.float32)
+            output_dir / f"depth_values_{split}.npy",
+            np.asarray(values, dtype=np.float32),
         )
         if board_aux:
             np.save(output_dir / f"aux_after_{split}.npy", np.stack(aux_after_rows))
-            np.save(
-                output_dir / f"aux_changed_{split}.npy", np.stack(aux_changed_rows)
-            )
+            np.save(output_dir / f"aux_changed_{split}.npy", np.stack(aux_changed_rows))
         metadata[f"rows_{split}"] = len(tokens)
         metadata["excluded"][split] = dict(excluded)
     metadata["teacher"] = teacher

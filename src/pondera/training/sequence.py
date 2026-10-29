@@ -29,7 +29,6 @@ from transformers import get_cosine_schedule_with_warmup
 
 from pondera.chess.tokens import PAD
 from pondera.data.positions import SequencePositions
-from pondera.models.board import pack_board_tokens
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model
 
@@ -103,7 +102,7 @@ class SequenceCollator:
     salt: int = 0
 
     def __call__(self, rows):
-        inputs = pack_board_tokens(torch.from_numpy(np.stack([row[0] for row in rows])))
+        inputs = {"ids": torch.from_numpy(np.stack([row[0] for row in rows]))}
         traces, lengths, final_moves = [], [], []
         for _, trace, trace_len, line_bounds in rows:
             segments = [trace[start:end] for start, end in line_bounds if start >= 0]
@@ -137,7 +136,7 @@ def trace_loss(model, inputs):
     """Masked mean next-token CE over the trace, plus the target positions."""
     trace_ids = inputs["trace_ids"]
     targets = trace_ids.long()
-    logits = model.trace_logits(inputs["ids"], inputs["positions"], trace_ids)
+    logits = model.trace_logits(inputs["ids"], trace_ids)
     mask = trace_ids != PAD
     ce = F.cross_entropy(
         logits.float().reshape(-1, logits.shape[-1]),
@@ -373,9 +372,9 @@ def train(
                 loss_sum += loss.detach()
                 if (micro + 1) % config.accumulation_steps:
                     continue
-                squares_grad = model.board_embedding.squares.weight.grad
-                squares_grad_norm = (
-                    None if squares_grad is None else squares_grad.norm().item()
+                token_grad = model.token_embedding.weight.grad
+                token_grad_norm = (
+                    None if token_grad is None else token_grad.norm().item()
                 )
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), config.grad_clip, error_if_nonfinite=True
@@ -398,7 +397,7 @@ def train(
                         "train/loss": (loss_sum / config.accumulation_steps).item(),
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/grad_norm": grad_norm.item(),
-                        "train/board_squares_grad_norm": squares_grad_norm,
+                        "train/embedding_grad_norm": token_grad_norm,
                         "train/rows_per_s": (step - initial_step)
                         * config.batch_size
                         * config.accumulation_steps

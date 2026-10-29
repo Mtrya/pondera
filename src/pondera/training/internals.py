@@ -40,7 +40,7 @@ class InternalProbe:
             for index, block in enumerate(_blocks(model))
         ]
         embedding = model.board_embedding
-        weights = {"tokens": embedding.tokens.weight, "squares": embedding.squares.weight}
+        weights = {"tokens": embedding.tokens.weight}
         if init_file is not None and init_file.exists():
             loaded = np.load(init_file)
             self.initial = {name: torch.from_numpy(loaded[name]) for name in weights}
@@ -141,10 +141,7 @@ class InternalProbe:
                 )
 
         embedding = model.board_embedding
-        for name, weight in (
-            ("tokens", embedding.tokens.weight),
-            ("squares", embedding.squares.weight),
-        ):
+        for name, weight in (("tokens", embedding.tokens.weight),):
             current = weight.detach().float().cpu()
             initial = self.initial[name]
             norms = current.norm(dim=1)

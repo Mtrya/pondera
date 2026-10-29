@@ -14,18 +14,19 @@ from teacher_release import (
 
 from pondera.chess.mapping import IDX_TO_UCI_MOVE
 from pondera.chess.tokens import (
+    BOARD_PIECES,
+    BOARD_TOKENS,
     CASTLING,
     CHESS_VOCAB_SIZE,
     EN_PASSANT,
+    END,
+    FINAL,
     LINE,
     MOVE,
     PAD,
     SIDE,
-    SNAPSHOT,
     VALUE,
-    decode_snapshot_token,
-    encode_boards,
-    snapshot_token,
+    encode_board,
 )
 from pondera.data.positions import SequencePositions
 from pondera.data.trace import (
@@ -35,14 +36,13 @@ from pondera.data.trace import (
     decode_snapshot,
     depth_snapshot,
     encode_trace,
-    is_snapshot_token,
+    is_board_token,
     max_segments,
     parse_trace,
     snapshot_of,
     snapshot_pieces,
     snapshot_positions,
 )
-from pondera.models.board import pack_board_tokens
 from pondera.models.factory import create_model
 from pondera.training.sequence import SequenceCollator, trace_loss
 
@@ -67,24 +67,31 @@ def line_segments(tokens):
     return segments
 
 
-class JointVocabTests(unittest.TestCase):
-    def test_joint_token_roundtrip_and_block_bounds(self):
+class BoardAtomTests(unittest.TestCase):
+    def test_board_atoms_are_joint_square_piece_ids(self):
         seen = set()
         for square in range(64):
             for piece in range(12):
-                token = snapshot_token(square, piece)
-                self.assertTrue(is_snapshot_token(token))
-                self.assertEqual(decode_snapshot_token(token), (square, piece))
+                token = square * BOARD_PIECES + piece
+                self.assertTrue(is_board_token(token))
+                self.assertEqual(divmod(token, BOARD_PIECES), (square, piece))
                 seen.add(token)
         self.assertEqual(len(seen), 12 * 64)
-        self.assertEqual(min(seen), 2400)
-        self.assertEqual(max(seen), CHESS_VOCAB_SIZE - 1)
-        for bad in ((64, 0), (0, 12), (-1, 0), (0, -1)):
-            with self.subTest(bad=bad):
-                with self.assertRaises(ValueError):
-                    snapshot_token(*bad)
-        with self.assertRaises(ValueError):
-            decode_snapshot_token(CASTLING)
+        self.assertEqual((min(seen), max(seen)), (0, BOARD_TOKENS - 1))
+        for token in (BOARD_TOKENS, SIDE, MOVE, PAD):
+            with self.subTest(token=token):
+                self.assertFalse(is_board_token(token))
+
+    def test_reading_a_board_and_writing_a_snapshot_emit_the_same_atoms(self):
+        # White to move: the trace snapshot is not mirrored, so its piece run
+        # must be exactly the prefix's piece run; only the counters differ.
+        board = chess.Board(chess.STARTING_FEN)
+        prefix = encode_board(board.fen(), 1)
+        run = snapshot_of(board, False)
+        pieces = len(snapshot_pieces(board))
+        self.assertEqual(run[:pieces], prefix[:pieces].tolist())
+        self.assertEqual(run[pieces], SIDE)
+        self.assertEqual(len(run), pieces + 6)
 
 
 class SnapshotEncodingTests(unittest.TestCase):
@@ -105,7 +112,7 @@ class SnapshotEncodingTests(unittest.TestCase):
             dict(decoded.pieces), dict(snapshot_pieces(canonical_board(board, True)))
         )
         self.assertEqual(dict(decoded.pieces), dict(snapshot_pieces(board.mirror())))
-        # The mirror swaps the drawn colors but not the root-frame side token.
+        # The mirror swaps the drawn colors but not the root-frame side atom.
         self.assertEqual(decoded.side_black, board.turn == chess.BLACK)
 
     def test_snapshots_follow_the_replayed_pv_in_the_move_frame(self):
@@ -129,7 +136,7 @@ class SnapshotEncodingTests(unittest.TestCase):
                         )
                         self.assertEqual(decoded.castling, truth_castling(replay))
                         self.assertEqual(decoded.ep, replay.ep_square or 64)
-                        # The side token names the mover in the root frame and
+                        # The side atom names the mover in the root frame and
                         # flips with every ply of the replayed line.
                         self.assertEqual(decoded.side_black, black ^ (number % 2 == 1))
 
@@ -194,7 +201,8 @@ class SnapshotEncodingTests(unittest.TestCase):
 
     def test_parse_reports_broken_snapshot_runs(self):
         move, evaluation = MOVE + 7, VALUE + 5
-        first, second = snapshot_token(10, 0), snapshot_token(20, 6)
+        first = 10 * BOARD_PIECES
+        second = 20 * BOARD_PIECES + 6
         metadata = [
             SIDE,
             CASTLING + 1,
@@ -203,7 +211,7 @@ class SnapshotEncodingTests(unittest.TestCase):
             CASTLING + 6,
             EN_PASSANT + 64,
         ]
-        answer = [2399, move, evaluation, 347]
+        answer = [FINAL, move, evaluation, END]
         _, error = parse_trace(
             [LINE, move, first, second, *metadata, evaluation, *answer]
         )
@@ -223,7 +231,7 @@ class SnapshotEncodingTests(unittest.TestCase):
                 _, error = parse_trace([LINE, move, *body, evaluation])
                 self.assertEqual(error, expected)
         # Snapshots belong to LINE segments; an answer carries none.
-        _, error = parse_trace([2399, first, *metadata, move, evaluation, 347])
+        _, error = parse_trace([FINAL, first, *metadata, move, evaluation, END])
         self.assertEqual(error, "final_without_move")
         _, error = parse_trace([LINE, first, *metadata, evaluation])
         self.assertEqual(error, "line_without_move")
@@ -239,94 +247,6 @@ class SnapshotEncodingTests(unittest.TestCase):
             encode_trace(depth_snapshot(row), False, S2E)
         with self.assertRaises(ValueError):
             encode_trace(depth_snapshot(row), False, "level2")
-
-
-class SnapshotTyingTests(unittest.TestCase):
-    """Snapshot tokens and board pieces read one shared embedding table."""
-
-    def setUp(self):
-        torch.set_num_threads(1)
-        torch.manual_seed(11)
-        self.model = create_model(
-            {
-                "architecture": "sequence",
-                "num_blocks": 1,
-                "hidden_size": 32,
-                "intermediate_size": 64,
-                "num_heads": 4,
-                "dropout": 0.0,
-            }
-        ).eval()
-        self.ids = torch.from_numpy(encode_boards([chess.STARTING_FEN]))
-        self.packed = pack_board_tokens(self.ids)
-        self.positions = self.packed["positions"][0].tolist()
-        self.pieces = snapshot_pieces(chess.Board(chess.STARTING_FEN))
-
-    def test_snapshot_tokens_embed_as_the_board_square_table(self):
-        # The board path embeds an occupied square from the joint table with no
-        # positional term; a snapshot token of the same (square, piece) must add
-        # only the trace's position sinusoid, which at position 0 is the frozen
-        # sin(0)=0, cos(0)=1 sequence.
-        board_hidden = self.model.board_embedding(
-            self.packed["ids"], self.packed["positions"]
-        ).hidden[0]
-        tokens = torch.tensor(
-            [[snapshot_token(*pair) for pair in self.pieces]], dtype=torch.int16
-        )
-        _, hidden, _, width, _ = self.model.sequence(
-            self.ids,
-            trace_ids=tokens,
-            trace_positions=torch.zeros(tokens.shape[1], dtype=torch.long),
-        )
-        trace_hidden = hidden[0, width:]
-        sinusoid = torch.tensor([0.0, 1.0] * (trace_hidden.shape[1] // 2))
-        for index, (square, piece) in enumerate(self.pieces):
-            expected = board_hidden[self.positions.index(square)] + sinusoid
-            torch.testing.assert_close(trace_hidden[index], expected, rtol=0, atol=0)
-
-    def test_trace_tokens_below_the_snapshot_block_keep_their_own_table(self):
-        # Checkpoint compatibility: ids below the snapshot block embed exactly
-        # as the trained table always did, with no contribution from the board.
-        tokens = torch.tensor([[LINE, MOVE + 5, SNAPSHOT - 1]], dtype=torch.int16)
-        _, hidden, _, width, _ = self.model.sequence(
-            self.ids,
-            trace_ids=tokens,
-            trace_positions=torch.zeros(tokens.shape[1], dtype=torch.long),
-        )
-        sinusoid = torch.tensor(
-            [0.0, 1.0] * (self.model.trace_embedding.embedding_dim // 2)
-        )
-        expected = self.model.trace_embedding(tokens.long()) + sinusoid
-        torch.testing.assert_close(hidden[:, width:], expected, rtol=0, atol=0)
-
-    def test_snapshot_gradients_update_the_board_square_table(self):
-        model = self.model.train()
-        square, piece = self.pieces[8]
-        index = self.positions.index(square)
-        before = (
-            model.board_embedding(self.packed["ids"], self.packed["positions"])
-            .hidden[0, index]
-            .clone()
-        )
-        token = torch.tensor([[snapshot_token(square, piece)]], dtype=torch.int16)
-        _, hidden, _, width, _ = model.sequence(self.ids, trace_ids=token)
-        hidden[:, width:].sum().backward()
-        squares = model.board_embedding.squares.weight
-        self.assertIsNotNone(squares.grad)
-        grad = squares.grad.clone()
-        # The snapshot writes gradient into exactly its own square table row and
-        # nothing into the base trace table.
-        self.assertTrue(torch.all(grad[square * 13 + piece] == 1))
-        self.assertEqual(int(torch.count_nonzero(grad)), squares.shape[1])
-        base_grad = model.trace_embedding.weight.grad
-        self.assertTrue(base_grad is None or not base_grad.any())
-        # One optimizer step through the snapshot path moves what the board path
-        # reads: the two paths share the parameters, not just their values.
-        torch.optim.SGD(model.parameters(), lr=0.5).step()
-        after = model.board_embedding(
-            self.packed["ids"], self.packed["positions"]
-        ).hidden[0, index]
-        torch.testing.assert_close(after, before - 0.5, rtol=0, atol=0)
 
 
 class SnapshotOrderTests(unittest.TestCase):
@@ -362,7 +282,7 @@ class SnapshotOrderTests(unittest.TestCase):
                 if start >= 0 and trace[start] == LINE:
                     self.assertGreater(end - start, 4)
                     self.assertTrue(
-                        any(is_snapshot_token(token) for token in trace[start:end])
+                        any(is_board_token(token) for token in trace[start:end])
                     )
             # Whole lines move together: the presented trace is a concatenation
             # of the stored segments with the FINAL segment last.
@@ -395,19 +315,19 @@ class SnapshotOrderTests(unittest.TestCase):
             }
         ).eval()
         board, trace, length, _ = SequencePositions(self.data, "val")[0]
-        self.assertEqual(model.trace_embedding.num_embeddings, SNAPSHOT)
+        self.assertEqual(model.token_embedding.num_embeddings, CHESS_VOCAB_SIZE)
         stored = trace[:length]
-        self.assertGreater(int((stored >= SNAPSHOT).sum()), 0)
+        self.assertGreater(sum(is_board_token(int(token)) for token in stored), 0)
         ids = torch.from_numpy(np.stack([board, board]))
         trace_ids = torch.from_numpy(np.stack([stored, stored])).to(torch.int16)
         logits = model(ids=ids, trace_ids=trace_ids)
-        width = pack_board_tokens(ids)["ids"].shape[1]
+        width = ids.shape[1]
         self.assertEqual(logits.shape, (2, width + length, CHESS_VOCAB_SIZE))
         segments, error = parse_trace(stored.tolist())
         self.assertIsNone(error)
         self.assertTrue(all(segment.snapshots for segment in segments[:-1]))
 
-    def test_snapshot_traces_train_and_generate_through_the_shared_table(self):
+    def test_snapshot_traces_train_and_generate_through_one_table(self):
         torch.set_num_threads(1)
         torch.manual_seed(23)
         model = create_model(
@@ -426,19 +346,17 @@ class SnapshotOrderTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(int(mask.sum()), 0)
         loss.backward()
-        squares_grad = model.board_embedding.squares.weight.grad
-        self.assertIsNotNone(squares_grad)
-        self.assertGreater(float(squares_grad.norm()), 0)
-        # The cached generation path walks the same snapshot tokens: prefill plus
+        grad = model.token_embedding.weight.grad
+        self.assertIsNotNone(grad)
+        self.assertGreater(float(grad.norm()), 0)
+        # The cached generation path walks the same snapshot atoms: prefill plus
         # one-token decode must reproduce the teacher-forced logits exactly.
         model.eval()
         trace = batch["trace_ids"][:1]
         length = int((trace != PAD).sum())
-        self.assertGreater(int((trace >= SNAPSHOT).sum()), 0)
-        forced = model.trace_logits(
-            batch["ids"][:1], batch["positions"][:1], trace[:, :length]
-        )
-        first, cache = model.prefill(batch["ids"][:1], batch["positions"][:1])
+        self.assertGreater(sum(is_board_token(int(token)) for token in trace[0]), 0)
+        forced = model.trace_logits(batch["ids"][:1], trace[:, :length])
+        first, cache = model.prefill(batch["ids"][:1])
         torch.testing.assert_close(first[0], forced[0, 0])
         for index in range(length - 1):
             step, cache = model.decode(trace[:, index : index + 1], cache)

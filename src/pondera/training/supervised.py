@@ -15,11 +15,14 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
-from pondera.chess.tokens import PAD
-from pondera.chess.mapping import EMPTY_SQ_IDX
-from pondera.chess.symmetry import NUM_TRANSFORMS, apply_to_legal, apply_to_moves, apply_to_tokens
+from pondera.chess.symmetry import (
+    NUM_TRANSFORMS,
+    apply_to_legal,
+    apply_to_moves,
+    apply_to_tokens,
+)
+from pondera.chess.tokens import BOARD_TOKENS, PAD
 from pondera.data.positions import TokenizedPositions
-from pondera.models.board import pack_board_tokens
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model
 from pondera.training.cost import policy_flops
@@ -120,12 +123,12 @@ class PolicyCollator:
             targets = apply_to_moves(targets, draws)
             if legal is not None:
                 legal = apply_to_legal(legal, draws)
-        inputs = pack_board_tokens(torch.from_numpy(ids))
+        inputs = {"ids": torch.from_numpy(ids)}
         metadata = {}
         if legal is not None:
             metadata = {
                 "legal": torch.from_numpy(legal).long(),
-                "pieces": torch.from_numpy(ids[:, :64] != EMPTY_SQ_IDX).sum(-1),
+                "pieces": torch.from_numpy((ids < BOARD_TOKENS).sum(-1)),
             }
         return inputs, torch.from_numpy(targets), metadata
 

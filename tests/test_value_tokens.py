@@ -1,18 +1,25 @@
 import unittest
 
-from pondera.chess.mapping import IDX_TO_UCI_MOVE
 from pondera.chess.tokens import (
+    BOARD_TOKENS,
+    CASTLING,
     CHESS_VOCAB_SIZE,
+    DELIM,
+    EN_PASSANT,
+    END,
     FINAL,
+    HALFMOVE,
     LINE,
     MATE_LOSS,
     MATE_WIN,
+    META_END,
     MOVE,
-    SNAPSHOT,
+    PAD,
+    REPETITION,
+    SIDE,
     VALUE,
     VALUE_BIN_BOUNDARIES,
     VALUE_BIN_REPRESENTATIVES,
-    VOCAB_SIZE,
     decode_value_token,
     mate_token,
     value_bin,
@@ -66,27 +73,30 @@ class ValueBinTests(unittest.TestCase):
 
 
 class UnifiedVocabularyTests(unittest.TestCase):
-    """Frozen id layout: board tokens, moves, values, mate distances, trace."""
+    """Frozen id layout: board and metadata atoms, moves, values, delimiters."""
 
     def test_frozen_offsets(self):
-        self.assertEqual(MOVE, 349)
-        self.assertEqual(MOVE, VOCAB_SIZE)
-        self.assertEqual(VALUE, 349 + len(IDX_TO_UCI_MOVE))
+        # Hand arithmetic over the frozen segment sizes: 768 board atoms,
+        # 181 metadata atoms (2 side + 8 castling + 65 ep + 101 halfmove +
+        # 5 repetition), then the 1,969-move block and the frozen value,
+        # mate, and delimiter blocks.
+        self.assertEqual(BOARD_TOKENS, 768)
+        self.assertEqual((SIDE, CASTLING, EN_PASSANT), (768, 770, 778))
+        self.assertEqual((HALFMOVE, REPETITION, META_END), (843, 944, 948))
+        self.assertEqual(MOVE, 949)
+        self.assertEqual(MOVE, META_END + 1)
+        self.assertEqual(VALUE, 949 + 1969)
         self.assertEqual(MATE_WIN, VALUE + 20)
         self.assertEqual(MATE_LOSS, MATE_WIN + 29)
-        self.assertEqual(LINE, MATE_LOSS + 31)
-        self.assertEqual(FINAL, LINE + 1)
-        self.assertEqual(SNAPSHOT, FINAL + 1)
-        self.assertEqual(CHESS_VOCAB_SIZE, SNAPSHOT + 12 * 64)
+        self.assertEqual(DELIM, MATE_LOSS + 31)
+        self.assertEqual((PAD, END, LINE, FINAL), (2998, 2999, 3000, 3001))
+        self.assertEqual(CHESS_VOCAB_SIZE, 3002)
 
-    def test_trace_tokens_extend_the_frozen_space_append_only(self):
-        # The last frozen unified id is 2397 (the deepest mate-loss distance);
-        # LINE and FINAL take the two following ids and the 768 snapshot ids
-        # follow them, so no earlier id moves.
-        self.assertEqual(MATE_LOSS + 30, 2397)
-        self.assertEqual((LINE, FINAL, SNAPSHOT), (2398, 2399, 2400))
-        self.assertEqual(CHESS_VOCAB_SIZE, 3168)
-        for token in (LINE, FINAL, SNAPSHOT, CHESS_VOCAB_SIZE - 1):
+    def test_value_decoder_rejects_non_value_tokens(self):
+        # The metadata atoms end at 948; the move block starts the unified
+        # sequence space and the delimiters close it.
+        self.assertEqual(CHESS_VOCAB_SIZE, DELIM + 4)
+        for token in (MOVE, META_END, PAD, END, LINE, FINAL):
             with self.assertRaises(ValueError):
                 decode_value_token(token)
 

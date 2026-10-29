@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from torch.utils.data import Dataset
 
-from pondera.chess.tokens import CHESS_TOKENIZER_VERSION, MIN_TOKENS
+from pondera.chess.tokens import BOARD_TOKENS_MAX, CHESS_TOKENIZER_VERSION
 
 
 class TokenizedPositions(Dataset):
@@ -21,7 +21,7 @@ class TokenizedPositions(Dataset):
         self.moves = np.load(directory / f"moves_{split}.npy", mmap_mode="r")
         if self.tokens.ndim != 2 or self.tokens.shape[0] != len(self.moves):
             raise ValueError("Token and move arrays have incompatible shapes")
-        if self.tokens.shape[1] < MIN_TOKENS or self.tokens.dtype != np.int16:
+        if self.tokens.shape[1] > BOARD_TOKENS_MAX or self.tokens.dtype != np.int16:
             raise ValueError("Token array does not match its declared format")
         self.manifest = manifest
         self.legal = None
@@ -66,7 +66,7 @@ class DepthPositions(Dataset):
         if (
             self.tokens.ndim != 2
             or self.tokens.dtype != np.int16
-            or self.tokens.shape[1] < MIN_TOKENS
+            or self.tokens.shape[1] > BOARD_TOKENS_MAX
         ):
             raise ValueError("Token array does not match its declared format")
         for name, array, dtype in (
@@ -86,7 +86,9 @@ class DepthPositions(Dataset):
         if board_aux:
             if not manifest.get("board_aux"):
                 raise ValueError("Dataset was not encoded with board aux targets")
-            self.aux_after = np.load(directory / f"aux_after_{split}.npy", mmap_mode="r")
+            self.aux_after = np.load(
+                directory / f"aux_after_{split}.npy", mmap_mode="r"
+            )
             self.aux_changed = np.load(
                 directory / f"aux_changed_{split}.npy", mmap_mode="r"
             )
@@ -145,7 +147,7 @@ class SequencePositions(Dataset):
         if (
             self.tokens.ndim != 2
             or self.tokens.dtype != np.int16
-            or self.tokens.shape[1] < MIN_TOKENS
+            or self.tokens.shape[1] > BOARD_TOKENS_MAX
         ):
             raise ValueError("Board token array does not match its declared format")
         if (

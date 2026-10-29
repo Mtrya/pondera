@@ -1,33 +1,14 @@
-"""Compact-piece board inputs with joint square-piece embeddings."""
+"""Sparse board atoms embedded by one joint table, without positional terms."""
 
 from dataclasses import dataclass
 
 import torch
 from torch import nn
 
-from pondera.chess.tokens import (
-    CASTLING,
-    EN_PASSANT,
-    MIN_TOKENS,
-    PAD,
-    SIDE,
-    VOCAB_SIZE,
-)
-from pondera.chess.mapping import EMPTY_SQ_IDX
-from pondera.models.blocks import sinusoidal_positions
+from pondera.chess.symmetry import TOKEN_MIRROR
+from pondera.chess.tokens import BOARD_VOCAB_SIZE, PAD, SIDE
 
-
-def pack_board_tokens(ids):
-    """Drop padding and empty squares; positions retain the original token IDs."""
-    positions = torch.arange(ids.shape[1], device=ids.device).expand_as(ids)
-    keep = (ids != PAD) & ((positions >= 64) | (ids != EMPTY_SQ_IDX))
-    width = int(keep.sum(1).max())
-    order = torch.argsort(~keep, dim=1, stable=True)[:, :width]
-    valid = keep.gather(1, order)
-    return {
-        "ids": ids.gather(1, order).masked_fill(~valid, PAD),
-        "positions": positions.gather(1, order),
-    }
+_MIRROR = torch.from_numpy(TOKEN_MIRROR)
 
 
 @dataclass
@@ -36,67 +17,39 @@ class BoardEmbeddings:
     valid: torch.Tensor
 
 
-def black_to_move(ids, positions=None):
-    if positions is None:
-        return ids[:, 64] == SIDE + 1
-    return ((positions == 64) & (ids == SIDE + 1)).any(-1)
+def black_to_move(ids):
+    """Whether each row carries the black-to-move side atom."""
+    return (ids == SIDE + 1).any(-1)
 
 
-def reflect_board_tokens(ids, positions, reflected):
-    """Reflect ranks and swap colors while preserving the original side flag.
-
-    The unchanged flag records the original orientation, so this transform is
-    reversible. Castling fields and en-passant coordinates change with the board;
-    counters and supplied repetition information retain their exact values.
-    """
-    valid = ids != PAD
-    board = (positions < 64) & valid
-    castling = (positions >= 65) & (positions < 69) & valid
-    ep = (positions == 69) & valid & (ids != EN_PASSANT + 64)
-    new_positions = torch.where(board, positions ^ 56, positions)
-    new_positions = torch.where(castling, 65 + ((positions - 65) ^ 2), new_positions)
-    new_ids = torch.where(board & (ids < EMPTY_SQ_IDX), (ids + 6) % 12, ids)
-    new_ids = torch.where(
-        castling, CASTLING + 2 * (new_positions - 65) + ((ids - CASTLING) % 2), new_ids
-    )
-    new_ids = torch.where(ep, EN_PASSANT + ((ids - EN_PASSANT) ^ 56), new_ids)
-    return torch.where(reflected[:, None], new_ids, ids).to(ids.dtype), torch.where(
-        reflected[:, None], new_positions, positions
-    )
+def reflect_board_tokens(ids, reflected):
+    """Apply the exact rank-mirror id permutation to the reflected rows."""
+    mirrored = _MIRROR.to(ids.device)[ids.long()]
+    return torch.where(reflected[:, None], mirrored, ids.long()).to(ids.dtype)
 
 
 class BoardEmbedding(nn.Module):
-    """Joint (square, piece) embeddings; metadata tokens carry sinusoidal positions."""
+    """One row per board or metadata atom, plus a dedicated padding row.
+
+    Padding ids clamp to that row, whose parameters stay zero and receive no
+    gradient; padded positions are masked out before attention. Prefix tokens
+    carry no positional term: the board is a set of atoms.
+    """
 
     def __init__(self, hidden_size):
         super().__init__()
-        self.tokens = nn.Embedding(VOCAB_SIZE - 13, hidden_size, padding_idx=PAD - 13)
-        self.squares = nn.Embedding(13 * 64, hidden_size)
+        self.pad_row = BOARD_VOCAB_SIZE
+        self.tokens = nn.Embedding(
+            BOARD_VOCAB_SIZE + 1, hidden_size, padding_idx=self.pad_row
+        )
         nn.init.normal_(self.tokens.weight, std=0.02)
-        nn.init.normal_(self.squares.weight, std=0.02)
         with torch.no_grad():
-            self.tokens.weight[PAD - 13].zero_()
+            self.tokens.weight[self.pad_row].zero_()
 
-    def forward(self, ids, positions=None):
+    def forward(self, ids):
         if ids.ndim != 2 or ids.dtype not in {torch.int16, torch.int32, torch.int64}:
-            raise ValueError("Expected lossless integer board tokens")
-        if positions is None:
-            if ids.shape[1] < MIN_TOKENS:
-                raise ValueError(
-                    "Unpacked inputs must contain a complete lossless board"
-                )
-            packed = pack_board_tokens(ids)
-            ids, positions = packed["ids"], packed["positions"]
-        ids, positions = reflect_board_tokens(
-            ids, positions, black_to_move(ids, positions)
-        )
+            raise ValueError("Expected sparse board token ids")
+        ids = reflect_board_tokens(ids, black_to_move(ids))
         valid = ids != PAD
-        board = (positions < 64) & valid
-        squares = positions.masked_fill(~board, -1)
-        content = self.tokens((ids.long() - 13).clamp_min(0))
-        spatial = self.squares(squares.clamp_min(0) * 13 + ids.long().clamp(0, 12))
-        metadata_position = sinusoidal_positions(
-            (positions - 64).clamp_min(0), content.shape[-1], content.dtype
-        )
-        hidden = torch.where(board.unsqueeze(-1), spatial, content + metadata_position)
+        hidden = self.tokens(ids.long().clamp(max=self.pad_row))
         return BoardEmbeddings(hidden.masked_fill(~valid.unsqueeze(-1), 0), valid)
