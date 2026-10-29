@@ -1,4 +1,4 @@
-"""Base, causal sequence, recurrent depth, and combined token backbones.
+"""Base, causal sequence, and recurrent depth token backbones.
 
 Inputs are embeddings; token meaning and training-only prediction heads belong
 to callers. Causal callers also supply sequence-position information in those
@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import torch
 from torch import nn
 
-from pondera.models.blocks import QueryLayout, TokenBlock
+from pondera.models.blocks import TokenBlock
 from pondera.models.cache import (
     CACHE_POLICIES,
     BackboneCache,
@@ -18,7 +18,6 @@ from pondera.models.cache import (
     select_state,
 )
 from pondera.models.config import BlockConfig, CoreConfig
-from pondera.models.controllers import make_controller
 
 
 @dataclass
@@ -31,19 +30,10 @@ class Readout:
 
 
 @dataclass
-class ControllerReadout:
-    core: int
-    repetition: int
-    logits: torch.Tensor
-    active: torch.Tensor
-
-
-@dataclass
 class BackboneOutput:
     hidden: torch.Tensor
     repetitions: tuple[torch.Tensor, ...]
     readouts: tuple[Readout, ...] = ()
-    controllers: tuple[ControllerReadout, ...] = ()
     cache: BackboneCache | None = None
 
 
@@ -52,17 +42,6 @@ class RepeatedCore(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(TokenBlock(block) for _ in range(config.layers))
-        self.controller = make_controller(config.repetition, block.hidden_size)
-        self.reinjection = (
-            nn.Linear(block.hidden_size, block.hidden_size, bias=False)
-            if config.reinject_input
-            else None
-        )
-        self.iteration = (
-            nn.Embedding(config.repetition.max_repetitions, block.hidden_size)
-            if config.condition_on_iteration
-            else None
-        )
 
 
 @dataclass
@@ -74,12 +53,11 @@ class Execution:
     capture: bool = False
     save_cache: bool = False
     readouts: list = field(default_factory=list)
-    controllers: list = field(default_factory=list)
     histories: dict = field(default_factory=dict)
 
 
 class TokenBackbone(nn.Module):
-    """Shared execution primitives, composed by the four public backbones."""
+    """Shared execution primitives, composed by the three public backbones."""
 
     def __init__(self, block, cores, cache_policy):
         super().__init__()
@@ -92,63 +70,21 @@ class TokenBackbone(nn.Module):
         self.cores = nn.ModuleList(RepeatedCore(block, core) for core in cores)
         self.final_norm = nn.RMSNorm(block.hidden_size)
 
-    def _core(self, core, index, x, execution, limits):
+    def _core(self, core, index, x, execution):
         config = core.config.repetition
         valid = execution.valid
-        if limits is None:
-            limits = torch.full_like(valid, config.max_repetitions, dtype=torch.long)
-            variable_limits = False
-        else:
-            if limits.shape != valid.shape or limits.dtype != torch.long:
-                raise ValueError(
-                    "Repetition limits must be int64 with shape (batch, tokens)"
-                )
-            if bool(
-                ((limits < config.min_repetitions) | (limits > config.max_repetitions))[
-                    valid
-                ].any()
-            ):
-                raise ValueError("Repetition limits lie outside configured bounds")
-            variable_limits = True
-        shared = torch.zeros_like(valid)
-        if config.scope == "shared":
-            if execution.prefix_length is None:
-                shared = valid
-            else:
-                positions = torch.arange(x.shape[1], device=x.device) + execution.offset
-                shared = valid & (positions[None, :] < execution.prefix_length)
-            if variable_limits:
-                low = torch.where(shared, limits, config.max_repetitions).amin(1)
-                high = torch.where(shared, limits, config.min_repetitions).amax(1)
-                if bool(((low != high) & shared.any(1)).any()):
-                    raise ValueError(
-                        "Members of a shared decision need identical limits"
-                    )
-        entry = x
-        active = valid
-        counts = torch.zeros_like(valid, dtype=torch.long)
+        query_positions = (
+            torch.arange(x.shape[1], device=x.device).expand(x.shape[0], -1)
+            + execution.offset
+        )
         histories = [[] for _ in core.layers]
         for repetition in range(config.max_repetitions):
-            if repetition == 0 or (config.mode == "fixed" and not variable_limits):
-                layout = QueryLayout.full(active)
-            else:
-                layout = QueryLayout.from_mask(active)
-            if layout.indices.shape[1] == 0:
-                break
-            previous = x
-            if core.reinjection is not None:
-                injected = layout.gather(x) + core.reinjection(layout.gather(entry))
-                x = layout.scatter(injected, x)
-            if core.iteration is not None:
-                conditioned = layout.gather(x) + core.iteration.weight[repetition]
-                x = layout.scatter(conditioned, x)
-            query_positions = layout.indices + execution.offset
             for layer_index, layer in enumerate(core.layers):
-                normalized = layer.norm_attention(layout.gather(x))
+                normalized = layer.norm_attention(x)
                 history = histories[layer_index]
                 # First-repetition sharing does not recompute later K/V projections.
                 if repetition == 0 or self.cache_policy != "first":
-                    history.append(layer.project(normalized, layout))
+                    history.append(layer.project(normalized, valid))
                 states = []
                 if execution.past is not None:
                     states.extend(
@@ -159,23 +95,15 @@ class TokenBackbone(nn.Module):
                 x = layer.attend(
                     x,
                     normalized,
-                    layout,
+                    valid,
                     join_states(states),
                     query_positions,
                     execution.prefix_length,
                 )
                 if execution.capture:
                     execution.readouts.append(
-                        Readout(index, layer_index, repetition + 1, x, active)
+                        Readout(index, layer_index, repetition + 1, x, valid)
                     )
-            counts = counts + active.long()
-            decision = core.controller(previous, x, shared)
-            if decision.logits is not None:
-                execution.controllers.append(
-                    ControllerReadout(index, repetition + 1, decision.logits, active)
-                )
-            can_stop = repetition + 1 >= config.min_repetitions
-            active = active & (counts < limits) & ~(decision.stop & can_stop)
         if execution.save_cache:
             for layer_index, history in enumerate(histories):
                 past = (
@@ -186,7 +114,7 @@ class TokenBackbone(nn.Module):
                 execution.histories[index, layer_index] = past + [
                     [state.detach() for state in history]
                 ]
-        return x, counts
+        return x, valid.long() * config.max_repetitions
 
     def _run(
         self,
@@ -197,7 +125,6 @@ class TokenBackbone(nn.Module):
         cache=None,
         return_cache=False,
         capture=False,
-        repetition_limits=None,
     ):
         if (
             x.ndim != 3
@@ -219,10 +146,6 @@ class TokenBackbone(nn.Module):
                 raise ValueError("The board prefix cannot change during decoding")
         if return_cache and self.training:
             raise ValueError("Incremental caches require evaluation mode")
-        if repetition_limits is None:
-            repetition_limits = [None] * len(self.cores)
-        if len(repetition_limits) != len(self.cores):
-            raise ValueError("Supply one repetition-limit tensor per core")
         execution = Execution(
             valid,
             prefix_length,
@@ -232,8 +155,8 @@ class TokenBackbone(nn.Module):
             return_cache,
         )
         counts = []
-        for i, (core, limits) in enumerate(zip(self.cores, repetition_limits)):
-            x, count = self._core(core, i, x, execution, limits)
+        for i, core in enumerate(self.cores):
+            x, count = self._core(core, i, x, execution)
             counts.append(count)
         output_cache = None
         if return_cache:
@@ -248,7 +171,6 @@ class TokenBackbone(nn.Module):
             hidden,
             tuple(counts),
             tuple(execution.readouts),
-            tuple(execution.controllers),
             output_cache,
         )
 
@@ -274,15 +196,8 @@ class DepthBackbone(TokenBackbone):
     ):
         super().__init__(block, cores, cache_policy)
 
-    def forward(
-        self, tokens, *, valid=None, capture=False, repetition_limits=None
-    ):
-        return self._run(
-            tokens,
-            valid=valid,
-            capture=capture,
-            repetition_limits=repetition_limits,
-        )
+    def forward(self, tokens, *, valid=None, capture=False):
+        return self._run(tokens, valid=valid, capture=capture)
 
 
 class CausalBackbone(TokenBackbone):
@@ -295,7 +210,6 @@ class CausalBackbone(TokenBackbone):
         *,
         valid=None,
         capture=False,
-        repetition_limits=None,
         return_cache=False,
     ):
         if not 0 <= prefix_length <= tokens.shape[1]:
@@ -305,7 +219,6 @@ class CausalBackbone(TokenBackbone):
             valid=valid,
             prefix_length=prefix_length,
             capture=capture,
-            repetition_limits=repetition_limits,
             return_cache=return_cache,
         )
 
@@ -321,7 +234,6 @@ class CausalBackbone(TokenBackbone):
         *,
         valid=None,
         capture=False,
-        repetition_limits=None,
     ):
         return self._run(
             tokens,
@@ -330,7 +242,6 @@ class CausalBackbone(TokenBackbone):
             cache=cache,
             return_cache=True,
             capture=capture,
-            repetition_limits=repetition_limits,
         )
 
 
@@ -339,19 +250,3 @@ class SequenceBackbone(CausalBackbone):
 
     def __init__(self, block: BlockConfig, num_layers: int):
         super().__init__(block, [CoreConfig(layers=num_layers)], "matched_fallback")
-
-
-class CombinedBackbone(CausalBackbone):
-    """Causal sequence expansion with adaptive per-thought recurrent depth.
-
-    Shared repetition decisions, when configured, apply only to board-prefix
-    tokens. Every thought token always receives its own stopping decision.
-    """
-
-    def __init__(
-        self,
-        block: BlockConfig,
-        cores: list[CoreConfig],
-        cache_policy="matched_fallback",
-    ):
-        super().__init__(block, cores, cache_policy)

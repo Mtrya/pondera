@@ -7,14 +7,12 @@ import torch
 from teacher_release import candidate_row, play
 
 from pondera.chess.tokens import (
-    CHESS_TOKENIZER_VERSION,
     CHESS_VOCAB_SIZE,
     END,
     FINAL,
     LINE,
     MOVE,
     PAD,
-    SNAPSHOT,
     VALUE,
     encode_boards,
 )
@@ -121,34 +119,6 @@ class SequencePolicyTests(unittest.TestCase):
             loaded = load_model(path)
             actual = loaded.trace_logits(self.ids[:1], trace_ids=trace)
             torch.testing.assert_close(actual, expected)
-
-    def test_checkpoint_before_the_snapshot_extension_masks_the_added_ids(self):
-        # Vocabulary growth is append-only, so a checkpoint whose head stops at
-        # the snapshot block keeps every trained output and can never select the
-        # ids it never saw.
-        trace = trace_of(chess.STARTING_FEN)
-        expected = self.model.trace_logits(self.ids[:1], trace_ids=trace)
-        state = {
-            key: (value[:SNAPSHOT] if key in ("head.weight", "head.bias") else value)
-            for key, value in self.model.state_dict().items()
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "sequence-v2.pth"
-            torch.save(
-                {
-                    "format_version": 1,
-                    "tokenizer_version": CHESS_TOKENIZER_VERSION,
-                    "model_config": CONFIG,
-                    "model_state_dict": state,
-                },
-                path,
-            )
-            loaded = load_model(path)
-        actual = loaded.trace_logits(self.ids[:1], trace_ids=trace)
-        torch.testing.assert_close(
-            actual[..., :SNAPSHOT], expected[..., :SNAPSHOT], rtol=0, atol=0
-        )
-        self.assertTrue(torch.all(actual[..., SNAPSHOT:] < -1000))
 
 
 if __name__ == "__main__":

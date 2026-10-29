@@ -2,7 +2,6 @@
 
 from pondera.models.backbones import (
     BaseBackbone,
-    CombinedBackbone,
     DepthBackbone,
     SequenceBackbone,
 )
@@ -17,7 +16,6 @@ __all__ = [
     "BaseBackbone",
     "SequenceBackbone",
     "DepthBackbone",
-    "CombinedBackbone",
     "BlockConfig",
     "CoreConfig",
     "RepetitionConfig",

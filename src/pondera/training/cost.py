@@ -34,11 +34,10 @@ def policy_flops(config, lengths, *, training=True):
 def depth_flops(config, lengths, head_exits, *, training=True, repetitions=None):
     """FLOPs for recurrent-depth policies under the policy_flops conventions.
 
-    Trunk layers execute once per core repetition (fixed limits); the shared
-    vocabulary head applies at every computed exit on the two readout
-    positions. Controllers, reinjection, and iteration embeddings are excluded
-    as per-token vector arithmetic. repetitions overrides the configured
-    per-core maximum for runs that truncate execution below it.
+    Trunk layers execute once per core repetition; the shared vocabulary head
+    applies at every computed exit on the two readout positions. repetitions
+    overrides the configured per-core maximum for analytical comparisons at a
+    lower executed depth.
     """
     if config.get("architecture") != "depth":
         raise ValueError("This FLOP convention is defined for the depth policy")

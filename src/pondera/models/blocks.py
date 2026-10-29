@@ -1,7 +1,6 @@
-"""Portable SDPA blocks with active-query packing."""
+"""Portable SDPA blocks."""
 
 import math
-from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -9,45 +8,6 @@ from torch.nn import functional as F
 
 from pondera.models.cache import KVState
 from pondera.models.config import BlockConfig
-
-
-@dataclass
-class QueryLayout:
-    indices: torch.Tensor
-    valid: torch.Tensor
-    full_length: int
-    dense: bool = False
-
-    @classmethod
-    def from_mask(cls, active):
-        counts = active.sum(1)
-        width = int(counts.max())
-        indices = torch.argsort(~active, dim=1, stable=True)[:, :width]
-        valid = torch.arange(width, device=active.device)[None, :] < counts[:, None]
-        return cls(indices, valid, active.shape[1])
-
-    @classmethod
-    def full(cls, valid):
-        indices = torch.arange(valid.shape[1], device=valid.device).expand(
-            valid.shape[0], -1
-        )
-        return cls(indices, valid, valid.shape[1], dense=True)
-
-    def gather(self, values):
-        if self.dense:
-            return values
-        return values.gather(
-            1, self.indices.unsqueeze(-1).expand(-1, -1, values.shape[-1])
-        )
-
-    def scatter(self, values, original):
-        if self.dense:
-            return torch.where(self.valid.unsqueeze(-1), values, original)
-        previous = self.gather(original)
-        updates = torch.where(self.valid.unsqueeze(-1), values, previous)
-        return original.scatter(
-            1, self.indices.unsqueeze(-1).expand_as(updates), updates
-        )
 
 
 def attention_mask(query_positions, key_length, prefix_length, key_valid):
@@ -107,31 +67,19 @@ class TokenBlock(nn.Module):
         )
         self.attention_capture = None
 
-    def project(self, normalized, layout: QueryLayout):
+    def project(self, normalized, valid):
         batch, queries, width = normalized.shape
         kv = self.key_value(normalized).view(
             batch, queries, 2, self.heads, self.head_size
         )
         kv = kv.permute(2, 0, 3, 1, 4)
-        if layout.dense:
-            return KVState(kv[0], kv[1], layout.valid)
-        index = layout.indices[:, None, :, None].expand(
-            -1, self.heads, -1, self.head_size
-        )
-        shape = (batch, self.heads, layout.full_length, self.head_size)
-        key = kv.new_zeros(shape).scatter(2, index, kv[0])
-        value = kv.new_zeros(shape).scatter(2, index, kv[1])
-        valid = torch.zeros(
-            batch, layout.full_length, device=normalized.device, dtype=torch.bool
-        )
-        valid = valid.scatter(1, layout.indices, layout.valid)
-        return KVState(key, value, valid)
+        return KVState(kv[0], kv[1], valid)
 
     def attend(
         self,
         x,
         normalized,
-        layout,
+        valid,
         memory,
         query_positions,
         prefix_length,
@@ -147,7 +95,7 @@ class TokenBlock(nn.Module):
             query_positions, memory.valid.shape[1], prefix_length, memory.valid
         )
         if self.attention_capture is not None:
-            self._capture_attention(q, key, mask, layout.valid)
+            self._capture_attention(q, key, mask, valid)
         attention = (
             F.scaled_dot_product_attention(
                 q,
@@ -159,13 +107,11 @@ class TokenBlock(nn.Module):
             .transpose(1, 2)
             .reshape(batch, queries, width)
         )
-        updated = layout.gather(x) + F.dropout(
-            self.output(attention), self.dropout, self.training
-        )
+        updated = x + F.dropout(self.output(attention), self.dropout, self.training)
         updated = updated + F.dropout(
             self.ffn(self.norm_ffn(updated)), self.dropout, self.training
         )
-        return layout.scatter(updated, x)
+        return torch.where(valid.unsqueeze(-1), updated, x)
 
     @torch.no_grad()
     def _capture_attention(self, queries, keys, mask, query_valid):

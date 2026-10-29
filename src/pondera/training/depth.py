@@ -73,10 +73,7 @@ class DepthTrainConfig:
     diagnostics: bool = False
     internals: bool = False
     train_probe_positions: int = 0
-    conflict_probe: bool = False
-    exit_adapter_lr_scale: float = 1.0
     teacher_depths: list | None = None
-    sample_repetitions: bool = False
 
     def __post_init__(self):
         if self.model.get("architecture") != "depth":
@@ -127,13 +124,6 @@ class DepthTrainConfig:
             raise ValueError("board_aux_weight must be finite and non-negative")
         if self.board_aux_weight > 0 and not self.model.get("board_aux"):
             raise ValueError("board_aux_weight requires a board_aux-equipped model")
-        if (
-            not math.isfinite(self.exit_adapter_lr_scale)
-            or self.exit_adapter_lr_scale <= 0
-        ):
-            raise ValueError("exit_adapter_lr_scale must be finite and positive")
-        if self.exit_adapter_lr_scale != 1.0 and not self.model.get("exit_adapter"):
-            raise ValueError("exit_adapter_lr_scale requires an adapter-equipped model")
         if not 0 <= self.warmup_ratio <= 1:
             raise ValueError("warmup_ratio must be between 0 and 1")
         if self.train_flops_budget is not None and (
@@ -179,23 +169,6 @@ def _masked_mean(values, mask):
 def load_config(path):
     with Path(path).open("rb") as handle:
         return DepthTrainConfig(**tomllib.load(handle))
-
-
-def stratified_repetitions(batches, max_repetitions, seed):
-    """Per-microbatch repetition counts: each value equally often (±1), shuffled.
-
-    Stratification keeps every epoch's executed-FLOPs mean at the midpoint of
-    1..max_repetitions exactly, rather than only in expectation.
-    """
-    if batches < 1 or max_repetitions < 1:
-        raise ValueError("Batch count and max repetitions must be positive")
-    base, remainder = divmod(batches, max_repetitions)
-    counts = [
-        base + (1 if index < remainder else 0) for index in range(max_repetitions)
-    ]
-    schedule = np.repeat(np.arange(1, max_repetitions + 1), counts)
-    np.random.default_rng(seed).shuffle(schedule)
-    return schedule.tolist()
 
 
 def train(
@@ -248,29 +221,8 @@ def train(
         )
     consumed_flops = 0.0
     examples_seen = 0
-    adapter_parameters = [
-        parameter
-        for name, parameter in model.named_parameters()
-        if name.startswith("exit_adapter")
-    ]
-    if adapter_parameters and config.exit_adapter_lr_scale != 1.0:
-        parameter_groups = [
-            {
-                "params": [
-                    parameter
-                    for name, parameter in model.named_parameters()
-                    if not name.startswith("exit_adapter")
-                ]
-            },
-            {
-                "params": adapter_parameters,
-                "lr": config.learning_rate * config.exit_adapter_lr_scale,
-            },
-        ]
-    else:
-        parameter_groups = model.parameters()
     optimizer = torch.optim.AdamW(
-        parameter_groups,
+        model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
         fused=True if device.type == "cuda" else None,
@@ -518,38 +470,6 @@ def train(
             values.update({f"internal/{key}": value for key, value in internal.items()})
         return values
 
-    def conflict_metrics():
-        """Pairwise cosine similarity of per-exit gradients on shared parameters."""
-        model.eval()
-        batch = min(config.batch_size, len(val_data))
-        inputs, targets = collate([val_data[i] for i in range(batch)])
-        inputs = {key: value.to(device) for key, value in inputs.items()}
-        targets = {key: value.to(device) for key, value in targets.items()}
-        shared = [
-            parameter
-            for name, parameter in model.named_parameters()
-            if not name.startswith("exit_adapter")
-        ]
-        gradients = []
-        with autocast():
-            exits, _ = model.forward_exits(**inputs)
-            losses, _ = exit_loss_terms(exits, inputs, targets, supervision)
-            for loss in losses:
-                grads = torch.autograd.grad(loss, shared, retain_graph=True)
-                gradients.append(
-                    torch.cat([grad.detach().float().reshape(-1) for grad in grads])
-                )
-        model.train()
-        metrics = {}
-        for first in range(len(gradients)):
-            for second in range(first + 1, len(gradients)):
-                metrics[f"grad_cosine_exit_{first + 1}_{second + 1}"] = float(
-                    torch.nn.functional.cosine_similarity(
-                        gradients[first], gradients[second], dim=0
-                    )
-                )
-        return metrics
-
     def validate():
         values = evaluate(
             val_data,
@@ -567,10 +487,6 @@ def train(
             final_key = f"exit_{exits_per_forward}/move_loss"
             values["generalization/loss_gap"] = (
                 values[f"val/{final_key}"] - values[f"train_probe/{final_key}"]
-            )
-        if config.conflict_probe:
-            values.update(
-                {f"internal/{key}": value for key, value in conflict_metrics().items()}
             )
         if probe is not None:
             batch = min(config.batch_size, len(val_data))
@@ -643,29 +559,14 @@ def train(
                 ),
             )
             loss_sum = torch.zeros((), device=device)
-            sampled = (
-                stratified_repetitions(
-                    steps_per_epoch * config.accumulation_steps,
-                    exits_per_forward,
-                    config.seed + epoch,
-                )
-                if config.sample_repetitions
-                else None
-            )
             for micro, (inputs, targets) in enumerate(loader):
                 if micro >= steps_per_epoch * config.accumulation_steps:
                     break
                 if epoch == start_epoch and micro < next_micro:
                     continue
-                repetitions = sampled[micro] if sampled is not None else None
                 lengths = (inputs["ids"] != PAD).sum(1).numpy()
                 consumed_flops += float(
-                    depth_flops(
-                        config.model,
-                        lengths,
-                        repetitions or exits_per_forward,
-                        repetitions=repetitions,
-                    ).sum()
+                    depth_flops(config.model, lengths, exits_per_forward).sum()
                 )
                 examples_seen += config.batch_size
                 device_inputs = {
@@ -673,9 +574,7 @@ def train(
                     for key, value in inputs.items()
                 }
                 with autocast():
-                    exits, _ = model.forward_exits(
-                        **device_inputs, repetition_limit=repetitions
-                    )
+                    exits, _ = model.forward_exits(**device_inputs)
                     loss, _ = exit_losses(
                         exits,
                         device_inputs,
@@ -683,7 +582,7 @@ def train(
                             key: value.to(device, non_blocking=True)
                             for key, value in targets.items()
                         },
-                        supervision[:repetitions] if repetitions else supervision,
+                        supervision,
                     )
                 (loss / config.accumulation_steps).backward()
                 loss_sum += loss.detach()
@@ -708,11 +607,6 @@ def train(
                         "train/loss": (loss_sum / config.accumulation_steps).item(),
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/grad_norm": grad_norm.item(),
-                        **(
-                            {"train/repetitions": repetitions}
-                            if repetitions is not None
-                            else {}
-                        ),
                         "train/pos_per_s": (step - initial_step)
                         * config.batch_size
                         * config.accumulation_steps
