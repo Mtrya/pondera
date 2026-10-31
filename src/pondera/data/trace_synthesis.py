@@ -498,11 +498,10 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
             raise SynthesisError("the root establishing call does not negate rank[0]")
         if call.get("pv") != top.get("pv"):
             raise SynthesisError("the root establishing call pv differs from rank[0]")
-        if "wdl" in top and "wdl" in call:
-            if list(call["wdl"]) != [top["wdl"][2], top["wdl"][1], top["wdl"][0]]:
-                raise SynthesisError(
-                    "the root establishing wdl is not the rank[wdl] mirror"
-                )
+        # No wdl symmetry is asserted here: candidate wdl is child-relative and
+        # rank wdl root-relative, and the engine's win-rate model scales with
+        # the material of the position it describes, so a capture's child wdl
+        # is not the exact mirror of the root wdl (docs/teacher.md).
 
     if search_end.get("bestmove") is None:
         raise SynthesisError("search_end has no bestmove")
@@ -823,7 +822,9 @@ class _Synthesis:
                     )
                 token = mate_token(0, True)
             else:
-                if raw != 0:
+                # The engine reports a draw as VALUE_DRAW - 1 + (nodes & 0x2),
+                # so -1 or +1 rather than 0, to break score ties.
+                if abs(raw) > 1:
                     raise SynthesisError(
                         "a rule draw child has a non-draw engine value"
                     )

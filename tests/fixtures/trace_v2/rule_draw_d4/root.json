@@ -1,0 +1,12 @@
+{
+  "root_id": "da85fc93ae2c2235f0748111527c7ba7a79e33e968b8bd7d42f0b2460746a6ad",
+  "split": "train",
+  "fen": "7k/8/8/8/8/8/8/R6K w - - 99 80",
+  "repetition": 1,
+  "turn": "white",
+  "position_key": "7k/8/8/8/8/8/8/R6K w - -",
+  "source": {
+    "case": "rule_draw_d4",
+    "depth": 4
+  }
+}

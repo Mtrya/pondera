@@ -24,6 +24,8 @@ CASES = {
     "middlegame_black_d4": 4,
     "mate_in_1_d4": 4,
     "claim_draw_d4": 4,
+    "capture_d4": 4,
+    "rule_draw_d4": 4,
 }
 
 
