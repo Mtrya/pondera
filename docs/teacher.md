@@ -2,7 +2,7 @@
 
 A teacher record is the complete log of one instrumented Stockfish 17.1 search over one root position. Offline synthesis reads the record and writes trace tokens; the training pipeline never runs the engine. The instrumented build adds one string UCI option, `TraceLog`, which writes a JSONL sidecar. The change is observational: with tracing off the build is indistinguishable from the unmodified engine, and with tracing on the sidecar is the only addition.
 
-This document is the contract between that build and the translator. It specifies where to observe the search, which events to write, and what every field means. The schema is versioned; the procedure and the schema change together. A release manifest records the SHA-256 of this document, so a record is interpretable only against the contract that produced it.
+This document is the contract between that build and the translator. It specifies where to observe the search, which events to write, and what every field means. The schema is versioned; the procedure and the schema change together. A release manifest records the schema version and the SHA-256 of this document, so a record is interpretable only against the contract that produced it.
 
 Stockfish is licensed under GPL-3.0-or-later. The instrumented source, the binary, and the records are external artifacts; this repository contains none of them. The procedure below describes observation points in prose and contains no engine source code.
 
@@ -52,9 +52,9 @@ The root is recorded. A `first` or `promote` call from a recorded node opens the
 
 A recorded node writes one candidate event for each of its `first`, `probe`, `rescore`, and `promote` calls. It writes nothing for `auxiliary` or `suppress` calls, or for candidates that are pruned before any search call. A null-window test writes exactly one line at the node that issues it and never records the tested child's subtree; this is the cheap-test rule.
 
-A candidate event carries the child path (root to child, ending with the tested move), the parent's candidate order, the role, the child's depth argument, the window passed to the child, the returned raw and `cp` values and the bound, the node-count delta, and the child's seldepth. A root full-window candidate, meaning a `first` or `promote` call whose path has length one, also carries the principal variation.
+A candidate event carries the child path (root to child, ending with the tested move), the parent's candidate order, the role, the child's depth argument, the window passed to the child, the returned `raw` value with its `cp` and `wdl` fields when the value is not a mate score, the bound, the node-count delta, and the child's seldepth. A root full-window candidate, meaning a `first` or `promote` call whose path has length one, also carries the principal variation.
 
-A frontier event is written when a recorded node's `first` or `promote` child call reaches depth zero and its value comes from the quiescence search. Write it after the quiescence search returns, with the child path, the quiescence value, its `cp` when the value is not a mate score, the bound, the node-count delta, and seldepth. Do not record anything inside the quiescence search. A rule draw detected before the quiescence search has no frontier event; its value is carried by the parent's candidate event. The frontier event's raw and `cp` values must equal the candidate event's for the same call; the duplicate is intentional and is used for validation.
+A frontier event is written when a recorded node's `first` or `promote` child call reaches depth zero and its value comes from the quiescence search. Write it after the quiescence search returns, with the child path, the quiescence value, its `cp` and `wdl` when the value is not a mate score, the bound, the node-count delta, and seldepth. Do not record anything inside the quiescence search. A rule draw detected before the quiescence search has no frontier event; its value is carried by the parent's candidate event. The frontier event's `raw`, `cp`, and `wdl` values must equal the candidate event's for the same call; the duplicate is intentional and is used for validation.
 
 Candidate `order` is the 1-based position of the candidate in the parent's move-loop sequence for that attempt. Every call that tests the same candidate shares the order. It is not the count of logged events, so pruned moves leave gaps. At the root it is the actual test order; `round_start.root_order` is the order at round entry.
 
@@ -100,7 +100,7 @@ The traced run adds the `TraceLog` line; the control and official runs omit it. 
 ### File and line format
 
 - UTF-8 JSON Lines. One object per line, no blank lines, compact separators, fixed key order, LF line endings.
-- Every line carries `schema` (currently 2), `seq` (the 1-based line number), and `type`.
+- Every line carries `schema` (currently 3), `seq` (the 1-based line number), and `type`.
 - One file holds one root: exactly one `session`, one `position`, one `search_start`, and one `search_end`. `session` is the first line and `search_end` is the last.
 - A consumer rejects a different schema version or a non-monotonic `seq`.
 - The file contains no floating-point numbers.
@@ -108,7 +108,9 @@ The traced run adds the `TraceLog` line; the control and official runs omit it. 
 ### Scores, windows, and bounds
 
 - `raw` is an integer in the engine's internal Value units, not UCI centipawns. In Stockfish 17.1 a pawn is 208 internal units, and the engine converts an ordinary internal score to centipawns with a material-dependent scale before printing `score cp`; `raw` and the printed centipawns are therefore different numbers. A mate score for the side to move is `value_mate - ply_to_mate`; a mated score is `-value_mate + ply_to_mate`. The distance unit is a ply. A value is a mate score when its magnitude is at least `value_mate - max_ply`; both constants are in the `session` event.
-- `cp` is the integer that the engine's own UCI conversion produces for `raw` at the position the event describes; for an ordinary score this is exactly the number printed as `score cp`. It is present exactly when `raw` is not a mate score. Value quantization uses `cp`; mate distances are converted from `raw` (plies) to moves. The collection uses no tablebases, so every non-mate value is an ordinary score.
+- `cp` is the integer that the engine's own UCI conversion produces for `raw` at the position the event describes; for an ordinary score this is exactly the number printed as `score cp`. It is present exactly when `raw` is not a mate score. It is kept for analysis and readability; value quantization does not use it.
+- `wdl` is the engine's win/draw/loss estimate for `raw` at the position the event describes: a three-integer array `[win, draw, loss]` in per-mille units that sums to 1000, produced by the same win-rate model that backs the engine's `UCI_ShowWDL` output. Enabling `UCI_ShowWDL` is not necessary and does not change the recorded values. It is present exactly when `raw` is not a mate score, and like `raw` it is from the side to move at the event's position, so candidate and frontier `wdl` are child-relative while attempt and rank `wdl` are root-relative.
+- Value quantization uses the WDL-derived scalar `(wdl[0] - wdl[2]) / 1000`, which lies in [-1, 1]; this is the value the frozen 20-bin codec bins. Mate distances are converted from `raw` (plies) to moves. The collection uses no tablebases, so every non-mate value is an ordinary score.
 - `raw` is from the side to move at the node the event describes. The root player's perspective is `raw * (-1) ** ply`, where `ply` is the node's distance from the root. `attempt` and `round_end` values are already at the root (ply zero).
 - `window` is the exact `{alpha, beta}` pair passed to the call, in the frame of the node being searched. `bound` is `exact` when `alpha < raw < beta`, `upper` when `raw <= alpha`, and `lower` when `raw >= beta`. A null window cannot produce `exact`. Because `raw` is child-relative, an `upper` bound is a fail-low of the child and a fail-high of the move, while a `lower` bound is a fail-high of the child and a fail-low (refutation) of the move.
 - Infinite sentinels may appear in windows and in failed-attempt results. They never appear as the value of a completed round.
@@ -164,6 +166,7 @@ Every event also carries `schema`, `seq`, and `type`.
 | `window` | object | Window passed to the root search, root perspective. |
 | `raw` | integer | Returned root value, root perspective. |
 | `cp` | integer, omitted for mate scores | Centipawn value of `raw` at the root, using the engine's UCI conversion. |
+| `wdl` | array of three integers, omitted for mate scores | Engine win/draw/loss estimate `[win, draw, loss]` at the root, per mille, summing to 1000. |
 | `bound` | string | `exact`, `lower`, or `upper` relative to `window`. |
 
 **`candidate`**
@@ -181,6 +184,7 @@ Every event also carries `schema`, `seq`, and `type`.
 | `window` | object | Window passed to the child, child perspective. |
 | `raw` | integer | Returned child value, child perspective. |
 | `cp` | integer, omitted for mate scores | Centipawn value of `raw` at the child position, using the engine's UCI conversion. |
+| `wdl` | array of three integers, omitted for mate scores | Engine win/draw/loss estimate `[win, draw, loss]` at the child position, per mille, summing to 1000. |
 | `bound` | string | `exact`, `lower`, or `upper` relative to `window`. |
 | `nodes_delta` | integer | Nodes consumed by the call. |
 | `seldepth` | integer | The child's seldepth counter at return. |
@@ -196,6 +200,7 @@ Every event also carries `schema`, `seq`, and `type`.
 | `ply` | integer | Path length. |
 | `raw` | integer | Quiescence-search return value, frontier-node perspective. |
 | `cp` | integer, omitted for mate scores | Centipawn value of `raw` at the frontier node, using the engine's UCI conversion. |
+| `wdl` | array of three integers, omitted for mate scores | Engine win/draw/loss estimate `[win, draw, loss]` at the frontier node, per mille, summing to 1000. |
 | `bound` | string | `exact`, `lower`, or `upper` relative to the window passed to the child. |
 | `nodes_delta` | integer | Nodes consumed by the quiescence search. |
 | `seldepth` | integer | Seldepth counter at return. |
@@ -207,7 +212,7 @@ Every event also carries `schema`, `seq`, and `type`.
 | `round` | integer | Round number. |
 | `depth` | integer | Iteration depth of the completed round. |
 | `attempt` | integer | The accepted attempt number. |
-| `rank` | array | Up to W entries `{move, raw, cp, pv}`, sorted by `raw` descending, ties in root order. `raw` is root perspective; `cp` is omitted for a mate entry; `pv` starts with `move`. |
+| `rank` | array | Up to W entries `{move, raw, cp, wdl, pv}`, sorted by `raw` descending, ties in root order. `raw` is root perspective; `cp` and `wdl` are omitted for a mate entry; `pv` starts with `move`. |
 | `counters` | object | `best_move_changes` (the engine's root best-move change counter for the round), `seldepth` (the engine's counter at round end), and `nodes` (cumulative nodes since search start). |
 
 **`search_end`**
@@ -229,9 +234,10 @@ Every event also carries `schema`, `seq`, and `type`.
 - In an accepted attempt, the root call that establishes the round's value is exact: the candidate at ply one whose call is `first` or `promote` and whose move is `round_end.rank[0].move` has `bound = exact`, its `raw` is the negation of `rank[0].raw`, and its `pv` equals `rank[0].pv`. A root call that establishes the round's value and returns a bound is a contract violation; synthesis must stop rather than coerce it. Full-window calls at internal recorded nodes may return a bound. That is normal PVS evidence, not a contract violation: the events stay in the file, the translator writes the child's records when they are used as evidence and writes no evaluation for that node, and synthesis does not stop.
 - A null-window child `lower` bound is a fail-low of the move; it is the only evidence for a refutation and carries no value. A null-window child `upper` bound is a fail-high of the move and is not a statement by itself. At the root, with teacher width one, it must be followed by a deeper null-window test or a full-window `promote`; a root fail-high without a follow-up is a contract violation. At an internal node the move may end in a beta cutoff with no follow-up; the candidate stays in the file and the translator does not represent it.
 - All calls that test the same candidate in one attempt share the same `order`.
-- When a frontier event exists, its `raw` equals the `raw` of the corresponding candidate event, and its `cp` equals the candidate's `cp` when present.
-- In an accepted attempt, `round_end.rank[0].raw` equals `attempt.raw` and its `cp` equals `attempt.cp` when present. `rank` is sorted by `raw` descending.
+- When a frontier event exists, its `raw` equals the `raw` of the corresponding candidate event, and its `cp` and `wdl` equal the candidate's when present.
+- In an accepted attempt, `round_end.rank[0].raw` equals `attempt.raw`, its `cp` equals `attempt.cp`, and its `wdl` equals `attempt.wdl` when present. `rank` is sorted by `raw` descending.
 - `cp` is present exactly when `raw` is not a mate score; its value equals the engine's UCI conversion at the event's position.
+- `wdl` is present exactly when `raw` is not a mate score; it is three nonnegative integers that sum to 1000 and equal the engine's win-rate model applied to `raw` at the event's position.
 - Round `depth` values are iteration depths. A candidate's `depth` is the actual child depth argument and may differ.
 - `search_end.bestmove` equals `rank[0].move` of the deepest `round_end`; `ponder`, when present, is the second move of that variation.
 - Principal variations are legal from the root and stop at a rule terminal. The record is raw search evidence: it is not rank-reflected and is not a token trace.
@@ -259,17 +265,17 @@ Rule terminals are not separate events. Checkmate, stalemate, repetition, and th
 
 ### Use by the translator
 
-- Take the accepted attempt of each round. The root call that establishes the round's value is a full-window exact call; its child's records are the evidence for that value. The round's evaluation is `rank[0].cp` when present and `rank[0].raw` otherwise.
+- Take the accepted attempt of each round. The root call that establishes the round's value is a full-window exact call; its child's records are the evidence for that value. The round's evaluation is the WDL-derived scalar `(rank[0].wdl[0] - rank[0].wdl[2]) / 1000` when `wdl` is present, and `rank[0].raw` (a mate score) otherwise. `rank[0].cp` remains available for analysis but is not quantized.
 - Full-window calls at internal recorded nodes may return a bound; they are normal PVS evidence. The translator writes the child's records when it uses them and writes no evaluation for the node whose call is bounded.
 - A null-window child `lower` bound (the move fails low) is a refutation and carries no value. A null-window child `upper` bound at the root is replaced by the full-window re-search that follows it; at an internal node a beta cutoff may leave it without a follow-up, and the candidate is not represented.
 - Pruned candidates and auxiliary searches have no events and are not represented. Failed attempts are evidence that the search retried, not part of the demonstrated line.
-- The deepest round's `rank[0]` supplies the final move, evaluation, and variation. The root's evaluation is `attempt.raw` and `attempt.cp` of the deepest accepted attempt.
+- The deepest round's `rank[0]` supplies the final move, evaluation, and variation. The root's evaluation is `attempt.raw` with the WDL-derived scalar from `attempt.wdl` of the deepest accepted attempt; `attempt.cp` remains available for analysis.
 
 ### Manifest
 
 The collection manifest records, at minimum:
 
-- the record schema version and the SHA-256 of this document;
+- the record schema version and the SHA-256 of this document, which together identify the teacher contract; a revision of either changes that identity, and the manifest is regenerated with the contract;
 - the SHA-256 of the collection configuration;
 - the engine name, the treatment binary's SHA-256, the instrumentation diff's SHA-256, and the control binary's identity;
 - the effective search options: depth, teacher width, threads, hash size, and the fixed options;
