@@ -6,40 +6,26 @@ from pathlib import Path
 import chess
 import numpy as np
 import torch
-from teacher_release import sequence_row, write_sequence_dataset
+from sequence_fixtures import sequence_row, write_sequence_dataset
 
-from pondera.chess.codec import decode_board, encode_board
-from pondera.chess.symmetry import TOKEN_MIRROR
-from pondera.chess.tracker import PathTracker
+from pondera.chess.codec import encode_board
 from pondera.chess.vocabulary import (
-    BACK,
-    BOARD,
     CHESS_TOKENIZER_VERSION,
+    END,
     FINAL,
-    HALFMOVE,
-    IDX_TO_UCI_MOVE,
-    MATE_LOSS,
-    MATE_WIN,
     MOVE,
     PAD,
-    REPETITION,
-    RESET,
-    SIDE,
     UCI_MOVE_TO_IDX,
-    VALUE,
 )
 from pondera.data.positions import SEQUENCE_FORMAT_VERSION, SequencePositions
 from pondera.data.trace import (
     ROLE_CONTROL,
-    ROLE_EVAL,
+    ROLE_FINAL_EVAL,
     ROLE_FINAL_MOVE,
     ROLE_MOVE,
     ROLE_PAD,
-    ROLE_TOOL,
     TRACE_GRAMMAR_VERSION,
-    TraceError,
     TraceWriter,
-    replay,
 )
 from pondera.models.factory import create_model
 from pondera.training.sequence import SequenceCollator
@@ -51,378 +37,28 @@ BLACK_TO_MOVE.push_uci("e2e4")
 BLACK_TO_MOVE = BLACK_TO_MOVE.fen(en_passant="fen")
 CASTLING_FEN = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"
 
-# Frozen hand constant: value 0.5 lies in value bin 15.
-BIN_OF_0_5 = 15
-
 
 def move_token(uci):
     return MOVE + UCI_MOVE_TO_IDX[uci]
 
 
-class ReplayTests(unittest.TestCase):
-    def test_writer_program_replays_against_python_chess(self):
-        writer = TraceWriter(chess.STARTING_FEN)
-        writer.move("e2e4")
-        writer.move("e7e5")
-        writer.back()
-        writer.board()
-        writer.evaluate(value=0.5)
-        writer.reset()
-        writer.final("d2d4")
-
-        program = replay(writer.tokens, chess.STARTING_FEN)
-        self.assertEqual(
-            [step.operation for step in program.steps],
-            ["move", "move", "back", "board", "evaluate", "reset", "final"],
-        )
-        self.assertEqual(
-            [step.path for step in program.steps[:3]],
-            [("e2e4",), ("e2e4", "e7e5"), ("e2e4",)],
-        )
-        self.assertEqual(program.steps[3].path, ("e2e4",))
-        self.assertEqual(program.steps[5].path, ())
-        self.assertEqual(program.final_move, "d2d4")
-
-        # python-chess is the independent source for SAN and legal sets.
-        board = chess.Board(chess.STARTING_FEN)
-        self.assertEqual(program.steps[0].san, board.san(chess.Move.from_uci("e2e4")))
-        board.push_uci("e2e4")
-        self.assertEqual(program.steps[1].san, board.san(chess.Move.from_uci("e7e5")))
-        self.assertIn(
-            chess.Move.from_uci(program.final_move), chess.Board().legal_moves
-        )
-        self.assertEqual(
-            program.steps[3].observed.split()[:5],
-            board.fen(en_passant="fen").split()[:5],
-        )
-
-        # Roles: the BOARD request is a control, its response is tool context,
-        # and only the token after FINAL is the final move.
-        board_step = program.steps[3]
-        self.assertEqual(program.roles[board_step.start], ROLE_CONTROL)
-        self.assertTrue(
-            all(
-                program.roles[index] == ROLE_TOOL
-                for index in range(board_step.start + 1, board_step.end)
-            )
-        )
-        self.assertEqual(program.roles[program.steps[0].start], ROLE_MOVE)
-        self.assertEqual(program.roles[program.steps[4].start], ROLE_EVAL)
-        self.assertEqual(program.roles[-2], ROLE_CONTROL)
-        self.assertEqual(program.roles[-1], ROLE_FINAL_MOVE)
-
-        rendered = program.render()
-        self.assertIn("e2e4", rendered)
-        self.assertIn(program.steps[3].observed, rendered)
-        self.assertIn("FINAL", rendered)
-        self.assertIn("d2d4", rendered)
-
-    def test_writer_exposes_the_current_path_and_legal_moves(self):
-        writer = TraceWriter(chess.STARTING_FEN)
-        board = chess.Board()
-        self.assertEqual(writer.path, ())
-        self.assertEqual(
-            writer.legal_moves(), sorted(move.uci() for move in board.legal_moves)
-        )
-        writer.move("e2e4")
-        board.push_uci("e2e4")
-        self.assertEqual(writer.path, ("e2e4",))
-        self.assertEqual(
-            writer.legal_moves(), sorted(move.uci() for move in board.legal_moves)
-        )
-        writer.back()
-        self.assertEqual(writer.path, ())
-
-    def test_reset_returns_to_the_root_from_any_depth(self):
-        writer = TraceWriter(chess.STARTING_FEN)
-        writer.move("e2e4")
-        writer.move("e7e5")
-        writer.reset()
-        self.assertEqual(writer.steps[-1].path, ())
-        writer.move("d2d4")
-        writer.final("g1f3")
-        program = replay(writer.tokens, chess.STARTING_FEN)
-        self.assertEqual(program.steps[2].operation, "reset")
-        self.assertEqual(program.steps[3].path, ("d2d4",))
-        self.assertEqual(program.final_move, "g1f3")
-
-        # RESET at the root is a valid no-op control.
-        writer = TraceWriter(chess.STARTING_FEN)
-        writer.reset()
-        writer.final("e2e4")
-        program = replay(writer.tokens, chess.STARTING_FEN)
-        self.assertEqual(program.steps[0].path, ())
-
-    def test_back_at_the_root_is_illegal(self):
-        writer = TraceWriter(chess.STARTING_FEN)
-        with self.assertRaises(ValueError):
-            writer.back()
-        tokens = [BACK, FINAL, move_token("e2e4")]
-        with self.assertRaises(TraceError) as context:
-            replay(tokens, chess.STARTING_FEN)
-        self.assertEqual(context.exception.tag, "back_at_root")
-
-        # BACK is legal after a move and yields the parent path.
-        writer.move("e2e4")
-        writer.back()
-        writer.final("d2d4")
-        program = replay(writer.tokens, chess.STARTING_FEN)
-        self.assertEqual(program.steps[-2].path, ())
-
-    def test_final_uses_the_root_legal_set_not_the_current_node(self):
-        writer = TraceWriter(chess.STARTING_FEN)
-        writer.move("e2e4")
-        # d2d4 is legal at the root but illegal at the current black-to-move node.
-        writer.final("d2d4")
-        program = replay(writer.tokens, chess.STARTING_FEN)
-        self.assertEqual(program.final_move, "d2d4")
-
-        # e7e5 is legal at the current node but not at the root.
-        tokens = [move_token("e2e4"), FINAL, move_token("e7e5")]
-        with self.assertRaises(TraceError) as context:
-            replay(tokens, chess.STARTING_FEN)
-        self.assertEqual(context.exception.tag, "final_illegal")
-
-        with self.assertRaises(ValueError):
-            TraceWriter(chess.STARTING_FEN).final("e7e5")
-
-    def test_final_terminates_and_rejects_trailing_tokens(self):
-        writer = TraceWriter(chess.STARTING_FEN)
-        writer.final("e2e4")
-        self.assertTrue(writer.finished)
-        for operation in (
-            lambda: writer.move("d2d4"),
-            writer.back,
-            writer.reset,
-            lambda: writer.evaluate(value=0.1),
-            writer.board,
-            lambda: writer.final("d2d4"),
-        ):
-            with self.assertRaises(ValueError):
-                operation()
-
-        tokens = [FINAL, move_token("e2e4")]
-        program = replay([*tokens, PAD, PAD], chess.STARTING_FEN)
-        self.assertEqual(program.tokens, tuple(tokens))
-        for trailing in (BACK, RESET, BOARD, VALUE + 3):
-            with self.subTest(trailing=trailing):
-                with self.assertRaises(TraceError) as context:
-                    replay([*tokens, trailing], chess.STARTING_FEN)
-                self.assertEqual(context.exception.tag, "trailing_tokens")
-
-        for tokens in ([FINAL], [FINAL, VALUE + 3]):
-            with self.assertRaises(TraceError) as context:
-                replay(tokens, chess.STARTING_FEN)
-            self.assertEqual(context.exception.tag, "final_without_move")
-
-    def test_malformed_programs_report_their_first_broken_rule(self):
-        cases = {
-            "missing_final": [move_token("e2e4")],
-            "unexpected_token": [SIDE + 1],
-            "pad_inside_trace": [move_token("e2e4"), PAD, FINAL, move_token("d2d4")],
-        }
-        for expected, tokens in cases.items():
-            with self.subTest(error=expected):
-                with self.assertRaises(TraceError) as context:
-                    replay(tokens, chess.STARTING_FEN)
-                self.assertEqual(context.exception.tag, expected)
-
-    def test_claim_draw_is_not_a_legal_move(self):
-        # The pseudo-move stays in the action vocabulary but never passes rules.
-        self.assertIn("<claim_draw>", UCI_MOVE_TO_IDX)
-        writer = TraceWriter(chess.STARTING_FEN)
-        with self.assertRaises(ValueError):
-            writer.move("<claim_draw>")
-        with self.assertRaises(ValueError):
-            writer.final("<claim_draw>")
-        tokens = [move_token("<claim_draw>"), FINAL, move_token("e2e4")]
-        with self.assertRaises(TraceError) as context:
-            replay(tokens, chess.STARTING_FEN)
-        self.assertEqual(context.exception.tag, "illegal_move")
-
-    def test_evaluations_use_root_perspective_tokens(self):
-        writer = TraceWriter(BLACK_TO_MOVE)
-        writer.evaluate(value=0.5)
-        writer.evaluate(mate=3, win=True)
-        writer.evaluate(mate=2, win=False)
-        writer.reset()
-        writer.final("c7c5")
-
-        program = replay(writer.tokens, BLACK_TO_MOVE)
-        self.assertEqual(writer.tokens[0], VALUE + BIN_OF_0_5)
-        self.assertEqual(writer.tokens[1], MATE_WIN + 3)
-        self.assertEqual(writer.tokens[2], MATE_LOSS + 2)
-        self.assertEqual((program.steps[1].mate, program.steps[1].mate_win), (3, True))
-        self.assertEqual((program.steps[2].mate, program.steps[2].mate_win), (2, False))
-        self.assertGreater(program.steps[0].evaluation, 0)
-        # Distance zero still distinguishes a win atom from a loss atom.
-        writer = TraceWriter(BLACK_TO_MOVE)
-        writer.evaluate(mate=0, win=True)
-        writer.evaluate(mate=0, win=False)
-        writer.final("c7c5")
-        program = replay(writer.tokens, BLACK_TO_MOVE)
-        self.assertEqual(writer.tokens[0], MATE_WIN)
-        self.assertEqual(writer.tokens[1], MATE_LOSS)
-        self.assertEqual(
-            [(step.mate, step.mate_win) for step in program.steps[:2]],
-            [(0, True), (0, False)],
-        )
-
-    def test_board_observations_match_the_true_position(self):
-        writer = TraceWriter(CASTLING_FEN)
-        writer.move("e1g1")
-        writer.board()
-        writer.final("a1b1")
-        program = replay(writer.tokens, CASTLING_FEN)
-        board = chess.Board(CASTLING_FEN)
-        board.push_uci("e1g1")
-        step = program.steps[1]
-        self.assertEqual(
-            step.observed.split()[:5], board.fen(en_passant="fen").split()[:5]
-        )
-        self.assertEqual(step.repetition, 1)
-        decoded, repetition = decode_board(
-            np.asarray(writer.tokens[step.start + 1 : step.end])
-        )
-        self.assertEqual(decoded.split()[:5], board.fen(en_passant="fen").split()[:5])
-        self.assertEqual(repetition, 1)
-
-    def test_board_observation_saturates_large_halfmove_clock(self):
-        root_fen = "7k/8/8/8/8/8/8/K6R w - - 99 1"
-        writer = TraceWriter(root_fen)
-        writer.move("h1h2")
-        writer.move("h8g8")
-        writer.board()
-        writer.final("h1h2")
-        board = chess.Board(root_fen)
-        board.push_uci("h1h2")
-        board.push_uci("h8g8")
-        self.assertEqual(board.halfmove_clock, 101)
-
-        program = replay(writer.tokens, root_fen)
-        step = program.steps[2]
-        self.assertEqual(step.position, board.fen(en_passant="fen"))
-        self.assertEqual(step.observed.split()[:4], board.fen().split()[:4])
-        self.assertEqual(step.observed.split()[4], "100")
-        self.assertEqual(writer.tokens[step.end - 2], HALFMOVE + 100)
-
-    def test_board_observation_rejects_wrong_or_broken_content(self):
-        writer = TraceWriter(chess.STARTING_FEN)
-        writer.move("e2e4")
-        writer.board()
-        writer.final("d2d4")
-        step = writer.steps[1]
-        tokens = list(writer.tokens)
-
-        wrong = list(tokens)
-        wrong[step.start + 1] = 0  # a1 pawn atom, not the observed position
-        with self.assertRaises(TraceError) as context:
-            replay(wrong, chess.STARTING_FEN)
-        self.assertEqual(context.exception.tag, "board_mismatch")
-
-        truncated = tokens[: step.end - 1]
-        with self.assertRaises(TraceError) as context:
-            replay(truncated, chess.STARTING_FEN)
-        self.assertEqual(context.exception.tag, "board_truncated")
-
-        invalid = list(tokens)
-        invalid[step.end - 7] = SIDE  # duplicate side atom
-        with self.assertRaises(TraceError) as context:
-            replay(invalid, chess.STARTING_FEN)
-        self.assertEqual(context.exception.tag, "board_invalid")
-
-        # The observation carries the true halfmove clock and repetition count.
-        for offset, token in (
-            (step.end - 2, HALFMOVE + 7),  # a clock the position does not have
-            (step.end - 1, REPETITION + 1),  # claims a second occurrence
-        ):
-            with self.subTest(offset=offset):
-                wrong_counter = list(tokens)
-                wrong_counter[offset] = token
-                with self.assertRaises(TraceError) as context:
-                    replay(wrong_counter, chess.STARTING_FEN)
-                self.assertEqual(context.exception.tag, "board_mismatch")
-
-    def test_board_atoms_are_a_set_not_a_byte_sequence(self):
-        # Replay validates by decoding the observation, so piece atoms may
-        # arrive in any order and still describe the same position.
-        writer = TraceWriter(chess.STARTING_FEN)
-        writer.move("e2e4")
-        writer.board()
-        writer.final("d2d4")
-        step = writer.steps[1]
-        tokens = list(writer.tokens)
-        pieces = tokens[step.start + 1 : step.end - 8]
-        reordered = (
-            tokens[: step.start + 1] + list(reversed(pieces)) + tokens[step.end - 8 :]
-        )
-        self.assertNotEqual(reordered, tokens)
-        program = replay(reordered, chess.STARTING_FEN)
-        self.assertEqual(program.steps[1].observed, writer.steps[1].observed)
-
-
-class BlackRootMirrorTests(unittest.TestCase):
-    def test_board_response_mirrors_pieces_but_not_side_or_counters(self):
-        root = chess.Board()
-        for move in ("e2e4", "e7e5", "g1f3"):
-            root.push_uci(move)
-        root_fen = root.fen(en_passant="fen")
-        self.assertEqual(root.turn, chess.BLACK)
-        self.assertEqual(root.halfmove_clock, 1)
-
-        writer = TraceWriter(root_fen)
-        self.assertTrue(writer.mirrored)
-        writer.move("b8c6")  # odd ply: White to move again, clock 2
-        writer.board()
-        writer.final("d7d5")
-        program = replay(writer.tokens, root_fen)
-
-        true_board = chess.Board(root_fen)
-        true_board.push_uci("b8c6")
-        self.assertEqual(true_board.turn, chess.WHITE)
-        self.assertEqual(true_board.halfmove_clock, 2)
-        step = program.steps[1]
-        self.assertEqual(
-            step.observed.split()[:5], true_board.fen(en_passant="fen").split()[:5]
-        )
-        # The stored side atom names the true side, not the mirrored one.
-        self.assertEqual(step.observed.split()[1], "w")
-
-        stored = writer.tokens[step.start + 1 : step.end]
-        directly, _ = decode_board(stored)
-        self.assertEqual(directly.split()[1], "w")
-        self.assertNotEqual(directly.split()[0], true_board.board_fen())
-        absolute, _ = decode_board(np.asarray(TOKEN_MIRROR)[stored])
-        self.assertEqual(
-            absolute.split()[:5], true_board.fen(en_passant="fen").split()[:5]
-        )
-        # A naive Board.mirror() would flip the side to move; the response does not.
-        self.assertEqual(true_board.mirror().fen().split()[1], "b")
-
-    def test_black_root_moves_are_stored_reflected(self):
-        writer = TraceWriter(BLACK_TO_MOVE)
-        writer.move("e7e5")
-        writer.back()
-        writer.final("c7c5")
-        program = replay(writer.tokens, BLACK_TO_MOVE)
-        self.assertEqual(program.steps[0].path, ("e7e5",))
-        self.assertEqual(program.steps[0].uci, "e7e5")
-        self.assertEqual(program.steps[0].san, "e5")
-        self.assertEqual(program.final_move, "c7c5")
-        # The stored move is the rank reflection of the absolute move.
-        self.assertEqual(
-            IDX_TO_UCI_MOVE[writer.tokens[0] - MOVE],
-            "e2e4",
-        )
-
-    def test_root_repetition_reaches_the_observation(self):
-        tracker = PathTracker(chess.STARTING_FEN, repetition=3)
-        decoded, repetition = decode_board(tracker.board_tokens())
-        self.assertEqual(repetition, 3)
-        self.assertEqual(decoded.split()[:5], chess.Board().fen().split()[:5])
-        tracker.push("g1f3")
-        _, repetition = decode_board(tracker.board_tokens())
-        self.assertEqual(repetition, 1)
+def counter_row(fen, repetition=1):
+    """A small v2 trace: a candidate, its evaluation, and the label suffix."""
+    board = chess.Board(fen)
+    legal = sorted(move.uci() for move in board.legal_moves)
+    writer = TraceWriter(fen, repetition)
+    writer.depth()
+    writer.move(legal[0])
+    writer.evaluate(value=0.25)
+    writer.back()
+    writer.evaluate(value=0.25)
+    writer.final(legal[1])
+    writer.final_evaluate(value=0.25)
+    after = chess.Board(fen)
+    after.push_uci(legal[1])
+    writer.final_pv(sorted(move.uci() for move in after.legal_moves)[0])
+    writer.end()
+    return sequence_row(fen, writer.tokens, writer.roles, repetition)
 
 
 class DatasetContractTests(unittest.TestCase):
@@ -430,29 +66,20 @@ class DatasetContractTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-
-        def row(fen, repetition=1):
-            board = chess.Board(fen)
-            legal = sorted(move.uci() for move in board.legal_moves)
-            writer = TraceWriter(fen, repetition)
-            writer.board()
-            writer.move(legal[0])
-            writer.evaluate(value=0.25)
-            writer.back()
-            writer.final(legal[1])
-            return sequence_row(fen, writer.tokens, writer.roles, repetition)
-
         fens = [chess.STARTING_FEN, BLACK_TO_MOVE, CASTLING_FEN]
-        self.rows = [row(fen) for fen in fens]
+        self.rows = [counter_row(fen) for fen in fens]
         self.data = write_sequence_dataset(
             self.root / "data", {"train": self.rows, "val": self.rows[:2]}
         )
 
-    def test_manifest_carries_the_grammar_and_not_old_level_fields(self):
+    def test_manifest_carries_the_current_grammar(self):
         manifest = json.loads((self.data / "manifest.json").read_text())
         self.assertEqual(manifest["kind"], "teacher-sequence")
-        self.assertEqual(manifest["grammar_version"], 1)
-        self.assertEqual(manifest["format_version"], 2)
+        self.assertEqual(manifest["grammar_version"], TRACE_GRAMMAR_VERSION)
+        self.assertEqual(manifest["grammar_version"], 2)
+        self.assertEqual(manifest["format_version"], SEQUENCE_FORMAT_VERSION)
+        self.assertEqual(manifest["format_version"], 3)
+        self.assertEqual(manifest["tokenizer_version"], CHESS_TOKENIZER_VERSION)
         for retired in ("level", "line_bounds", "max_lines", "pv_limit"):
             self.assertNotIn(retired, manifest)
 
@@ -473,9 +100,14 @@ class DatasetContractTests(unittest.TestCase):
         self.assertEqual(trace[:length].tolist(), self.rows[0]["trace"].tolist())
         self.assertEqual(roles[:length].tolist(), self.rows[0]["roles"].tolist())
         self.assertTrue(np.all(roles[length:] == ROLE_PAD))
-        self.assertEqual(int(roles[length - 1]), ROLE_FINAL_MOVE)
+        # The decision follows FINAL, and the trace closes with <end>.
+        self.assertEqual(int(trace[length - 1]), END)
+        decision = int(np.flatnonzero(roles[:length] == ROLE_FINAL_MOVE)[0])
+        self.assertEqual(int(trace[decision - 1]), FINAL)
+        self.assertNotEqual(decision, length - 1)
+        self.assertEqual(int(roles[length - 1]), ROLE_CONTROL)
 
-    def test_collator_pads_tokens_and_roles_and_locates_the_final_move(self):
+    def test_collator_pads_tokens_and_locates_the_final_decision(self):
         positions = SequencePositions(self.data, "train")
         rows = [positions[index] for index in range(len(positions))]
         batch = SequenceCollator()(rows)
@@ -495,10 +127,76 @@ class DatasetContractTests(unittest.TestCase):
             self.assertTrue(
                 bool((batch["trace_roles"][index, length:] == ROLE_PAD).all())
             )
-            self.assertEqual(int(batch["final_move_index"][index]), length - 1)
-            self.assertEqual(
-                int(batch["trace_roles"][index, length - 1]), ROLE_FINAL_MOVE
+            decision = int(batch["final_move_index"][index])
+            self.assertEqual(int(roles[decision]), ROLE_FINAL_MOVE)
+            self.assertEqual(int(trace[decision - 1]), FINAL)
+            self.assertEqual(int(roles[length - 1]), ROLE_CONTROL)
+
+
+class CollatorContractTests(unittest.TestCase):
+    def setUp(self):
+        self.writer = TraceWriter(chess.STARTING_FEN)
+        self.writer.depth()
+        self.writer.move("e2e4")
+        self.writer.evaluate(value=0.25)
+        self.writer.back()
+        self.writer.final("d2d4")
+        self.writer.final_evaluate(value=0.25)
+        self.writer.final_pv("e7e5")
+        self.writer.end()
+        self.trace = self.writer.tokens.copy()
+        self.roles = self.writer.roles.copy()
+
+    def test_collator_rejects_invalid_trace_structure(self):
+        board = encode_board(chess.STARTING_FEN)
+        length = len(self.trace)
+        cases = {}
+        invalid = board.copy()
+        invalid[0] = 3006
+        cases["board vocabulary"] = (invalid, self.trace, length, self.roles)
+        invalid = self.trace.copy()
+        invalid[-1] = self.trace[-2]
+        cases["missing end"] = (board, invalid, length, self.roles)
+        invalid = self.trace.copy()
+        invalid[0] = 3006
+        cases["trace vocabulary"] = (board, invalid, length, self.roles)
+        invalid = self.roles.copy()
+        invalid[0] = 127
+        cases["invalid role"] = (board, self.trace, length, invalid)
+        cases["invalid length"] = (board, self.trace, len(self.trace) + 1, self.roles)
+
+        # A v1-style trace ending in FINAL and its move has no <end>.
+        legacy = self.trace[:5]
+        cases["v1 ending"] = (board, legacy, len(legacy), self.roles[:5])
+        for name, row in cases.items():
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                SequenceCollator()([row])
+
+    def test_collator_rejects_a_decision_that_does_not_follow_final(self):
+        roles = self.roles.copy()
+        decision = int(np.flatnonzero(roles == ROLE_FINAL_MOVE)[0])
+        roles[decision] = ROLE_MOVE
+        roles[decision - 2] = ROLE_FINAL_MOVE
+        with self.assertRaises(ValueError):
+            SequenceCollator()(
+                [(encode_board(chess.STARTING_FEN), self.trace, len(self.trace), roles)]
             )
+
+    def test_final_move_index_is_the_decision_not_the_end(self):
+        batch = SequenceCollator()(
+            [
+                (
+                    encode_board(chess.STARTING_FEN),
+                    self.trace,
+                    len(self.trace),
+                    self.roles,
+                )
+            ]
+        )
+        decision = int(batch["final_move_index"][0])
+        self.assertEqual(int(self.trace[decision]), move_token("d2d4"))
+        self.assertNotEqual(decision, len(self.trace) - 1)
+        self.assertEqual(int(self.roles[decision + 1]), ROLE_FINAL_EVAL)
 
 
 def write_shard(directory, index, fen):
@@ -506,6 +204,8 @@ def write_shard(directory, index, fen):
     board = chess.Board(fen)
     writer = TraceWriter(fen)
     writer.final(sorted(move.uci() for move in board.legal_moves)[0])
+    writer.final_evaluate(value=0.0)
+    writer.end()
     shard = directory / f"shard-{index:06d}"
     shard.mkdir()
     np.save(shard / "board_tokens.npy", encode_board(fen)[None, :])

@@ -40,10 +40,13 @@ def tiny_sequence(blocks=2):
 def sequence_inputs(walk=0):
     """One trace with `walk` move/BACK pairs before the final decision."""
     writer = TraceWriter(START)
+    writer.depth()
     for _ in range(walk):
         writer.move("e2e4")
         writer.back()
     writer.final("d2d4")
+    writer.final_evaluate(value=0.0)
+    writer.end()
     return {
         "ids": torch.from_numpy(encode_boards([START])),
         "trace_ids": torch.from_numpy(np.stack([writer.tokens])),
@@ -114,11 +117,12 @@ class SequenceProbeTests(unittest.TestCase):
         for block in model.backbone.cores[0].layers:
             with torch.no_grad():
                 block.key_value.weight.zero_()
-        # 150 move/BACK pairs plus FINAL and its move: 302 trace tokens, long
-        # enough to cross the probe's query chunk.
+        # 150 move/BACK pairs plus <depth>, FINAL, its decision, the label
+        # evaluation, and <end>: 305 trace tokens, long enough to cross the
+        # probe's query chunk.
         inputs = sequence_inputs(walk=150)
         trace_length = inputs["trace_ids"].shape[1]
-        self.assertEqual(trace_length, 302)
+        self.assertEqual(trace_length, 305)
         probe = InternalProbe(model)
         _, arrays = probe.collect(model, inputs)
         probe.close()

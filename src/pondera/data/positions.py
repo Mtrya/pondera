@@ -121,8 +121,9 @@ class SequencePositions(Dataset):
     """Board tokens with an encoded sequence trace (kind=teacher-sequence).
 
     Rows are (boards, trace tokens, trace length, trace roles). Every trace
-    ends with FINAL and its root move, so the last role is ROLE_FINAL_MOVE;
-    positions past the stored length are padding.
+    ends with ``<end>``; the FINAL decision carries ROLE_FINAL_MOVE and the
+    label suffix continues after it. Positions past the stored length are
+    padding.
     """
 
     def __init__(self, directory, split):

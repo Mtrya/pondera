@@ -14,10 +14,10 @@ to the root from any depth, and both leave evaluations untouched.
 The observation of a node is the board encoding of its absolute position:
 occupied-square piece-joint atoms plus the eight metadata atoms, including
 saturated halfmove and repetition counters. The tracker retains exact counters
-for game rules. Repetition is the number
-of times the current position has occurred, counting the root's prior history:
-python-chess judges repetitions along the current path, and a current position
-equal to the root adds the root's pre-history occurrences.
+for game rules. Two repetition readings stay separate: ``repetition`` is the
+observation's count and includes the root's prior history, while
+``search_terminal`` applies the engine's search rule, which knows only the
+written path and ignores that history.
 """
 
 import chess
@@ -100,6 +100,32 @@ class PathTracker:
         if self._position_key(self.board) == self._root_key:
             count += self.root_repetition - 1
         return count
+
+    def search_terminal(self):
+        """Search-rule terminal verdict for the current node.
+
+        Returns ``"mate"`` for checkmate, ``"draw"`` for stalemate, repetition,
+        or the 50-move rule, and ``None`` when the search may continue. Only
+        the written path counts: the root's pre-history repetition is ignored,
+        and a second occurrence of the root position is not a draw while a
+        third is. A position that occurred once strictly after the root is a
+        draw. Checkmate takes precedence over the 50-move rule, and
+        insufficient material is not a terminal: the engine keeps searching
+        there, so ``board.is_game_over()`` must not stand in for this rule.
+        """
+        if self.board.is_checkmate():
+            return "mate"
+        if self.board.is_stalemate():
+            return "draw"
+        current = self._position_key(self.board)
+        prior = sum(
+            1 for board in self._stack[:-1] if self._position_key(board) == current
+        )
+        if prior >= 2 or (prior == 1 and current != self._root_key):
+            return "draw"
+        if self.board.halfmove_clock >= 100:
+            return "draw"
+        return None
 
     def board_tokens(self):
         """Current position as piece-joint atoms plus eight metadata atoms."""

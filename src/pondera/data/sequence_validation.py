@@ -13,14 +13,16 @@ from pondera.chess.codec import BOARD_TOKENS_MAX, encode_board
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import (
     CHESS_TOKENIZER_VERSION,
+    DEPTH,
     IDX_TO_UCI_MOVE,
     MOVE,
     PAD,
+    VALUE,
 )
 from pondera.data.storage import load_manifest, write_manifest
 from pondera.data.trace import ROLE_COUNT, TRACE_GRAMMAR_VERSION, replay
 
-SEQUENCE_FORMAT_VERSION = 2
+SEQUENCE_FORMAT_VERSION = 3
 TRACE_ARRAYS = ("board_tokens", "trace_tokens", "trace_len", "trace_roles")
 STATE_ARRAYS = (
     "state_no_tool",
@@ -30,6 +32,9 @@ STATE_ARRAYS = (
     "state_value",
 )
 SEQUENCE_ARRAYS = (*TRACE_ARRAYS, *STATE_ARRAYS, "state_count")
+# The label region after FINAL is not a thinking boundary; truncation states
+# stop at the last thought operation.
+FINAL_SUFFIX_OPS = frozenset({"final", "final_evaluate", "final_pv", "end"})
 ROOT_SET_METADATA = frozenset(
     {"root_selection", "root_selections", "roots", "root_sets"}
 )
@@ -191,7 +196,8 @@ def verify_shard_files(release_dir, shard, expected_metadata=None):
 def _validate_shard_rows(
     release_dir, shard, teachers, expected_metadata=None, expected_roots=None
 ):
-    _, rows, arrays = verify_shard_files(release_dir, shard, expected_metadata)
+    manifest, rows, arrays = verify_shard_files(release_dir, shard, expected_metadata)
+    teacher_width = int(manifest.get("teacher_width", 1))
     identities = []
     counts = Counter()
     state_total = 0
@@ -229,10 +235,13 @@ def _validate_shard_rows(
             arrays["trace_roles"][index, length:] == 0
         ):
             raise ValueError(f"Trace padding is invalid: {row['root_id']}")
-        program = replay(tokens, row["fen"], row["repetition"])
-        if program.final_move_index != length - 1 or not np.array_equal(
-            program.roles, arrays["trace_roles"][index, :length]
-        ):
+        program = replay(
+            tokens,
+            row["fen"],
+            row["repetition"],
+            teacher_width=teacher_width,
+        )
+        if not np.array_equal(program.roles, arrays["trace_roles"][index, :length]):
             raise ValueError(f"Trace roles disagree with replay: {row['root_id']}")
         max_trace = max(max_trace, length)
 
@@ -245,7 +254,12 @@ def _validate_shard_rows(
         no_tool_tokens = list(tokens)
         for start, end in reversed(board_spans):
             del no_tool_tokens[start:end]
-        no_tool = replay(no_tool_tokens, row["fen"], row["repetition"])
+        no_tool = replay(
+            no_tool_tokens,
+            row["fen"],
+            row["repetition"],
+            teacher_width=teacher_width,
+        )
         expected_boundaries = []
         operation = 0
         previous_no_tool_end = 0
@@ -262,7 +276,7 @@ def _validate_shard_rows(
             ):
                 raise ValueError(f"Tool and no-tool traces differ: {row['root_id']}")
             previous_no_tool_end = no_tool_step.end
-            if step.operation != "final":
+            if step.operation not in FINAL_SUFFIX_OPS:
                 expected_boundaries.append((step.end, no_tool_step.end))
             operation += 1
         if operation != len(no_tool.steps):
@@ -286,14 +300,25 @@ def _validate_shard_rows(
                     f"Truncation-state padding is invalid: {row['root_id']}"
                 )
         basis = arrays["state_basis"][index, :count]
-        if np.any((basis < 0) | (basis > 2)):
+        rounds = int(np.count_nonzero(np.asarray(tokens) == DEPTH))
+        if np.any((basis < 0) | (basis > rounds)):
             raise ValueError(f"Truncation-state basis is invalid: {row['root_id']}")
         mirrored = board.turn == chess.BLACK
-        for token in arrays["state_best"][index, :count]:
-            token = int(token)
-            if not MOVE <= token < MOVE + len(IDX_TO_UCI_MOVE):
+        best = arrays["state_best"][index, :count]
+        values = arrays["state_value"][index, :count]
+        for move_token, value_token in zip(best, values):
+            move_token, value_token = int(move_token), int(value_token)
+            if move_token == -1 or value_token == -1:
+                if move_token != -1 or value_token != -1:
+                    raise ValueError(
+                        f"Truncation-state champion is half unset: {row['root_id']}"
+                    )
+                continue
+            if not MOVE <= move_token < MOVE + len(IDX_TO_UCI_MOVE):
                 raise ValueError(f"Truncation-state move is invalid: {row['root_id']}")
-            uci = IDX_TO_UCI_MOVE[token - MOVE]
+            if not VALUE <= value_token < PAD:
+                raise ValueError(f"Truncation-state value is invalid: {row['root_id']}")
+            uci = IDX_TO_UCI_MOVE[move_token - MOVE]
             if mirrored:
                 uci = reflect_uci(uci)
             if chess.Move.from_uci(uci) not in board.legal_moves:

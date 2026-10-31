@@ -29,10 +29,13 @@ def trace_of(fen):
     board = chess.Board(fen)
     legal = sorted(move.uci() for move in board.legal_moves)
     writer = TraceWriter(fen)
+    writer.depth()
     writer.move(legal[0])
     writer.evaluate(value=0.5)
     writer.back()
     writer.final(legal[1])
+    writer.final_evaluate(value=0.5)
+    writer.end()
     return torch.from_numpy(np.stack([writer.tokens]))
 
 
@@ -41,6 +44,8 @@ def final_trace(fen):
     move = sorted(move.uci() for move in board.legal_moves)[0]
     writer = TraceWriter(fen)
     writer.final(move)
+    writer.final_evaluate(value=0.0)
+    writer.end()
     return torch.from_numpy(np.stack([writer.tokens]))
 
 
@@ -71,7 +76,7 @@ class SequencePolicyTests(unittest.TestCase):
         # Causal contract: a prediction may not depend on its own target or any
         # later token, and the first target must move with the board.
         trace = trace_of(chess.STARTING_FEN)
-        self.assertEqual(trace.shape[1], 5)
+        self.assertEqual(trace.shape[1], 8)
         perturbed = trace.clone()
         perturbed[0, 2] = RESET
         reference = self.model.trace_logits(self.ids[:1], trace_ids=trace)

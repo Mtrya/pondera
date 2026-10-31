@@ -8,7 +8,7 @@
 - `vocabulary.py` + `vocabulary.txt`：词表的唯一权威。`vocabulary.txt` 一行一个 token 的规范名字，行号即 id；`vocabulary.py` 定义各段的算术布局常量，并在导入时校验文件与布局一致。词表的数值语义（value 分箱边界等）不在此文件。
 - `codec.py`：FEN/重复计数与 token 数组之间的编解码、合法走法索引，以及 value/mate token 的数值语义（分箱边界、代表值、mate 覆盖）。
 - `symmetry.py`：黑白镜像——token 镜像表、UCI 走法反射、走法置换表。
-- `tracker.py`：纯规则路径状态机——根局面与重复计数、绝对 UCI 路径、当前 python-chess 局面、合法走法与 BOARD 观测编码。不做评估与搜索，不 import data/models/training。
+- `tracker.py`：纯规则路径状态机——根局面与两种重复口径（观察编码含根前历史，搜索终局只看已写路径）、绝对 UCI 路径、当前 python-chess 局面、合法走法与 BOARD 观测编码。不做评估与搜索，不 import data/models/training。
 
 ## 稳定性提示
 

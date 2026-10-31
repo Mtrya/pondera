@@ -2,16 +2,15 @@
 
 Follows the depth.py training skeleton (resume, schedule, tracking) under the
 sequence contract: the board prefix is attended bidirectionally, the trace
-suffix causally, and supervision is shifted next-token CE on generated trace
-tokens. The loss averages generated context tokens and the final move with
-equal weight; an external BOARD response is context only. Evaluation reports
-the aggregate loss and top-1 accuracy for validation and a frozen evenly
-spaced train probe, their gaps, per-role cross-entropy, and optional internal
-health probes. Training accounts actual board and trace tokens plus analytical
-FLOPs; ``train_flops_budget`` replaces the step-count schedule and stop with
-that compute budget while checkpoints retain step and compute together. This
-trainer intentionally duplicates the depth.py boilerplate instead of sharing
-it: the two data and model contracts evolve independently.
+suffix causally, and supervision is shifted next-token CE on every generated
+trace token with equal weight. Tool responses are context only. Evaluation
+reports the aggregate loss and top-1 accuracy for validation and a frozen
+evenly spaced train probe, their gaps, per-role cross-entropy, and optional
+internal health probes. Training accounts actual board and trace tokens plus
+analytical FLOPs; ``train_flops_budget`` replaces the step-count schedule and
+stop with that compute budget while checkpoints retain step and compute
+together. This trainer intentionally duplicates the depth.py boilerplate
+instead of sharing it: the two data and model contracts evolve independently.
 """
 
 import argparse
@@ -32,10 +31,9 @@ from transformers import get_cosine_schedule_with_warmup
 from pondera.chess.vocabulary import (
     BOARD_VOCAB_SIZE,
     CHESS_VOCAB_SIZE,
+    END,
     FINAL,
-    MOVE,
     PAD,
-    VALUE,
 )
 from pondera.data.positions import SequencePositions
 from pondera.data.sequence_validation import sequence_data_identity
@@ -43,9 +41,12 @@ from pondera.data.trace import (
     ROLE_CONTROL,
     ROLE_COUNT,
     ROLE_EVAL,
+    ROLE_FINAL_EVAL,
     ROLE_FINAL_MOVE,
+    ROLE_FINAL_PV,
     ROLE_MOVE,
     ROLE_PAD,
+    ROLE_REFUTED,
     ROLE_TOOL,
 )
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
@@ -120,12 +121,14 @@ class SequenceTrainConfig:
 
 @dataclass
 class SequenceCollator:
-    """Pad stored traces and roles, and locate each row's final move.
+    """Pad stored traces and roles, and locate each row's final decision.
 
     The trace already carries its presentation order. Board rows come padded
     to their shard's width, which can differ across shards; they are repadded
-    to the batch maximum. Every row must end with the FINAL delimiter and its
-    root move, which is the last token and the only ROLE_FINAL_MOVE position.
+    to the batch maximum. Every row ends with ``<end>``, and exactly one FINAL
+    delimiter is followed by the decision that carries ROLE_FINAL_MOVE. The
+    label suffix continues after that decision, so the final move is not the
+    last token.
     """
 
     def __call__(self, rows):
@@ -141,24 +144,25 @@ class SequenceCollator:
         traces, roles, final_moves = [], [], []
         for _, trace, trace_len, trace_roles in rows:
             trace_len = int(trace_len)
-            if len(trace) != len(trace_roles) or not 2 <= trace_len <= len(trace):
+            if len(trace) != len(trace_roles) or not 4 <= trace_len <= len(trace):
                 raise ValueError("A trace row has inconsistent token boundaries")
             stored = trace[:trace_len]
             if np.any((stored < 0) | (stored >= CHESS_VOCAB_SIZE)):
                 raise ValueError("A trace row contains an out-of-vocabulary token")
-            if stored[-2] != FINAL or not MOVE <= stored[-1] < VALUE:
-                raise ValueError("A trace row must end with FINAL and a move token")
+            if stored[-1] != END or np.count_nonzero(stored == END) != 1:
+                raise ValueError("A trace row must end with <end>")
             stored_roles = trace_roles[:trace_len]
             if np.any((stored_roles < 0) | (stored_roles >= ROLE_COUNT)):
                 raise ValueError("A trace row contains an invalid token role")
             final = np.flatnonzero(stored_roles == ROLE_FINAL_MOVE)
             if len(final) != 1:
                 raise ValueError("A trace row needs exactly one final move role")
-            if final[0] != trace_len - 1:
-                raise ValueError("The final move must close the trace")
+            decision = int(final[0])
+            if decision == 0 or stored[decision - 1] != FINAL:
+                raise ValueError("The final move must follow FINAL")
             traces.append(stored)
             roles.append(stored_roles)
-            final_moves.append(int(final[0]))
+            final_moves.append(decision)
         width = max((len(trace) for trace in traces), default=0)
         trace_ids = np.full((len(traces), width), PAD, dtype=np.int16)
         role_ids = np.full((len(roles), width), ROLE_PAD, dtype=np.int8)
@@ -182,19 +186,22 @@ ROLE_LOSS_NAMES = {
     "move": ROLE_MOVE,
     "evaluation": ROLE_EVAL,
     "control": ROLE_CONTROL,
-    "final": ROLE_FINAL_MOVE,
+    "refuted": ROLE_REFUTED,
+    "final_move": ROLE_FINAL_MOVE,
+    "final_line": ROLE_FINAL_PV,
+    "final_evaluation": ROLE_FINAL_EVAL,
 }
 
 
 def trace_loss_parts(model, inputs):
-    """Token CE and masks behind the equal-weight aggregate trace loss.
+    """Token CE and masks behind the equal-weight trace loss.
 
-    The generated-context mean covers moves, evaluations, controls, and the
-    FINAL delimiter: every target that is neither the final move nor an
-    external tool response nor padding. A BOARD request is a control token and
-    is supervised; its response is context only. The final move has its own
-    mean, so the two objectives are equally weighted regardless of trace
-    length.
+    Every generated token is one next-token target, so the loss is the plain
+    mean CE over all roles except tool responses and padding. Thought tokens,
+    the FINAL decision, the label evaluation, the best line, and ``<end>``
+    carry the same weight; trace length and role mix do not rescale any part.
+    A BOARD request is a control token and is supervised; its response is
+    context only. The per-role sums are diagnostics and do not enter the loss.
     """
     trace_ids = inputs["trace_ids"]
     roles = inputs["trace_roles"]
@@ -206,16 +213,13 @@ def trace_loss_parts(model, inputs):
         reduction="none",
     ).reshape(trace_ids.shape)
     generated = (roles != ROLE_PAD) & (roles != ROLE_TOOL)
-    final_mask = roles == ROLE_FINAL_MOVE
-    context_mask = generated & ~final_mask
-    loss = (ce * context_mask).sum() / context_mask.sum().clamp_min(1)
-    loss = loss + (ce * final_mask).sum() / final_mask.sum().clamp_min(1)
-    return loss, ce, logits, generated, final_mask
+    loss = (ce * generated).sum() / generated.sum().clamp_min(1)
+    return loss, ce, logits, generated
 
 
 def trace_loss(model, inputs):
-    """Equal-weight generated-context CE and final-move CE."""
-    loss, _, logits, generated, _ = trace_loss_parts(model, inputs)
+    """Equal-weight next-token CE over generated trace tokens."""
+    loss, _, logits, generated = trace_loss_parts(model, inputs)
     return loss, logits, generated
 
 
@@ -386,7 +390,7 @@ def train(
                 for key, value in eval_collate([data[i] for i in selected]).items()
             }
             with autocast():
-                loss, ce, logits, _, _ = trace_loss_parts(model, inputs)
+                loss, ce, logits, _ = trace_loss_parts(model, inputs)
             loss_sum += float(loss) * len(selected)
             for name, (total, tokens) in role_loss_totals(
                 ce, inputs["trace_roles"]

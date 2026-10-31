@@ -55,7 +55,7 @@ forbidden_modules = ["pondera.data", "pondera.training", "pondera.inference", "p
 name = "Training is separate from inference and evaluation"
 type = "forbidden"
 source_modules = ["pondera.training"]
-forbidden_modules = ["pondera.inference", "pondera.evaluation", "pondera.data.annotation"]
+forbidden_modules = ["pondera.inference", "pondera.evaluation"]
 
 [[tool.importlinter.contracts]]
 name = "Inference does not import training or evaluation"

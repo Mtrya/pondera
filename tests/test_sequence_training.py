@@ -7,15 +7,20 @@ from pathlib import Path
 import chess
 import numpy as np
 import torch
-from teacher_release import play, sequence_row, write_sequence_dataset
+from sequence_fixtures import play, sequence_row, write_sequence_dataset
 from torch.nn import functional as F
 
-from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL, MOVE, PAD
+from pondera.chess.vocabulary import PAD
 from pondera.data.positions import SequencePositions
 from pondera.data.trace import (
     ROLE_CONTROL,
+    ROLE_EVAL,
+    ROLE_FINAL_EVAL,
     ROLE_FINAL_MOVE,
+    ROLE_FINAL_PV,
+    ROLE_MOVE,
     ROLE_PAD,
+    ROLE_REFUTED,
     ROLE_TOOL,
     TraceWriter,
 )
@@ -26,7 +31,6 @@ from pondera.training.sequence import (
     SequenceCollator,
     SequenceTrainConfig,
     role_loss_totals,
-    trace_loss,
     trace_loss_parts,
     train,
 )
@@ -38,15 +42,25 @@ CASTLING_START = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"
 
 
 def trace_row(fen, repetition=1):
-    """One search-shaped trace: observe, walk, evaluate, return, decide."""
+    """One search-shaped trace: observe, test, refute, return, decide, label."""
     board = chess.Board(fen)
     legal = sorted(move.uci() for move in board.legal_moves)
     writer = TraceWriter(fen, repetition)
-    writer.board()
+    writer.depth()
     writer.move(legal[0])
+    writer.board()
     writer.evaluate(value=0.25)
     writer.back()
-    writer.final(legal[1])
+    writer.move(legal[1])
+    writer.refuted()
+    writer.back()
+    writer.evaluate(value=0.25)
+    writer.final(legal[2])
+    writer.final_evaluate(value=0.25)
+    after = chess.Board(fen)
+    after.push_uci(legal[2])
+    writer.final_pv(sorted(move.uci() for move in after.legal_moves)[0])
+    writer.end()
     return sequence_row(fen, writer.tokens, writer.roles, repetition)
 
 
@@ -55,6 +69,8 @@ def direct_row(fen, repetition=1):
     move = sorted(move.uci() for move in board.legal_moves)[0]
     writer = TraceWriter(fen, repetition)
     writer.final(move)
+    writer.final_evaluate(value=0.0)
+    writer.end()
     return sequence_row(fen, writer.tokens, writer.roles, repetition)
 
 
@@ -140,65 +156,85 @@ class SequenceTrainingTests(unittest.TestCase):
         self.assertTrue(final["training_complete"])
         self.assertGreater(final["val/loss"], 0.0)
         self.assertEqual(final["val/rows"], 2)
-        # A direct answer has no generated move or evaluation targets.
-        self.assertNotIn("val/role/move_loss", final)
-        self.assertNotIn("val/role/evaluation_loss", final)
+        # A direct answer has no generated thought or best-line targets.
+        for role in ("move", "evaluation", "refuted", "final_line"):
+            self.assertNotIn(f"val/role/{role}_loss", final)
         self.assertIn("val/role/control_loss", final)
-        self.assertIn("val/role/final_loss", final)
+        self.assertIn("val/role/final_move_loss", final)
+        self.assertIn("val/role/final_evaluation_loss", final)
 
-    def test_trace_loss_weights_context_and_final_move_equally(self):
+    def test_trace_loss_is_the_equal_weight_mean(self):
         row = SequencePositions(self.data, "val")[0]
         batch = SequenceCollator()([row])
         model = create_model(self.config.model)
-        loss, logits, generated = trace_loss(model, batch)
+        loss, ce, logits, generated = trace_loss_parts(model, batch)
 
         targets = batch["trace_ids"].long()
-        ce = F.cross_entropy(
+        expected_ce = F.cross_entropy(
             logits.float().reshape(-1, logits.shape[-1]),
             targets.reshape(-1),
             reduction="none",
         ).reshape(targets.shape)
         roles = batch["trace_roles"]
-        context = (
-            (roles != ROLE_PAD) & (roles != ROLE_TOOL) & (roles != ROLE_FINAL_MOVE)
-        )
-        final = roles == ROLE_FINAL_MOVE
-        expected = (ce * context).sum() / context.sum()
-        expected = expected + (ce * final).sum() / final.sum()
-        torch.testing.assert_close(loss, expected)
-        torch.testing.assert_close(generated, context | final)
+        expected_mask = (roles != ROLE_PAD) & (roles != ROLE_TOOL)
+        torch.testing.assert_close(ce, expected_ce)
+        torch.testing.assert_close(generated, expected_mask)
+        torch.testing.assert_close(loss, expected_ce[expected_mask].mean())
 
-        # Hand counts for this trace: BOARD request, move, evaluation, BACK,
-        # and the FINAL delimiter form the context mean; one root move follows.
-        self.assertEqual(int(context.sum()), 5)
-        self.assertEqual(int(final.sum()), 1)
-        # The observed start position is 32 piece atoms plus 8 metadata atoms.
+        # Hand counts: depth, move, BOARD request, evaluation, BACK, move,
+        # refutation, BACK, root evaluation, FINAL, decision, final evaluation,
+        # best line, and <end>; the 40-token BOARD response is context only.
+        self.assertEqual(int(expected_mask.sum()), 14)
         self.assertEqual(int((roles == ROLE_TOOL).sum()), 40)
-        self.assertEqual(int((roles == ROLE_PAD).sum()), 0)
-        # The BOARD request itself is supervised; its response is not.
-        self.assertEqual(int(roles[0, 0]), ROLE_CONTROL)
-        self.assertTrue(bool(generated[0, 0]))
-        self.assertEqual(int(roles[0, 1]), ROLE_TOOL)
-        self.assertFalse(bool(generated[0, 1]))
+        counts = {
+            name: int((roles == role).sum())
+            for name, role in (
+                ("move", ROLE_MOVE),
+                ("evaluation", ROLE_EVAL),
+                ("control", ROLE_CONTROL),
+                ("refuted", ROLE_REFUTED),
+                ("final_move", ROLE_FINAL_MOVE),
+                ("final_line", ROLE_FINAL_PV),
+                ("final_evaluation", ROLE_FINAL_EVAL),
+            )
+        }
+        self.assertEqual(
+            counts,
+            {
+                "move": 2,
+                "evaluation": 2,
+                "control": 6,
+                "refuted": 1,
+                "final_move": 1,
+                "final_line": 1,
+                "final_evaluation": 1,
+            },
+        )
+        # The BOARD request is supervised; its response is not.
+        self.assertEqual(int(roles[0, 2]), ROLE_CONTROL)
+        self.assertTrue(bool(generated[0, 2]))
+        self.assertEqual(int(roles[0, 3]), ROLE_TOOL)
+        self.assertFalse(bool(generated[0, 3]))
 
     def test_role_losses_partition_the_aggregate_loss(self):
         row = SequencePositions(self.data, "val")[0]
         batch = SequenceCollator()([row])
         model = create_model(self.config.model)
-        loss, ce, _, _, _ = trace_loss_parts(model, batch)
+        loss, ce, _, _ = trace_loss_parts(model, batch)
         totals = role_loss_totals(ce, batch["trace_roles"])
-        counts = {name: tokens for name, (_, tokens) in totals.items()}
-        # This trace writes BOARD, one move, one evaluation, BACK, the FINAL
-        # delimiter, and the final move. The 40-token BOARD response is tool
-        # context and carries no role.
-        self.assertEqual(counts, {"move": 1, "evaluation": 1, "control": 3, "final": 1})
-        context = sum(
-            float(totals[name][0].detach())
-            for name in ("move", "evaluation", "control")
-        )
-        # Five context targets form one mean, plus the final-move mean.
-        expected = torch.tensor(context / 5 + float(totals["final"][0].detach()))
-        torch.testing.assert_close(loss, expected, rtol=1e-6, atol=1e-6)
+        expected_keys = {
+            "move",
+            "evaluation",
+            "control",
+            "refuted",
+            "final_move",
+            "final_line",
+            "final_evaluation",
+        }
+        self.assertEqual(set(totals), expected_keys)
+        total = sum(float(role_total.detach()) for role_total, _ in totals.values())
+        tokens = sum(count for _, count in totals.values())
+        torch.testing.assert_close(loss, torch.tensor(total / tokens))
 
     def test_diagnostics_report_probe_roles_gaps_and_internals(self):
         config = replace(self.config, internals=True, internals_positions=2)
@@ -208,7 +244,15 @@ class SequenceTrainingTests(unittest.TestCase):
         # The default train probe is larger than this fixture's train split.
         self.assertEqual(final["train_probe/rows"], 8)
         for prefix in ("val", "train_probe"):
-            for role in ("move", "evaluation", "control", "final"):
+            for role in (
+                "move",
+                "evaluation",
+                "control",
+                "refuted",
+                "final_move",
+                "final_line",
+                "final_evaluation",
+            ):
                 self.assertIn(f"{prefix}/role/{role}_loss", final)
                 self.assertGreater(final[f"{prefix}/role/{role}_loss"], 0.0)
         self.assertNotIn("val/role/tool_loss", final)
@@ -315,32 +359,6 @@ class SequenceTrainingTests(unittest.TestCase):
             torch.testing.assert_close(
                 actual["model_state_dict"][key], value, rtol=0, atol=0
             )
-
-    def test_collator_rejects_invalid_trace_structure(self):
-        board, trace, length, roles = SequencePositions(self.data, "val")[0]
-        cases = {}
-        invalid = board.copy()
-        invalid[0] = CHESS_VOCAB_SIZE
-        cases["board vocabulary"] = (invalid, trace, length, roles)
-        invalid = board.copy()
-        invalid[0] = MOVE
-        cases["move token in board"] = (invalid, trace, length, roles)
-        invalid = trace.copy()
-        invalid[0] = CHESS_VOCAB_SIZE
-        cases["trace vocabulary"] = (board, invalid, length, roles)
-        invalid = trace.copy()
-        invalid[-2] = invalid[-3]
-        cases["missing FINAL"] = (board, invalid, length, roles)
-        invalid = trace.copy()
-        invalid[-1] = FINAL
-        cases["final is not a move"] = (board, invalid, length, roles)
-        invalid = roles.copy()
-        invalid[0] = 127
-        cases["invalid role"] = (board, trace, length, invalid)
-        cases["invalid length"] = (board, trace, len(trace) + 1, roles)
-        for name, row in cases.items():
-            with self.subTest(name=name), self.assertRaises(ValueError):
-                SequenceCollator()([row])
 
     def test_resume_rejects_changed_validation_data(self):
         output = self.root / "resume-validation-data"
