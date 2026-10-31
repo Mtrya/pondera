@@ -6,7 +6,8 @@ import chess
 import torch
 
 from pondera.chess.codec import encode_boards
-from pondera.chess.vocabulary import UCI_MOVE_TO_IDX
+from pondera.chess.domain import SQUARE_TO_IDX
+from pondera.chess.vocabulary import EN_PASSANT, HALFMOVE, UCI_MOVE_TO_IDX
 from pondera.inference.policy import pick_move
 from pondera.models.checkpoint import load_model, save_checkpoint
 from pondera.models.factory import create_model
@@ -60,6 +61,25 @@ class DepthPolicyTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             pick_move(sequence, chess.Board())
+
+    def test_move_selection_encodes_en_passant_without_a_legal_capture(self):
+        board = chess.Board("r3k2r/8/8/3pP3/8/8/8/R3K2R b Kq e3 99 400")
+        # python-chess omits the ep square from its default FEN when no legal
+        # ep capture exists; the policy input must keep the stored field.
+        self.assertEqual(board.fen().split()[3], "-")
+        captured = []
+
+        def capture(module, args, kwargs):
+            captured.append(kwargs["ids"])
+
+        handle = self.model.register_forward_pre_hook(capture, with_kwargs=True)
+        try:
+            pick_move(self.model, board)
+        finally:
+            handle.remove()
+        tokens = captured[0][0].tolist()
+        ep_atoms = [token for token in tokens if EN_PASSANT <= token < HALFMOVE]
+        self.assertEqual(ep_atoms, [EN_PASSANT + SQUARE_TO_IDX["e3"]])
 
     def test_reflection_table_matches_python_chess_mirrors(self):
         # Independent source: python-chess legal moves of mirrored boards.

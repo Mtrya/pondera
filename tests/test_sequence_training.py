@@ -10,7 +10,7 @@ import torch
 from teacher_release import play, sequence_row, write_sequence_dataset
 from torch.nn import functional as F
 
-from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL, PAD
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL, MOVE, PAD
 from pondera.data.positions import SequencePositions
 from pondera.data.trace import (
     ROLE_CONTROL,
@@ -322,6 +322,9 @@ class SequenceTrainingTests(unittest.TestCase):
         invalid = board.copy()
         invalid[0] = CHESS_VOCAB_SIZE
         cases["board vocabulary"] = (invalid, trace, length, roles)
+        invalid = board.copy()
+        invalid[0] = MOVE
+        cases["move token in board"] = (invalid, trace, length, roles)
         invalid = trace.copy()
         invalid[0] = CHESS_VOCAB_SIZE
         cases["trace vocabulary"] = (board, invalid, length, roles)
@@ -331,18 +334,22 @@ class SequenceTrainingTests(unittest.TestCase):
         invalid = trace.copy()
         invalid[-1] = FINAL
         cases["final is not a move"] = (board, invalid, length, roles)
+        invalid = roles.copy()
+        invalid[0] = 127
+        cases["invalid role"] = (board, trace, length, invalid)
         cases["invalid length"] = (board, trace, len(trace) + 1, roles)
         for name, row in cases.items():
             with self.subTest(name=name), self.assertRaises(ValueError):
                 SequenceCollator()([row])
 
-    def test_resume_rejects_changed_validation_manifest(self):
+    def test_resume_rejects_changed_validation_data(self):
         output = self.root / "resume-validation-data"
         interrupted = train(self.config, self.data, output, max_steps=1)
-        manifest_path = self.data / "manifest.json"
-        manifest = json.loads(manifest_path.read_text())
-        manifest["files"]["trace_tokens_val.npy"] = "0" * 64
-        manifest_path.write_text(json.dumps(manifest))
+        path = self.data / "trace_tokens_val.npy"
+        array = np.load(path, mmap_mode="r+")
+        array[0, 0] += 1
+        array.flush()
+        del array
         with self.assertRaises(ValueError):
             train(self.config, self.data, output, resume=interrupted)
 

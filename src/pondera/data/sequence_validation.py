@@ -46,6 +46,52 @@ def sha256(path):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def _content_sha256(payload):
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def sequence_data_identity(directory):
+    """Verify and fingerprint the files that define Sequence training input."""
+    directory = Path(directory)
+    manifest_path = directory / (
+        "release.json" if (directory / "release.json").exists() else "manifest.json"
+    )
+    manifest = load_manifest(manifest_path)
+    files = {}
+    if "shards" in manifest:
+        for shard in manifest["shards"]:
+            shard_dir = directory / shard["path"]
+            manifest_path = shard_dir / "manifest.json"
+            manifest_sha = sha256(manifest_path)
+            if manifest_sha != shard["sha256"]:
+                raise ValueError(f"Shard manifest checksum mismatch: {manifest_path}")
+            shard_manifest = load_manifest(manifest_path)
+            files[manifest_path.relative_to(directory).as_posix()] = manifest_sha
+            filenames = [f"{name}.npy" for name in TRACE_ARRAYS] + ["roots.jsonl"]
+            for filename in filenames:
+                expected = shard_manifest.get("files", {}).get(filename)
+                if expected is None:
+                    raise ValueError(
+                        f"Shard has no checksum for {filename}: {shard_dir}"
+                    )
+                path = shard_dir / filename
+                actual = sha256(path)
+                if actual != expected:
+                    raise ValueError(f"Training input checksum mismatch: {path}")
+                files[path.relative_to(directory).as_posix()] = actual
+    else:
+        if not manifest.get("files"):
+            raise ValueError("Sequence dataset manifest has no input checksums")
+        for filename, expected in manifest["files"].items():
+            path = directory / filename
+            actual = sha256(path)
+            if actual != expected:
+                raise ValueError(f"Training input checksum mismatch: {path}")
+            files[filename] = actual
+    return _content_sha256({"manifest": manifest, "files": files})
+
+
 def validate_sequence_arrays(arrays, rows=None):
     """Check the shared array contract without interpreting individual traces."""
     if not arrays:
@@ -142,7 +188,9 @@ def verify_shard_files(release_dir, shard, expected_metadata=None):
     return manifest, roots, arrays
 
 
-def _validate_shard_rows(release_dir, shard, teachers, expected_metadata=None):
+def _validate_shard_rows(
+    release_dir, shard, teachers, expected_metadata=None, expected_roots=None
+):
     _, rows, arrays = verify_shard_files(release_dir, shard, expected_metadata)
     identities = []
     counts = Counter()
@@ -154,6 +202,17 @@ def _validate_shard_rows(release_dir, shard, teachers, expected_metadata=None):
             raise ValueError(f"Unknown teacher in shard row: {row['teacher']}")
         if row["split"] not in {"train", "val"}:
             raise ValueError(f"Unknown split in shard row: {row['split']}")
+        if expected_roots is not None:
+            expected = expected_roots.get(row["root_id"])
+            if expected is None:
+                raise ValueError(
+                    f"Release contains an unselected root: {row['root_id']}"
+                )
+            for name in ROOT_RECORD_FIELDS:
+                if row.get(name) != expected.get(name):
+                    raise ValueError(
+                        f"Release root {name} differs from its selection: {row['root_id']}"
+                    )
         board = chess.Board(row["fen"])
         if board.turn != (row["turn"] == "white"):
             raise ValueError(f"Root turn disagrees with FEN: {row['root_id']}")
@@ -239,9 +298,7 @@ def _validate_shard_rows(release_dir, shard, teachers, expected_metadata=None):
                 uci = reflect_uci(uci)
             if chess.Move.from_uci(uci) not in board.legal_moves:
                 raise ValueError(f"Truncation-state move is illegal: {row['root_id']}")
-        identities.append(
-            (row["root_id"], row["teacher"], row["fen"], row["repetition"])
-        )
+        identities.append((row["root_id"], row["teacher"]))
         counts[row["split"]] += 1
         counts[row["teacher"]] += 1
         state_total += count
@@ -252,6 +309,91 @@ def _validate_shard_rows(release_dir, shard, teachers, expected_metadata=None):
         "board_responses": board_responses,
         "max_trace": max_trace,
     }
+
+
+SEARCH_FIELDS = ("depth", "multipv", "threads", "hash_mb", "max_time")
+TEACHER_SPEC_FIELDS = frozenset(
+    {
+        "kind",
+        "max_depth",
+        "max_nodes",
+        "width",
+        "value_floor",
+        "near_value",
+        "max_candidates",
+    }
+)
+ROOT_RECORD_FIELDS = ("split", "fen", "repetition", "turn", "d16", "source")
+
+
+def _valid_root_set(identity):
+    if not isinstance(identity, dict) or set(identity) != {"rows", "sha256"}:
+        return False
+    rows = identity["rows"]
+    digest = identity["sha256"]
+    return (
+        isinstance(rows, int)
+        and not isinstance(rows, bool)
+        and rows > 0
+        and isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+    )
+
+
+def _release_identity_contract(release, root_count):
+    metadata = release.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("Release has no synthesis identity")
+    teachers = metadata.get("teachers")
+    if (
+        not isinstance(teachers, list)
+        or not teachers
+        or not all(isinstance(name, str) for name in teachers)
+        or len(set(teachers)) != len(teachers)
+    ):
+        raise ValueError("Release teacher names must be nonempty and unique")
+    search = metadata.get("search")
+    if not isinstance(search, dict) or any(
+        name not in search for name in SEARCH_FIELDS
+    ):
+        raise ValueError("Release identity has incomplete search settings")
+    specs = metadata.get("teacher_specs")
+    if not isinstance(specs, dict) or set(specs) != set(teachers):
+        raise ValueError("Release identity does not cover every teacher")
+    for name in teachers:
+        spec = specs[name]
+        if not isinstance(spec, dict) or set(spec) != TEACHER_SPEC_FIELDS:
+            raise ValueError(f"Teacher identity is incomplete: {name}")
+        if spec["kind"] not in {"fixed", "adaptive"}:
+            raise ValueError(f"Teacher identity has an unknown kind: {name}")
+    if ("roots" in metadata) == ("root_sets" in metadata):
+        raise ValueError("Release identity needs one roots or root_sets record")
+    if "roots" in metadata:
+        root_sets = [metadata["roots"]]
+    else:
+        root_sets = metadata["root_sets"]
+        if not isinstance(root_sets, list) or not root_sets:
+            raise ValueError("Release root_sets must be a nonempty list")
+    if not all(_valid_root_set(root_set) for root_set in root_sets):
+        raise ValueError("Release root identity is malformed")
+    if sum(root_set["rows"] for root_set in root_sets) != root_count:
+        raise ValueError("Release root identity does not match its root count")
+    for key, value in metadata.items():
+        if release.get(key) != value:
+            raise ValueError(f"Release metadata {key} differs from its identity")
+    return metadata
+
+
+def validate_release_identity(release):
+    complete = release.get("complete_root_ids")
+    if (
+        not isinstance(complete, list)
+        or not complete
+        or len(set(complete)) != len(complete)
+    ):
+        raise ValueError("Release root ids must be nonempty and unique")
+    return _release_identity_contract(release, len(complete))
 
 
 def validate_release(directory, roots=None, workers=8):
@@ -270,14 +412,23 @@ def validate_release(directory, roots=None, workers=8):
     for key, value in expected_metadata.items():
         if release.get(key) != value:
             raise ValueError(f"Release metadata {key} is unsupported")
-    expected_shard_metadata = {**expected_metadata, **release["metadata"]}
-    teachers = release["metadata"]["teachers"]
-    if not teachers or len(set(teachers)) != len(teachers):
-        raise ValueError("Release teacher names must be nonempty and unique")
     complete = release["complete_root_ids"]
-    if len(set(complete)) != len(complete):
-        raise ValueError("Release root ids must be unique")
-    expected = {row["root_id"]: row for row in roots} if roots is not None else None
+    metadata = validate_release_identity(release)
+    expected_shard_metadata = {**expected_metadata, **metadata}
+    teachers = metadata["teachers"]
+    expected = None
+    if roots is not None:
+        root_records = list(roots)
+        expected = {row["root_id"]: row for row in root_records}
+        if len(expected) != len(root_records):
+            raise ValueError("External root records contain duplicate root ids")
+        if "roots" in metadata:
+            identity = metadata["roots"]
+            if (
+                len(root_records) != identity["rows"]
+                or _content_sha256(root_records) != identity["sha256"]
+            ):
+                raise ValueError("External root records do not match the release hash")
     seen = set()
     seen_roots = set()
     counts = Counter()
@@ -286,24 +437,18 @@ def validate_release(directory, roots=None, workers=8):
     max_trace = 0
 
     def validate(shard):
-        return _validate_shard_rows(directory, shard, teachers, expected_shard_metadata)
+        return _validate_shard_rows(
+            directory, shard, teachers, expected_shard_metadata, expected
+        )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for result in pool.map(validate, release["shards"]):
-            for root_id, teacher, fen, repetition in result["identities"]:
+            for root_id, teacher in result["identities"]:
                 key = (root_id, teacher)
                 if key in seen:
                     raise ValueError(f"Duplicate teacher row: {key}")
                 seen.add(key)
                 seen_roots.add(root_id)
-                if expected is not None:
-                    if root_id not in expected:
-                        raise ValueError(
-                            f"Release contains an unselected root: {root_id}"
-                        )
-                    root = expected[root_id]
-                    if fen != root["fen"] or repetition != root["repetition"]:
-                        raise ValueError(f"Release root provenance changed: {root_id}")
             counts.update(result["counts"])
             states += result["states"]
             board_responses += result["board_responses"]

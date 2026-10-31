@@ -1135,14 +1135,31 @@ def run_synthesis(
     }
 
 
-def quality_identity_payload(config, synthesis_sha, engine_identity):
+def _reference_val_roots(config, roots, synthesis):
+    """Validation roots with synthesis records, truncated to the reference budget.
+
+    This is the single selection used by both the quality run and the summary.
+    Returns the requested roots and the number of validation roots available
+    before truncation.
+    """
+    available = [
+        root
+        for root in roots
+        if root["split"] == "val" and root["root_id"] in synthesis
+    ]
+    return available[: config.reference_val_rows], len(available)
+
+
+def quality_identity_payload(config, roots, synthesis, synthesis_sha, engine_identity):
+    requested, available = _reference_val_roots(config, roots, synthesis)
     identity = {
         "format_version": QUALITY_FORMAT_VERSION,
         "kind": "sequence-pilot-quality",
         "synthesis_identity_sha256": synthesis_sha,
         "reference": {
             "depth": config.reference_depth,
-            "val_rows": config.val_roots,
+            "val_rows": len(requested),
+            "available_val_rows": available,
             "planned_val_rows": config.reference_val_rows,
             "method": (
                 "depth-limited search with multipv=1 and root_moves set to the "
@@ -1185,11 +1202,7 @@ def run_quality(
     output = Path(output)
     synth_store = JsonlStore(output / "synthesis.jsonl", synthesis_sha)
     synthesis = synth_store.load()
-    val_roots = [
-        root
-        for root in roots
-        if root["split"] == "val" and root["root_id"] in synthesis
-    ][: config.reference_val_rows]
+    val_roots, _ = _reference_val_roots(config, roots, synthesis)
     quality_sha = load_identity(
         output / "quality.identity.json", "sequence-pilot-quality-identity"
     )["sha256"]
@@ -1662,11 +1675,8 @@ def build_summary(
     for record in synthesis_failures:
         if record.get("root_id") in missing_set:
             failure_by_root[record["root_id"]] = record.get("error")
-    quality_expected = {
-        root["root_id"]
-        for root in roots
-        if root["split"] == "val" and root["root_id"] in synthesis
-    }
+    quality_roots, _ = _reference_val_roots(config, roots, synthesis)
+    quality_expected = {root["root_id"] for root in quality_roots}
     quality_missing = quality_expected - set(quality)
     quality_failure_by_root = {}
     for record in quality_failures:
@@ -1846,6 +1856,7 @@ def main(argv=None):
     synthesis_sha = None
     engine_identity = None
     validation = None
+    synthesis = None
     if args.stage in {"synthesis", "all", "quality"}:
         engine_identity = load_engine_identity(config)
     if args.stage in {"synthesis", "all"}:
@@ -1885,8 +1896,10 @@ def main(argv=None):
         synthesis_sha = synthesis_sha or _synthesis_identity_sha(output)
         if engine_identity is None:
             engine_identity = load_engine_identity(config)
+        if synthesis is None:
+            synthesis = JsonlStore(output / "synthesis.jsonl", synthesis_sha).load()
         quality_payload = quality_identity_payload(
-            config, synthesis_sha, engine_identity
+            config, roots, synthesis, synthesis_sha, engine_identity
         )
         quality_identity = ensure_identity(
             output / "quality.identity.json",
@@ -1908,10 +1921,10 @@ def main(argv=None):
         )
         _print(f"quality identity: {quality_identity['sha256']}")
     if args.stage in {"summary", "all"}:
-        synthesis_store = JsonlStore(
-            output / "synthesis.jsonl", _synthesis_identity_sha(output)
-        )
-        synthesis = synthesis_store.load()
+        if synthesis is None:
+            synthesis = JsonlStore(
+                output / "synthesis.jsonl", _synthesis_identity_sha(output)
+            ).load()
         quality = _load_quality(config, output)
         if validation is None and (output / "validation.json").exists():
             validation = load_manifest(output / "validation.json")

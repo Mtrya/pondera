@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from pondera.chess.codec import decode_board, encode_board, encode_boards
-from pondera.chess.domain import PIECE_TO_IDX
+from pondera.chess.domain import PIECE_TO_IDX, repetition_count
 from pondera.chess.vocabulary import SIDE
 from pondera.models.board import black_to_move, reflect_board_tokens
 
@@ -57,6 +57,22 @@ class BoardEncodingTests(unittest.TestCase):
         duplicated = np.concatenate((tokens[:2], tokens[:1], tokens[1:]))
         with self.assertRaises(ValueError):
             decode_board(duplicated)
+
+    def test_repetition_count_matches_played_occurrences(self):
+        board = chess.Board()
+        cycle = ["g1f3", "g8f6", "f3g1", "f6g8"]
+        # Three four-ply knight cycles return to the start: four occurrences.
+        for _ in range(3):
+            for move in cycle:
+                board.push_uci(move)
+        self.assertEqual(repetition_count(board), 4)
+        # A fourth cycle makes five, the shared top repetition atom.
+        for move in cycle:
+            board.push_uci(move)
+        self.assertEqual(repetition_count(board), 5)
+        for move in cycle:
+            board.push_uci(move)
+        self.assertEqual(repetition_count(board), 5)
 
     def test_orientation_is_reversible_and_matches_chess_mirror(self):
         fens = [

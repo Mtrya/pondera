@@ -12,6 +12,7 @@ from pondera.data.sequence_pilot import (
     PilotConfig,
     build_summary,
     ensure_roots,
+    quality_identity_payload,
     select_roots,
 )
 
@@ -433,6 +434,60 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summary["synthesis"]["missing"], 0)
         self.assertEqual(summary["analysis"]["calls_total"], 2)
         self.assertEqual(summary["analysis"]["mean_nodes"], 2.0)
+
+    def test_reference_budget_truncates_quality_expectations_and_identity(self):
+        config = PilotConfig(
+            release="release.json",
+            release_sha256="0" * 64,
+            train_roots=1,
+            val_roots=5,
+            reference_val_rows=2,
+            teachers=(TEACHER,),
+        )
+        roots = [{"root_id": "root-train", "split": "train"}]
+        roots += [{"root_id": f"root-{index}", "split": "val"} for index in range(5)]
+        synthesis = {
+            root["root_id"]: {
+                "analysis": {
+                    "calls": 0,
+                    "elapsed_ms": 0,
+                    "nodes": 1,
+                    "terminal_nodes": 0,
+                },
+                "elapsed_ms": 0,
+                "teachers": {TEACHER: {"metrics": self.metrics()}},
+            }
+            for root in roots
+        }
+        summary = build_summary(
+            config,
+            roots,
+            synthesis,
+            {},
+            {"ok": True},
+            [],
+            [{"root_id": "root-4", "error": "unrequested"}],
+        )
+        self.assertEqual(summary["quality"]["requested"], 2)
+        self.assertEqual(summary["quality"]["missing"], 2)
+        self.assertEqual(summary["quality"]["failure_root_ids"], [])
+        identity = quality_identity_payload(config, roots, synthesis, "0" * 64, {})
+        reference = identity["identity"]["reference"]
+        self.assertEqual(reference["val_rows"], 2)
+        self.assertEqual(reference["available_val_rows"], 5)
+        self.assertEqual(reference["planned_val_rows"], 2)
+        larger = PilotConfig(
+            release="release.json",
+            release_sha256="0" * 64,
+            train_roots=1,
+            val_roots=5,
+            reference_val_rows=9,
+            teachers=(TEACHER,),
+        )
+        identity = quality_identity_payload(larger, roots, synthesis, "0" * 64, {})
+        reference = identity["identity"]["reference"]
+        self.assertEqual(reference["val_rows"], 5)
+        self.assertEqual(reference["available_val_rows"], 5)
 
 
 if __name__ == "__main__":

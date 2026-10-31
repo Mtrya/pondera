@@ -15,7 +15,9 @@ def pick_move(model, board: chess.Board, device="cpu") -> str:
         raise ValueError("UCI move selection supports depth-policy models only")
     if board.is_game_over():
         return "0000"
-    ids = torch.from_numpy(encode_board(board.fen(), repetition_count(board)))
+    ids = torch.from_numpy(
+        encode_board(board.fen(en_passant="fen"), repetition_count(board))
+    )
     logits, _ = model(ids=ids.unsqueeze(0).to(device))
     legal = legal_move_indices(board)
     index = logits[0, legal].float().argmax().item()

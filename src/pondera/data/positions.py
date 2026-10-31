@@ -107,6 +107,8 @@ class _ShardedSequenceArrays:
             if len(rows) != shard["rows"]:
                 raise ValueError(f"Shard roots do not match its release: {shard_dir}")
             for row_index, row in enumerate(rows):
+                if row["split"] not in {"train", "val"}:
+                    raise ValueError(f"Unknown shard split: {row['split']}")
                 if row["split"] == split:
                     self.index.append((len(self.arrays["board_tokens"]) - 1, row_index))
 
@@ -124,6 +126,8 @@ class SequencePositions(Dataset):
     """
 
     def __init__(self, directory, split):
+        if split not in {"train", "val"}:
+            raise ValueError(f"Unknown sequence split: {split}")
         directory = Path(directory)
         manifest_path = directory / (
             "release.json" if (directory / "release.json").exists() else "manifest.json"

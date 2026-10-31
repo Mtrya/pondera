@@ -14,7 +14,7 @@ from pondera.data.sequence_release import (
     merge_releases,
     produce_shards,
 )
-from pondera.data.sequence_validation import validate_release
+from pondera.data.sequence_validation import sha256, validate_release
 from pondera.data.trace import replay
 from pondera.training.sequence import SequenceTrainConfig
 from pondera.training.sequence import train as train_sequence
@@ -22,6 +22,22 @@ from pondera.training.sequence import train as train_sequence
 
 @unittest.skipUnless(shutil.which("stockfish"), "Requires Stockfish on PATH")
 class SequenceReleaseTests(unittest.TestCase):
+    def test_empty_roots_and_unknown_splits_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            config = SequenceReleaseConfig(workers=1)
+            metadata = {"teachers": ["fixed-depth-3-width-2"]}
+            with self.assertRaises(ValueError):
+                produce_shards([], output, config, metadata)
+            with self.assertRaises(ValueError):
+                produce_shards(
+                    [{"root_id": "bad", "split": "validation"}],
+                    output,
+                    config,
+                    metadata,
+                )
+            self.assertFalse((output / "release.json").exists())
+
     def test_sharded_release_roundtrip_and_resume(self):
         board = chess.Board()
         board.push_uci("e2e4")
@@ -64,6 +80,25 @@ class SequenceReleaseTests(unittest.TestCase):
             self.assertEqual(validation["rows"], 4)
             self.assertEqual(validation["roots"], 2)
             self.assertGreater(validation["states"], 0)
+            release_path = output / "release.json"
+            release_bytes = release_path.read_bytes()
+            release_payload = json.loads(release_bytes)
+            for field in ("search", "teacher_specs", "roots"):
+                altered = json.loads(release_bytes)
+                del altered["metadata"][field]
+                altered.pop(field, None)
+                release_path.write_text(json.dumps(altered))
+                with (
+                    self.subTest(missing_identity=field),
+                    self.assertRaises(ValueError),
+                ):
+                    validate_release(output, roots, workers=2)
+            release_path.write_bytes(release_bytes)
+            changed_selection = [dict(root) for root in roots]
+            changed_selection[0]["split"] = "val"
+            with self.assertRaises(ValueError):
+                validate_release(output, changed_selection, workers=2)
+            self.assertEqual(release_payload["metadata"]["roots"]["rows"], 2)
             for index in range(len(train)):
                 board, trace, length, roles = train[index]
                 program = replay(trace[:length], chess.STARTING_FEN)
@@ -126,6 +161,7 @@ class SequenceReleaseTests(unittest.TestCase):
             )
             self.assertEqual(len(merged_manifest["metadata"]["root_sets"]), 2)
             self.assertNotIn("roots", merged_manifest["metadata"])
+            self.assertEqual(validate_release(merged, roots, workers=2)["rows"], 4)
             self.assertEqual(len(SequencePositions(merged, "train")), 2)
             self.assertEqual(len(SequencePositions(merged, "val")), 2)
             with self.assertRaises(ValueError):
@@ -158,6 +194,33 @@ class SequenceReleaseTests(unittest.TestCase):
             ]
             self.assertEqual(metrics[-1]["step"], 1)
             self.assertTrue((output / "training" / "final.pth").is_file())
+
+            roots_path = left / "shard-000000" / "roots.jsonl"
+            roots_bytes = roots_path.read_bytes()
+            shard_manifest_path = left / "shard-000000" / "manifest.json"
+            shard_manifest_bytes = shard_manifest_path.read_bytes()
+            part_release_path = left / "release.json"
+            part_release_bytes = part_release_path.read_bytes()
+            root_rows = [json.loads(line) for line in roots_bytes.splitlines()]
+            for row in root_rows:
+                row["split"] = "val"
+            roots_path.write_text("".join(json.dumps(row) + "\n" for row in root_rows))
+            shard_manifest = json.loads(shard_manifest_bytes)
+            shard_manifest["files"]["roots.jsonl"] = sha256(roots_path)
+            shard_manifest_path.write_text(json.dumps(shard_manifest))
+            part_release = json.loads(part_release_bytes)
+            part_release["shards"][0]["sha256"] = sha256(shard_manifest_path)
+            part_release_path.write_text(json.dumps(part_release))
+            with self.assertRaises(ValueError):
+                validate_release(left, roots[:1], workers=1)
+            for row in root_rows:
+                row["split"] = "validation"
+            roots_path.write_text("".join(json.dumps(row) + "\n" for row in root_rows))
+            with self.assertRaises(ValueError):
+                SequencePositions(left, "train")
+            roots_path.write_bytes(roots_bytes)
+            shard_manifest_path.write_bytes(shard_manifest_bytes)
+            part_release_path.write_bytes(part_release_bytes)
 
             role_path = left / "shard-000000" / "trace_roles.npy"
             role_array = np.load(role_path, mmap_mode="r+")
@@ -201,6 +264,10 @@ class SequenceReleaseTests(unittest.TestCase):
                 else:
                     with self.assertRaises(ValueError):
                         produce_shards(roots, output, config, metadata, shard_size=1)
+                    with self.assertRaises(ValueError):
+                        train_sequence(
+                            training_config, output, output / "tampered-training"
+                        )
 
 
 if __name__ == "__main__":

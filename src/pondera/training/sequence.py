@@ -15,7 +15,6 @@ it: the two data and model contracts evolve independently.
 """
 
 import argparse
-import hashlib
 import json
 import math
 import time
@@ -30,10 +29,19 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
-from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL, MOVE, PAD, VALUE
+from pondera.chess.vocabulary import (
+    BOARD_VOCAB_SIZE,
+    CHESS_VOCAB_SIZE,
+    FINAL,
+    MOVE,
+    PAD,
+    VALUE,
+)
 from pondera.data.positions import SequencePositions
+from pondera.data.sequence_validation import sequence_data_identity
 from pondera.data.trace import (
     ROLE_CONTROL,
+    ROLE_COUNT,
     ROLE_EVAL,
     ROLE_FINAL_MOVE,
     ROLE_MOVE,
@@ -125,8 +133,9 @@ class SequenceCollator:
         board_width = max((len(board) for board in boards), default=0)
         board_ids = np.full((len(boards), board_width), PAD, dtype=np.int16)
         for index, board in enumerate(boards):
-            if np.any((board < 0) | (board >= CHESS_VOCAB_SIZE)):
-                raise ValueError("A board row contains an out-of-vocabulary token")
+            invalid = (board != PAD) & ((board < 0) | (board >= BOARD_VOCAB_SIZE))
+            if np.any(invalid):
+                raise ValueError("A board row contains a non-board token")
             board_ids[index, : len(board)] = board
         inputs = {"ids": torch.from_numpy(board_ids)}
         traces, roles, final_moves = [], [], []
@@ -140,6 +149,8 @@ class SequenceCollator:
             if stored[-2] != FINAL or not MOVE <= stored[-1] < VALUE:
                 raise ValueError("A trace row must end with FINAL and a move token")
             stored_roles = trace_roles[:trace_len]
+            if np.any((stored_roles < 0) | (stored_roles >= ROLE_COUNT)):
+                raise ValueError("A trace row contains an invalid token role")
             final = np.flatnonzero(stored_roles == ROLE_FINAL_MOVE)
             if len(final) != 1:
                 raise ValueError("A trace row needs exactly one final move role")
@@ -237,13 +248,7 @@ def train(
     train_data = SequencePositions(data_dir, "train")
     val_data = SequencePositions(data_dir, "val")
     eval_collate = SequenceCollator()
-    data_identity = hashlib.sha256(
-        json.dumps(
-            {"train": train_data.manifest, "val": val_data.manifest},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    data_identity = sequence_data_identity(data_dir)
     micro_batches = len(train_data) // config.batch_size
     steps_per_epoch = micro_batches // config.accumulation_steps
     if not steps_per_epoch or not len(val_data):

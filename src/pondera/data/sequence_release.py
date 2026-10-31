@@ -25,7 +25,7 @@ from pondera.chess.vocabulary import (
 from pondera.data.annotation import AnnotationConfig
 from pondera.data.sequence_validation import (
     SEQUENCE_FORMAT_VERSION,
-    shard_configuration,
+    validate_release_identity,
     verify_shard_files,
 )
 from pondera.data.storage import load_manifest, write_manifest
@@ -110,6 +110,19 @@ def _teacher_rows(root, teacher, board):
     }
 
 
+def _root_row(root, teacher):
+    return {
+        "root_id": root["root_id"],
+        "split": root["split"],
+        "fen": root["fen"],
+        "repetition": root.get("repetition", 1),
+        "turn": root["turn"],
+        "teacher": teacher,
+        "d16": root.get("d16"),
+        "source": root.get("source"),
+    }
+
+
 def _write_shard(directory, records, metadata):
     boards, traces, roles, lengths = [], [], [], []
     no_tool, tool, best, basis, values, counts = [], [], [], [], [], []
@@ -129,18 +142,7 @@ def _write_shard(directory, records, metadata):
             basis.append(row.pop("state_basis"))
             values.append(row.pop("state_value"))
             counts.append(row.pop("state_count"))
-            root_rows.append(
-                {
-                    "root_id": record["root_id"],
-                    "split": record["split"],
-                    "fen": record["fen"],
-                    "repetition": record.get("repetition", 1),
-                    "turn": record["turn"],
-                    "teacher": name,
-                    "d16": record.get("d16"),
-                    "source": record.get("source"),
-                }
-            )
+            root_rows.append(_root_row(record, name))
     if not boards:
         raise ValueError("A sequence shard cannot be empty")
     directory.mkdir(parents=True)
@@ -171,6 +173,25 @@ def _write_shard(directory, records, metadata):
     return payload
 
 
+def _recover_shard(output, index, roots, metadata):
+    final = output / f"shard-{index:06d}"
+    manifest = load_manifest(final / "manifest.json")
+    if not isinstance(manifest.get("rows"), int):
+        raise FileExistsError(f"Unregistered shard has no valid row count: {final}")
+    published = {
+        "path": final.name,
+        "rows": manifest["rows"],
+        "sha256": _sha256(final / "manifest.json"),
+    }
+    _, rows, _ = verify_shard_files(output, published, metadata)
+    expected = [
+        _root_row(root, teacher) for root in roots for teacher in metadata["teachers"]
+    ]
+    if rows != expected:
+        raise FileExistsError(f"Unregistered shard has different roots: {final}")
+    return published
+
+
 def _publish_shard(output, index, records, metadata):
     final = output / f"shard-{index:06d}"
     temporary = output / f".shard-{index:06d}.tmp"
@@ -178,18 +199,9 @@ def _publish_shard(output, index, records, metadata):
         shutil.rmtree(temporary)
     payload = _write_shard(temporary, records, metadata)
     if final.exists():
-        existing = load_manifest(final / "manifest.json")
-        if shard_configuration(existing) != shard_configuration(payload):
-            raise FileExistsError(f"Unregistered shard has different contents: {final}")
-        published = {
-            "path": final.name,
-            "rows": payload["rows"],
-            "sha256": _sha256(final / "manifest.json"),
-        }
-        verify_shard_files(output, published, metadata)
         shutil.rmtree(temporary)
-    else:
-        os.replace(temporary, final)
+        return _recover_shard(output, index, records, metadata)
+    os.replace(temporary, final)
     return {
         "path": final.name,
         "rows": payload["rows"],
@@ -210,6 +222,10 @@ def _release_metadata(metadata):
 
 def _release_identity(roots, config, metadata):
     roots = list(roots)
+    if not roots:
+        raise ValueError("A sequence release needs at least one root")
+    if any(root.get("split") not in {"train", "val"} for root in roots):
+        raise ValueError("Every sequence root must belong to train or val")
     root_ids = [root["root_id"] for root in roots]
     if len(set(root_ids)) != len(root_ids):
         raise ValueError("A sequence release cannot contain duplicate root ids")
@@ -286,9 +302,12 @@ def produce_shards(roots, output_dir, config, metadata, shard_size=1024):
     ) as pool:
         for start in range(0, len(pending), shard_size):
             group = pending[start : start + shard_size]
-            records = list(pool.map(_synthesize_root, group))
             index = len(shards)
-            shard = _publish_shard(output_dir, index, records, release_metadata)
+            if (output_dir / f"shard-{index:06d}").exists():
+                shard = _recover_shard(output_dir, index, group, release_metadata)
+            else:
+                records = list(pool.map(_synthesize_root, group))
+                shard = _publish_shard(output_dir, index, records, release_metadata)
             shards.append(shard)
             complete.update(root["root_id"] for root in group)
             payload = {
@@ -350,7 +369,7 @@ def merge_releases(inputs, output_dir):
     for directory in inputs:
         directory = Path(directory).resolve()
         manifest = load_manifest(directory / "release.json")
-        part_metadata = manifest["metadata"]
+        part_metadata = validate_release_identity(manifest)
         release_metadata = _release_metadata(part_metadata)
         if any(manifest.get(key) != value for key, value in release_metadata.items()):
             raise ValueError(f"Release metadata differs from its identity: {directory}")

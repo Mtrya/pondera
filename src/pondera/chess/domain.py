@@ -36,8 +36,8 @@ IDX_TO_SQUARE: Dict[int, str] = {v: k for k, v in SQUARE_TO_IDX.items()}
 
 
 def repetition_count(board: chess.Board) -> int:
-    if board.is_repetition(3):
-        return 3
-    if board.is_repetition(2):
-        return 2
+    """Occurrences of the current position, saturated at five."""
+    for count in range(5, 1, -1):
+        if board.is_repetition(count):
+            return count
     return 1
