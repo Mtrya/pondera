@@ -78,7 +78,7 @@ class DatasetContractTests(unittest.TestCase):
         self.assertEqual(manifest["grammar_version"], TRACE_GRAMMAR_VERSION)
         self.assertEqual(manifest["grammar_version"], 2)
         self.assertEqual(manifest["format_version"], SEQUENCE_FORMAT_VERSION)
-        self.assertEqual(manifest["format_version"], 3)
+        self.assertEqual(manifest["format_version"], 4)
         self.assertEqual(manifest["tokenizer_version"], CHESS_TOKENIZER_VERSION)
         for retired in ("level", "line_bounds", "max_lines", "pv_limit"):
             self.assertNotIn(retired, manifest)

@@ -1,6 +1,5 @@
 """Integrity checks and independent replay validation for Sequence releases."""
 
-import hashlib
 import json
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -9,20 +8,32 @@ from pathlib import Path
 import chess
 import numpy as np
 
-from pondera.chess.codec import BOARD_TOKENS_MAX, encode_board
+from pondera.chess.codec import BOARD_TOKENS_MAX, encode_board, value_bin
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import (
     CHESS_TOKENIZER_VERSION,
     DEPTH,
     IDX_TO_UCI_MOVE,
+    MATE_LOSS,
+    MATE_WIN,
     MOVE,
     PAD,
     VALUE,
 )
-from pondera.data.storage import load_manifest, write_manifest
-from pondera.data.trace import ROLE_COUNT, TRACE_GRAMMAR_VERSION, replay
+from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
+from pondera.data.trace import (
+    CLAIM_DRAW_UCI,
+    ROLE_COUNT,
+    TRACE_GRAMMAR_VERSION,
+    replay,
+)
+from pondera.data.trace_synthesis import (
+    PRESENTATIONS,
+    SIDECAR_SCHEMA,
+    mate_distance_moves,
+)
 
-SEQUENCE_FORMAT_VERSION = 3
+SEQUENCE_FORMAT_VERSION = 4
 TRACE_ARRAYS = ("board_tokens", "trace_tokens", "trace_len", "trace_roles")
 STATE_ARRAYS = (
     "state_no_tool",
@@ -35,66 +46,223 @@ SEQUENCE_ARRAYS = (*TRACE_ARRAYS, *STATE_ARRAYS, "state_count")
 # The label region after FINAL is not a thinking boundary; truncation states
 # stop at the last thought operation.
 FINAL_SUFFIX_OPS = frozenset({"final", "final_evaluate", "final_pv", "end"})
-ROOT_SET_METADATA = frozenset(
-    {"root_selection", "root_selections", "roots", "root_sets"}
+RELEASE_ONLY_METADATA = frozenset(
+    {"root_selection", "root_selections", "roots", "root_sets", "sidecars"}
+)
+ROOT_RECORD_FIELDS = ("split", "fen", "repetition", "turn", "position_key", "source")
+SEARCH_FIELDS = frozenset(
+    {"depth", "teacher_width", "threads", "hash_mb", "fresh_engine_per_root"}
+)
+BOARD_FIELDS = frozenset({"board_descent_hazard", "board_frontier_p"})
+PRESENTATION_FIELDS = frozenset(
+    {
+        "zero",
+        "full",
+        "random",
+        "last_root",
+        "random_min_fraction",
+        "random_max_fraction",
+    }
+)
+SYNTHESIS_FIELDS = frozenset({"confirmatory_repetition", "claim_draw"})
+TEACHER_FIELDS = frozenset(
+    {"schema_version", "contract", "contract_sha256", "value_mate", "max_ply"}
+)
+ENGINE_FIELDS = frozenset(
+    {"name", "sha256", "instrumentation", "instrumentation_sha256", "control"}
+)
+ROOT_SELECTION_FIELDS = frozenset(
+    {"source", "source_sha256", "algorithm", "seed", "requested", "counts"}
 )
 
 
 def shard_configuration(metadata):
     return {
-        key: value for key, value in metadata.items() if key not in ROOT_SET_METADATA
+        key: value
+        for key, value in metadata.items()
+        if key not in RELEASE_ONLY_METADATA
     }
 
 
-def sha256(path):
-    with Path(path).open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
-
-
-def _content_sha256(payload):
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def sequence_data_identity(directory):
-    """Verify and fingerprint the files that define Sequence training input."""
-    directory = Path(directory)
-    manifest_path = directory / (
-        "release.json" if (directory / "release.json").exists() else "manifest.json"
+def _is_hex64(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
     )
-    manifest = load_manifest(manifest_path)
-    files = {}
-    if "shards" in manifest:
-        for shard in manifest["shards"]:
-            shard_dir = directory / shard["path"]
-            manifest_path = shard_dir / "manifest.json"
-            manifest_sha = sha256(manifest_path)
-            if manifest_sha != shard["sha256"]:
-                raise ValueError(f"Shard manifest checksum mismatch: {manifest_path}")
-            shard_manifest = load_manifest(manifest_path)
-            files[manifest_path.relative_to(directory).as_posix()] = manifest_sha
-            filenames = [f"{name}.npy" for name in TRACE_ARRAYS] + ["roots.jsonl"]
-            for filename in filenames:
-                expected = shard_manifest.get("files", {}).get(filename)
-                if expected is None:
-                    raise ValueError(
-                        f"Shard has no checksum for {filename}: {shard_dir}"
-                    )
-                path = shard_dir / filename
-                actual = sha256(path)
-                if actual != expected:
-                    raise ValueError(f"Training input checksum mismatch: {path}")
-                files[path.relative_to(directory).as_posix()] = actual
+
+
+def _is_int(value, minimum=None):
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    return minimum is None or value >= minimum
+
+
+def _is_probability(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0.0 <= float(value) <= 1.0
+    )
+
+
+def _valid_root_set(identity):
+    if not isinstance(identity, dict) or set(identity) != {"rows", "sha256"}:
+        return False
+    return _is_int(identity["rows"], 1) and _is_hex64(identity["sha256"])
+
+
+def _release_identity_contract(release, root_count):
+    metadata = release.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("Release has no synthesis identity")
+    required = {
+        "teacher",
+        "engine",
+        "config",
+        "search",
+        "board",
+        "presentation",
+        "synthesis",
+        "root_selection",
+    }
+    missing = required - set(metadata)
+    if missing:
+        raise ValueError(f"Release identity is missing {sorted(missing)[0]}")
+
+    teacher = metadata["teacher"]
+    if not isinstance(teacher, dict) or set(teacher) != TEACHER_FIELDS:
+        raise ValueError("Release teacher identity is incomplete")
+    if teacher["schema_version"] != SIDECAR_SCHEMA:
+        raise ValueError("Release teacher schema is unsupported")
+    if not isinstance(teacher["contract"], str):
+        raise ValueError("Release teacher contract path is invalid")
+    if not _is_hex64(teacher["contract_sha256"]):
+        raise ValueError("Release teacher contract hash is invalid")
+    if not _is_int(teacher["value_mate"], 1) or not _is_int(teacher["max_ply"], 1):
+        raise ValueError("Release teacher mate constants are invalid")
+
+    engine = metadata["engine"]
+    if not isinstance(engine, dict) or set(engine) != ENGINE_FIELDS:
+        raise ValueError("Release engine identity is incomplete")
+    if not isinstance(engine["name"], str) or not engine["name"]:
+        raise ValueError("Release engine name is invalid")
+    if not _is_hex64(engine["sha256"]):
+        raise ValueError("Release engine hash is invalid")
+    if not isinstance(engine["instrumentation"], str):
+        raise ValueError("Release instrumentation path is invalid")
+    if not _is_hex64(engine["instrumentation_sha256"]):
+        raise ValueError("Release instrumentation hash is invalid")
+    control = engine["control"]
+    if not isinstance(control, dict) or not _is_hex64(control.get("sha256")):
+        raise ValueError("Release control binary identity is invalid")
+
+    config = metadata["config"]
+    if (
+        not isinstance(config, dict)
+        or set(config) != {"path", "sha256"}
+        or not isinstance(config["path"], str)
+        or not _is_hex64(config["sha256"])
+    ):
+        raise ValueError("Release configuration identity is invalid")
+
+    search = metadata["search"]
+    if not isinstance(search, dict) or set(search) != SEARCH_FIELDS:
+        raise ValueError("Release identity has incomplete search settings")
+    if not _is_int(search["depth"], 1) or not _is_int(search["hash_mb"], 1):
+        raise ValueError("Release search limits are invalid")
+    if search["teacher_width"] != 1:
+        raise ValueError("Release teacher width must be one")
+    if search["threads"] != 1:
+        raise ValueError("Release must use one search thread")
+    if search["fresh_engine_per_root"] is not True:
+        raise ValueError("Release must restart the engine for every root")
+
+    board = metadata["board"]
+    if not isinstance(board, dict) or set(board) != BOARD_FIELDS:
+        raise ValueError("Release BOARD identity is incomplete")
+    if not all(_is_probability(board[name]) for name in BOARD_FIELDS):
+        raise ValueError("Release BOARD probabilities are invalid")
+
+    presentation = metadata["presentation"]
+    if not isinstance(presentation, dict) or set(presentation) != PRESENTATION_FIELDS:
+        raise ValueError("Release presentation identity is incomplete")
+    fractions = [presentation[name] for name in ("zero", "full", "random", "last_root")]
+    if not all(_is_probability(value) for value in fractions):
+        raise ValueError("Release presentation fractions are invalid")
+    if abs(sum(fractions) - 1.0) > 1e-9:
+        raise ValueError("Release presentation fractions do not sum to one")
+    if not (
+        _is_probability(presentation["random_min_fraction"])
+        and _is_probability(presentation["random_max_fraction"])
+        and presentation["random_min_fraction"] < presentation["random_max_fraction"]
+    ):
+        raise ValueError("Release random cut interval is invalid")
+
+    synthesis = metadata["synthesis"]
+    if not isinstance(synthesis, dict) or set(synthesis) != SYNTHESIS_FIELDS:
+        raise ValueError("Release synthesis identity is incomplete")
+    if synthesis["confirmatory_repetition"] != "faithful":
+        raise ValueError("Release confirmatory repetitions are not faithful")
+    if not isinstance(synthesis["claim_draw"], bool):
+        raise ValueError("Release draw claim setting is invalid")
+
+    root_selection = metadata["root_selection"]
+    if (
+        not isinstance(root_selection, dict)
+        or set(root_selection)
+        not in (ROOT_SELECTION_FIELDS, ROOT_SELECTION_FIELDS | {"source_counts"})
+        or not isinstance(root_selection.get("source"), str)
+        or not _is_hex64(root_selection.get("source_sha256"))
+        or not isinstance(root_selection.get("algorithm"), str)
+        or not _is_int(root_selection.get("seed"))
+        or not _is_int(root_selection.get("requested"), 1)
+        or not isinstance(root_selection.get("counts"), dict)
+        or set(root_selection["counts"]) != {"train", "val"}
+        or not all(_is_int(value, 0) for value in root_selection["counts"].values())
+    ):
+        raise ValueError("Release root selection identity is incomplete")
+    source_counts = root_selection.get("source_counts")
+    if source_counts is not None and (
+        not isinstance(source_counts, dict)
+        or set(source_counts) != {"train", "val"}
+        or not all(_is_int(value, 0) for value in source_counts.values())
+    ):
+        raise ValueError("Release source root counts are invalid")
+
+    if ("roots" in metadata) == ("root_sets" in metadata):
+        raise ValueError("Release identity needs one roots or root_sets record")
+    if "roots" in metadata:
+        root_sets = [metadata["roots"]]
     else:
-        if not manifest.get("files"):
-            raise ValueError("Sequence dataset manifest has no input checksums")
-        for filename, expected in manifest["files"].items():
-            path = directory / filename
-            actual = sha256(path)
-            if actual != expected:
-                raise ValueError(f"Training input checksum mismatch: {path}")
-            files[filename] = actual
-    return _content_sha256({"manifest": manifest, "files": files})
+        root_sets = metadata["root_sets"]
+        if not isinstance(root_sets, list) or not root_sets:
+            raise ValueError("Release root_sets must be a nonempty list")
+    if not all(_valid_root_set(root_set) for root_set in root_sets):
+        raise ValueError("Release root identity is malformed")
+    if sum(root_set["rows"] for root_set in root_sets) != root_count:
+        raise ValueError("Release root identity does not match its root count")
+    if "sidecars" in metadata:
+        sidecars = metadata["sidecars"]
+        if not _valid_root_set(sidecars) or sidecars["rows"] != sum(
+            root_set["rows"] for root_set in root_sets
+        ):
+            raise ValueError("Release sidecar identity is malformed")
+    for key, value in metadata.items():
+        if release.get(key) != value:
+            raise ValueError(f"Release metadata {key} differs from its identity")
+    return metadata
+
+
+def validate_release_identity(release):
+    complete = release.get("complete_root_ids")
+    if (
+        not isinstance(complete, list)
+        or not complete
+        or len(set(complete)) != len(complete)
+    ):
+        raise ValueError("Release root ids must be nonempty and unique")
+    return _release_identity_contract(release, len(complete))
 
 
 def validate_sequence_arrays(arrays, rows=None):
@@ -162,6 +330,47 @@ def load_sequence_arrays(directory, names=TRACE_ARRAYS):
     return arrays
 
 
+def sequence_data_identity(directory):
+    """Verify and fingerprint the files that define Sequence training input."""
+    directory = Path(directory)
+    manifest_path = directory / (
+        "release.json" if (directory / "release.json").exists() else "manifest.json"
+    )
+    manifest = load_manifest(manifest_path)
+    files = {}
+    if "shards" in manifest:
+        for shard in manifest["shards"]:
+            shard_dir = directory / shard["path"]
+            manifest_path = shard_dir / "manifest.json"
+            manifest_sha = sha256(manifest_path)
+            if manifest_sha != shard["sha256"]:
+                raise ValueError(f"Shard manifest checksum mismatch: {manifest_path}")
+            shard_manifest = load_manifest(manifest_path)
+            files[manifest_path.relative_to(directory).as_posix()] = manifest_sha
+            filenames = [f"{name}.npy" for name in TRACE_ARRAYS] + ["roots.jsonl"]
+            for filename in filenames:
+                expected = shard_manifest.get("files", {}).get(filename)
+                if expected is None:
+                    raise ValueError(
+                        f"Shard has no checksum for {filename}: {shard_dir}"
+                    )
+                path = shard_dir / filename
+                actual = sha256(path)
+                if actual != expected:
+                    raise ValueError(f"Training input checksum mismatch: {path}")
+                files[path.relative_to(directory).as_posix()] = actual
+    else:
+        if not manifest.get("files"):
+            raise ValueError("Sequence dataset manifest has no input checksums")
+        for filename, expected in manifest["files"].items():
+            path = directory / filename
+            actual = sha256(path)
+            if actual != expected:
+                raise ValueError(f"Training input checksum mismatch: {path}")
+            files[filename] = actual
+    return content_sha256({"manifest": manifest, "files": files})
+
+
 def verify_shard_files(release_dir, shard, expected_metadata=None):
     """Verify a published shard and return its manifest, roots, and arrays."""
     directory = Path(release_dir) / shard["path"]
@@ -175,7 +384,10 @@ def verify_shard_files(release_dir, shard, expected_metadata=None):
                 raise ValueError(f"Shard metadata {key} differs from its release")
     if manifest["rows"] != shard["rows"]:
         raise ValueError(f"Shard row count differs from its release: {directory}")
-    expected_files = {f"{name}.npy" for name in SEQUENCE_ARRAYS} | {"roots.jsonl"}
+    expected_files = {f"{name}.npy" for name in SEQUENCE_ARRAYS} | {
+        "roots.jsonl",
+        "champions.jsonl",
+    }
     if set(manifest.get("files", {})) != expected_files:
         raise ValueError(f"Shard file inventory is incomplete: {directory}")
     for name, expected in manifest["files"].items():
@@ -193,56 +405,269 @@ def verify_shard_files(release_dir, shard, expected_metadata=None):
     return manifest, roots, arrays
 
 
+def _read_champions(directory):
+    directory = Path(directory)
+    return [
+        json.loads(line)
+        for line in (directory / "champions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+
+
+def _move_token(uci, mirrored):
+    return MOVE + IDX_TO_UCI_MOVE_REVERSE[reflect_uci(uci) if mirrored else uci]
+
+
+IDX_TO_UCI_MOVE_REVERSE = {move: index for index, move in IDX_TO_UCI_MOVE.items()}
+
+
+def _check_champion_round(root_id, entry, board, value_mate, max_ply):
+    if set(entry) != {
+        "round",
+        "depth",
+        "move",
+        "raw",
+        "wdl",
+        "mate",
+        "value_token",
+        "pv",
+        "refutations",
+        "candidates",
+    }:
+        raise ValueError(f"Champion record is incomplete: {root_id}")
+    round_number = entry["round"]
+    if not _is_int(round_number, 1) or not _is_int(entry["depth"], 1):
+        raise ValueError(f"Champion round is invalid: {root_id}")
+    move = entry["move"]
+    if not isinstance(move, str) or chess.Move.from_uci(move) not in board.legal_moves:
+        raise ValueError(f"Champion move is illegal: {root_id}")
+    pv = entry["pv"]
+    if not isinstance(pv, list) or not pv or pv[0] != move:
+        raise ValueError(f"Champion principal variation is invalid: {root_id}")
+    tracker = chess.Board(board.fen(en_passant="fen"))
+    for index, step in enumerate(pv):
+        if not isinstance(step, str):
+            raise ValueError(f"Champion principal variation has a bad move: {root_id}")
+        try:
+            tracker.push_uci(step)
+        except ValueError as error:
+            raise ValueError(
+                f"Champion principal variation is illegal: {root_id}"
+            ) from error
+        if index + 1 < len(pv) and tracker.is_game_over():
+            # The search rule, not python-chess's material rule, defines the
+            # trace's terminals; the writer re-checks the exact rule on replay.
+            continue
+    value_token = entry["value_token"]
+    if not isinstance(value_token, int) or not VALUE <= value_token < PAD:
+        raise ValueError(f"Champion value token is invalid: {root_id}")
+    wdl = entry["wdl"]
+    mate = entry["mate"]
+    if wdl is None:
+        if mate is None or not isinstance(mate, int) or mate == 0:
+            raise ValueError(f"Champion mate claim is incomplete: {root_id}")
+        expected = mate_token_for(mate)
+        if value_token != expected:
+            raise ValueError(f"Champion mate token disagrees: {root_id}")
+        if mate_distance_moves(entry["raw"], value_mate, max_ply) != mate:
+            raise ValueError(f"Champion mate distance disagrees: {root_id}")
+    else:
+        if (
+            not isinstance(wdl, list)
+            or len(wdl) != 3
+            or any(not _is_int(value, 0) for value in wdl)
+            or sum(wdl) != 1000
+            or mate is not None
+        ):
+            raise ValueError(f"Champion WDL is invalid: {root_id}")
+        expected = VALUE + value_bin((wdl[0] - wdl[2]) / 1000)
+        if value_token != expected:
+            raise ValueError(f"Champion value token disagrees: {root_id}")
+    candidates = entry["candidates"]
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError(f"Champion round has no exact candidates: {root_id}")
+    seen_moves = set()
+    best = None
+    for candidate in candidates:
+        if set(candidate) != {
+            "move",
+            "raw",
+            "wdl",
+            "mate",
+            "value_token",
+            "order",
+        }:
+            raise ValueError(f"Champion candidate is incomplete: {root_id}")
+        if (
+            not isinstance(candidate["move"], str)
+            or chess.Move.from_uci(candidate["move"]) not in board.legal_moves
+            or not _is_int(candidate["order"], 1)
+            or candidate["move"] in seen_moves
+        ):
+            raise ValueError(f"Champion candidate is invalid: {root_id}")
+        seen_moves.add(candidate["move"])
+        if candidate["wdl"] is None:
+            if candidate["mate"] is None:
+                raise ValueError(f"Champion candidate has no value: {root_id}")
+            expected = mate_token_for(candidate["mate"])
+        else:
+            if (
+                not isinstance(candidate["wdl"], list)
+                or len(candidate["wdl"]) != 3
+                or any(not _is_int(value, 0) for value in candidate["wdl"])
+                or sum(candidate["wdl"]) != 1000
+                or candidate["mate"] is not None
+            ):
+                raise ValueError(f"Champion candidate WDL is invalid: {root_id}")
+            expected = VALUE + value_bin(
+                (candidate["wdl"][0] - candidate["wdl"][2]) / 1000
+            )
+        if candidate["value_token"] != expected:
+            raise ValueError(f"Champion candidate token disagrees: {root_id}")
+        key = (candidate["raw"], -candidate["order"])
+        if best is None or key > best[0]:
+            best = (key, candidate["move"])
+    if best[1] != move:
+        raise ValueError(f"Champion is not the raw-argmax candidate: {root_id}")
+
+
+def mate_token_for(mate):
+    if mate >= 0:
+        return MATE_WIN + mate
+    return MATE_LOSS + (-mate)
+
+
+def _expected_states(program, tokens, champions, mirrored):
+    """Derive the champion visible at each thought boundary from the trace."""
+    entries = {entry["round"]: entry for entry in champions["rounds"]}
+    states = []
+    round_number = 0
+    round_candidates = {}
+    previous = None
+    current = None
+    for step in program.steps:
+        if step.operation in FINAL_SUFFIX_OPS:
+            break
+        if step.operation == "depth":
+            round_number += 1
+            round_candidates = {}
+            current = previous
+        elif step.operation == "evaluate" and len(step.path) == 1:
+            move = step.path[-1]
+            entry = entries.get(round_number)
+            if entry is not None:
+                candidate = next(
+                    (
+                        candidate
+                        for candidate in entry["candidates"]
+                        if candidate["move"] == move
+                    ),
+                    None,
+                )
+                if candidate is not None:
+                    round_candidates[move] = candidate
+                    best = max(
+                        round_candidates.values(),
+                        key=lambda candidate: (candidate["raw"], -candidate["order"]),
+                    )
+                    current = (
+                        _move_token(best["move"], mirrored),
+                        best["value_token"],
+                    )
+        elif step.operation == "evaluate" and not step.path:
+            entry = entries.get(round_number)
+            if entry is not None:
+                current = (_move_token(entry["move"], mirrored), entry["value_token"])
+                previous = current
+        if current is None:
+            states.append((-1, -1, round_number))
+        else:
+            states.append((current[0], current[1], round_number))
+    return states
+
+
 def _validate_shard_rows(
-    release_dir, shard, teachers, expected_metadata=None, expected_roots=None
+    release_dir,
+    shard,
+    presentations,
+    teacher_width,
+    depth,
+    value_mate,
+    max_ply,
+    expected_metadata=None,
+    expected_roots=None,
 ):
+    directory = Path(release_dir) / shard["path"]
     manifest, rows, arrays = verify_shard_files(release_dir, shard, expected_metadata)
-    teacher_width = int(manifest.get("teacher_width", 1))
+    champions_rows = _read_champions(directory)
+    champions = {row["root_id"]: row for row in champions_rows}
+    if len(champions) != len(champions_rows):
+        raise ValueError(f"Champion records contain duplicate roots: {directory}")
     identities = []
     counts = Counter()
     state_total = 0
     board_responses = 0
     max_trace = 0
+    presentations_seen = Counter()
+    suffixes = {}
+    roots_seen = set()
+    checked_champions = set()
     for index, row in enumerate(rows):
-        if row["teacher"] not in teachers:
-            raise ValueError(f"Unknown teacher in shard row: {row['teacher']}")
-        if row["split"] not in {"train", "val"}:
-            raise ValueError(f"Unknown split in shard row: {row['split']}")
+        root_id = row.get("root_id")
+        presentation = row.get("presentation")
+        if not isinstance(root_id, str) or presentation not in presentations:
+            raise ValueError(f"Release row identity is invalid: {directory}")
+        if row.get("teacher_width") != teacher_width:
+            raise ValueError(f"Release teacher width differs: {root_id}")
+        if row.get("depth") != depth:
+            raise ValueError(f"Release depth differs: {root_id}")
+        champion = champions.get(root_id)
+        if champion is None:
+            raise ValueError(f"Release row has no champion record: {root_id}")
         if expected_roots is not None:
-            expected = expected_roots.get(row["root_id"])
+            expected = expected_roots.get(root_id)
             if expected is None:
-                raise ValueError(
-                    f"Release contains an unselected root: {row['root_id']}"
-                )
+                raise ValueError(f"Release contains an unselected root: {root_id}")
             for name in ROOT_RECORD_FIELDS:
-                if row.get(name) != expected.get(name):
+                if name in expected and row.get(name) != expected.get(name):
                     raise ValueError(
-                        f"Release root {name} differs from its selection: {row['root_id']}"
+                        f"Release root {name} differs from its selection: {root_id}"
                     )
         board = chess.Board(row["fen"])
         if board.turn != (row["turn"] == "white"):
-            raise ValueError(f"Root turn disagrees with FEN: {row['root_id']}")
-        encoded = encode_board(row["fen"], row["repetition"])
+            raise ValueError(f"Root turn disagrees with FEN: {root_id}")
+        repetition = row["repetition"]
+        if not _is_int(repetition, 1) or repetition > 4:
+            raise ValueError(f"Root repetition is out of range: {root_id}")
+        if root_id not in checked_champions:
+            if len(champion.get("rounds", [])) != depth:
+                raise ValueError(f"Champion record has the wrong depth: {root_id}")
+            for entry in champion["rounds"]:
+                _check_champion_round(root_id, entry, board, value_mate, max_ply)
+            checked_champions.add(root_id)
+        encoded = encode_board(row["fen"], repetition)
         board_tokens = arrays["board_tokens"][index]
         if not np.array_equal(board_tokens[: len(encoded)], encoded) or not np.all(
             board_tokens[len(encoded) :] == PAD
         ):
-            raise ValueError(f"Board tokens disagree with FEN: {row['root_id']}")
+            raise ValueError(f"Board tokens disagree with FEN: {root_id}")
 
         length = int(arrays["trace_len"][index])
         tokens = arrays["trace_tokens"][index, :length]
         if not np.all(arrays["trace_tokens"][index, length:] == PAD) or not np.all(
             arrays["trace_roles"][index, length:] == 0
         ):
-            raise ValueError(f"Trace padding is invalid: {row['root_id']}")
+            raise ValueError(f"Trace padding is invalid: {root_id}")
         program = replay(
             tokens,
             row["fen"],
-            row["repetition"],
+            repetition,
             teacher_width=teacher_width,
         )
         if not np.array_equal(program.roles, arrays["trace_roles"][index, :length]):
-            raise ValueError(f"Trace roles disagree with replay: {row['root_id']}")
+            raise ValueError(f"Trace roles disagree with replay: {root_id}")
         max_trace = max(max_trace, length)
 
         board_spans = [
@@ -257,7 +682,7 @@ def _validate_shard_rows(
         no_tool = replay(
             no_tool_tokens,
             row["fen"],
-            row["repetition"],
+            repetition,
             teacher_width=teacher_width,
         )
         expected_boundaries = []
@@ -274,18 +699,18 @@ def _validate_shard_rows(
                 or step.evaluation != no_tool_step.evaluation
                 or step.mate != no_tool_step.mate
             ):
-                raise ValueError(f"Tool and no-tool traces differ: {row['root_id']}")
+                raise ValueError(f"Tool and no-tool traces differ: {root_id}")
             previous_no_tool_end = no_tool_step.end
             if step.operation not in FINAL_SUFFIX_OPS:
                 expected_boundaries.append((step.end, no_tool_step.end))
             operation += 1
         if operation != len(no_tool.steps):
-            raise ValueError(f"Tool and no-tool operations differ: {row['root_id']}")
+            raise ValueError(f"Tool and no-tool operations differ: {root_id}")
         expected_boundaries.sort()
 
         count = int(arrays["state_count"][index])
         if count != len(expected_boundaries):
-            raise ValueError(f"Truncation-state count is invalid: {row['root_id']}")
+            raise ValueError(f"Truncation-state count is invalid: {root_id}")
         actual_boundaries = list(
             zip(
                 map(int, arrays["state_tool"][index, :count]),
@@ -293,40 +718,101 @@ def _validate_shard_rows(
             )
         )
         if actual_boundaries != expected_boundaries:
-            raise ValueError(f"Truncation boundaries are invalid: {row['root_id']}")
+            raise ValueError(f"Truncation boundaries are invalid: {root_id}")
         for name in STATE_ARRAYS:
             if not np.all(arrays[name][index, count:] == -1):
-                raise ValueError(
-                    f"Truncation-state padding is invalid: {row['root_id']}"
-                )
-        basis = arrays["state_basis"][index, :count]
-        rounds = int(np.count_nonzero(np.asarray(tokens) == DEPTH))
-        if np.any((basis < 0) | (basis > rounds)):
-            raise ValueError(f"Truncation-state basis is invalid: {row['root_id']}")
+                raise ValueError(f"Truncation-state padding is invalid: {root_id}")
+        expected_states = _expected_states(
+            program, tokens, champion, board.turn == chess.BLACK
+        )
+        if len(expected_states) != count:
+            raise ValueError(f"Truncation-state count is invalid: {root_id}")
+        for position, expected_state in enumerate(expected_states):
+            actual = (
+                int(arrays["state_best"][index, position]),
+                int(arrays["state_value"][index, position]),
+                int(arrays["state_basis"][index, position]),
+            )
+            if actual != expected_state:
+                raise ValueError(f"Truncation state is invalid: {root_id}")
+
+        final_step = next(step for step in program.steps if step.operation == "final")
+        final_index = final_step.start
+        suffix = tuple(int(token) for token in tokens[final_index:])
+        if root_id in suffixes and suffixes[root_id] != suffix:
+            raise ValueError(f"Presentations disagree on the FINAL suffix: {root_id}")
+        suffixes[root_id] = suffix
+        if row.get("thinking_tokens") != final_index:
+            raise ValueError(f"Thinking-token count is invalid: {root_id}")
+        rounds = sum(1 for token in tokens[:final_index] if token == DEPTH)
+        if row.get("rounds") != rounds:
+            raise ValueError(f"Row round count is invalid: {root_id}")
+        final_move = program.final_move
+        if row.get("final_move") != final_move:
+            raise ValueError(f"FINAL move differs from the trace: {root_id}")
+        if row.get("claim_draw") != (final_move == CLAIM_DRAW_UCI):
+            raise ValueError(f"Draw-claim flag differs from the trace: {root_id}")
+        value_token = int(tokens[final_index + 2])
+        if row.get("final_value_bin") != value_token - VALUE:
+            raise ValueError(f"FINAL value bin differs from the trace: {root_id}")
+        mate_distance = None
+        mate_index = final_index + 3
+        if mate_index < len(tokens) and MATE_WIN <= int(tokens[mate_index]) < PAD:
+            token = int(tokens[mate_index])
+            mate_distance = (
+                -(token - MATE_LOSS) if token >= MATE_LOSS else token - MATE_WIN
+            )
+        if row.get("mate_distance") != mate_distance:
+            raise ValueError(f"FINAL mate distance differs from the trace: {root_id}")
+        deepest = champion["rounds"][-1]
+        if deepest["round"] != champion["rounds"].__len__():
+            raise ValueError(f"Champion rounds are not contiguous: {root_id}")
+        if final_move == CLAIM_DRAW_UCI:
+            claimable = repetition >= 3 or board.halfmove_clock >= 100
+            if not claimable or deepest["raw"] > 0:
+                raise ValueError(f"Draw claim is not justified: {root_id}")
+        elif final_move != deepest["move"]:
+            raise ValueError(f"FINAL move differs from the deepest champion: {root_id}")
+        if deepest["mate"] != mate_distance:
+            raise ValueError(
+                f"FINAL mate distance differs from the champion: {root_id}"
+            )
+        if deepest["wdl"] is None:
+            expected_bin = 19 if deepest["mate"] > 0 else 0
+        else:
+            expected_bin = value_bin((deepest["wdl"][0] - deepest["wdl"][2]) / 1000)
+        if row.get("final_value_bin") != expected_bin:
+            raise ValueError(f"FINAL value bin differs from the champion: {root_id}")
+        pv_start = final_index + (4 if mate_distance is not None else 3)
+        pv_tokens = [int(token) for token in tokens[pv_start:-1]]
         mirrored = board.turn == chess.BLACK
-        best = arrays["state_best"][index, :count]
-        values = arrays["state_value"][index, :count]
-        for move_token, value_token in zip(best, values):
-            move_token, value_token = int(move_token), int(value_token)
-            if move_token == -1 or value_token == -1:
-                if move_token != -1 or value_token != -1:
-                    raise ValueError(
-                        f"Truncation-state champion is half unset: {row['root_id']}"
-                    )
-                continue
-            if not MOVE <= move_token < MOVE + len(IDX_TO_UCI_MOVE):
-                raise ValueError(f"Truncation-state move is invalid: {row['root_id']}")
-            if not VALUE <= value_token < PAD:
-                raise ValueError(f"Truncation-state value is invalid: {row['root_id']}")
-            uci = IDX_TO_UCI_MOVE[move_token - MOVE]
-            if mirrored:
-                uci = reflect_uci(uci)
-            if chess.Move.from_uci(uci) not in board.legal_moves:
-                raise ValueError(f"Truncation-state move is illegal: {row['root_id']}")
-        identities.append((row["root_id"], row["teacher"]))
+        actual_pv = [
+            reflect_uci(IDX_TO_UCI_MOVE[token - MOVE])
+            if mirrored
+            else IDX_TO_UCI_MOVE[token - MOVE]
+            for token in pv_tokens
+        ]
+        expected_pv = [] if final_move == CLAIM_DRAW_UCI else deepest["pv"][1:]
+        if actual_pv != expected_pv:
+            raise ValueError(f"FINAL variation differs from the champion: {root_id}")
+
+        identities.append((root_id, presentation))
         counts[row["split"]] += 1
-        counts[row["teacher"]] += 1
+        counts[presentation] += 1
         state_total += count
+        presentations_seen[root_id] += 1
+        roots_seen.add(root_id)
+    if roots_seen != set(champions):
+        raise ValueError(f"Shard rows do not cover its champion records: {directory}")
+    if any(count != len(presentations) for count in presentations_seen.values()):
+        raise ValueError(f"A shard root is missing a presentation: {directory}")
+    for champion in champions.values():
+        if len(champion["rounds"]) != depth:
+            raise ValueError(f"Champion record has the wrong depth: {directory}")
+        if [entry["round"] for entry in champion["rounds"]] != list(
+            range(1, depth + 1)
+        ):
+            raise ValueError(f"Champion rounds are not contiguous: {directory}")
     return {
         "identities": identities,
         "counts": counts,
@@ -336,97 +822,14 @@ def _validate_shard_rows(
     }
 
 
-SEARCH_FIELDS = ("depth", "multipv", "threads", "hash_mb", "max_time")
-TEACHER_SPEC_FIELDS = frozenset(
-    {
-        "kind",
-        "max_depth",
-        "max_nodes",
-        "width",
-        "value_floor",
-        "near_value",
-        "max_candidates",
-    }
-)
-ROOT_RECORD_FIELDS = ("split", "fen", "repetition", "turn", "d16", "source")
-
-
-def _valid_root_set(identity):
-    if not isinstance(identity, dict) or set(identity) != {"rows", "sha256"}:
-        return False
-    rows = identity["rows"]
-    digest = identity["sha256"]
-    return (
-        isinstance(rows, int)
-        and not isinstance(rows, bool)
-        and rows > 0
-        and isinstance(digest, str)
-        and len(digest) == 64
-        and all(character in "0123456789abcdef" for character in digest)
-    )
-
-
-def _release_identity_contract(release, root_count):
-    metadata = release.get("metadata")
-    if not isinstance(metadata, dict):
-        raise ValueError("Release has no synthesis identity")
-    teachers = metadata.get("teachers")
-    if (
-        not isinstance(teachers, list)
-        or not teachers
-        or not all(isinstance(name, str) for name in teachers)
-        or len(set(teachers)) != len(teachers)
-    ):
-        raise ValueError("Release teacher names must be nonempty and unique")
-    search = metadata.get("search")
-    if not isinstance(search, dict) or any(
-        name not in search for name in SEARCH_FIELDS
-    ):
-        raise ValueError("Release identity has incomplete search settings")
-    specs = metadata.get("teacher_specs")
-    if not isinstance(specs, dict) or set(specs) != set(teachers):
-        raise ValueError("Release identity does not cover every teacher")
-    for name in teachers:
-        spec = specs[name]
-        if not isinstance(spec, dict) or set(spec) != TEACHER_SPEC_FIELDS:
-            raise ValueError(f"Teacher identity is incomplete: {name}")
-        if spec["kind"] not in {"fixed", "adaptive"}:
-            raise ValueError(f"Teacher identity has an unknown kind: {name}")
-    if ("roots" in metadata) == ("root_sets" in metadata):
-        raise ValueError("Release identity needs one roots or root_sets record")
-    if "roots" in metadata:
-        root_sets = [metadata["roots"]]
-    else:
-        root_sets = metadata["root_sets"]
-        if not isinstance(root_sets, list) or not root_sets:
-            raise ValueError("Release root_sets must be a nonempty list")
-    if not all(_valid_root_set(root_set) for root_set in root_sets):
-        raise ValueError("Release root identity is malformed")
-    if sum(root_set["rows"] for root_set in root_sets) != root_count:
-        raise ValueError("Release root identity does not match its root count")
-    for key, value in metadata.items():
-        if release.get(key) != value:
-            raise ValueError(f"Release metadata {key} differs from its identity")
-    return metadata
-
-
-def validate_release_identity(release):
-    complete = release.get("complete_root_ids")
-    if (
-        not isinstance(complete, list)
-        or not complete
-        or len(set(complete)) != len(complete)
-    ):
-        raise ValueError("Release root ids must be nonempty and unique")
-    return _release_identity_contract(release, len(complete))
-
-
 def validate_release(directory, roots=None, workers=8):
     """Validate every file and replay every row of a complete sharded release."""
     if workers < 1:
         raise ValueError("Validation workers must be positive")
     directory = Path(directory)
     release = load_manifest(directory / "release.json")
+    if not release:
+        raise FileNotFoundError(directory / "release.json")
     expected_metadata = {
         "format_version": SEQUENCE_FORMAT_VERSION,
         "grammar_version": TRACE_GRAMMAR_VERSION,
@@ -439,8 +842,9 @@ def validate_release(directory, roots=None, workers=8):
             raise ValueError(f"Release metadata {key} is unsupported")
     complete = release["complete_root_ids"]
     metadata = validate_release_identity(release)
-    expected_shard_metadata = {**expected_metadata, **metadata}
-    teachers = metadata["teachers"]
+    teacher = metadata["teacher"]
+    search = metadata["search"]
+    expected_shard_metadata = {**expected_metadata, **shard_configuration(metadata)}
     expected = None
     if roots is not None:
         root_records = list(roots)
@@ -451,7 +855,7 @@ def validate_release(directory, roots=None, workers=8):
             identity = metadata["roots"]
             if (
                 len(root_records) != identity["rows"]
-                or _content_sha256(root_records) != identity["sha256"]
+                or content_sha256(root_records) != identity["sha256"]
             ):
                 raise ValueError("External root records do not match the release hash")
     seen = set()
@@ -463,25 +867,37 @@ def validate_release(directory, roots=None, workers=8):
 
     def validate(shard):
         return _validate_shard_rows(
-            directory, shard, teachers, expected_shard_metadata, expected
+            directory,
+            shard,
+            PRESENTATIONS,
+            search["teacher_width"],
+            search["depth"],
+            teacher["value_mate"],
+            teacher["max_ply"],
+            expected_shard_metadata,
+            expected,
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for result in pool.map(validate, release["shards"]):
-            for root_id, teacher in result["identities"]:
-                key = (root_id, teacher)
+            for root_id, presentation in result["identities"]:
+                key = (root_id, presentation)
                 if key in seen:
-                    raise ValueError(f"Duplicate teacher row: {key}")
+                    raise ValueError(f"Duplicate release row: {key}")
                 seen.add(key)
                 seen_roots.add(root_id)
             counts.update(result["counts"])
             states += result["states"]
             board_responses += result["board_responses"]
             max_trace = max(max_trace, result["max_trace"])
-    if seen_roots != set(complete) or len(seen) != len(complete) * len(teachers):
-        raise ValueError("Release rows do not match its roots and teachers")
+    if seen_roots != set(complete) or len(seen) != len(complete) * len(PRESENTATIONS):
+        raise ValueError("Release rows do not match its roots and presentations")
     if expected is not None:
-        wanted = {(root_id, teacher) for root_id in expected for teacher in teachers}
+        wanted = {
+            (root_id, presentation)
+            for root_id in expected
+            for presentation in PRESENTATIONS
+        }
         if seen != wanted or set(complete) != set(expected):
             raise ValueError("Release does not contain exactly the selected roots")
     result = {

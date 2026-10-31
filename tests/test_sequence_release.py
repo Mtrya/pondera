@@ -1,0 +1,306 @@
+import copy
+import json
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+
+from pondera.data.positions import SequencePositions
+from pondera.data.sequence_release import load_collection, produce_shards
+from pondera.data.sequence_validation import (
+    sequence_data_identity,
+    validate_release,
+    validate_release_identity,
+    verify_shard_files,
+)
+from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
+from pondera.data.trace import replay
+from pondera.data.trace_config import load_config
+from pondera.data.trace_synthesis import PRESENTATIONS
+
+FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
+CASES = ("start_d4", "middlegame_black_d4", "mate_in_1_d4", "claim_draw_d4")
+ENGINE_SHA256 = "52498f1a544a7c238c9c6db0614aa5821877b83d157db167d931ec56f4525761"
+INSTRUMENTATION_SHA256 = (
+    "a8ff707418c820f6f5ad411a2744141286c5d86e4b67553f2373a8c6f4128a67"
+)
+CONTROL_SHA256 = "3116251d2cdf84f710b7fe27a037d0b0a390f1f379fb1f32aeace2f41f095b34"
+
+
+def config_text():
+    return (
+        Path("configs/trace_v2.toml")
+        .read_text(encoding="utf-8")
+        .replace("depth = 16", "depth = 4")
+    )
+
+
+def build_run(directory):
+    directory = Path(directory)
+    config_path = directory / "trace_v2.toml"
+    config_path.write_text(config_text(), encoding="utf-8")
+    config = load_config(config_path)
+    run = directory / "run"
+    (run / "roots").mkdir(parents=True)
+    roots = []
+    mapping = {}
+    for case in CASES:
+        fixture = FIXTURES / case
+        root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
+        roots.append(root)
+        target = run / "roots" / root["root_id"]
+        target.mkdir()
+        shutil.copyfile(fixture / "sidecar.jsonl", target / "sidecar.jsonl")
+        mapping[root["root_id"]] = sha256(target / "sidecar.jsonl")
+    roots_path = run / "roots.jsonl"
+    roots_path.write_text(
+        "".join(json.dumps(root, separators=(",", ":")) + "\n" for root in roots),
+        encoding="utf-8",
+    )
+    write_manifest(run / "sidecars.json", mapping)
+    session = json.loads(
+        (FIXTURES / CASES[0] / "sidecar.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    identity = {
+        "teacher": {
+            "schema_version": 3,
+            "contract": "docs/teacher.md",
+            "contract_sha256": sha256("docs/teacher.md"),
+            "value_mate": session["value_mate"],
+            "max_ply": session["max_ply"],
+        },
+        "engine": {
+            "name": session["engine"],
+            "sha256": ENGINE_SHA256,
+            "instrumentation": "instrumentation.patch",
+            "instrumentation_sha256": INSTRUMENTATION_SHA256,
+            "control": {"path": "control", "sha256": CONTROL_SHA256},
+        },
+        "config": {"path": str(config_path), "sha256": sha256(config_path)},
+        "search": config.search_dict(),
+        "board": config.board_dict(),
+        "presentation": config.presentation_dict(),
+        "synthesis": config.synthesis_dict(),
+        "root_selection": {
+            "source": str(roots_path),
+            "source_sha256": sha256(roots_path),
+            "algorithm": "fixture",
+            "seed": 640,
+            "requested": len(roots),
+            "counts": {"train": len(roots), "val": 0},
+            "source_counts": {"train": len(roots), "val": 0},
+        },
+        "roots": {
+            "path": "roots.jsonl",
+            "rows": len(roots),
+            "sha256": content_sha256(roots),
+        },
+        "sidecars": {"rows": len(mapping), "sha256": content_sha256(mapping)},
+    }
+    collection_path = run / "collection.json"
+    write_manifest(
+        collection_path,
+        {"kind": "trace-v2-collection", "format_version": 1, **identity},
+    )
+    return config, roots, collection_path, run
+
+
+class ReleaseTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (
+            self.config,
+            self.roots,
+            self.collection_path,
+            self.run,
+        ) = build_run(self.root)
+        _collection, selected, identity, base = load_collection(self.collection_path)
+        self.assertEqual(selected, self.roots)
+        self.result = produce_shards(
+            self.roots,
+            base,
+            base / "release",
+            self.config,
+            identity,
+            contract_path=Path("docs/teacher.md"),
+            shard_size=2,
+            workers=1,
+        )
+        self.release = base / "release"
+
+    def test_release_layout_identity_and_validation(self):
+        self.assertEqual(self.result["roots"], len(CASES))
+        self.assertEqual(len(self.result["shards"]), 2)
+        self.assertEqual([shard["rows"] for shard in self.result["shards"]], [8, 8])
+        release = load_manifest(self.release / "release.json")
+        self.assertEqual(release["format_version"], 4)
+        self.assertEqual(release["grammar_version"], 2)
+        self.assertEqual(release["teacher"]["schema_version"], 3)
+        self.assertEqual(
+            release["teacher"]["contract_sha256"], sha256("docs/teacher.md")
+        )
+        self.assertEqual(release["search"]["depth"], 4)
+        self.assertEqual(release["search"]["teacher_width"], 1)
+        self.assertEqual(release["engine"]["sha256"], ENGINE_SHA256)
+        self.assertEqual(release["presentation"], self.config.presentation_dict())
+        self.assertEqual(release["roots"]["rows"], len(CASES))
+        self.assertEqual(release["sidecars"]["rows"], len(CASES))
+        self.assertEqual(release["metadata"], validate_release_identity(release))
+        validation = validate_release(self.release, self.roots, workers=1)
+        self.assertTrue(validation["ok"])
+        self.assertEqual(validation["roots"], len(CASES))
+        self.assertEqual(validation["rows"], len(CASES) * len(PRESENTATIONS))
+        self.assertEqual(validation["counts"]["train"], len(CASES) * len(PRESENTATIONS))
+        self.assertTrue((self.release / "validation.json").exists())
+
+    def expected_shard_metadata(self, release):
+        expected = {
+            key: release[key]
+            for key in (
+                "format_version",
+                "grammar_version",
+                "tokenizer_version",
+                "kind",
+                "role_count",
+            )
+        }
+        expected.update(release["metadata"])
+        return expected
+
+    def test_shards_have_arrays_champions_and_identical_suffixes(self):
+        release = load_manifest(self.release / "release.json")
+        expected = self.expected_shard_metadata(release)
+        suffixes = {}
+        for shard in release["shards"]:
+            manifest, rows, arrays = verify_shard_files(self.release, shard, expected)
+            self.assertIn("champions.jsonl", manifest["files"])
+            champions = {
+                row["root_id"]: row
+                for row in (
+                    json.loads(line)
+                    for line in (self.release / shard["path"] / "champions.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                    if line.strip()
+                )
+            }
+            for index, row in enumerate(rows):
+                length = int(arrays["trace_len"][index])
+                tokens = arrays["trace_tokens"][index, :length]
+                program = replay(
+                    tokens,
+                    row["fen"],
+                    row["repetition"],
+                    teacher_width=1,
+                )
+                final = next(
+                    step for step in program.steps if step.operation == "final"
+                )
+                suffix = tuple(int(token) for token in tokens[final.start :])
+                key = row["root_id"]
+                self.assertEqual(suffixes.setdefault(key, suffix), suffix)
+                self.assertEqual(row["thinking_tokens"], final.start)
+                self.assertEqual(len(champions[key]["rounds"]), row["depth"])
+                thought = [
+                    step
+                    for step in program.steps
+                    if step.operation
+                    not in {"final", "final_evaluate", "final_pv", "end"}
+                ]
+                self.assertEqual(int(arrays["state_count"][index]), len(thought))
+        self.assertEqual(set(suffixes), {root["root_id"] for root in self.roots})
+        positions = SequencePositions(self.release, "train")
+        self.assertEqual(len(positions), len(CASES) * len(PRESENTATIONS))
+        row = positions[0]
+        self.assertEqual(len(row), 4)
+        self.assertGreater(int(row[2]), 0)
+
+    def test_resume_and_shard_recovery(self):
+        _, _, identity, _ = load_collection(self.collection_path)
+        again = produce_shards(
+            self.roots,
+            self.run,
+            self.release,
+            self.config,
+            identity,
+            contract_path=Path("docs/teacher.md"),
+            shard_size=2,
+            workers=1,
+        )
+        self.assertEqual(again["roots"], len(CASES))
+        self.assertEqual(len(again["shards"]), 2)
+        (self.release / "release.json").unlink()
+        recovered = produce_shards(
+            self.roots,
+            self.run,
+            self.release,
+            self.config,
+            identity,
+            contract_path=Path("docs/teacher.md"),
+            shard_size=2,
+            workers=1,
+        )
+        self.assertEqual(recovered["roots"], len(CASES))
+        self.assertTrue(validate_release(self.release, self.roots, workers=1)["ok"])
+
+    def test_sequence_data_identity_covers_the_training_inputs(self):
+        identity = sequence_data_identity(self.release)
+        self.assertEqual(len(identity), 64)
+        self.assertTrue(all(character in "0123456789abcdef" for character in identity))
+
+    def test_validation_detects_a_tampered_shard(self):
+        release = load_manifest(self.release / "release.json")
+        shard = release["shards"][0]
+        path = self.release / shard["path"] / "trace_tokens.npy"
+        with path.open("r+b") as handle:
+            handle.seek(path.stat().st_size // 2)
+            byte = handle.read(1)
+            handle.seek(-1, 1)
+            handle.write(bytes([byte[0] ^ 0xFF]))
+        with self.assertRaises(ValueError):
+            validate_release(self.release, self.roots, workers=1)
+
+    def test_identity_rejects_inconsistent_metadata(self):
+        release = load_manifest(self.release / "release.json")
+        cases = []
+        wrong = copy.deepcopy(release)
+        wrong["metadata"]["search"]["teacher_width"] = 2
+        cases.append(wrong)
+        wrong = copy.deepcopy(release)
+        wrong["metadata"]["presentation"]["zero"] = 0.2
+        cases.append(wrong)
+        wrong = copy.deepcopy(release)
+        wrong["metadata"]["teacher"]["schema_version"] = 2
+        cases.append(wrong)
+        wrong = copy.deepcopy(release)
+        wrong["metadata"]["engine"]["sha256"] = "not-a-checksum"
+        cases.append(wrong)
+        wrong = copy.deepcopy(release)
+        wrong["metadata"]["roots"]["sha256"] = "0" * 64
+        cases.append(wrong)
+        for wrong in cases:
+            with self.subTest(wrong=wrong["metadata"]):
+                with self.assertRaises(ValueError):
+                    validate_release_identity(wrong)
+
+    def test_claim_root_is_materialized_without_a_variation(self):
+        release = load_manifest(self.release / "release.json")
+        claim_roots = set()
+        expected = self.expected_shard_metadata(release)
+        for shard in release["shards"]:
+            _, rows, _ = verify_shard_files(self.release, shard, expected)
+            for row in rows:
+                if row["claim_draw"]:
+                    claim_roots.add(row["root_id"])
+                    self.assertEqual(row["final_move"], "<claim_draw>")
+                    self.assertEqual(row["mate_distance"], None)
+        claim = json.loads((FIXTURES / "claim_draw_d4" / "root.json").read_text())
+        self.assertEqual(claim_roots, {claim["root_id"]})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -18,9 +18,18 @@ A node visit runs from the move that enters the node to the BACK or RESET that l
 
 `FINAL` is the decision point, not the end of the trace. It may follow any operation boundary and implicitly returns to the root. It is followed by a root move, a value token, an optional mate-distance token, the best line, and `<end>`. A root that can claim a draw writes the draw claim in place of the move and has no line: `FINAL <claim_draw> <value> [<mate>] <end>`. The suffix is a prediction region, so a truncated trace carries the final answer of its complete search regardless of where its thought was cut. `pondera.data.trace.TraceWriter` produces traces and `replay` rebuilds and validates them with python-chess from the root FEN alone. The writer, replay, and the generation mask share one visit state machine.
 
-Sequence datasets store `board_tokens`, `trace_tokens`, `trace_len`, and `trace_roles` arrays with manifest `format_version = 3` and `grammar_version = 2`. Roles mark thought moves, evaluations, controls, refutations, the FINAL decision, the label evaluation, and the best line; tool responses carry no loss. Every trace ends with `<end>`, and the FINAL decision is not the last token.
+Sequence datasets store `board_tokens`, `trace_tokens`, `trace_len`, and `trace_roles` arrays with manifest `format_version = 4` and `grammar_version = 2`. Roles mark thought moves, evaluations, controls, refutations, the FINAL decision, the label evaluation, and the best line; tool responses carry no loss. Every trace ends with `<end>`, and the FINAL decision is not the last token.
 
-Validate a completed release with `uv run python -m pondera.data.sequence_validation --release RELEASE --roots ROOTS.jsonl --workers 8`. This checks file hashes and array shapes, then replays every trace with python-chess to verify board observations, token roles, visit and refutation rules, the FINAL suffix, tool/no-tool equivalence, truncation boundaries, and the stored truncation states. `--roots`, `--start`, and `--end` are optional; without them, validation checks internal completeness rather than equality with an external root selection. When external roots are supplied, validation also checks their content hash where available and every stored provenance field, including the train/validation split. Training reads only the four board/trace arrays directly; the remaining arrays describe the search state at each truncation boundary.
+Offline collection and synthesis are driven by `configs/trace_v2.toml`. The collector samples roots from an existing root release, runs one fresh instrumented engine process per root, and keeps the sidecar and root metadata in a run directory. The release builder turns those records into four presentation rows per root and publishes independently hashed shards, resuming existing shards by root. Both commands are library entry points:
+
+```bash
+uv run python -m pondera.data.trace_collect --config configs/trace_v2.toml --roots ROOTS.jsonl \
+    --instrumentation INSTRUMENTATION.patch --control CONTROL_BINARY
+uv run python -m pondera.data.sequence_release --config configs/trace_v2.toml \
+    --collection RUN/collection.json
+```
+
+Validate a completed release with `uv run python -m pondera.data.sequence_validation --release RELEASE --roots ROOTS.jsonl --workers 8`. This checks file hashes and array shapes, then replays every trace with python-chess to verify board observations, token roles, visit and refutation rules, the FINAL suffix, tool/no-tool equivalence, truncation boundaries, and the stored truncation states. `--roots`, `--start`, and `--end` are optional; without them, validation checks internal completeness rather than equality with an external root selection. When external roots are supplied, validation also checks their content hash where available and every stored provenance field, including the train/validation split. Training reads only the four board/trace arrays directly; the remaining arrays describe the search state at each truncation boundary, and each shard's `champions.jsonl` records the per-round champion audit used to validate those states.
 
 ## Train and resume
 

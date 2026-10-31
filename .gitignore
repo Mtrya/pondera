@@ -22,6 +22,8 @@ htmlcov/
 *.arrow
 *.sqlite
 *.jsonl
+# Frozen test inputs are not generated artifacts.
+!tests/fixtures/**/*.jsonl
 *.log
 .env
 .env.*

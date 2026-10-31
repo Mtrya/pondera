@@ -1,0 +1,12 @@
+{
+  "root_id": "bc6ae1d761cf700dfb66ef956ac17bef4a90e0f4846624e57d22ba65f92426c7",
+  "split": "train",
+  "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+  "repetition": 1,
+  "turn": "white",
+  "position_key": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
+  "source": {
+    "case": "start_d4",
+    "depth": 4
+  }
+}
