@@ -1,0 +1,153 @@
+# Teacher collection and trace synthesis configuration.
+#
+# This file is the single authority for the knobs used to collect teacher
+# search records and to synthesize traces from them. Every comment states the
+# knob's exact meaning, its consequence for the produced data, and the
+# statistical quantity it moves. The collector rejects unknown keys and
+# inconsistent values. A release manifest records the effective values, the
+# SHA-256 of this file, and the SHA-256 of the teacher contract document.
+#
+# Reproducibility: with this file, the root selection, the teacher contract,
+# and the instrumented engine binary fixed, collection is byte-reproducible.
+# Engine location is environment, not a search parameter, but the resolved
+# binary's SHA-256 is always recorded.
+
+[engine]
+# Absolute path to the instrumented teacher binary, or a bare executable name
+# resolved on PATH. The binary must expose the TraceLog option; the official
+# binary is used only as the search-output reference for the consistency gate.
+# The collector refuses a binary that cannot trace and records the resolved
+# binary's SHA-256 plus the instrumentation diff's SHA-256. Changing the
+# binary changes every value in the dataset.
+path = "stockfish"
+
+[search]
+# Search depth per root. Every round from 1 to this depth is recorded and
+# presented; the deepest completed round supplies the final move, evaluation,
+# and variation. Deeper searches lengthen traces, raise the converged-depth
+# distribution and the number of refutations, and increase compute roughly
+# with the searched tree. Depth values are not comparable: the trace-length
+# and value-trajectory distributions shift with this setting.
+depth = 16
+
+# MultiPV width W. W = 1 establishes one exact root line per round: the
+# incumbent plus any challengers that fail high and are re-searched. W > 1
+# establishes W exact root lines each round, moves the root refutation
+# reference from the first to the W-th exact candidate, and multiplies trace
+# volume. Translation for W > 1 is undefined until a collection pilot
+# calibrates the order of wide root events, so recorded releases use 1.
+# The value is recorded in the manifest and read by the validator.
+teacher_width = 1
+
+# Engine threads. Recorded data requires 1. More threads make node counts,
+# PVs, and sidecar order depend on scheduling, which breaks byte-exact
+# reproduction and the event-order invariants. This is a data-identity knob,
+# not a throughput knob.
+threads = 1
+
+# Transposition-table size in MiB, fixed for a whole release. The table
+# changes move ordering, pruning, node counts, and occasionally values, so it
+# is part of the data identity rather than a speed-only setting. The same
+# value must be used for every root in a release.
+hash_mb = 256
+
+# Restart the engine before every root. True is required for recorded data:
+# the rounds of one root share the transposition and history tables (that
+# sharing is the demonstrated process), while different roots must not share
+# anything. False leaks state across roots and destroys reproducibility; the
+# collector rejects it for recorded releases.
+fresh_engine_per_root = true
+
+# Roots collected in parallel. Each worker owns one engine process and one
+# root at a time, so peak memory is about workers * hash_mb plus sidecar
+# writing. Worker count changes wall time only; per-root records are identical
+# for any value. It is not a statistical parameter and is not recorded as part
+# of the data identity, only as an execution detail.
+workers = 8
+
+[board]
+# Per-ply hazard of inserting a BOARD observation on the downward spine. After
+# each written spine move, measured from the previous observation or from the
+# root at round start, a geometric gap is drawn with this per-ply probability;
+# the mean gap is 1 / hazard (about 6.7 plies at 0.15). Only descending moves
+# trigger it, not return evaluations and not root evaluations; the root never
+# requests a board because the root board is the prefix. Higher values raise
+# observation density, sequence length, and the share of zero-loss tool
+# response tokens, and give the model more frequent observation practice.
+# 0 disables descent boards; 1 observes after every spine move.
+board_descent_hazard = 0.15
+
+# Probability that an exact frontier evaluation is immediately preceded by a
+# BOARD request and its response (move, BOARD, response, evaluation). It
+# applies only to exact frontier evaluations on the spine: not to root or
+# return evaluations, not to refutations. It is independent of the descent
+# hazard, so both sources can fire on the same node. It sets the frequency of
+# the "refresh the position, then commit" adjacency and therefore the amount
+# of tool supervision near decisions. 1 makes the adjacency deterministic;
+# 0 removes it.
+board_frontier_p = 0.5
+
+[presentation]
+# Each root produces one row per presentation group, all built from the same
+# complete traced search and sharing the same FINAL suffix.
+#   zero:      final answer and variation with no thinking; the direct-answer
+#              baseline and the policy-plus-value-only view.
+#   full:      the complete trace.
+#   random:    one cut at a random interior boundary; see the fractions below.
+#   last_root: the boundary immediately before the last round's root
+#              evaluation, which exercises stopping just short of the answer.
+# The four values must sum to 1. They set the mixture of supervision lengths,
+# the share of early-stop decisions, and the average row length. They are
+# frozen design constants, not a tuning surface.
+zero = 0.10
+full = 0.50
+random = 0.30
+last_root = 0.10
+
+# Random cuts are drawn uniformly over token positions in [0.05, 0.95] of the
+# full trace's thinking tokens (the part before FINAL), then moved forward to
+# the next operation boundary. A BOARD request is never separated from its
+# response. The interval excludes cuts in the first and last few tokens;
+# widening it adds more extreme truncations. The fraction is of thinking
+# tokens, not of the full row including the answer suffix. Larger coverage of
+# the interval spreads supervision over more causal horizons.
+random_min_fraction = 0.05
+random_max_fraction = 0.95
+
+[synthesis]
+# Confirmatory repetitions. "faithful" writes every completed round's root
+# evaluation even when it equals the previous round's value: a real
+# recomputation is the convergence signal and is supervised. Compressing it
+# would shorten traces and remove that signal, shifting the value-trajectory
+# and length distributions. "faithful" is the only value accepted for
+# releases; no compressed form is defined yet.
+confirmatory_repetition = "faithful"
+
+# Root draw claims. When true and a draw is claimable at the root from the
+# source game's history (the position has occurred at least three times, or
+# the halfmove clock is at least 100) and the champion's raw root value is at
+# most zero, the final action is a draw claim with no variation. A claimable
+# but winning root keeps the normal move, evaluation, and variation. This is
+# the only action label not emitted by the engine; it is derived from rule
+# facts plus the engine's real value. False removes the label entirely,
+# leaving that token unsupervised and hiding the claimable-but-losing
+# contrast. The calibration probe is: claim exactly when the reported root
+# evaluation is at most zero.
+claim_draw = true
+
+[smoke]
+# Sampled roots for the local smoke run, with four presentation rows per root
+# (about 4000 rows). The sample is large enough to size the trace-length
+# distribution, refutation density, converged-depth distribution, and claim
+# frequency coarsely. It is not a release and not a training set.
+roots = 1000
+
+# Root sampling seed. Sampling is reproducible and independent of engine
+# behavior: the seed changes which roots enter the sample, never how a root is
+# searched. It is recorded in the manifest together with the root-selection
+# hash.
+seed = 640
+
+# Local output directory for sidecars, synthesized rows, manifests, and the
+# statistics report. It is untracked and never part of a release.
+output = ".local/runs/trace-v2-smoke"
