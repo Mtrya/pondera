@@ -143,24 +143,24 @@ class DepthFlopsTests(unittest.TestCase):
     def test_hand_derived_literal(self):
         # Effective layers: 2 layers x 3 repetitions = 6. Length 10 + 2 readouts = 12.
         # Per layer: 8*12*16^2 + 6*12*16*32 + 4*12^2*16 = 24576+36864+9216 = 70656.
-        # Trunk: 6*70656 = 423936. Head: 3 exits x 2 positions x 2*16*3003 = 576576.
-        # Training: 3*(423936+576576) = 3001536; evaluation: 1000512.
+        # Trunk: 6*70656 = 423936. Head: 3 exits x 2 positions x 2*16*3006 = 577152.
+        # Training: 3*(423936+577152) = 3003264; evaluation: 1001088.
         config = {
             "architecture": "depth",
             "hidden_size": 16,
             "intermediate_size": 32,
             "cores": [{"layers": 2, "repetition": {"max_repetitions": 3}}],
         }
-        self.assertEqual(float(depth_flops(config, [10], head_exits=3)[0]), 3001536.0)
+        self.assertEqual(float(depth_flops(config, [10], head_exits=3)[0]), 3003264.0)
         self.assertEqual(
             float(depth_flops(config, [10], head_exits=3, training=False)[0]),
-            1000512.0,
+            1001088.0,
         )
 
     def test_repetitions_override_scales_trunk(self):
         # Same per-layer cost 70656 as above. Override to 2 executed repetitions:
-        # trunk 4*70656 = 282624; head 2 exits x 2 positions x 2*16*3003 = 384384.
-        # Training: 3*(282624+384384) = 2001024. Override equal to the configured
+        # trunk 4*70656 = 282624; head 2 exits x 2 positions x 2*16*3006 = 384768.
+        # Training: 3*(282624+384768) = 2002176. Override equal to the configured
         # maximum must reproduce the un-overridden value exactly.
         config = {
             "architecture": "depth",
@@ -170,7 +170,7 @@ class DepthFlopsTests(unittest.TestCase):
         }
         self.assertEqual(
             float(depth_flops(config, [10], head_exits=2, repetitions=2)[0]),
-            2001024.0,
+            2002176.0,
         )
         self.assertEqual(
             float(depth_flops(config, [10], head_exits=3, repetitions=3)[0]),

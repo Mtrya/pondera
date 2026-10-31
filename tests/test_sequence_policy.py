@@ -134,11 +134,11 @@ class SequencePolicyTests(unittest.TestCase):
 
 class SequenceFlopsTests(unittest.TestCase):
     def test_hand_derived_literal(self):
-        # Two layers, d=16, f=32, B=10, T=3, V=3003. Linear per layer:
+        # Two layers, d=16, f=32, B=10, T=3, V=3006. Linear per layer:
         # 2*13*(4*16^2 + 3*16*32) = 66560. Attention pairs:
         # 10^2 + 10*3 + 3*4/2 = 136, costing 4*16*136 = 8704.
-        # Per layer 75264, two layers 150528. Head: 2*3*16*3003 = 288288.
-        # Forward 438816; training counts forward plus two backward passes.
+        # Per layer 75264, two layers 150528. Head: 2*3*16*3006 = 288576.
+        # Forward 439104; training counts forward plus two backward passes.
         config = {
             "architecture": "sequence",
             "num_blocks": 2,
@@ -146,9 +146,9 @@ class SequenceFlopsTests(unittest.TestCase):
             "intermediate_size": 32,
             "num_heads": 2,
         }
-        self.assertEqual(float(sequence_flops(config, [10], [3])[0]), 1316448.0)
+        self.assertEqual(float(sequence_flops(config, [10], [3])[0]), 1317312.0)
         self.assertEqual(
-            float(sequence_flops(config, [10], [3], training=False)[0]), 438816.0
+            float(sequence_flops(config, [10], [3], training=False)[0]), 439104.0
         )
 
     def test_rejects_other_architectures_and_empty_rows(self):

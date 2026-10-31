@@ -5,7 +5,8 @@ id; the line number is the id. The layout is arithmetic: 768 occupied-square
 atoms (square * 12 + piece over a1..h8 and PNBRQKpnbrqk), then self-contained
 metadata atoms (side, castling, en passant, halfmove clock, repetition count),
 then the move block, 20 value bins, mate-distance tokens (win 0-28, loss 0-30),
-and the five trace delimiters PAD, BACK, RESET, BOARD, FINAL.
+and the eight trace delimiters PAD, BACK, RESET, BOARD, FINAL, REFUTED, DEPTH,
+END.
 
 The file is the contract. This module validates the arithmetic layout against
 the file at import; regenerate the file only when the vocabulary deliberately
@@ -33,7 +34,7 @@ MOVES = 1969  # geometrically possible moves plus the draw claim
 VALUE_BINS = 20
 MATE_WINS = 29  # distance 0..28; 0 is the terminal position
 MATE_LOSSES = 31  # distance 0..30
-DELIMITERS = 5
+DELIMITERS = 8
 
 # --- Segment offsets --- #
 SIDE = BOARD_TOKENS
@@ -49,12 +50,15 @@ VALUE = MOVE + MOVES
 MATE_WIN = VALUE + VALUE_BINS
 MATE_LOSS = MATE_WIN + MATE_WINS
 DELIM = MATE_LOSS + MATE_LOSSES
-PAD, BACK, RESET, BOARD, FINAL = (
+PAD, BACK, RESET, BOARD, FINAL, REFUTED, DEPTH, END = (
     DELIM,
     DELIM + 1,
     DELIM + 2,
     DELIM + 3,
     DELIM + 4,
+    DELIM + 5,
+    DELIM + 6,
+    DELIM + 7,
 )
 CHESS_VOCAB_SIZE = DELIM + DELIMITERS
 
@@ -116,6 +120,9 @@ def _validate():
         (RESET, "<reset>"),
         (BOARD, "<board>"),
         (FINAL, "<final>"),
+        (REFUTED, "<refuted>"),
+        (DEPTH, "<depth>"),
+        (END, "<end>"),
     ]:
         if LINES[token] != name:
             raise ValueError(f"Vocabulary id {token} is not {name}")
@@ -186,7 +193,16 @@ def chess_vocabulary():
     lines += [f"value:bin:{bin:02d}" for bin in range(VALUE_BINS)]
     lines += [f"mate:win:{distance}" for distance in range(MATE_WINS)]
     lines += [f"mate:loss:{distance}" for distance in range(MATE_LOSSES)]
-    lines += ["<pad>", "<back>", "<reset>", "<board>", "<final>"]
+    lines += [
+        "<pad>",
+        "<back>",
+        "<reset>",
+        "<board>",
+        "<final>",
+        "<refuted>",
+        "<depth>",
+        "<end>",
+    ]
     return lines
 
 

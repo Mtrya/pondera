@@ -48,13 +48,18 @@ TRACE_GRAMMAR_VERSION = 1
 
 # Per-token roles: the loss sees generated moves, evaluations, and controls,
 # treats a tool response as context only, and weights the final move apart.
+# The FINAL suffix separates the decision move, its evaluation, and its best
+# line; a refutation states a candidate's outcome without a value.
 ROLE_PAD = 0
 ROLE_TOOL = 1
 ROLE_MOVE = 2
 ROLE_EVAL = 3
 ROLE_CONTROL = 4
 ROLE_FINAL_MOVE = 5
-ROLE_COUNT = 6
+ROLE_REFUTED = 6
+ROLE_FINAL_PV = 7
+ROLE_FINAL_EVAL = 8
+ROLE_COUNT = 9
 
 # One board observation carries eight metadata atoms after its piece atoms.
 OBSERVATION_METADATA = 8

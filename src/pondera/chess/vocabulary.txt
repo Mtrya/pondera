@@ -3001,3 +3001,6 @@ mate:loss:30
 <reset>
 <board>
 <final>
+<refuted>
+<depth>
+<end>
