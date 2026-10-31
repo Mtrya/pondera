@@ -1,0 +1,12 @@
+{
+  "root_id": "f78a244bc877234ec777bcf57fab0988740de210fc15f282d64a8d3fe47ba473",
+  "split": "train",
+  "fen": "8/8/7R/1p1k4/P2P4/3KP3/6PP/8 w - - 2 38",
+  "repetition": 1,
+  "turn": "white",
+  "position_key": "8/8/7R/1p1k4/P2P4/3KP3/6PP/8 w - -",
+  "source": {
+    "case": "stalemate_d4",
+    "depth": 4
+  }
+}

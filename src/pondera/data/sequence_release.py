@@ -109,6 +109,7 @@ def _champion_row(root, synthesized):
                     "mate": candidate.mate,
                     "value_token": candidate.value_token,
                     "order": candidate.order,
+                    "draw": candidate.draw,
                 }
                 for candidate in audit.candidates
             ],

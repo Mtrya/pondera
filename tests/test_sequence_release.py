@@ -19,7 +19,13 @@ from pondera.data.trace_config import load_config
 from pondera.data.trace_synthesis import PRESENTATIONS
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
-CASES = ("start_d4", "middlegame_black_d4", "mate_in_1_d4", "claim_draw_d4")
+CASES = (
+    "start_d4",
+    "middlegame_black_d4",
+    "mate_in_1_d4",
+    "claim_draw_d4",
+    "stalemate_d4",
+)
 ENGINE_SHA256 = "52498f1a544a7c238c9c6db0614aa5821877b83d157db167d931ec56f4525761"
 INSTRUMENTATION_SHA256 = (
     "a8ff707418c820f6f5ad411a2744141286c5d86e4b67553f2373a8c6f4128a67"
@@ -134,8 +140,9 @@ class ReleaseTests(unittest.TestCase):
 
     def test_release_layout_identity_and_validation(self):
         self.assertEqual(self.result["roots"], len(CASES))
-        self.assertEqual(len(self.result["shards"]), 2)
-        self.assertEqual([shard["rows"] for shard in self.result["shards"]], [8, 8])
+        # Five roots, shard_size two: 2 + 2 + 1 roots, 8 + 8 + 4 rows.
+        self.assertEqual(len(self.result["shards"]), 3)
+        self.assertEqual([shard["rows"] for shard in self.result["shards"]], [8, 8, 4])
         release = load_manifest(self.release / "release.json")
         self.assertEqual(release["format_version"], 4)
         self.assertEqual(release["grammar_version"], 2)
@@ -232,7 +239,7 @@ class ReleaseTests(unittest.TestCase):
             workers=1,
         )
         self.assertEqual(again["roots"], len(CASES))
-        self.assertEqual(len(again["shards"]), 2)
+        self.assertEqual(len(again["shards"]), 3)
         (self.release / "release.json").unlink()
         recovered = produce_shards(
             self.roots,

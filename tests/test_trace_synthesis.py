@@ -26,6 +26,7 @@ CASES = {
     "claim_draw_d4": 4,
     "capture_d4": 4,
     "rule_draw_d4": 4,
+    "stalemate_d4": 4,
 }
 
 

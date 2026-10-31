@@ -592,6 +592,7 @@ class CandidateAudit:
     mate: int | None
     value_token: int
     order: int
+    draw: bool
 
 
 @dataclass(frozen=True)
@@ -787,21 +788,22 @@ class _Synthesis:
 
     # --- candidate narration --- #
 
-    def _record_root_candidate(self, round_number, candidate, token):
+    def _record_root_candidate(self, round_number, candidate, token, draw=False):
         if candidate.parent != ():
             return
         raw = -candidate.exact["raw"]
         self.state.record_exact(candidate.move, raw, token, candidate.order)
-        wdl = candidate.exact.get("wdl")
+        wdl = None if draw else candidate.exact.get("wdl")
         self._recorded_root_candidates.append(
             CandidateAudit(
                 round_number,
                 candidate.move,
                 raw,
                 None if wdl is None else (wdl[2], wdl[1], wdl[0]),
-                _token_mate(token),
+                None if draw else _token_mate(token),
                 token,
                 candidate.order,
+                draw,
             )
         )
 
@@ -822,15 +824,19 @@ class _Synthesis:
                     )
                 token = mate_token(0, True)
             else:
-                # The engine reports a draw as VALUE_DRAW - 1 + (nodes & 0x2),
-                # so -1 or +1 rather than 0, to break score ties.
-                if abs(raw) > 1:
+                # A draw is a rule verdict, not an engine score. Deeper nodes
+                # return VALUE_DRAW with the +-1 tie-break, but qsearch does
+                # not detect stalemate, so a depth-zero stalemate leaf carries
+                # its static evaluation instead.
+                if depth > 0 and abs(raw) > 1:
                     raise SynthesisError(
-                        "a rule draw child has a non-draw engine value"
+                        "a non-leaf rule draw child has a non-draw score"
                     )
                 token = VALUE + value_bin(0.0)
             self.terminal_evals += 1
-            self._record_root_candidate(round_number, candidate, token)
+            self._record_root_candidate(
+                round_number, candidate, token, draw=terminal != "mate"
+            )
             self._write_eval(token)
             return
         if depth <= 0:

@@ -498,6 +498,7 @@ def _check_champion_round(root_id, entry, board, value_mate, max_ply):
             "mate",
             "value_token",
             "order",
+            "draw",
         }:
             raise ValueError(f"Champion candidate is incomplete: {root_id}")
         if (
@@ -508,7 +509,15 @@ def _check_champion_round(root_id, entry, board, value_mate, max_ply):
         ):
             raise ValueError(f"Champion candidate is invalid: {root_id}")
         seen_moves.add(candidate["move"])
-        if candidate["wdl"] is None:
+        if not isinstance(candidate["draw"], bool):
+            raise ValueError(f"Champion candidate draw flag is invalid: {root_id}")
+        if candidate["draw"]:
+            if candidate["wdl"] is not None or candidate["mate"] is not None:
+                raise ValueError(
+                    f"Champion draw candidate carries an engine value: {root_id}"
+                )
+            expected = VALUE + value_bin(0.0)
+        elif candidate["wdl"] is None:
             if candidate["mate"] is None:
                 raise ValueError(f"Champion candidate has no value: {root_id}")
             expected = mate_token_for(candidate["mate"])
