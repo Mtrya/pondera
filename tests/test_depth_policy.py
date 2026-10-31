@@ -7,6 +7,7 @@ import torch
 
 from pondera.chess.codec import encode_boards
 from pondera.chess.vocabulary import UCI_MOVE_TO_IDX
+from pondera.inference.policy import pick_move
 from pondera.models.checkpoint import load_model, save_checkpoint
 from pondera.models.factory import create_model
 from pondera.training.cost import depth_flops
@@ -46,6 +47,19 @@ class DepthPolicyTests(unittest.TestCase):
         move, value = self.model(ids=self.ids)
         torch.testing.assert_close(exits[-1].move_logits, move)
         torch.testing.assert_close(exits[-1].value_logits, value)
+
+    def test_uci_move_selection_rejects_sequence_models(self):
+        sequence = create_model(
+            {
+                "architecture": "sequence",
+                "num_blocks": 1,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_heads": 2,
+            }
+        )
+        with self.assertRaises(ValueError):
+            pick_move(sequence, chess.Board())
 
     def test_reflection_table_matches_python_chess_mirrors(self):
         # Independent source: python-chess legal moves of mirrored boards.
@@ -109,24 +123,24 @@ class DepthFlopsTests(unittest.TestCase):
     def test_hand_derived_literal(self):
         # Effective layers: 2 layers x 3 repetitions = 6. Length 10 + 2 readouts = 12.
         # Per layer: 8*12*16^2 + 6*12*16*32 + 4*12^2*16 = 24576+36864+9216 = 70656.
-        # Trunk: 6*70656 = 423936. Head: 3 exits x 2 positions x 2*16*3002 = 576384.
-        # Training: 3*(423936+576384) = 3000960; evaluation: 1000320.
+        # Trunk: 6*70656 = 423936. Head: 3 exits x 2 positions x 2*16*3003 = 576576.
+        # Training: 3*(423936+576576) = 3001536; evaluation: 1000512.
         config = {
             "architecture": "depth",
             "hidden_size": 16,
             "intermediate_size": 32,
             "cores": [{"layers": 2, "repetition": {"max_repetitions": 3}}],
         }
-        self.assertEqual(float(depth_flops(config, [10], head_exits=3)[0]), 3000960.0)
+        self.assertEqual(float(depth_flops(config, [10], head_exits=3)[0]), 3001536.0)
         self.assertEqual(
             float(depth_flops(config, [10], head_exits=3, training=False)[0]),
-            1000320.0,
+            1000512.0,
         )
 
     def test_repetitions_override_scales_trunk(self):
         # Same per-layer cost 70656 as above. Override to 2 executed repetitions:
-        # trunk 4*70656 = 282624; head 2 exits x 2 positions x 2*16*3002 = 384256.
-        # Training: 3*(282624+384256) = 2000640. Override equal to the configured
+        # trunk 4*70656 = 282624; head 2 exits x 2 positions x 2*16*3003 = 384384.
+        # Training: 3*(282624+384384) = 2001024. Override equal to the configured
         # maximum must reproduce the un-overridden value exactly.
         config = {
             "architecture": "depth",
@@ -136,7 +150,7 @@ class DepthFlopsTests(unittest.TestCase):
         }
         self.assertEqual(
             float(depth_flops(config, [10], head_exits=2, repetitions=2)[0]),
-            2000640.0,
+            2001024.0,
         )
         self.assertEqual(
             float(depth_flops(config, [10], head_exits=3, repetitions=3)[0]),

@@ -1,10 +1,12 @@
 import math
 import unittest
 
+import numpy as np
 import torch
 
 from pondera.chess.codec import encode_boards
-from pondera.models.policy import DepthPolicyModel
+from pondera.data.trace import TraceWriter
+from pondera.models.policy import DepthPolicyModel, SequencePolicyModel
 from pondera.training.internals import InternalProbe, effective_rank
 
 START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -23,6 +25,29 @@ def tiny_model():
 
 def probe_inputs(batch=2):
     return {"ids": torch.from_numpy(encode_boards([START] * batch))}
+
+
+def tiny_sequence(blocks=2):
+    torch.manual_seed(640)
+    return SequencePolicyModel(
+        num_blocks=blocks,
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=2,
+    )
+
+
+def sequence_inputs(walk=0):
+    """One trace with `walk` move/BACK pairs before the final decision."""
+    writer = TraceWriter(START)
+    for _ in range(walk):
+        writer.move("e2e4")
+        writer.back()
+    writer.final("d2d4")
+    return {
+        "ids": torch.from_numpy(encode_boards([START])),
+        "trace_ids": torch.from_numpy(np.stack([writer.tokens])),
+    }
 
 
 class AttentionCaptureTests(unittest.TestCase):
@@ -54,6 +79,70 @@ class AttentionCaptureTests(unittest.TestCase):
         for entropy, peak in stats:
             self.assertAlmostEqual(entropy, math.log(42), places=3)
             self.assertAlmostEqual(peak, 1 / 42, places=4)
+
+
+class SequenceProbeTests(unittest.TestCase):
+    def test_capture_is_output_invariant_and_reports_health(self):
+        model = tiny_sequence().eval()
+        inputs = sequence_inputs()
+        with torch.no_grad():
+            expected = model(**inputs)
+            captured, output = model(**inputs, return_backbone=True, capture=True)
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+        self.assertEqual(len(output.readouts), 2)
+
+        probe = InternalProbe(model)
+        scalars, arrays = probe.collect(model, inputs)
+        probe.close()
+        for key in (
+            "layer_00/residual_rms",
+            "layer_00/attention_entropy_mean",
+            "layer_00/effective_rank",
+            "layer_00/ffn_dead_fraction",
+            "embedding/tokens_row_norm_mean",
+            "embedding/tokens_starved_fraction",
+            "drift/embedding",
+        ):
+            self.assertIn(key, scalars)
+        self.assertEqual(arrays["attention_entropy"].shape, (2, 2))
+        # The fresh model has not moved any embedding row yet.
+        self.assertEqual(scalars["embedding/tokens_starved_fraction"], 1.0)
+        self.assertEqual(scalars["drift/embedding"], 0.0)
+
+    def test_long_sequence_attention_is_uniform_with_zero_keys(self):
+        model = tiny_sequence().eval()
+        for block in model.backbone.cores[0].layers:
+            with torch.no_grad():
+                block.key_value.weight.zero_()
+        # 150 move/BACK pairs plus FINAL and its move: 302 trace tokens, long
+        # enough to cross the probe's query chunk.
+        inputs = sequence_inputs(walk=150)
+        trace_length = inputs["trace_ids"].shape[1]
+        self.assertEqual(trace_length, 302)
+        probe = InternalProbe(model)
+        _, arrays = probe.collect(model, inputs)
+        probe.close()
+
+        # Zero keys make attention uniform over the accessible keys. Board
+        # queries see the whole B-token prefix; the j-th trace query sees the
+        # prefix plus j+1 trace positions. The capture averages per query, so
+        # the expected entropy and peak are hand-averaged over those counts.
+        board = inputs["ids"].shape[1]
+        keys = [board] * board + [board + index + 1 for index in range(trace_length)]
+        expected_entropy = sum(math.log(count) for count in keys) / len(keys)
+        expected_peak = sum(1 / count for count in keys) / len(keys)
+        for block in range(2):
+            for head in range(2):
+                self.assertAlmostEqual(
+                    float(arrays["attention_entropy"][block, head]),
+                    expected_entropy,
+                    places=3,
+                )
+                self.assertAlmostEqual(
+                    float(arrays["attention_peak"][block, head]),
+                    expected_peak,
+                    places=5,
+                )
 
 
 class EffectiveRankTests(unittest.TestCase):

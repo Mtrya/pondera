@@ -186,10 +186,10 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
     dataset; it carries no positional encoding. Trace tokens add sinusoidal
     positions. Both read one full-vocabulary embedding table, so the id of a
     piece on a square means the same thing whether it appears while reading a
-    board or writing a snapshot. The head spans the unified vocabulary and
-    reads the whole sequence; supervision follows the shifted trace contract
-    in sequence_target_positions. Generation prefills the board, then decodes
-    one token at a time from the cached prefix.
+    board prefix or a BOARD observation. The head spans the unified vocabulary
+    and reads the whole sequence; supervision follows the shifted trace
+    contract in sequence_target_positions. Generation prefills the board, then
+    decodes one token at a time from the cached prefix.
     """
 
     def __init__(
@@ -228,7 +228,7 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
         hidden = self.token_embedding(ids.long())
         return hidden.masked_fill(~valid.unsqueeze(-1), 0), valid
 
-    def sequence(self, ids, trace_ids=None, trace_positions=None):
+    def sequence(self, ids, trace_ids=None, trace_positions=None, *, capture=False):
         """Backbone output over the sparse board prefix and the trace suffix."""
         hidden, valid = self._prefix_embeddings(ids)
         board_width = ids.shape[1]
@@ -242,7 +242,7 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
             )
             hidden = torch.cat((hidden, trace), dim=1)
             valid = torch.cat((valid, trace_ids != PAD), dim=1)
-        output = self.backbone(hidden, board_width, valid=valid)
+        output = self.backbone(hidden, board_width, valid=valid, capture=capture)
         return hidden, valid, board_width, output
 
     def forward(
@@ -252,10 +252,13 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
         *,
         return_backbone=False,
         trace_positions=None,
+        capture=False,
     ):
         if ids is None:
             raise ValueError("Sequence policies consume encoded board tokens")
-        _, _, _, output = self.sequence(ids, trace_ids, trace_positions)
+        _, _, _, output = self.sequence(
+            ids, trace_ids, trace_positions, capture=capture
+        )
         logits = self.head(output.hidden)
         return (logits, output) if return_backbone else logits
 

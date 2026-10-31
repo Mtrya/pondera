@@ -12,7 +12,7 @@ cd pondera
 uv sync --all-extras --group dev
 ```
 
-Python 3.13 or later is required. Stockfish and fastchess are external executables; install them separately and put them on `PATH`. A minimal inference installation needs only `uv sync --no-dev`; data processing and training dependencies are available through the `data` and `training` extras.
+Python 3.13 or later is required. Stockfish and fastchess are external executables; install them separately and put them on `PATH`. A minimal inference installation needs only `uv sync --no-dev`; experiment tracking and training-schedule helpers are available through the `training` extra.
 
 ## Usage
 

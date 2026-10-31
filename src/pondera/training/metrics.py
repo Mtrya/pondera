@@ -80,9 +80,7 @@ class PolicyMetrics:
             "legal_confidence",
             "entropy",
         )
-        result = {
-            name: float(arrays[name].mean()) for name in names if name in arrays
-        }
+        result = {name: float(arrays[name].mean()) for name in names if name in arrays}
         result["positions"] = len(arrays["loss"])
         for prefix in ("", "legal_"):
             confidence = arrays[f"{prefix}confidence"]

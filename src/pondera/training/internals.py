@@ -13,6 +13,13 @@ def _blocks(model):
     return [layer for core in model.backbone.cores for layer in core.layers]
 
 
+def _embedding_weight(model):
+    """Token embedding table of either board-policy architecture."""
+    if hasattr(model, "token_embedding"):
+        return model.token_embedding.weight
+    return model.board_embedding.tokens.weight
+
+
 def effective_rank(singular_values):
     """Entropy effective rank from singular values."""
     total = singular_values.sum().clamp_min(1e-12)
@@ -24,7 +31,7 @@ def _group(name):
     if name.startswith("backbone.cores."):
         parts = name.split(".")
         return f"core{parts[2]}_layer_{int(parts[4]):02d}"
-    if name.startswith("board_embedding"):
+    if name.startswith(("board_embedding", "token_embedding")):
         return "embedding"
     return name.split(".")[0]
 
@@ -39,8 +46,8 @@ class InternalProbe:
             block.ffn.down_proj.register_forward_pre_hook(self._ffn_hook(index))
             for index, block in enumerate(_blocks(model))
         ]
-        embedding = model.board_embedding
-        weights = {"tokens": embedding.tokens.weight}
+        embedding = _embedding_weight(model)
+        weights = {"tokens": embedding}
         if init_file is not None and init_file.exists():
             loaded = np.load(init_file)
             self.initial = {name: torch.from_numpy(loaded[name]) for name in weights}
@@ -83,7 +90,7 @@ class InternalProbe:
             block.attention_capture = []
         was_training = model.training
         model.eval()
-        _, _, output = model(**inputs, return_backbone=True, capture=True)
+        output = model(**inputs, return_backbone=True, capture=True)[-1]
         if was_training:
             model.train()
         self.active = False
@@ -130,7 +137,13 @@ class InternalProbe:
             )
 
         for index, gated in sorted(self.ffn_inputs.items()):
-            channel_max = gated.float().abs().amax(dim=(0, 1)).cpu().numpy()
+            gated = gated.float()
+            # Every readout shares the execution's token mask; trace padding is
+            # excluded so dead-channel counts reflect real tokens only.
+            if readouts and readouts[0].active.shape == gated.shape[:2]:
+                channel_max = gated[readouts[0].active].abs().amax(dim=0).cpu().numpy()
+            else:
+                channel_max = gated.abs().amax(dim=(0, 1)).cpu().numpy()
             arrays[f"ffn_channel_max_{index:02d}"] = channel_max
             scalars[f"layer_{index:02d}/ffn_dead_fraction"] = float(
                 (channel_max < 1e-4).mean()
@@ -140,20 +153,17 @@ class InternalProbe:
                     np.percentile(channel_max, quantile)
                 )
 
-        embedding = model.board_embedding
-        for name, weight in (("tokens", embedding.tokens.weight),):
-            current = weight.detach().float().cpu()
-            initial = self.initial[name]
-            norms = current.norm(dim=1)
-            scalars[f"embedding/{name}_row_norm_mean"] = float(norms.mean())
-            scalars[f"embedding/{name}_row_norm_std"] = float(norms.std())
-            delta = (current - initial).norm(dim=1) / initial.norm(dim=1).clamp_min(
-                1e-8
-            )
-            arrays[f"embedding_{name}_relative_delta"] = delta.numpy()
-            scalars[f"embedding/{name}_starved_fraction"] = float(
-                (delta < 0.02).float().mean()
-            )
+        weight = _embedding_weight(model)
+        current = weight.detach().float().cpu()
+        initial = self.initial["tokens"]
+        norms = current.norm(dim=1)
+        scalars["embedding/tokens_row_norm_mean"] = float(norms.mean())
+        scalars["embedding/tokens_row_norm_std"] = float(norms.std())
+        delta = (current - initial).norm(dim=1) / initial.norm(dim=1).clamp_min(1e-8)
+        arrays["embedding_tokens_relative_delta"] = delta.numpy()
+        scalars["embedding/tokens_starved_fraction"] = float(
+            (delta < 0.02).float().mean()
+        )
 
         updates = {}
         for name, parameter in model.named_parameters():

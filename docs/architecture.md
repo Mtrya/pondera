@@ -4,7 +4,7 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 
 | Location | Responsibility |
 |---|---|
-| `chess/` | Action vocabulary, position history, lossless board token encoding, and exact symmetry transforms |
+| `chess/` | Action vocabulary, rule-only path tracking, lossless board token encoding, and exact symmetry transforms |
 | `models/` | Neural model and checkpoint serialization |
 | `data/` | Offline annotation, frozen teacher releases, and encoded training arrays |
 | `training/` | Supervised optimization and resumable training state |
@@ -15,7 +15,7 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 
 Representation code does not import application layers. Models depend on representation, while training and inference depend on models. Training does not call search, annotation, or evaluation code. Evaluation orchestrates inference and external engines. Data and evaluation do not import training. Import contracts enforce these boundaries.
 
-The board tokenizer has one lossless format shared by offline teacher-release preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving the first five FEN fields. The fullmove counter is not encoded, so decoding restores the FEN modulo that counter. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
+The board tokenizer has one format shared by offline teacher-release preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving piece placement and the first four FEN fields exactly. The fullmove counter is not encoded; halfmove clocks above 100 and repetition counts above four share their respective top atoms. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
 
 Token backbones compose attention blocks, repeated cores, and explicit KV access policies. Board policies attach lossless board embeddings and action/value readouts. Sequence backbones accept embeddings without prescribing thought-token semantics or training-only heads. Their contracts and examples are described in [token backbones](backbones.md).
 

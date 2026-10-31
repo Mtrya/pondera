@@ -1,4 +1,4 @@
-"""Analytical dense-matmul FLOPs for recurrent-depth board-policy comparisons.
+"""Analytical dense-matmul FLOPs for board-policy comparisons.
 
 A multiply-add counts as two FLOPs. Padding, embedding lookups, normalization,
 activation functions, scalar bias arithmetic, and optimizer updates are excluded.
@@ -43,4 +43,33 @@ def depth_flops(config, lengths, head_exits, *, training=True, repetitions=None)
         + 4 * lengths**2 * width
     )
     head = head_exits * 2 * (2 * width * CHESS_VOCAB_SIZE)
+    return (3 if training else 1) * (trunk + head)
+
+
+def sequence_flops(config, board_lengths, trace_lengths, *, training=True):
+    """FLOPs for the causal sequence policy over actual board and trace lengths.
+
+    The board prefix attends bidirectionally and every trace token attends the
+    prefix plus the trace up to itself. A row with ``B`` board atoms and ``T``
+    trace tokens therefore has ``B**2 + B*T + T*(T+1)/2`` query-key pairs. The
+    vocabulary head is applied at the ``T`` supervised trace positions. Callers
+    pass exact non-padding counts: padded positions cost nothing, while tool
+    responses and the final move are ordinary attended tokens and do count.
+    """
+    if config.get("architecture") != "sequence":
+        raise ValueError("This FLOP convention is defined for the sequence policy")
+    board = np.asarray(board_lengths, dtype=np.float64)
+    trace = np.asarray(trace_lengths, dtype=np.float64)
+    if board.shape != trace.shape:
+        raise ValueError("Board and trace lengths must describe the same rows")
+    if np.any(board < 1) or np.any(trace < 1):
+        raise ValueError("Every row needs at least one board and one trace token")
+    width, intermediate = config["hidden_size"], config["intermediate_size"]
+    layers = config["num_blocks"]
+    tokens = board + trace
+    pairs = board**2 + board * trace + trace * (trace + 1) / 2
+    trunk = layers * (
+        2 * tokens * (4 * width**2 + 3 * width * intermediate) + 4 * width * pairs
+    )
+    head = 2 * trace * width * CHESS_VOCAB_SIZE
     return (3 if training else 1) * (trunk + head)

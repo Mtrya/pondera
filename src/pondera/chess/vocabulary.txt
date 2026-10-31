@@ -941,7 +941,7 @@ meta:halfmove:96
 meta:halfmove:97
 meta:halfmove:98
 meta:halfmove:99
-meta:halfmove:100
+meta:halfmove:100+
 meta:repetition:1
 meta:repetition:2
 meta:repetition:3
@@ -2997,6 +2997,7 @@ mate:loss:28
 mate:loss:29
 mate:loss:30
 <pad>
-<end>
-<line>
+<back>
+<reset>
+<board>
 <final>

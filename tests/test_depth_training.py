@@ -148,15 +148,18 @@ class DepthTrainingTests(unittest.TestCase):
             replace(self.config, teacher_depth=0)
         # teacher_depth beyond the encoded depths is rejected by train().
         with self.assertRaises(ValueError):
-            train(
-                replace(self.config, teacher_depth=3), self.data, self.root / "deep"
-            )
+            train(replace(self.config, teacher_depth=3), self.data, self.root / "deep")
         # The depth trainer only accepts depth-architecture models.
         with self.assertRaises(ValueError):
             replace(
                 self.config,
-                model={"architecture": "base", "num_blocks": 1, "hidden_size": 16,
-                       "intermediate_size": 32, "num_heads": 2},
+                model={
+                    "architecture": "base",
+                    "num_blocks": 1,
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_heads": 2,
+                },
             )
 
     def test_teacher_depths_validation(self):

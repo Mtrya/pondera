@@ -1,394 +1,507 @@
-"""Sequence trace targets: candidate lines, board snapshots, and the answer.
+"""Sequence trace programs over the unified chess vocabulary.
 
-A trace is a canonical program over the unified chess vocabulary. Level 0 holds
-the answer alone (FINAL, best move, evaluation, END); level 1.5 prefixes one
-LINE segment per teacher candidate (LINE, up to ten PV moves, evaluation) and
-closes with the same FINAL segment. Levels s2e and s2r3 additionally interleave
-explicit board snapshots inside every LINE: s2e at the end of each line, s2r3
-after every third move and at the end.
+A trace is a causal program over one root position. Move tokens walk a path of
+absolute UCI moves; BACK returns to the parent, RESET returns to the root from
+any depth, value and mate tokens evaluate the current node from the root
+player's perspective, BOARD asks for the full encoded observation of the
+current node, and ``FINAL <root move>`` ends the program immediately. A later
+evaluation of a node corrects an earlier one.
 
-Moves are stored in the black-to-move canonical orientation, so a black-to-move
-root has every PV move rank-reflected; evaluations keep the teacher's
-root-player sign. A snapshot is a run of board atoms in a1..h8 scan order (the
-same ids a board prefix uses) followed by six metadata atoms (side, castling,
-en passant) without counters, and it is emitted in the same canonical frame:
-pieces rank-mirrored and color-swapped for a black-to-move root, side atom in
-the root frame's naming, which the mirror leaves unchanged. Snapshots carry
-rule truth replayed with python-chess, so their side, castling, and en-passant
-fields follow the pushed PV rather than the root.
+Stored moves are rank-reflected when the root has Black to move, matching the
+board prefix's canonical frame. Controls, value tokens, and board responses
+stay in that frame too: a response is the token mirror of the current absolute
+position, so its side and counter metadata keep their absolute values while
+pieces, castling rights, and the en-passant square are reflected. Counters
+above the vocabulary's range share its top atom.
 
-Segment bounds are ordered [start, end) pairs: the last used entry is the FINAL
-segment, unused slots are (-1, -1), and the collator reorders only the leading
-LINE segments, each whole line with its snapshots.
+``TraceWriter`` is the only producer. ``replay`` rebuilds every state from the
+token stream and the root FEN with python-chess and never reads writer state;
+it returns the validated steps and their natural-language rendering.
 """
 
 from dataclasses import dataclass
 
 import chess
+import numpy as np
 
-from pondera.chess.codec import mate_token, value_bin
-from pondera.chess.symmetry import reflect_uci
+from pondera.chess.codec import decode_board, decode_value_token, mate_token, value_bin
+from pondera.chess.symmetry import TOKEN_MIRROR, reflect_uci
+from pondera.chess.tracker import PathTracker
 from pondera.chess.vocabulary import (
-    BOARD_PIECES,
-    BOARD_TOKENS,
-    CASTLING,
-    EN_PASSANT,
-    END,
+    BACK,
+    BOARD,
     FINAL,
-    HALFMOVE,
     IDX_TO_UCI_MOVE,
-    LINE,
+    MATE_LOSS,
+    MATE_WIN,
+    META_END,
     MOVE,
     PAD,
+    RESET,
     SIDE,
     UCI_MOVE_TO_IDX,
     VALUE,
 )
 
-LEVEL0 = "level0"
-LEVEL15 = "level15"
-S2E = "s2e"
-S2R3 = "s2r3"
-LEVELS = (LEVEL0, LEVEL15, S2E, S2R3)
+# The grammar version recorded in sequence dataset manifests.
+TRACE_GRAMMAR_VERSION = 1
 
-# Teacher ranks in presented order; MultiPV four leaves the tail absent.
-CANDIDATE_RANKS = ("r1", "r2", "r3", "r4")
+# Per-token roles: the loss sees generated moves, evaluations, and controls,
+# treats a tool response as context only, and weights the final move apart.
+ROLE_PAD = 0
+ROLE_TOOL = 1
+ROLE_MOVE = 2
+ROLE_EVAL = 3
+ROLE_CONTROL = 4
+ROLE_FINAL_MOVE = 5
+ROLE_COUNT = 6
 
-# PV truncation of a LINE segment, in plies.
-PV_LIMIT = 10
-
-# Snapshot cadence of the s2r3 level, in plies.
-SNAPSHOT_INTERVAL = 3
-
-# Metadata fields of one snapshot run, in order after the piece tokens.
-SNAPSHOT_METADATA = 6
+# One board observation carries eight metadata atoms after its piece atoms.
+OBSERVATION_METADATA = 8
 
 
-@dataclass(frozen=True)
-class Segment:
-    """One parsed trace segment in the trace orientation.
+class TraceError(ValueError):
+    """A malformed or rule-inconsistent trace, tagged at its first bad token."""
 
-    snapshots holds (moves_before, token run) pairs for the board snapshots
-    carried by the segment, in the order they were emitted.
-    """
-
-    kind: str
-    moves: tuple
-    evaluation: int
-    terminated: bool
-    snapshots: tuple = ()
+    def __init__(self, tag, index, detail=""):
+        self.tag = tag
+        self.index = index
+        message = f"{tag} at token {index}"
+        if detail:
+            message += f": {detail}"
+        super().__init__(message)
 
 
-@dataclass(frozen=True)
-class Snapshot:
-    """Decoded board snapshot: occupied squares plus its metadata fields."""
-
-    pieces: tuple
-    side_black: bool
-    castling: tuple
-    ep: int
+def is_move_token(token):
+    return MOVE <= token < VALUE
 
 
-def is_move_token(token: int) -> bool:
-    return MOVE <= token < MOVE + len(IDX_TO_UCI_MOVE)
-
-
-def is_eval_token(token: int) -> bool:
+def is_eval_token(token):
     return VALUE <= token < PAD
 
 
-def is_board_token(token: int) -> bool:
-    return 0 <= token < BOARD_TOKENS
+def is_metadata_token(token):
+    return SIDE <= token <= META_END
 
 
-def is_snapshot_metadata(token: int) -> bool:
-    """A board-metadata id, only legal inside a snapshot's trailing block."""
-    return SIDE <= token <= EN_PASSANT + 64
+@dataclass(frozen=True)
+class Step:
+    """One validated trace operation with its token span and resulting state.
 
-
-def piece_code(piece) -> int:
-    """Board-encoding piece code of a python-chess piece (0..11, no empty)."""
-    return (piece.piece_type - 1) + (0 if piece.color else 6)
-
-
-def depth_snapshot(row, depth=16):
-    """The per-depth entry of a teacher release row, or None when absent."""
-    for entry in row["unit"]["per_depth"]:
-        if entry["d"] == depth:
-            return entry
-    return None
-
-
-def evaluation_token(candidate):
-    """The candidate's d16 evaluation as a value bin or mate token."""
-    if candidate["mate"] is not None:
-        return mate_token(abs(candidate["mate"]), candidate["mate"] > 0)
-    return VALUE + value_bin(candidate["value"])
-
-
-def move_token(uci, black):
-    """Vocabulary index of a UCI move in the trace's canonical orientation."""
-    return MOVE + UCI_MOVE_TO_IDX[reflect_uci(uci) if black else uci]
-
-
-def absolute_uci(move_tokens, black):
-    """Trace-orientation move indices as absolute UCI strings."""
-    if black:
-        return [reflect_uci(IDX_TO_UCI_MOVE[token - MOVE]) for token in move_tokens]
-    return [IDX_TO_UCI_MOVE[token - MOVE] for token in move_tokens]
-
-
-def candidates(snapshot, limit=len(CANDIDATE_RANKS)):
-    """Teacher candidates in rank order, up to the MultiPV width."""
-    return [snapshot[key] for key in CANDIDATE_RANKS[:limit] if key in snapshot]
-
-
-def max_segments(level):
-    """Bound on the segment-bound rows of a level."""
-    if level not in LEVELS:
-        raise ValueError(f"Unknown trace level: {level}")
-    return 1 if level == LEVEL0 else 1 + len(CANDIDATE_RANKS)
-
-
-def canonical_board(board, mirror):
-    """The position in the trace's canonical frame (ranks flipped on a mirror).
-
-    python-chess's mirror also flips the side to move; the snapshot's side token
-    is taken from the root frame separately, so the flip is irrelevant here.
+    ``position`` is the absolute current node after the operation. ``observed``
+    is the decoded content of a BOARD response. ``mate`` is a nonnegative
+    distance and ``mate_win`` says whose mate it is; ``evaluation`` is the
+    token's decoded scalar.
     """
-    return board.mirror() if mirror else board.copy()
+
+    start: int
+    end: int
+    operation: str
+    path: tuple
+    position: str
+    uci: str | None = None
+    san: str | None = None
+    evaluation: float | None = None
+    mate: int | None = None
+    mate_win: bool | None = None
+    observed: str | None = None
+    repetition: int | None = None
 
 
-def snapshot_pieces(board):
-    """Occupied (square, piece code) pairs of a position in a1..h8 scan order."""
-    return tuple(
-        sorted(
-            (square, piece_code(piece)) for square, piece in board.piece_map().items()
+@dataclass(frozen=True)
+class TraceProgram:
+    """A replayed trace: tokens, roles, steps, and the root decision."""
+
+    root_fen: str
+    root_repetition: int
+    tokens: tuple
+    roles: tuple
+    steps: tuple
+    final_move: str
+    mirrored: bool
+
+    @property
+    def final_move_index(self):
+        return len(self.tokens) - 1
+
+    def render(self):
+        """Natural-language transcription of the replayed program."""
+        lines = [f"Root position (repetition {self.root_repetition}): {self.root_fen}"]
+        if self.mirrored:
+            lines.append(
+                "Black-to-move root: trace moves and observations are rank-mirrored."
+            )
+        for number, step in enumerate(self.steps, 1):
+            span = f"[{step.start}:{step.end}]"
+            where = " ".join(step.path) or "root"
+            if step.operation == "move":
+                lines.append(
+                    f"{number}. {span} move {step.san} ({step.uci}); "
+                    f"path {where}; position {step.position}"
+                )
+            elif step.operation == "back":
+                lines.append(
+                    f"{number}. {span} BACK; path {where}; position {step.position}"
+                )
+            elif step.operation == "reset":
+                lines.append(
+                    f"{number}. {span} RESET; path {where}; position {step.position}"
+                )
+            elif step.operation == "evaluate":
+                if step.mate is not None:
+                    verdict = (
+                        f"mate in {step.mate} "
+                        f"({'win' if step.mate_win else 'loss'}) for the root player"
+                    )
+                else:
+                    verdict = f"value {step.evaluation:+.3f} for the root player"
+                lines.append(
+                    f"{number}. {span} evaluate {verdict}; "
+                    f"path {where}; position {step.position}"
+                )
+            elif step.operation == "board":
+                lines.append(
+                    f"{number}. {span} BOARD; observed {step.observed} "
+                    f"(repetition {step.repetition}); path {where}"
+                )
+            elif step.operation == "final":
+                lines.append(
+                    f"{number}. {span} FINAL {step.san} ({step.uci}) from the root; "
+                    f"thought ended at path {where}; position {step.position}"
+                )
+        return "\n".join(lines)
+
+
+class TraceWriter:
+    """Accumulate one rule-consistent trace over a root position.
+
+    Every operation advances the tracker, so the writer never stores a state
+    the replay could not rebuild. Writing after FINAL raises; the final move is
+    checked against the root's legal set, not the current node's.
+    """
+
+    def __init__(self, root_fen: str, repetition: int = 1):
+        self._tracker = PathTracker(root_fen, repetition)
+        self._root = self._tracker.board.copy()
+        self._mirror = self._root.turn == chess.BLACK
+        self._tokens = []
+        self._roles = []
+        self._steps = []
+        self._finished = False
+
+    def _require_open(self):
+        if self._finished:
+            raise ValueError("Trace already ended with FINAL")
+
+    def _move_token(self, uci):
+        framed = reflect_uci(uci) if self._mirror else uci
+        return MOVE + UCI_MOVE_TO_IDX[framed]
+
+    def _append(self, token, role):
+        self._tokens.append(int(token))
+        self._roles.append(role)
+
+    def _step(self, start, operation, **fields):
+        self._steps.append(
+            Step(
+                start,
+                len(self._tokens),
+                operation,
+                self._tracker.path,
+                self._tracker.fen(),
+                **fields,
+            )
         )
-    )
 
+    def move(self, uci):
+        """Enter the child of the current node reached by a legal board move."""
+        self._require_open()
+        start = len(self._tokens)
+        san = self._tracker.board.san(_board_move(uci))
+        self._tracker.push(uci)
+        self._append(self._move_token(uci), ROLE_MOVE)
+        self._step(start, "move", uci=uci, san=san)
 
-def snapshot_run(board, side_black):
-    """Snapshot token run of a position already in the canonical frame.
+    def back(self):
+        """Return to the parent; illegal at the root."""
+        self._require_open()
+        start = len(self._tokens)
+        self._tracker.back()
+        self._append(BACK, ROLE_CONTROL)
+        self._step(start, "back")
 
-    side_black is the side to move in the root frame, which the canonical mirror
-    leaves unchanged, matching the board prefix's side-token convention.
-    """
-    tokens = [square * BOARD_PIECES + piece for square, piece in snapshot_pieces(board)]
-    tokens.append(SIDE + side_black)
-    rights = (
-        board.has_kingside_castling_rights(chess.WHITE),
-        board.has_queenside_castling_rights(chess.WHITE),
-        board.has_kingside_castling_rights(chess.BLACK),
-        board.has_queenside_castling_rights(chess.BLACK),
-    )
-    tokens.extend(CASTLING + 2 * index + int(flag) for index, flag in enumerate(rights))
-    tokens.append(EN_PASSANT + (board.ep_square if board.ep_square is not None else 64))
-    return tokens
+    def reset(self):
+        """Return to the root from any depth."""
+        self._require_open()
+        start = len(self._tokens)
+        self._tracker.reset()
+        self._append(RESET, ROLE_CONTROL)
+        self._step(start, "reset")
 
+    def evaluate(self, value=None, mate=None, win=None):
+        """Write an evaluation of the current node from the root player's view.
 
-def snapshot_of(board, mirror):
-    """Snapshot token run of a true position in the trace's canonical frame."""
-    return snapshot_run(canonical_board(board, mirror), board.turn == chess.BLACK)
-
-
-def decode_snapshot(tokens) -> Snapshot:
-    """Decode one snapshot token run; raises when the run is malformed.
-
-    Metadata atoms are self-contained and identified by their ids, so their
-    order inside the six-atom block is not significant.
-    """
-    pieces, index = [], 0
-    while index < len(tokens) and is_board_token(tokens[index]):
-        pieces.append(divmod(int(tokens[index]), BOARD_PIECES))
-        index += 1
-    if not pieces:
-        raise ValueError("A snapshot needs at least one piece atom")
-    if any(
-        square >= next_square
-        for (square, _), (next_square, _) in zip(pieces, pieces[1:])
-    ):
-        raise ValueError("Snapshot squares must increase in scan order")
-    metadata = [int(token) for token in tokens[index : index + SNAPSHOT_METADATA]]
-    if len(metadata) != SNAPSHOT_METADATA or not all(
-        is_snapshot_metadata(token) for token in metadata
-    ):
-        raise ValueError("Snapshot metadata is truncated")
-    side = [token for token in metadata if token in (SIDE, SIDE + 1)]
-    castling_tokens = [token for token in metadata if CASTLING <= token < EN_PASSANT]
-    ep_tokens = [token for token in metadata if EN_PASSANT <= token < HALFMOVE]
-    if len(side) != 1:
-        raise ValueError("Invalid snapshot side token")
-    flags = {}
-    for token in castling_tokens:
-        field, flag = divmod(token - CASTLING, 2)
-        if field in flags:
-            raise ValueError("Invalid snapshot castling token")
-        flags[field] = flag
-    if len(flags) != 4 or len(ep_tokens) != 1:
-        raise ValueError("Invalid snapshot castling token")
-    return Snapshot(
-        tuple(pieces),
-        side[0] == SIDE + 1,
-        tuple(flags[field] for field in range(4)),
-        ep_tokens[0] - EN_PASSANT,
-    )
-
-
-def snapshot_positions(level, moves):
-    """Move counts after which a LINE segment of this level carries a snapshot."""
-    if level == S2E:
-        return (moves,) if moves else ()
-    return tuple(range(SNAPSHOT_INTERVAL, moves + 1, SNAPSHOT_INTERVAL)) + (
-        (moves,) if moves % SNAPSHOT_INTERVAL else ()
-    )
-
-
-def encode_trace(snapshot, black, level, board=None):
-    """Encode one depth snapshot into trace tokens and ordered segment bounds.
-
-    The FINAL segment always uses the rank-1 move and evaluation directly; the
-    LINE segments carry the candidates in teacher rank order (training reorders
-    them) with PVs truncated to PV_LIMIT plies. Levels s2e and s2r3 additionally
-    interleave board snapshots and require the root position as a python-chess
-    board, which supplies the rule truth for every snapshot point.
-    """
-    if level not in LEVELS:
-        raise ValueError(f"Unknown trace level: {level}")
-    if level in (S2E, S2R3) and board is None:
-        raise ValueError("Snapshot levels need the root position")
-    ranked = candidates(snapshot)
-    if not ranked:
-        raise ValueError("Depth snapshot carries no candidate ranks")
-    tokens, bounds = [], []
-    if level != LEVEL0:
-        for candidate in ranked:
-            moves = [move_token(move, black) for move in candidate["pv"][:PV_LIMIT]]
-            start = len(tokens)
-            tokens.append(LINE)
-            if level in (S2E, S2R3):
-                if not moves:
-                    raise ValueError("Snapshot levels need at least one PV move")
-                replay = canonical_board(board, black)
-                due = set(snapshot_positions(level, len(moves)))
-                for number, move in enumerate(moves, 1):
-                    tokens.append(move)
-                    replay.push_uci(IDX_TO_UCI_MOVE[move - MOVE])
-                    if number in due:
-                        side_black = black if number % 2 == 0 else not black
-                        tokens.extend(snapshot_run(replay, side_black))
-            else:
-                tokens.extend(moves)
-            tokens.append(evaluation_token(candidate))
-            bounds.append((start, len(tokens)))
-    start = len(tokens)
-    tokens.extend(
-        (
-            FINAL,
-            move_token(ranked[0]["bm"], black),
-            evaluation_token(ranked[0]),
-            END,
+        ``mate`` is a nonnegative distance and ``win`` says whether the root
+        player delivers it; the explicit flag keeps distance zero unambiguous.
+        """
+        self._require_open()
+        if (value is None) == (mate is None):
+            raise ValueError("Give exactly one of value or mate")
+        if mate is not None:
+            if not isinstance(win, bool):
+                raise ValueError("A mate evaluation needs win=True or win=False")
+            token = mate_token(mate, win)
+            distance, win = mate, win
+        else:
+            if win is not None:
+                raise ValueError("win applies only to mate evaluations")
+            token = VALUE + value_bin(value)
+            distance, win = None, None
+        start = len(self._tokens)
+        self._append(token, ROLE_EVAL)
+        self._step(
+            start,
+            "evaluate",
+            evaluation=decode_value_token(token),
+            mate=distance,
+            mate_win=win,
         )
+
+    def board(self):
+        """Request and write the full observation of the current node.
+
+        The request carries loss; the appended response is external context.
+        A black-to-move root mirrors the response while leaving its side and
+        counter atoms absolute.
+        """
+        self._require_open()
+        start = len(self._tokens)
+        observation = self._tracker.board_tokens()
+        if self._mirror:
+            observation = TOKEN_MIRROR[observation]
+        self._append(BOARD, ROLE_CONTROL)
+        for token in observation:
+            self._append(int(token), ROLE_TOOL)
+        self._step(
+            start,
+            "board",
+            observed=_decode_observation(observation, self._mirror)[0],
+            repetition=self._tracker.repetition(),
+        )
+
+    def final(self, uci):
+        """Write the root decision and end the trace immediately."""
+        self._require_open()
+        start = len(self._tokens)
+        move = _board_move(uci)
+        if move not in self._root.legal_moves:
+            raise ValueError(f"FINAL needs a legal root move: {uci}")
+        san = self._root.san(move)
+        self._append(FINAL, ROLE_CONTROL)
+        self._append(self._move_token(uci), ROLE_FINAL_MOVE)
+        self._step(start, "final", uci=uci, san=san)
+        self._finished = True
+
+    @property
+    def finished(self):
+        return self._finished
+
+    @property
+    def mirrored(self):
+        return self._mirror
+
+    @property
+    def path(self):
+        """Absolute UCI path from the root to the current node."""
+        return self._tracker.path
+
+    def legal_moves(self):
+        """Absolute UCI moves that are legal at the current node."""
+        return self._tracker.legal_moves()
+
+    @property
+    def tokens(self):
+        return np.asarray(self._tokens, dtype=np.int16)
+
+    @property
+    def roles(self):
+        return np.asarray(self._roles, dtype=np.int8)
+
+    @property
+    def steps(self):
+        return tuple(self._steps)
+
+
+def _board_move(uci):
+    """Parse an absolute UCI board move, rejecting the draw-claim pseudo-move."""
+    try:
+        return chess.Move.from_uci(uci)
+    except ValueError as error:
+        raise ValueError(f"Not a board move: {uci}") from error
+
+
+def _absolute_uci(token, mirrored):
+    uci = IDX_TO_UCI_MOVE[token - MOVE]
+    return reflect_uci(uci) if mirrored else uci
+
+
+def _root_san(root, uci, index):
+    try:
+        move = _board_move(uci)
+    except ValueError as error:
+        raise TraceError("final_illegal", index, str(error)) from error
+    if move not in root.legal_moves:
+        raise TraceError("final_illegal", index, f"not legal at the root: {uci}")
+    return root.san(move)
+
+
+def _decode_observation(tokens, mirrored):
+    """Decode a stored observation into the absolute FEN and repetition."""
+    values = (
+        [int(TOKEN_MIRROR[token]) for token in tokens] if mirrored else list(tokens)
     )
-    bounds.append((start, len(tokens)))
-    return tokens, bounds
+    return decode_board(values)
 
 
-def read_snapshot(values, index):
-    """Read one snapshot run at index; returns (run, next index, error tag)."""
-    start, squares = index, []
-    while index < len(values) and is_board_token(values[index]):
-        squares.append(values[index] // BOARD_PIECES)
+def _read_observation(values, request):
+    """Read one BOARD response starting after the request token."""
+    start = request + 1
+    index = start
+    while index < len(values) and 0 <= values[index] < SIDE:
         index += 1
-    if not squares:
-        return (), index, "snapshot_without_pieces"
-    if any(square >= next_square for square, next_square in zip(squares, squares[1:])):
-        return (), index, "snapshot_square_order"
-    metadata = values[index : index + SNAPSHOT_METADATA]
-    if len(metadata) < SNAPSHOT_METADATA or not all(
-        is_snapshot_metadata(token) for token in metadata
+    if index == start:
+        raise TraceError("board_truncated", request, "missing piece atoms")
+    end = index + OBSERVATION_METADATA
+    if end > len(values) or not all(
+        is_metadata_token(values[position]) for position in range(index, end)
     ):
-        return (), index, "snapshot_truncated"
-    side = [token for token in metadata if token in (SIDE, SIDE + 1)]
-    if len(side) != 1:
-        return (), index, "snapshot_side"
-    fields = [
-        (token - CASTLING) // 2 for token in metadata if CASTLING <= token < EN_PASSANT
-    ]
-    ep = [token for token in metadata if EN_PASSANT <= token < HALFMOVE]
-    if len(fields) != 4 or len(set(fields)) != 4 or len(ep) != 1:
-        return (), index, "snapshot_castling"
-    return (
-        tuple(values[start : index + SNAPSHOT_METADATA]),
-        index + SNAPSHOT_METADATA,
-        None,
-    )
+        raise TraceError("board_truncated", request, "missing metadata atoms")
+    return values[start:end], end
 
 
-def parse_trace(tokens):
-    """Parse a canonical trace into segments; returns (segments, error tag).
+def _mate_fields(token):
+    if MATE_WIN <= token < MATE_LOSS:
+        return token - MATE_WIN, True
+    if MATE_LOSS <= token < PAD:
+        return token - MATE_LOSS, False
+    return None, None
 
-    Errors name the first broken rule, so callers can tell a truncated thought
-    from a malformed program. Trailing padding is ignored.
+
+def replay(tokens, root_fen, repetition=1):
+    """Rebuild and validate a trace from its tokens and the root position.
+
+    The state is reconstructed with python-chess from the root FEN alone;
+    writer intermediates are never consulted. Raises TraceError at the first
+    broken rule, with a machine-readable tag and token index.
     """
     values = [int(token) for token in tokens]
     while values and values[-1] == PAD:
         values.pop()
-    segments, index, error = [], 0, None
+    if PAD in values:
+        raise TraceError("pad_inside_trace", values.index(PAD))
+    tracker = PathTracker(root_fen, repetition)
+    root = tracker.board.copy()
+    mirrored = root.turn == chess.BLACK
+    roles, steps = [], []
+    index, final_move = 0, None
     while index < len(values):
         token = values[index]
-        if token == LINE:
-            index += 1
-            moves, snapshots = [], []
-            while index < len(values):
-                if is_move_token(values[index]):
-                    moves.append(values[index])
-                    index += 1
-                elif is_board_token(values[index]):
-                    run, index, error = read_snapshot(values, index)
-                    if error is not None:
-                        break
-                    snapshots.append((len(moves), run))
-                else:
-                    break
-            if error is not None:
-                break
-            if not moves:
-                error = "line_without_move"
-                break
-            if index >= len(values):
-                error = "truncated"
-                break
-            if not is_eval_token(values[index]):
-                error = "line_missing_evaluation"
-                break
-            segments.append(
-                Segment("line", tuple(moves), values[index], False, tuple(snapshots))
+        start = index
+        if is_move_token(token):
+            uci = _absolute_uci(token, mirrored)
+            try:
+                san = tracker.board.san(_board_move(uci))
+                tracker.push(uci)
+            except ValueError as error:
+                raise TraceError("illegal_move", index, str(error)) from error
+            roles.append(ROLE_MOVE)
+            steps.append(
+                Step(start, start + 1, "move", tracker.path, tracker.fen(), uci, san)
             )
             index += 1
+        elif token == BACK:
+            if not tracker.path:
+                raise TraceError("back_at_root", index)
+            tracker.back()
+            roles.append(ROLE_CONTROL)
+            steps.append(Step(start, start + 1, "back", tracker.path, tracker.fen()))
+            index += 1
+        elif token == RESET:
+            tracker.reset()
+            roles.append(ROLE_CONTROL)
+            steps.append(Step(start, start + 1, "reset", tracker.path, tracker.fen()))
+            index += 1
+        elif is_eval_token(token):
+            distance, win = _mate_fields(token)
+            roles.append(ROLE_EVAL)
+            steps.append(
+                Step(
+                    start,
+                    start + 1,
+                    "evaluate",
+                    tracker.path,
+                    tracker.fen(),
+                    evaluation=decode_value_token(token),
+                    mate=distance,
+                    mate_win=win,
+                )
+            )
+            index += 1
+        elif token == BOARD:
+            observation, end = _read_observation(values, index)
+            try:
+                observed, observed_repetition = _decode_observation(
+                    observation, mirrored
+                )
+            except ValueError as error:
+                raise TraceError("board_invalid", index, str(error)) from error
+            observed_fields = observed.split()
+            true_fields = tracker.fen().split()
+            true_repetition = tracker.repetition()
+            if (
+                observed_fields[:4] != true_fields[:4]
+                or observed_fields[4] != str(min(int(true_fields[4]), 100))
+                or observed_repetition != min(true_repetition, 5)
+            ):
+                raise TraceError("board_mismatch", index, observed)
+            roles.append(ROLE_CONTROL)
+            roles.extend([ROLE_TOOL] * (end - start - 1))
+            steps.append(
+                Step(
+                    start,
+                    end,
+                    "board",
+                    tracker.path,
+                    tracker.fen(),
+                    observed=observed,
+                    repetition=true_repetition,
+                )
+            )
+            index = end
         elif token == FINAL:
-            index += 1
-            if index >= len(values) or not is_move_token(values[index]):
-                error = "final_without_move"
-                break
-            move = values[index]
-            index += 1
-            if index >= len(values) or not is_eval_token(values[index]):
-                error = "final_missing_evaluation"
-                break
-            evaluation = values[index]
-            index += 1
-            if index >= len(values) or values[index] != END:
-                error = "final_missing_end"
-                break
-            index += 1
-            segments.append(Segment("final", (move,), evaluation, True))
+            if index + 1 >= len(values) or not is_move_token(values[index + 1]):
+                raise TraceError("final_without_move", index)
+            uci = _absolute_uci(values[index + 1], mirrored)
+            san = _root_san(root, uci, index)
+            roles.extend([ROLE_CONTROL, ROLE_FINAL_MOVE])
+            steps.append(
+                Step(start, start + 2, "final", tracker.path, tracker.fen(), uci, san)
+            )
+            final_move = uci
+            index += 2
             if index != len(values):
-                error = "trailing_tokens"
-                break
-        else:
-            error = "unexpected_token"
+                raise TraceError("trailing_tokens", index)
             break
-    if error is None and not any(segment.kind == "final" for segment in segments):
-        error = "missing_final"
-    return segments, error
+        else:
+            raise TraceError("unexpected_token", index, f"token {token}")
+    if final_move is None:
+        raise TraceError("missing_final", len(values))
+    return TraceProgram(
+        root_fen,
+        repetition,
+        tuple(values),
+        tuple(roles),
+        tuple(steps),
+        final_move,
+        mirrored,
+    )

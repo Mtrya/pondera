@@ -10,10 +10,11 @@ from pondera.chess.vocabulary import SIDE
 from pondera.models.board import black_to_move, reflect_board_tokens
 
 
-def assert_modulo_fullmove(test, tokens, fen, repetition):
-    """Decoded FEN matches every field except the fullmove counter."""
+def assert_decoded_board(test, tokens, fen, repetition):
+    """Check the FEN modulo the fullmove counter and saturated counters."""
     decoded, decoded_repetition = decode_board(tokens)
-    test.assertEqual(decoded.split()[:5], fen.split()[:5])
+    test.assertEqual(decoded.split()[:4], fen.split()[:4])
+    test.assertEqual(decoded.split()[4], str(min(int(fen.split()[4]), 100)))
     test.assertEqual(decoded.split()[5], "1")
     test.assertEqual(decoded_repetition, min(repetition, 5))
 
@@ -22,21 +23,21 @@ class BoardEncodingTests(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
 
-    def test_lossless_fields_and_counter_atoms(self):
+    def test_board_fields_and_counter_atoms(self):
         fens = [
             chess.STARTING_FEN,
             "r3k2r/8/8/3pP3/8/8/8/R3K2R w KQkq d6 99 257",
             "7k/Q7/8/8/8/8/8/K7 b - - 100 400",
+            "7k/Q7/8/8/8/8/8/K7 b - - 137 500",
         ]
-        repetitions = [1, 4, 9]
+        repetitions = [1, 4, 9, 2]
         batch = encode_boards(fens, repetitions)
         for fen, rep, tokens in zip(fens, repetitions, batch):
-            assert_modulo_fullmove(self, tokens, fen, rep)
+            assert_decoded_board(self, tokens, fen, rep)
         for bad in [
             "8/8/8/8/8/8/8/9 w - - 0 1",
             "8/8/8/8/8/8/8/8 x - - 0 1",
             "8/8/8/8/8/8/8/8 w - - -1 1",
-            "8/8/8/8/8/8/8/8 w - - 101 1",
         ]:
             with self.assertRaises(ValueError):
                 encode_board(bad)
@@ -75,7 +76,7 @@ class BoardEncodingTests(unittest.TestCase):
             # The side atom and the encoded counters keep the root frame.
             parts[1] = fen.split()[1]
             parts[5] = "1"
-            assert_modulo_fullmove(
+            assert_decoded_board(
                 self, changed[index], " ".join(parts), [3, 2, 1][index]
             )
 

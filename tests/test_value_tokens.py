@@ -8,21 +8,22 @@ from pondera.chess.codec import (
     value_bin,
 )
 from pondera.chess.vocabulary import (
+    BACK,
+    BOARD,
     BOARD_TOKENS,
     CASTLING,
     CHESS_VOCAB_SIZE,
     DELIM,
     EN_PASSANT,
-    END,
     FINAL,
     HALFMOVE,
-    LINE,
     MATE_LOSS,
     MATE_WIN,
     META_END,
     MOVE,
     PAD,
     REPETITION,
+    RESET,
     SIDE,
     VALUE,
 )
@@ -91,14 +92,16 @@ class UnifiedVocabularyTests(unittest.TestCase):
         self.assertEqual(MATE_WIN, VALUE + 20)
         self.assertEqual(MATE_LOSS, MATE_WIN + 29)
         self.assertEqual(DELIM, MATE_LOSS + 31)
-        self.assertEqual((PAD, END, LINE, FINAL), (2998, 2999, 3000, 3001))
-        self.assertEqual(CHESS_VOCAB_SIZE, 3002)
+        self.assertEqual(
+            (PAD, BACK, RESET, BOARD, FINAL), (2998, 2999, 3000, 3001, 3002)
+        )
+        self.assertEqual(CHESS_VOCAB_SIZE, 3003)
 
     def test_value_decoder_rejects_non_value_tokens(self):
         # The metadata atoms end at 948; the move block starts the unified
         # sequence space and the delimiters close it.
-        self.assertEqual(CHESS_VOCAB_SIZE, DELIM + 4)
-        for token in (MOVE, META_END, PAD, END, LINE, FINAL):
+        self.assertEqual(CHESS_VOCAB_SIZE, DELIM + 5)
+        for token in (MOVE, META_END, PAD, BACK, RESET, BOARD, FINAL):
             with self.assertRaises(ValueError):
                 decode_value_token(token)
 

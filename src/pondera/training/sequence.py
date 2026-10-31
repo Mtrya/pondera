@@ -2,21 +2,24 @@
 
 Follows the depth.py training skeleton (resume, schedule, tracking) under the
 sequence contract: the board prefix is attended bidirectionally, the trace
-suffix causally, and supervision is shifted next-token CE on trace tokens only.
-Line segments are reordered per presentation so candidate order carries no
-teacher ranking; the FINAL segment always stays last. This trainer
-intentionally duplicates the depth.py boilerplate instead of sharing it: the
-two data and model contracts evolve independently.
+suffix causally, and supervision is shifted next-token CE on generated trace
+tokens. The loss averages generated context tokens and the final move with
+equal weight; an external BOARD response is context only. Evaluation reports
+the aggregate loss and top-1 accuracy for validation and a frozen evenly
+spaced train probe, their gaps, per-role cross-entropy, and optional internal
+health probes. Training accounts actual board and trace tokens plus analytical
+FLOPs; ``train_flops_budget`` replaces the step-count schedule and stop with
+that compute budget while checkpoints retain step and compute together. This
+trainer intentionally duplicates the depth.py boilerplate instead of sharing
+it: the two data and model contracts evolve independently.
 """
 
 import argparse
 import hashlib
 import json
 import math
-import random
 import time
 import tomllib
-import zlib
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -27,10 +30,20 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
-from pondera.chess.vocabulary import PAD
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL, MOVE, PAD, VALUE
 from pondera.data.positions import SequencePositions
+from pondera.data.trace import (
+    ROLE_CONTROL,
+    ROLE_EVAL,
+    ROLE_FINAL_MOVE,
+    ROLE_MOVE,
+    ROLE_PAD,
+    ROLE_TOOL,
+)
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model
+from pondera.training.cost import sequence_flops
+from pondera.training.internals import InternalProbe
 
 
 @dataclass
@@ -40,7 +53,7 @@ class SequenceTrainConfig:
             "architecture": "sequence",
             "num_blocks": 12,
             "hidden_size": 768,
-            "intermediate_size": 2027,
+            "intermediate_size": 2048,
             "num_heads": 12,
             "dropout": 0.0,
         }
@@ -57,6 +70,10 @@ class SequenceTrainConfig:
     precision: str = "bf16"
     val_every: int = 128
     val_positions: int = 8192
+    train_probe_positions: int = 2048
+    internals: bool = False
+    internals_positions: int = 8
+    train_flops_budget: float | None = None
     log_every: int = 50
     save_every: int = 1024
 
@@ -69,11 +86,14 @@ class SequenceTrainConfig:
             "epochs",
             "val_every",
             "val_positions",
+            "internals_positions",
             "log_every",
             "save_every",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
+        if self.train_probe_positions < 0:
+            raise ValueError("train_probe_positions must be non-negative")
         if self.workers < 0 or self.precision not in {"fp32", "bf16"}:
             raise ValueError("Invalid workers or precision")
         for name in ("learning_rate", "grad_clip"):
@@ -84,45 +104,58 @@ class SequenceTrainConfig:
             raise ValueError("weight_decay must be finite and non-negative")
         if not 0 <= self.warmup_ratio <= 1:
             raise ValueError("warmup_ratio must be between 0 and 1")
+        if self.train_flops_budget is not None and (
+            not math.isfinite(self.train_flops_budget) or self.train_flops_budget <= 0
+        ):
+            raise ValueError("train_flops_budget must be finite and positive")
 
 
 @dataclass
 class SequenceCollator:
-    """Pack boards, pad traces, and reorder LINE segments per presentation.
+    """Pad stored traces and roles, and locate each row's final move.
 
-    The FINAL segment always stays last; only the leading LINE segments move,
-    and shuffling changes presentation order alone, never token content. Every
-    permutation is derived from the row's stored trace and the salt, not from
-    the consumption order, so runs, worker processes, and resumed runs present
-    the same row in the same order. With shuffle off the presented trace is
-    exactly the stored one, the deterministic layout used for validation.
+    The trace already carries its presentation order. Board rows come padded
+    to their shard's width, which can differ across shards; they are repadded
+    to the batch maximum. Every row must end with the FINAL delimiter and its
+    root move, which is the last token and the only ROLE_FINAL_MOVE position.
     """
 
-    shuffle: bool = True
-    salt: int = 0
-
     def __call__(self, rows):
-        inputs = {"ids": torch.from_numpy(np.stack([row[0] for row in rows]))}
-        traces, lengths, final_moves = [], [], []
-        for _, trace, trace_len, line_bounds in rows:
-            segments = [trace[start:end] for start, end in line_bounds if start >= 0]
-            if not segments:
-                raise ValueError("A trace row carries no segment bounds")
-            if self.shuffle and len(segments) > 1:
-                order = list(range(len(segments) - 1))
-                random.Random(zlib.crc32(trace.tobytes(), self.salt)).shuffle(order)
-                segments = [segments[index] for index in order] + [segments[-1]]
-            presented = np.concatenate(segments)
-            if len(presented) != trace_len:
-                raise ValueError("Segment bounds do not tile the stored trace")
-            traces.append(presented)
-            lengths.append(trace_len)
-            final_moves.append(sum(len(segment) for segment in segments[:-1]) + 1)
-        width = max(lengths)
+        boards = [row[0] for row in rows]
+        board_width = max((len(board) for board in boards), default=0)
+        board_ids = np.full((len(boards), board_width), PAD, dtype=np.int16)
+        for index, board in enumerate(boards):
+            if np.any((board < 0) | (board >= CHESS_VOCAB_SIZE)):
+                raise ValueError("A board row contains an out-of-vocabulary token")
+            board_ids[index, : len(board)] = board
+        inputs = {"ids": torch.from_numpy(board_ids)}
+        traces, roles, final_moves = [], [], []
+        for _, trace, trace_len, trace_roles in rows:
+            trace_len = int(trace_len)
+            if len(trace) != len(trace_roles) or not 2 <= trace_len <= len(trace):
+                raise ValueError("A trace row has inconsistent token boundaries")
+            stored = trace[:trace_len]
+            if np.any((stored < 0) | (stored >= CHESS_VOCAB_SIZE)):
+                raise ValueError("A trace row contains an out-of-vocabulary token")
+            if stored[-2] != FINAL or not MOVE <= stored[-1] < VALUE:
+                raise ValueError("A trace row must end with FINAL and a move token")
+            stored_roles = trace_roles[:trace_len]
+            final = np.flatnonzero(stored_roles == ROLE_FINAL_MOVE)
+            if len(final) != 1:
+                raise ValueError("A trace row needs exactly one final move role")
+            if final[0] != trace_len - 1:
+                raise ValueError("The final move must close the trace")
+            traces.append(stored)
+            roles.append(stored_roles)
+            final_moves.append(int(final[0]))
+        width = max((len(trace) for trace in traces), default=0)
         trace_ids = np.full((len(traces), width), PAD, dtype=np.int16)
-        for index, presented in enumerate(traces):
-            trace_ids[index, : len(presented)] = presented
+        role_ids = np.full((len(roles), width), ROLE_PAD, dtype=np.int8)
+        for index, (trace, trace_roles) in enumerate(zip(traces, roles)):
+            trace_ids[index, : len(trace)] = trace
+            role_ids[index, : len(trace_roles)] = trace_roles
         inputs["trace_ids"] = torch.from_numpy(trace_ids)
+        inputs["trace_roles"] = torch.from_numpy(role_ids)
         inputs["final_move_index"] = torch.tensor(final_moves, dtype=torch.long)
         return inputs
 
@@ -132,18 +165,59 @@ def load_config(path):
         return SequenceTrainConfig(**tomllib.load(handle))
 
 
-def trace_loss(model, inputs):
-    """Masked mean next-token CE over the trace, plus the target positions."""
+# Per-role reporting names for the supervised token classes. Tool responses and
+# padding carry no loss and therefore no role entry.
+ROLE_LOSS_NAMES = {
+    "move": ROLE_MOVE,
+    "evaluation": ROLE_EVAL,
+    "control": ROLE_CONTROL,
+    "final": ROLE_FINAL_MOVE,
+}
+
+
+def trace_loss_parts(model, inputs):
+    """Token CE and masks behind the equal-weight aggregate trace loss.
+
+    The generated-context mean covers moves, evaluations, controls, and the
+    FINAL delimiter: every target that is neither the final move nor an
+    external tool response nor padding. A BOARD request is a control token and
+    is supervised; its response is context only. The final move has its own
+    mean, so the two objectives are equally weighted regardless of trace
+    length.
+    """
     trace_ids = inputs["trace_ids"]
+    roles = inputs["trace_roles"]
     targets = trace_ids.long()
     logits = model.trace_logits(inputs["ids"], trace_ids)
-    mask = trace_ids != PAD
     ce = F.cross_entropy(
         logits.float().reshape(-1, logits.shape[-1]),
         targets.reshape(-1),
         reduction="none",
     ).reshape(trace_ids.shape)
-    return (ce * mask).sum() / mask.sum().clamp_min(1), logits, mask
+    generated = (roles != ROLE_PAD) & (roles != ROLE_TOOL)
+    final_mask = roles == ROLE_FINAL_MOVE
+    context_mask = generated & ~final_mask
+    loss = (ce * context_mask).sum() / context_mask.sum().clamp_min(1)
+    loss = loss + (ce * final_mask).sum() / final_mask.sum().clamp_min(1)
+    return loss, ce, logits, generated, final_mask
+
+
+def trace_loss(model, inputs):
+    """Equal-weight generated-context CE and final-move CE."""
+    loss, _, logits, generated, _ = trace_loss_parts(model, inputs)
+    return loss, logits, generated
+
+
+def role_loss_totals(ce, roles):
+    """Per-role CE sums and token counts; tool responses and padding excluded.
+
+    Callers divide each sum by its count after accumulating over evaluation
+    batches, so the reported means weight every supervised token equally.
+    """
+    return {
+        name: ((ce * (roles == role)).sum(), int((roles == role).sum()))
+        for name, role in ROLE_LOSS_NAMES.items()
+    }
 
 
 def train(
@@ -162,9 +236,13 @@ def train(
         torch.backends.cuda.matmul.allow_tf32 = True
     train_data = SequencePositions(data_dir, "train")
     val_data = SequencePositions(data_dir, "val")
-    eval_collate = SequenceCollator(shuffle=False)
+    eval_collate = SequenceCollator()
     data_identity = hashlib.sha256(
-        json.dumps(train_data.manifest, sort_keys=True).encode()
+        json.dumps(
+            {"train": train_data.manifest, "val": val_data.manifest},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
     ).hexdigest()
     micro_batches = len(train_data) // config.batch_size
     steps_per_epoch = micro_batches // config.accumulation_steps
@@ -181,9 +259,26 @@ def train(
         weight_decay=config.weight_decay,
         fused=True if device.type == "cuda" else None,
     )
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, int(total_steps * config.warmup_ratio), total_steps
-    )
+    consumed_flops = 0.0
+    examples_seen = 0
+    board_tokens = 0
+    trace_tokens = 0
+    if config.train_flops_budget is None:
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, int(total_steps * config.warmup_ratio), total_steps
+        )
+    else:
+
+        def learning_rate_fraction(_):
+            progress = min(1.0, consumed_flops / config.train_flops_budget)
+            if progress < config.warmup_ratio:
+                return progress / config.warmup_ratio
+            decay = (progress - config.warmup_ratio) / max(
+                1e-12, 1 - config.warmup_ratio
+            )
+            return 0.5 * (1 + math.cos(math.pi * decay))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_fraction)
     step, start_epoch, next_micro = 0, 0, 0
     tracking_id = None
     checkpoint = None
@@ -240,6 +335,10 @@ def train(
                 }
             )
         tracking_id = checkpoint.get("tracking_id")
+        consumed_flops = checkpoint["train_flops"]
+        board_tokens = checkpoint["board_tokens"]
+        trace_tokens = checkpoint["trace_tokens"]
+        examples_seen = checkpoint["examples_seen"]
     tracker = None
     if track:
         import swanlab
@@ -273,8 +372,8 @@ def train(
     @torch.no_grad()
     def evaluate(data, indices, prefix):
         model.eval()
-        loss_sum = torch.zeros((), device=device)
-        token_count, correct, count = 0, 0, 0
+        loss_sum, correct, count = 0.0, 0, 0
+        role_totals = {name: [0.0, 0] for name in ROLE_LOSS_NAMES}
         for start in range(0, len(indices), config.batch_size):
             selected = indices[start : start + config.batch_size]
             inputs = {
@@ -282,9 +381,13 @@ def train(
                 for key, value in eval_collate([data[i] for i in selected]).items()
             }
             with autocast():
-                loss, logits, mask = trace_loss(model, inputs)
-            loss_sum += float(loss) * int(mask.sum())
-            token_count += int(mask.sum())
+                loss, ce, logits, _, _ = trace_loss_parts(model, inputs)
+            loss_sum += float(loss) * len(selected)
+            for name, (total, tokens) in role_loss_totals(
+                ce, inputs["trace_roles"]
+            ).items():
+                role_totals[name][0] += float(total)
+                role_totals[name][1] += tokens
             final = inputs["final_move_index"]
             selected_logits = logits.gather(
                 1, final[:, None, None].expand(-1, 1, logits.shape[-1])
@@ -297,13 +400,55 @@ def train(
             )
             count += len(selected)
         model.train()
-        return {
-            f"{prefix}/loss": loss_sum.item() / max(token_count, 1),
+        values = {
+            f"{prefix}/loss": loss_sum / max(count, 1),
             f"{prefix}/final_move_top1": correct / count,
             f"{prefix}/rows": count,
         }
+        values.update(
+            {
+                f"{prefix}/role/{name}_loss": total / tokens
+                for name, (total, tokens) in role_totals.items()
+                if tokens
+            }
+        )
+        return values
 
-    examples_seen = step * config.batch_size * config.accumulation_steps
+    probe_indices = (
+        torch.linspace(
+            0,
+            len(train_data) - 1,
+            min(config.train_probe_positions, len(train_data)),
+        )
+        .long()
+        .tolist()
+        if config.train_probe_positions
+        else []
+    )
+
+    def validate():
+        values = evaluate(
+            val_data, range(min(config.val_positions, len(val_data))), "val"
+        )
+        if config.train_probe_positions:
+            values.update(evaluate(train_data, probe_indices, "train_probe"))
+            values["generalization/loss_gap"] = (
+                values["val/loss"] - values["train_probe/loss"]
+            )
+            values["generalization/final_move_top1_gap"] = (
+                values["val/final_move_top1"] - values["train_probe/final_move_top1"]
+            )
+        if probe is not None:
+            batch = min(config.internals_positions, len(val_data))
+            inputs = eval_collate([val_data[i] for i in range(batch)])
+            inputs = {key: inputs[key].to(device) for key in ("ids", "trace_ids")}
+            with autocast():
+                scalars, arrays = probe.collect(model, inputs)
+            values.update({f"internal/{key}": value for key, value in scalars.items()})
+            artifact = output_dir / "probes" / f"internal-{step:06d}.npz"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(artifact, **arrays)
+        return values
 
     def save(name, epoch, micro):
         save_checkpoint(
@@ -321,6 +466,9 @@ def train(
             if device.type == "cuda"
             else None,
             tracking_id=tracking_id,
+            train_flops=consumed_flops,
+            board_tokens=board_tokens,
+            trace_tokens=trace_tokens,
             examples_seen=examples_seen,
             data_identity=data_identity,
             execution_history=execution_history,
@@ -328,6 +476,11 @@ def train(
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
+    probe = (
+        InternalProbe(model, output_dir / "probes" / "init-embeddings.npz")
+        if config.internals
+        else None
+    )
     val_metrics = {}
     start_time = time.monotonic()
     initial_step = step
@@ -337,9 +490,12 @@ def train(
     limit = total_steps if max_steps is None else min(max_steps, total_steps)
     with (output_dir / "metrics.jsonl").open("a") as metrics:
         for epoch in range(start_epoch, config.epochs):
-            if step >= limit:
+            if step >= limit or (
+                config.train_flops_budget is not None
+                and consumed_flops >= config.train_flops_budget
+            ):
                 break
-            train_collate = SequenceCollator(shuffle=True, salt=config.seed + epoch)
+            train_collate = SequenceCollator()
             loader = DataLoader(
                 train_data,
                 batch_size=config.batch_size,
@@ -361,6 +517,13 @@ def train(
                     break
                 if epoch == start_epoch and micro < next_micro:
                     continue
+                board_lengths = (inputs["ids"] != PAD).sum(1).numpy()
+                trace_lengths = (inputs["trace_ids"] != PAD).sum(1).numpy()
+                consumed_flops += float(
+                    sequence_flops(config.model, board_lengths, trace_lengths).sum()
+                )
+                board_tokens += int(board_lengths.sum())
+                trace_tokens += int(trace_lengths.sum())
                 examples_seen += config.batch_size
                 inputs = {
                     key: value.to(device, non_blocking=True)
@@ -387,24 +550,31 @@ def train(
                 val_metrics = {}
                 should_validate = step == 1 or step % config.val_every == 0
                 if should_validate:
-                    val_metrics = evaluate(
-                        val_data, range(min(config.val_positions, len(val_data))), "val"
-                    )
+                    val_metrics = validate()
                 if should_validate or step % config.log_every == 0:
                     values = {
                         "step": step,
                         "epoch": epoch,
                         "train/loss": (loss_sum / config.accumulation_steps).item(),
                         "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/lr_fraction": optimizer.param_groups[0]["lr"]
+                        / config.learning_rate,
                         "train/grad_norm": grad_norm.item(),
                         "train/embedding_grad_norm": token_grad_norm,
                         "train/rows_per_s": (step - initial_step)
                         * config.batch_size
                         * config.accumulation_steps
                         / (time.monotonic() - start_time),
+                        "train/theoretical_flops": consumed_flops,
+                        "train/board_tokens": board_tokens,
+                        "train/trace_tokens": trace_tokens,
                         "train/examples": examples_seen,
                         "train/data_passes": examples_seen / len(train_data),
-                        "train/schedule_progress": step / total_steps,
+                        "train/schedule_progress": min(
+                            1.0, consumed_flops / config.train_flops_budget
+                        )
+                        if config.train_flops_budget
+                        else step / total_steps,
                         "model/parameters": trainable_parameters,
                         "elapsed_seconds": time.monotonic() - start_time,
                         "memory/peak_allocated_bytes": torch.cuda.max_memory_allocated(
@@ -422,23 +592,40 @@ def train(
                 loss_sum.zero_()
                 if step % config.save_every == 0:
                     save(f"step-{step:06d}.pth", epoch, cursor)
-                if step >= limit:
+                if step >= limit or (
+                    config.train_flops_budget is not None
+                    and consumed_flops >= config.train_flops_budget
+                ):
                     break
-            if step >= limit:
+            if step >= limit or (
+                config.train_flops_budget is not None
+                and consumed_flops >= config.train_flops_budget
+            ):
                 break
             cursor = 0
     final_metrics = {
         "step": step,
         "final": True,
-        "training_complete": step >= total_steps,
+        "training_complete": step >= total_steps
+        or (
+            config.train_flops_budget is not None
+            and consumed_flops >= config.train_flops_budget
+        ),
+        "train/theoretical_flops": consumed_flops,
+        "train/board_tokens": board_tokens,
+        "train/trace_tokens": trace_tokens,
         "train/examples": examples_seen,
         "train/data_passes": examples_seen / len(train_data),
-        **evaluate(val_data, range(min(config.val_positions, len(val_data))), "val"),
+        "flop_budget_reached": config.train_flops_budget is not None
+        and consumed_flops >= config.train_flops_budget,
+        **validate(),
     }
     with (output_dir / "metrics.jsonl").open("a") as metrics:
         metrics.write(json.dumps(final_metrics) + "\n")
     print(json.dumps(final_metrics), flush=True)
     save("final.pth", epoch, cursor)
+    if probe is not None:
+        probe.close()
     if tracker:
         tracker.finish()
     return output_dir / "final.pth"

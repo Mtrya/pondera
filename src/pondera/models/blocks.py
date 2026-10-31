@@ -9,6 +9,9 @@ from torch.nn import functional as F
 from pondera.models.cache import KVState
 from pondera.models.config import BlockConfig
 
+# Query rows per chunk in the probe-only attention capture.
+_CAPTURE_QUERY_CHUNK = 128
+
 
 def attention_mask(query_positions, key_length, prefix_length, key_valid):
     """Boolean SDPA mask: True means accessible."""
@@ -115,26 +118,40 @@ class TokenBlock(nn.Module):
 
     @torch.no_grad()
     def _capture_attention(self, queries, keys, mask, query_valid):
-        """Per-head attention entropy and peak weight; probe-only path."""
-        scores = queries.float() @ keys.float().transpose(-1, -2)
-        scores = scores / math.sqrt(self.head_size)
-        scores = scores.masked_fill(~mask, float("-inf"))
-        probs = scores.softmax(-1)
-        entropy = -(probs * probs.clamp_min(1e-12).log()).sum(-1)
-        peak = probs.max(-1).values
+        """Per-head attention entropy and peak weight; probe-only path.
+
+        Queries are processed in chunks so a long-sequence probe never
+        materializes the full query-by-key matrix at once.
+        """
+        scale = math.sqrt(self.head_size)
+        queries = queries.float()
+        keys = keys.float()
         rows = query_valid[:, None, :] & mask.any(-1)
         if rows.shape[1] == 1:
-            rows = rows.expand_as(entropy)
+            rows = rows.expand(-1, self.heads, -1)
+        entropy_sum = [0.0] * self.heads
+        peak_sum = [0.0] * self.heads
+        counts = [0] * self.heads
+        for start in range(0, queries.shape[2], _CAPTURE_QUERY_CHUNK):
+            stop = start + _CAPTURE_QUERY_CHUNK
+            scores = queries[:, :, start:stop] @ keys.transpose(-1, -2)
+            scores = scores / scale
+            scores = scores.masked_fill(~mask[..., start:stop, :], float("-inf"))
+            probs = scores.softmax(-1)
+            entropy = -(probs * probs.clamp_min(1e-12).log()).sum(-1)
+            peak = probs.max(-1).values
+            selected = rows[:, :, start:stop]
+            for head in range(self.heads):
+                head_selected = selected[:, head]
+                entropy_sum[head] += float(entropy[:, head][head_selected].sum())
+                peak_sum[head] += float(peak[:, head][head_selected].sum())
+                counts[head] += int(head_selected.sum())
         stats = []
         for head in range(self.heads):
-            selected = rows[:, head]
-            if not selected.any():
+            if not counts[head]:
                 continue
             stats.append(
-                (
-                    float(entropy[:, head][selected].mean()),
-                    float(peak[:, head][selected].mean()),
-                )
+                (entropy_sum[head] / counts[head], peak_sum[head] / counts[head])
             )
         self.attention_capture.append(stats)
 

@@ -4,9 +4,9 @@ A board encoding is the set of occupied squares as joint (square, piece) atoms
 in a1..h8 scan order, followed by eight metadata atoms: side to move, four
 castling rights, en passant, halfmove clock, and repetition count. Every atom
 is one complete statement; an empty square is the absence of an atom. The
-encoding is lossless for the first five FEN fields. The fullmove counter is
-not encoded, so decoding restores the FEN modulo that counter; repetition
-counts above four share the top atom.
+encoding preserves placement and the first four FEN fields exactly. The
+fullmove counter is not encoded; halfmove clocks above 100 and repetition
+counts above four share their respective top atoms.
 
 The id layout itself lives in `pondera.chess.vocabulary`; this module only
 converts. Value-bin boundaries and representatives are the numeric semantics
@@ -132,9 +132,8 @@ def encode_board(fen: str, repetition: int = 1) -> np.ndarray:
     """Encode a FEN as occupied-square atoms plus self-contained metadata.
 
     The fullmove counter is not part of the vocabulary; callers keep the
-    source FEN when it matters. Halfmove clocks outside 0..100 and repetition
-    counts above five cannot be represented and are rejected or shared with
-    the top repetition atom respectively.
+    source FEN when it matters. Halfmove clocks above 100 and repetition
+    counts above four share their respective top atoms.
     """
     placement, side, castling, ep, halfmove, fullmove = fen.split()
     rows = placement.split("/")
@@ -162,8 +161,8 @@ def encode_board(fen: str, repetition: int = 1) -> np.ndarray:
     if ep != "-" and ep not in SQUARE_TO_IDX:
         raise ValueError("Invalid en-passant square")
     halfmove_count, fullmove_count = int(halfmove), int(fullmove)
-    if not 0 <= halfmove_count <= 100:
-        raise ValueError("Halfmove clock must lie in 0..100")
+    if halfmove_count < 0:
+        raise ValueError("Halfmove clock must be nonnegative")
     if fullmove_count < 1 or repetition < 1:
         raise ValueError("Invalid fullmove or repetition count")
     tokens = [
@@ -176,7 +175,7 @@ def encode_board(fen: str, repetition: int = 1) -> np.ndarray:
         CASTLING + 2 * index + (right in castling) for index, right in enumerate("KQkq")
     )
     tokens.append(EN_PASSANT + (64 if ep == "-" else SQUARE_TO_IDX[ep]))
-    tokens.append(HALFMOVE + halfmove_count)
+    tokens.append(HALFMOVE + min(halfmove_count, 100))
     tokens.append(REPETITION + min(repetition, 5) - 1)
     return np.asarray(tokens, dtype=np.int16)
 

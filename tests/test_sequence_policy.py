@@ -3,22 +3,15 @@ import unittest
 from pathlib import Path
 
 import chess
+import numpy as np
 import torch
-from teacher_release import candidate_row, play
 
 from pondera.chess.codec import encode_boards
-from pondera.chess.vocabulary import (
-    CHESS_VOCAB_SIZE,
-    END,
-    FINAL,
-    LINE,
-    MOVE,
-    PAD,
-    VALUE,
-)
-from pondera.data.trace import LEVEL15, depth_snapshot, encode_trace
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, PAD, RESET
+from pondera.data.trace import TraceWriter
 from pondera.models.checkpoint import load_model, save_checkpoint
 from pondera.models.factory import create_model
+from pondera.training.cost import sequence_flops
 
 CONFIG = {
     "architecture": "sequence",
@@ -28,18 +21,27 @@ CONFIG = {
     "num_heads": 4,
     "dropout": 0.0,
 }
-RUY_LOPEZ = ["e2e4", "e7e5", "g1f3", "b8c6"]
 # A short endgame position packs to fewer tokens than the start position.
 SHORT_FEN = "8/8/8/3k4/8/3K4/8/8 w - - 0 1"
 
 
-def trace_of(fen, level=LEVEL15):
+def trace_of(fen):
     board = chess.Board(fen)
-    moves = sorted(move.uci() for move in board.legal_moves)[:2]
-    candidates = [(move, [move], None, 0.5) for move in moves]
-    row = candidate_row(fen, candidates)
-    tokens, _ = encode_trace(depth_snapshot(row), board.turn == chess.BLACK, level)
-    return torch.tensor([tokens], dtype=torch.int16)
+    legal = sorted(move.uci() for move in board.legal_moves)
+    writer = TraceWriter(fen)
+    writer.move(legal[0])
+    writer.evaluate(value=0.5)
+    writer.back()
+    writer.final(legal[1])
+    return torch.from_numpy(np.stack([writer.tokens]))
+
+
+def final_trace(fen):
+    board = chess.Board(fen)
+    move = sorted(move.uci() for move in board.legal_moves)[0]
+    writer = TraceWriter(fen)
+    writer.final(move)
+    return torch.from_numpy(np.stack([writer.tokens]))
 
 
 class SequencePolicyTests(unittest.TestCase):
@@ -54,10 +56,10 @@ class SequencePolicyTests(unittest.TestCase):
         # prefill of the row alone, and the shifted trace readout of a batch
         # whose longer first row pads the second row's packed board.
         trace = torch.full((2, 8), PAD, dtype=torch.int16)
-        trace[0, :7] = torch.tensor([FINAL, MOVE + 3, VALUE + 5, END, PAD, PAD, PAD])
-        trace[1, :7] = torch.tensor(
-            [LINE, MOVE + 8, VALUE + 2, FINAL, MOVE + 9, VALUE + 1, END]
-        )
+        first = trace_of(chess.STARTING_FEN)[0]
+        second = final_trace(SHORT_FEN)[0]
+        trace[0, : len(first)] = first
+        trace[1, : len(second)] = second
         batch = self.model.trace_logits(self.ids, trace_ids=trace)
         alone = self.model.trace_logits(self.ids[1:2], trace_ids=trace[1:2])
         torch.testing.assert_close(batch[1], alone[0])
@@ -69,16 +71,17 @@ class SequencePolicyTests(unittest.TestCase):
         # Causal contract: a prediction may not depend on its own target or any
         # later token, and the first target must move with the board.
         trace = trace_of(chess.STARTING_FEN)
+        self.assertEqual(trace.shape[1], 5)
         perturbed = trace.clone()
-        perturbed[0, 6] = END
+        perturbed[0, 2] = RESET
         reference = self.model.trace_logits(self.ids[:1], trace_ids=trace)
         changed = self.model.trace_logits(self.ids[:1], trace_ids=perturbed)
-        for index in range(7):
+        for index in range(3):
             torch.testing.assert_close(
                 reference[0, index], changed[0, index], rtol=0, atol=0
             )
-        self.assertFalse(torch.allclose(reference[0, 7], changed[0, 7]))
-        other = torch.from_numpy(encode_boards([play(RUY_LOPEZ)[1][0]]))
+        self.assertFalse(torch.allclose(reference[0, 3], changed[0, 3]))
+        other = torch.from_numpy(encode_boards([SHORT_FEN]))
         different = self.model.trace_logits(other, trace_ids=trace)
         self.assertFalse(torch.allclose(reference[0, 0], different[0, 0]))
 
@@ -127,6 +130,39 @@ class SequencePolicyTests(unittest.TestCase):
             loaded = load_model(path)
             actual = loaded.trace_logits(self.ids[:1], trace_ids=trace)
             torch.testing.assert_close(actual, expected)
+
+
+class SequenceFlopsTests(unittest.TestCase):
+    def test_hand_derived_literal(self):
+        # Two layers, d=16, f=32, B=10, T=3, V=3003. Linear per layer:
+        # 2*13*(4*16^2 + 3*16*32) = 66560. Attention pairs:
+        # 10^2 + 10*3 + 3*4/2 = 136, costing 4*16*136 = 8704.
+        # Per layer 75264, two layers 150528. Head: 2*3*16*3003 = 288288.
+        # Forward 438816; training counts forward plus two backward passes.
+        config = {
+            "architecture": "sequence",
+            "num_blocks": 2,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_heads": 2,
+        }
+        self.assertEqual(float(sequence_flops(config, [10], [3])[0]), 1316448.0)
+        self.assertEqual(
+            float(sequence_flops(config, [10], [3], training=False)[0]), 438816.0
+        )
+
+    def test_rejects_other_architectures_and_empty_rows(self):
+        config = {
+            "architecture": "sequence",
+            "num_blocks": 1,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_heads": 2,
+        }
+        with self.assertRaises(ValueError):
+            sequence_flops({**config, "architecture": "depth"}, [10], [3])
+        with self.assertRaises(ValueError):
+            sequence_flops(config, [10], [0])
 
 
 if __name__ == "__main__":

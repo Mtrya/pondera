@@ -5,7 +5,7 @@ id; the line number is the id. The layout is arithmetic: 768 occupied-square
 atoms (square * 12 + piece over a1..h8 and PNBRQKpnbrqk), then self-contained
 metadata atoms (side, castling, en passant, halfmove clock, repetition count),
 then the move block, 20 value bins, mate-distance tokens (win 0-28, loss 0-30),
-and the four trace delimiters PAD, END, LINE, FINAL.
+and the five trace delimiters PAD, BACK, RESET, BOARD, FINAL.
 
 The file is the contract. This module validates the arithmetic layout against
 the file at import; regenerate the file only when the vocabulary deliberately
@@ -16,7 +16,8 @@ import hashlib
 from importlib.resources import files
 
 # The version pins the serialized board-token format recorded in data
-# manifests and checkpoints.
+# manifests and checkpoints; sequence trace grammars version themselves
+# separately in dataset manifests.
 CHESS_TOKENIZER_VERSION = 3
 
 # --- Layout cardinalities --- #
@@ -26,13 +27,13 @@ BOARD_TOKENS = 64 * BOARD_PIECES
 SIDES = 2
 CASTLING_RIGHTS = 8  # K Q k q, present and absent
 EN_PASSANT_SQUARES = 65  # 64 squares plus no-square
-HALFMOVE_CLOCKS = 101  # 0..100
+HALFMOVE_CLOCKS = 101  # 0..99 and >=100
 REPETITION_COUNTS = 5  # 1, 2, 3, 4, >=5
 MOVES = 1969  # geometrically possible moves plus the draw claim
 VALUE_BINS = 20
 MATE_WINS = 29  # distance 0..28; 0 is the terminal position
 MATE_LOSSES = 31  # distance 0..30
-DELIMITERS = 4
+DELIMITERS = 5
 
 # --- Segment offsets --- #
 SIDE = BOARD_TOKENS
@@ -48,7 +49,13 @@ VALUE = MOVE + MOVES
 MATE_WIN = VALUE + VALUE_BINS
 MATE_LOSS = MATE_WIN + MATE_WINS
 DELIM = MATE_LOSS + MATE_LOSSES
-PAD, END, LINE, FINAL = DELIM, DELIM + 1, DELIM + 2, DELIM + 3
+PAD, BACK, RESET, BOARD, FINAL = (
+    DELIM,
+    DELIM + 1,
+    DELIM + 2,
+    DELIM + 3,
+    DELIM + 4,
+)
 CHESS_VOCAB_SIZE = DELIM + DELIMITERS
 
 _PATH = files("pondera.chess") / "vocabulary.txt"
@@ -105,6 +112,9 @@ def _validate():
         (SIDE, "meta:side:w"),
         (MOVE, "<claim_draw>"),
         (PAD, "<pad>"),
+        (BACK, "<back>"),
+        (RESET, "<reset>"),
+        (BOARD, "<board>"),
         (FINAL, "<final>"),
     ]:
         if LINES[token] != name:
@@ -166,14 +176,17 @@ def chess_vocabulary():
     ]
     lines += [f"meta:ep:{_square(square)}" for square in range(64)]
     lines += ["meta:ep:-"]
-    lines += [f"meta:halfmove:{count}" for count in range(HALFMOVE_CLOCKS)]
+    lines += [
+        f"meta:halfmove:{count}{'+' if count == HALFMOVE_CLOCKS - 1 else ''}"
+        for count in range(HALFMOVE_CLOCKS)
+    ]
     lines += [f"meta:repetition:{count}" for count in range(1, REPETITION_COUNTS)]
     lines += [f"meta:repetition:{REPETITION_COUNTS}+"]
     lines += _move_vocabulary()
     lines += [f"value:bin:{bin:02d}" for bin in range(VALUE_BINS)]
     lines += [f"mate:win:{distance}" for distance in range(MATE_WINS)]
     lines += [f"mate:loss:{distance}" for distance in range(MATE_LOSSES)]
-    lines += ["<pad>", "<end>", "<line>", "<final>"]
+    lines += ["<pad>", "<back>", "<reset>", "<board>", "<final>"]
     return lines
 
 
