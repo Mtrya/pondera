@@ -32,9 +32,10 @@ Agent 是好奇、主动、负责的研究者，不仅是软件工程师；与�
 
 ## 规范指针
 
-具体规范按目录归位，根部只留指针；在对应目录工作前必读其 AGENTS.md：
+具体规范按目录归位，根部只留指针；在对应目录工作前必读其 AGENTS.md 或模块 README.md：
 
 - 模块边界、目录职责与仓库卫生细则：[docs/architecture.md](docs/architecture.md)
+- 模块内文件职责：各模块 `README.md`（如 [src/pondera/chess/README.md](src/pondera/chess/README.md)、[src/pondera/data/README.md](src/pondera/data/README.md)）
 - 测试规范：[tests/AGENTS.md](tests/AGENTS.md)
 - 公开文档与研究结论晋升标准：[docs/AGENTS.md](docs/AGENTS.md)
 - 实验设计、研判与记录规范：`.local/research/AGENTS.md`（本地研究层，不入 git；若缺失，按本文件精神与 docs/AGENTS.md 的晋升标准重建）
