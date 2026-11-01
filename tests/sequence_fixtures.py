@@ -8,7 +8,7 @@ import numpy as np
 
 from pondera.chess.codec import encode_board
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION, PAD
-from pondera.data.positions import SEQUENCE_FORMAT_VERSION
+from pondera.data.sequence_format import SEQUENCE_FORMAT_VERSION
 from pondera.data.storage import write_manifest
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 

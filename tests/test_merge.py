@@ -22,8 +22,9 @@ from pondera.chess.merge import (
     usage_counts,
 )
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
+from pondera.data.sidecar import load_sidecar
 from pondera.data.trace_config import load_config
-from pondera.data.trace_synthesis import load_sidecar, synthesize_root
+from pondera.data.trace_synthesis import synthesize_root
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
 CASES = ("start_d4", "middlegame_black_d4", "mate_in_1_d4")

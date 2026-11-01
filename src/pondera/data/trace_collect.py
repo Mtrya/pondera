@@ -17,14 +17,14 @@ from pathlib import Path
 
 import chess
 
-from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
-from pondera.data.trace_config import sample_depth, sample_width
-from pondera.data.trace_synthesis import (
+from pondera.data.sidecar import (
     SIDECAR_SCHEMA,
     SIDECAR_SCHEMA_WIDE,
     load_sidecar,
-    validate_root,
 )
+from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
+from pondera.data.trace_config import sample_depth, sample_width
+from pondera.data.trace_synthesis import validate_root
 
 SELECTION_ALGORITHM = (
     "random.Random(f'{seed}:{split}') reservoir sampling in source order; "

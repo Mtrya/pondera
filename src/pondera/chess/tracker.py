@@ -25,6 +25,14 @@ import chess
 from pondera.chess.codec import encode_board
 
 
+def repetition_count(board: chess.Board) -> int:
+    """Occurrences of the current position in the board's move history, capped at five."""
+    for count in range(5, 1, -1):
+        if board.is_repetition(count):
+            return count
+    return 1
+
+
 class PathTracker:
     """Root position plus an absolute-UCI path and its current board."""
 

@@ -11,12 +11,11 @@ from trace_fixtures import tie_sidecar_lines
 
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
-from pondera.data.positions import SequencePositions
+from pondera.data.positions import SequencePositions, sequence_data_identity
+from pondera.data.sequence_format import SEQUENCE_ARRAYS
 from pondera.data.sequence_release import load_collection, produce_shards
 from pondera.data.sequence_validation import (
-    SEQUENCE_ARRAYS,
     load_sequence_arrays,
-    sequence_data_identity,
     validate_release,
     validate_release_identity,
     verify_shard_files,

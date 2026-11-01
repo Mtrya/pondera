@@ -18,15 +18,13 @@ from pondera.chess.vocabulary import (
     UCI_MOVE_TO_IDX,
     VALUE,
 )
+from pondera.data.sidecar import SynthesisError, load_sidecar, parse_sidecar
 from pondera.data.trace import DRAW_CLAIM_BOUND, replay
 from pondera.data.trace_config import load_config
+from pondera.data.trace_profile import profile_roots
 from pondera.data.trace_synthesis import (
     PRESENTATIONS,
-    SynthesisError,
-    load_sidecar,
     mate_distance_moves,
-    parse_sidecar,
-    profile_roots,
     synthesize_root,
 )
 

@@ -4,7 +4,7 @@ import chess
 import torch
 
 from pondera.chess.codec import encode_board, legal_move_indices
-from pondera.chess.domain import repetition_count
+from pondera.chess.tracker import repetition_count
 from pondera.chess.vocabulary import IDX_TO_UCI_MOVE
 from pondera.models.policy import DepthPolicyModel
 

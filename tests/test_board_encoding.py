@@ -5,7 +5,8 @@ import numpy as np
 import torch
 
 from pondera.chess.codec import decode_board, encode_board, encode_boards
-from pondera.chess.domain import PIECE_TO_IDX, repetition_count
+from pondera.chess.domain import PIECE_TO_IDX
+from pondera.chess.tracker import repetition_count
 from pondera.chess.vocabulary import SIDE
 from pondera.models.board import black_to_move, reflect_board_tokens
 

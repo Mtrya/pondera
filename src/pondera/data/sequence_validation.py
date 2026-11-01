@@ -21,6 +21,13 @@ from pondera.chess.vocabulary import (
     PAD,
     VALUE,
 )
+from pondera.data.sequence_format import (
+    SEQUENCE_ARRAYS,
+    SEQUENCE_FORMAT_VERSION,
+    STATE_ARRAYS,
+    TRACE_ARRAYS,
+)
+from pondera.data.sidecar import SIDECAR_SCHEMA, SIDECAR_SCHEMA_WIDE
 from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
 from pondera.data.trace import (
     CLAIM_DRAW_UCI,
@@ -35,23 +42,8 @@ from pondera.data.trace_config import (
     sample_presentation,
     sample_width,
 )
-from pondera.data.trace_synthesis import (
-    PRESENTATIONS,
-    SIDECAR_SCHEMA,
-    SIDECAR_SCHEMA_WIDE,
-    mate_distance_moves,
-)
+from pondera.data.trace_synthesis import PRESENTATIONS, mate_distance_moves
 
-SEQUENCE_FORMAT_VERSION = 5
-TRACE_ARRAYS = ("board_tokens", "trace_tokens", "trace_len", "trace_roles")
-STATE_ARRAYS = (
-    "state_no_tool",
-    "state_tool",
-    "state_best",
-    "state_basis",
-    "state_value",
-)
-SEQUENCE_ARRAYS = (*TRACE_ARRAYS, *STATE_ARRAYS, "state_count")
 # The label region after FINAL is not a thinking boundary; truncation states
 # stop at the last thought operation.
 FINAL_SUFFIX_OPS = frozenset({"final", "final_evaluate", "final_pv", "end"})
@@ -346,47 +338,6 @@ def load_sequence_arrays(directory, names=TRACE_ARRAYS):
     }
     validate_sequence_arrays(arrays)
     return arrays
-
-
-def sequence_data_identity(directory):
-    """Verify and fingerprint the files that define Sequence training input."""
-    directory = Path(directory)
-    manifest_path = directory / (
-        "release.json" if (directory / "release.json").exists() else "manifest.json"
-    )
-    manifest = load_manifest(manifest_path)
-    files = {}
-    if "shards" in manifest:
-        for shard in manifest["shards"]:
-            shard_dir = directory / shard["path"]
-            manifest_path = shard_dir / "manifest.json"
-            manifest_sha = sha256(manifest_path)
-            if manifest_sha != shard["sha256"]:
-                raise ValueError(f"Shard manifest checksum mismatch: {manifest_path}")
-            shard_manifest = load_manifest(manifest_path)
-            files[manifest_path.relative_to(directory).as_posix()] = manifest_sha
-            filenames = [f"{name}.npy" for name in TRACE_ARRAYS] + ["roots.jsonl"]
-            for filename in filenames:
-                expected = shard_manifest.get("files", {}).get(filename)
-                if expected is None:
-                    raise ValueError(
-                        f"Shard has no checksum for {filename}: {shard_dir}"
-                    )
-                path = shard_dir / filename
-                actual = sha256(path)
-                if actual != expected:
-                    raise ValueError(f"Training input checksum mismatch: {path}")
-                files[path.relative_to(directory).as_posix()] = actual
-    else:
-        if not manifest.get("files"):
-            raise ValueError("Sequence dataset manifest has no input checksums")
-        for filename, expected in manifest["files"].items():
-            path = directory / filename
-            actual = sha256(path)
-            if actual != expected:
-                raise ValueError(f"Training input checksum mismatch: {path}")
-            files[filename] = actual
-    return content_sha256({"manifest": manifest, "files": files})
 
 
 def verify_shard_files(release_dir, shard, expected_metadata=None):

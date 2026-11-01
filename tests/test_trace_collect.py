@@ -5,6 +5,7 @@ import unittest
 from collections import Counter
 from pathlib import Path
 
+from pondera.data.sidecar import SynthesisError, load_sidecar
 from pondera.data.storage import content_sha256, sha256
 from pondera.data.trace_collect import (
     CollectionError,
@@ -20,7 +21,6 @@ from pondera.data.trace_config import (
     sample_presentation,
     sample_width,
 )
-from pondera.data.trace_synthesis import SynthesisError, load_sidecar
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
 

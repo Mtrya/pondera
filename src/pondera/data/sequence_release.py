@@ -19,21 +19,18 @@ import numpy as np
 
 from pondera.chess.codec import encode_board
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION, PAD
-from pondera.data.sequence_validation import (
-    SEQUENCE_FORMAT_VERSION,
-    verify_shard_files,
+from pondera.data.sequence_format import SEQUENCE_FORMAT_VERSION
+from pondera.data.sequence_validation import verify_shard_files
+from pondera.data.sidecar import (
+    SIDECAR_SCHEMA,
+    SIDECAR_SCHEMA_WIDE,
+    load_sidecar,
 )
 from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
 from pondera.data.trace import ROLE_COUNT, TRACE_GRAMMAR_VERSION
 from pondera.data.trace_config import DEFAULT_TEACHER_PATH, sample_presentation
-from pondera.data.trace_synthesis import (
-    PRESENTATIONS,
-    SIDECAR_SCHEMA,
-    SIDECAR_SCHEMA_WIDE,
-    RootProfile,
-    load_sidecar,
-    synthesize_root,
-)
+from pondera.data.trace_profile import RootProfile
+from pondera.data.trace_synthesis import PRESENTATIONS, synthesize_root
 
 RELEASE_ONLY_METADATA = frozenset(
     {"root_selection", "root_selections", "roots", "root_sets", "sidecars"}

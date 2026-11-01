@@ -9,11 +9,12 @@ from torch.utils.data import Dataset
 
 from pondera.chess.codec import BOARD_TOKENS_MAX
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
+from pondera.data.sequence_format import SEQUENCE_FORMAT_VERSION, TRACE_ARRAYS
 from pondera.data.sequence_validation import (
-    SEQUENCE_FORMAT_VERSION,
     load_sequence_arrays,
     validate_sequence_arrays,
 )
+from pondera.data.storage import content_sha256, load_manifest, sha256
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 
@@ -139,6 +140,47 @@ class _ShardedSequenceArrays:
     def get(self, name, index):
         shard, row = self.index[index]
         return self._arrays(shard)[name][row].copy()
+
+
+def sequence_data_identity(directory):
+    """Verify and fingerprint the files that define Sequence training input."""
+    directory = Path(directory)
+    manifest_path = directory / (
+        "release.json" if (directory / "release.json").exists() else "manifest.json"
+    )
+    manifest = load_manifest(manifest_path)
+    files = {}
+    if "shards" in manifest:
+        for shard in manifest["shards"]:
+            shard_dir = directory / shard["path"]
+            manifest_path = shard_dir / "manifest.json"
+            manifest_sha = sha256(manifest_path)
+            if manifest_sha != shard["sha256"]:
+                raise ValueError(f"Shard manifest checksum mismatch: {manifest_path}")
+            shard_manifest = load_manifest(manifest_path)
+            files[manifest_path.relative_to(directory).as_posix()] = manifest_sha
+            filenames = [f"{name}.npy" for name in TRACE_ARRAYS] + ["roots.jsonl"]
+            for filename in filenames:
+                expected = shard_manifest.get("files", {}).get(filename)
+                if expected is None:
+                    raise ValueError(
+                        f"Shard has no checksum for {filename}: {shard_dir}"
+                    )
+                path = shard_dir / filename
+                actual = sha256(path)
+                if actual != expected:
+                    raise ValueError(f"Training input checksum mismatch: {path}")
+                files[path.relative_to(directory).as_posix()] = actual
+    else:
+        if not manifest.get("files"):
+            raise ValueError("Sequence dataset manifest has no input checksums")
+        for filename, expected in manifest["files"].items():
+            path = directory / filename
+            actual = sha256(path)
+            if actual != expected:
+                raise ValueError(f"Training input checksum mismatch: {path}")
+            files[filename] = actual
+    return content_sha256({"manifest": manifest, "files": files})
 
 
 class SequencePositions(Dataset):

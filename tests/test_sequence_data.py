@@ -17,7 +17,8 @@ from pondera.chess.vocabulary import (
     PAD,
     UCI_MOVE_TO_IDX,
 )
-from pondera.data.positions import SEQUENCE_FORMAT_VERSION, SequencePositions
+from pondera.data.positions import SequencePositions
+from pondera.data.sequence_format import SEQUENCE_FORMAT_VERSION
 from pondera.data.trace import (
     ROLE_CONTROL,
     ROLE_FINAL_EVAL,

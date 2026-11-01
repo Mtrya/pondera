@@ -38,8 +38,7 @@ from pondera.chess.vocabulary import (
     FINAL,
     PAD,
 )
-from pondera.data.positions import SequencePositions
-from pondera.data.sequence_validation import sequence_data_identity
+from pondera.data.positions import SequencePositions, sequence_data_identity
 from pondera.data.trace import (
     ROLE_CONTROL,
     ROLE_COUNT,

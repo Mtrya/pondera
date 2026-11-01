@@ -1,12 +1,10 @@
-"""Chess domain primitives: pieces, squares, and position history.
+"""Chess domain primitives: piece and square indices.
 
-This module knows the game but no token ids; everything id-shaped lives in
-`pondera.chess.vocabulary` and `pondera.chess.codec`.
+This module knows the game board shape but no token ids; everything id-shaped
+lives in `pondera.chess.vocabulary` and `pondera.chess.codec`.
 """
 
 from typing import Dict
-
-import chess
 
 PIECE_TO_IDX: Dict[str, int] = {
     "P": 0,
@@ -33,11 +31,3 @@ SQUARE_TO_IDX: Dict[str, int] = {
     for file in "abcdefgh"
 }
 IDX_TO_SQUARE: Dict[int, str] = {v: k for k, v in SQUARE_TO_IDX.items()}
-
-
-def repetition_count(board: chess.Board) -> int:
-    """Occurrences of the current position, saturated at five."""
-    for count in range(5, 1, -1):
-        if board.is_repetition(count):
-            return count
-    return 1
