@@ -186,11 +186,14 @@ def sample_distribution(rng, distribution):
     """Draw one key from a frozen sorted distribution."""
     roll = rng.random()
     cumulative = 0.0
+    fallback = distribution[0][0]
     for key, probability in distribution:
+        if probability > 0.0:
+            fallback = key
         cumulative += probability
         if roll < cumulative:
             return key
-    return distribution[-1][0]
+    return fallback
 
 
 def sample_width(recipe, seed, root_id, default_width):

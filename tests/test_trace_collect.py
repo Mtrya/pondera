@@ -94,6 +94,13 @@ class RecipeConfigTests(unittest.TestCase):
         self.assertIsNone(sample_presentation(config.recipe, 640, "root"))
         self.assertFalse(config.recipe.samples_presentations())
 
+    def test_zero_probability_keys_are_never_drawn(self):
+        config = self.load(config_text() + "\n[recipe]\nwidths = {1 = 0.0, 3 = 1.0}\n")
+        draws = {
+            sample_width(config.recipe, 640, f"root-{index}", 1) for index in range(100)
+        }
+        self.assertEqual(draws, {3})
+
     def test_recipe_attaches_sampled_teacher_fields_per_root(self):
         config = self.load(config_text() + RECIPE_TEXT)
         roots = [{"root_id": f"root-{index}", "split": "train"} for index in range(200)]
