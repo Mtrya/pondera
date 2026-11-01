@@ -1,20 +1,4 @@
-"""Causal sequence training over encoded teacher traces.
-
-Follows the depth.py training skeleton (resume, schedule, tracking) under the
-sequence contract: the board prefix is attended bidirectionally, the trace
-suffix causally, and supervision is shifted next-token CE on the generated
-trace tokens. The current mask excludes tool responses and padding and
-weights the remaining tokens equally; this mask is a provisional training
-choice, not part of the data contract, and loss coverage and weighting remain
-open. Evaluation reports the aggregate loss and top-1 accuracy for
-validation and a frozen evenly spaced train probe, their gaps, per-role
-cross-entropy, and optional
-internal health probes. Training accounts actual board and trace tokens plus
-analytical FLOPs; ``train_flops_budget`` replaces the step-count schedule and
-stop with that compute budget while checkpoints retain step and compute
-together. This trainer intentionally duplicates the depth.py boilerplate
-instead of sharing it: the two data and model contracts evolve independently.
-"""
+"""Resumable next-token training over encoded teacher traces."""
 
 import argparse
 import json
@@ -38,8 +22,9 @@ from pondera.chess.vocabulary import (
     FINAL,
     PAD,
 )
-from pondera.data.dataset import SequencePositions, sequence_data_identity
+from pondera.data.dataset import TracePositions, trace_data_identity
 from pondera.data.trace import (
+    ROLE_BOARD,
     ROLE_CONTROL,
     ROLE_COUNT,
     ROLE_EVAL,
@@ -49,19 +34,15 @@ from pondera.data.trace import (
     ROLE_MOVE,
     ROLE_PAD,
     ROLE_REFUTED,
-    ROLE_TOOL,
 )
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
-from pondera.models.factory import create_model
-from pondera.training.cost import sequence_flops
-from pondera.training.internals import InternalProbe
+from pondera.models.policy import create_model
 
 
 @dataclass
-class SequenceTrainConfig:
+class TrainConfig:
     model: dict = field(
         default_factory=lambda: {
-            "architecture": "sequence",
             "num_blocks": 12,
             "hidden_size": 768,
             "intermediate_size": 2048,
@@ -82,22 +63,16 @@ class SequenceTrainConfig:
     val_every: int = 128
     val_positions: int = 8192
     train_probe_positions: int = 2048
-    internals: bool = False
-    internals_positions: int = 8
-    train_flops_budget: float | None = None
     log_every: int = 50
     save_every: int = 1024
 
     def __post_init__(self):
-        if self.model.get("architecture") != "sequence":
-            raise ValueError("Sequence training requires a sequence-architecture model")
         for name in (
             "batch_size",
             "accumulation_steps",
             "epochs",
             "val_every",
             "val_positions",
-            "internals_positions",
             "log_every",
             "save_every",
         ):
@@ -115,14 +90,10 @@ class SequenceTrainConfig:
             raise ValueError("weight_decay must be finite and non-negative")
         if not 0 <= self.warmup_ratio <= 1:
             raise ValueError("warmup_ratio must be between 0 and 1")
-        if self.train_flops_budget is not None and (
-            not math.isfinite(self.train_flops_budget) or self.train_flops_budget <= 0
-        ):
-            raise ValueError("train_flops_budget must be finite and positive")
 
 
 @dataclass
-class SequenceCollator:
+class TraceCollator:
     """Pad stored traces and roles, and locate each row's final decision.
 
     The trace already carries its presentation order. Board rows come padded
@@ -179,12 +150,11 @@ class SequenceCollator:
 
 def load_config(path):
     with Path(path).open("rb") as handle:
-        return SequenceTrainConfig(**tomllib.load(handle))
+        return TrainConfig(**tomllib.load(handle))
 
 
-# Per-role diagnostic names. Tool responses and padding have no role entry
-# under the current supervision mask.
 ROLE_LOSS_NAMES = {
+    "board": ROLE_BOARD,
     "move": ROLE_MOVE,
     "evaluation": ROLE_EVAL,
     "control": ROLE_CONTROL,
@@ -196,15 +166,7 @@ ROLE_LOSS_NAMES = {
 
 
 def trace_loss_parts(model, inputs):
-    """Token CE and the current supervision mask.
-
-    Every counted token is one next-token target, so the current loss is the
-    plain mean CE over generated trace tokens whose roles are not padding or
-    tool responses. Thought tokens, the FINAL decision, the label evaluation,
-    the best line, and ``<end>`` currently carry the same weight; the per-role
-    sums are diagnostics and do not enter the loss. Loss coverage and weighting
-    remain open; vanilla equal-weight CE is only the starting point.
-    """
+    """Return equal-weight next-token CE over all non-padding trace tokens."""
     trace_ids = inputs["trace_ids"]
     roles = inputs["trace_roles"]
     targets = trace_ids.long()
@@ -214,7 +176,7 @@ def trace_loss_parts(model, inputs):
         targets.reshape(-1),
         reduction="none",
     ).reshape(trace_ids.shape)
-    generated = (roles != ROLE_PAD) & (roles != ROLE_TOOL)
+    generated = roles != ROLE_PAD
     loss = (ce * generated).sum() / generated.sum().clamp_min(1)
     return loss, ce, logits, generated
 
@@ -226,11 +188,7 @@ def trace_loss(model, inputs):
 
 
 def role_loss_totals(ce, roles):
-    """Per-role CE sums and token counts; tool responses and padding excluded.
-
-    Callers divide each sum by its count after accumulating over evaluation
-    batches, so the reported means weight every supervised token equally.
-    """
+    """Return per-role CE sums and token counts for diagnostics."""
     return {
         name: ((ce * (roles == role)).sum(), int((roles == role).sum()))
         for name, role in ROLE_LOSS_NAMES.items()
@@ -251,10 +209,10 @@ def train(
     torch.manual_seed(config.seed)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
-    train_data = SequencePositions(data_dir, "train")
-    val_data = SequencePositions(data_dir, "val")
-    eval_collate = SequenceCollator()
-    data_identity = sequence_data_identity(data_dir)
+    train_data = TracePositions(data_dir, "train")
+    val_data = TracePositions(data_dir, "val")
+    eval_collate = TraceCollator()
+    data_identity = trace_data_identity(data_dir)
     micro_batches = len(train_data) // config.batch_size
     steps_per_epoch = micro_batches // config.accumulation_steps
     if not steps_per_epoch or not len(val_data):
@@ -270,26 +228,12 @@ def train(
         weight_decay=config.weight_decay,
         fused=True if device.type == "cuda" else None,
     )
-    consumed_flops = 0.0
     examples_seen = 0
     board_tokens = 0
     trace_tokens = 0
-    if config.train_flops_budget is None:
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer, int(total_steps * config.warmup_ratio), total_steps
-        )
-    else:
-
-        def learning_rate_fraction(_):
-            progress = min(1.0, consumed_flops / config.train_flops_budget)
-            if progress < config.warmup_ratio:
-                return progress / config.warmup_ratio
-            decay = (progress - config.warmup_ratio) / max(
-                1e-12, 1 - config.warmup_ratio
-            )
-            return 0.5 * (1 + math.cos(math.pi * decay))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_fraction)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, int(total_steps * config.warmup_ratio), total_steps
+    )
     step, start_epoch, next_micro = 0, 0, 0
     tracking_id = None
     checkpoint = None
@@ -346,7 +290,6 @@ def train(
                 }
             )
         tracking_id = checkpoint.get("tracking_id")
-        consumed_flops = checkpoint["train_flops"]
         board_tokens = checkpoint["board_tokens"]
         trace_tokens = checkpoint["trace_tokens"]
         examples_seen = checkpoint["examples_seen"]
@@ -450,16 +393,6 @@ def train(
             values["generalization/final_move_top1_gap"] = (
                 values["val/final_move_top1"] - values["train_probe/final_move_top1"]
             )
-        if probe is not None:
-            batch = min(config.internals_positions, len(val_data))
-            inputs = eval_collate([val_data[i] for i in range(batch)])
-            inputs = {key: inputs[key].to(device) for key in ("ids", "trace_ids")}
-            with autocast():
-                scalars, arrays = probe.collect(model, inputs)
-            values.update({f"internal/{key}": value for key, value in scalars.items()})
-            artifact = output_dir / "probes" / f"internal-{step:06d}.npz"
-            artifact.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(artifact, **arrays)
         return values
 
     def save(name, epoch, micro):
@@ -478,7 +411,6 @@ def train(
             if device.type == "cuda"
             else None,
             tracking_id=tracking_id,
-            train_flops=consumed_flops,
             board_tokens=board_tokens,
             trace_tokens=trace_tokens,
             examples_seen=examples_seen,
@@ -488,11 +420,6 @@ def train(
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    probe = (
-        InternalProbe(model, output_dir / "probes" / "init-embeddings.npz")
-        if config.internals
-        else None
-    )
     val_metrics = {}
     start_time = time.monotonic()
     initial_step = step
@@ -502,12 +429,9 @@ def train(
     limit = total_steps if max_steps is None else min(max_steps, total_steps)
     with (output_dir / "metrics.jsonl").open("a") as metrics:
         for epoch in range(start_epoch, config.epochs):
-            if step >= limit or (
-                config.train_flops_budget is not None
-                and consumed_flops >= config.train_flops_budget
-            ):
+            if step >= limit:
                 break
-            train_collate = SequenceCollator()
+            train_collate = TraceCollator()
             loader = DataLoader(
                 train_data,
                 batch_size=config.batch_size,
@@ -532,9 +456,6 @@ def train(
                     continue
                 board_lengths = (inputs["ids"] != PAD).sum(1).numpy()
                 trace_lengths = (inputs["trace_ids"] != PAD).sum(1).numpy()
-                consumed_flops += float(
-                    sequence_flops(config.model, board_lengths, trace_lengths).sum()
-                )
                 board_tokens += int(board_lengths.sum())
                 trace_tokens += int(trace_lengths.sum())
                 examples_seen += config.batch_size
@@ -585,16 +506,11 @@ def train(
                         * config.batch_size
                         * config.accumulation_steps
                         / (time.monotonic() - start_time),
-                        "train/theoretical_flops": consumed_flops,
                         "train/board_tokens": board_tokens,
                         "train/trace_tokens": trace_tokens,
                         "train/examples": examples_seen,
                         "train/data_passes": examples_seen / len(train_data),
-                        "train/schedule_progress": min(
-                            1.0, consumed_flops / config.train_flops_budget
-                        )
-                        if config.train_flops_budget
-                        else step / total_steps,
+                        "train/schedule_progress": step / total_steps,
                         "model/parameters": trainable_parameters,
                         "elapsed_seconds": time.monotonic() - start_time,
                         "memory/peak_allocated_bytes": torch.cuda.max_memory_allocated(
@@ -613,40 +529,25 @@ def train(
                 step_tokens = 0
                 if step % config.save_every == 0:
                     save(f"step-{step:06d}.pth", epoch, cursor)
-                if step >= limit or (
-                    config.train_flops_budget is not None
-                    and consumed_flops >= config.train_flops_budget
-                ):
+                if step >= limit:
                     break
-            if step >= limit or (
-                config.train_flops_budget is not None
-                and consumed_flops >= config.train_flops_budget
-            ):
+            if step >= limit:
                 break
             cursor = 0
     final_metrics = {
         "step": step,
         "final": True,
-        "training_complete": step >= total_steps
-        or (
-            config.train_flops_budget is not None
-            and consumed_flops >= config.train_flops_budget
-        ),
-        "train/theoretical_flops": consumed_flops,
+        "training_complete": step >= total_steps,
         "train/board_tokens": board_tokens,
         "train/trace_tokens": trace_tokens,
         "train/examples": examples_seen,
         "train/data_passes": examples_seen / len(train_data),
-        "flop_budget_reached": config.train_flops_budget is not None
-        and consumed_flops >= config.train_flops_budget,
         **validate(),
     }
     with (output_dir / "metrics.jsonl").open("a") as metrics:
         metrics.write(json.dumps(final_metrics) + "\n")
     print(json.dumps(final_metrics), flush=True)
     save("final.pth", epoch, cursor)
-    if probe is not None:
-        probe.close()
     if tracker:
         tracker.finish()
     return output_dir / "final.pth"

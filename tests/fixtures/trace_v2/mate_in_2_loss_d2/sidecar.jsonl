@@ -1,0 +1,14 @@
+{"schema":3,"seq":1,"type":"session","engine":"Stockfish 17.1","value_mate":32000,"max_ply":246,"options":{"threads":1,"hash_mb":256,"multipv":1}}
+{"schema":3,"seq":2,"type":"position","fen":"7r/p1Pk1p2/3p4/2n5/4qKp1/6PB/3Bb2P/1rN4R w - - 6 38"}
+{"schema":3,"seq":3,"type":"search_start","depth":2,"multi_pv":1}
+{"schema":3,"seq":4,"type":"round_start","round":1,"depth":1,"window":{"alpha":-32001,"beta":32001},"root_order":["f4g5"]}
+{"schema":3,"seq":5,"type":"candidate","round":1,"attempt":1,"path":["f4g5"],"ply":1,"move":"f4g5","order":1,"call":"first","depth":0,"window":{"alpha":-32001,"beta":32001},"raw":31999,"bound":"exact","nodes_delta":0,"seldepth":1,"pv":["f4g5"]}
+{"schema":3,"seq":6,"type":"frontier","round":1,"attempt":1,"path":["f4g5"],"ply":1,"raw":31999,"bound":"exact","nodes_delta":0,"seldepth":1}
+{"schema":3,"seq":7,"type":"attempt","round":1,"attempt":1,"window":{"alpha":-32001,"beta":32001},"raw":-31999,"bound":"exact"}
+{"schema":3,"seq":8,"type":"round_end","round":1,"depth":1,"attempt":1,"rank":[{"move":"f4g5","raw":-31999,"pv":["f4g5"]}],"counters":{"best_move_changes":0,"seldepth":1,"nodes":1}}
+{"schema":3,"seq":9,"type":"round_start","round":2,"depth":2,"window":{"alpha":-32001,"beta":32001},"root_order":["f4g5"]}
+{"schema":3,"seq":10,"type":"candidate","round":2,"attempt":1,"path":["f4g5"],"ply":1,"move":"f4g5","order":1,"call":"first","depth":1,"window":{"alpha":-32001,"beta":32001},"raw":31999,"bound":"exact","nodes_delta":0,"seldepth":2,"pv":["f4g5","e4e5"]}
+{"schema":3,"seq":11,"type":"candidate","round":2,"attempt":1,"path":["f4g5","e4e5"],"ply":2,"move":"e4e5","order":1,"call":"first","depth":0,"window":{"alpha":-32001,"beta":32001},"raw":-31999,"bound":"exact","nodes_delta":0,"seldepth":1}
+{"schema":3,"seq":12,"type":"attempt","round":2,"attempt":1,"window":{"alpha":-32001,"beta":32001},"raw":-31999,"bound":"exact"}
+{"schema":3,"seq":13,"type":"round_end","round":2,"depth":2,"attempt":1,"rank":[{"move":"f4g5","raw":-31999,"pv":["f4g5","e4e5"]}],"counters":{"best_move_changes":0,"seldepth":2,"nodes":2}}
+{"schema":3,"seq":14,"type":"search_end","bestmove":"f4g5","ponder":null,"nodes":3,"seldepth":2,"depth":2}

@@ -1,176 +1,21 @@
-"""Board policies using the lossless input format and composable backbones."""
-
-from dataclasses import dataclass
+"""Causal policy over board atoms and trace tokens."""
 
 import torch
 from huggingface_hub import PyTorchModelHubMixin
 from torch import nn
 
-from pondera.chess.codec import encode_boards
-from pondera.chess.domain import EMPTY_SQ_IDX
-from pondera.chess.symmetry import move_permutations
 from pondera.chess.vocabulary import (
+    CHESS_TOKENIZER_VERSION,
     CHESS_VOCAB_SIZE,
-    IDX_TO_UCI_MOVE,
-    MOVE,
     PAD,
-    VALUE,
 )
-from pondera.models.backbones import DepthBackbone, SequenceBackbone
+from pondera.models.backbones import Backbone
 from pondera.models.blocks import sinusoidal_positions
-from pondera.models.board import (
-    BoardEmbedding,
-    black_to_move,
-    reflect_board_tokens,
-)
-from pondera.models.config import BlockConfig, CoreConfig
+from pondera.models.board import black_to_move, reflect_board_tokens
+from pondera.models.config import BlockConfig
 
 
-def _reflection_table():
-    """Action-permutation undoing the black-to-move rank reflection."""
-    return torch.tensor(move_permutations()[1])
-
-
-@dataclass
-class ExitPrediction:
-    """One supervised core exit: move and value logits plus the active mask."""
-
-    move_logits: torch.Tensor
-    value_logits: torch.Tensor
-    active: torch.Tensor
-    board_logits: torch.Tensor | None = None
-    active_board: torch.Tensor | None = None
-
-
-class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
-    """Recurrent-depth policy; one shared vocabulary head read at every core exit.
-
-    The head spans the unified token vocabulary. The action readout consumes its
-    MOVE segment, the value readout its VALUE/MATE segment; both read the two
-    trailing readout tokens appended to the board prefix. Exits are the core
-    repetition boundaries in execution order; the final answer is the last exit.
-    With board_aux, a shared 13-class head additionally reads every sequence
-    position at each exit, predicting the square contents after replaying the
-    exit's teacher move (a training-time auxiliary; the fast path ignores it).
-    """
-
-    def __init__(
-        self,
-        cores,
-        hidden_size,
-        intermediate_size,
-        num_heads,
-        dropout=0.0,
-        possible_moves=len(IDX_TO_UCI_MOVE),
-        cache_policy="matched_fallback",
-        architecture="depth",
-        board_aux=False,
-    ):
-        super().__init__()
-        if architecture != "depth":
-            raise ValueError("Unsupported board-policy architecture")
-        if possible_moves != len(IDX_TO_UCI_MOVE):
-            raise ValueError(
-                "Side-to-move orientation requires the full action vocabulary"
-            )
-        self.board_embedding = BoardEmbedding(hidden_size)
-        self.register_buffer("reflected_actions", _reflection_table(), persistent=False)
-        self.act_token = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
-        self.val_token = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
-        self.head = nn.Linear(hidden_size, CHESS_VOCAB_SIZE)
-        groups = [
-            CoreConfig(**value) if isinstance(value, dict) else value for value in cores
-        ]
-        block = BlockConfig(hidden_size, intermediate_size, num_heads, dropout)
-        self.backbone = DepthBackbone(block, groups, cache_policy)
-        self.board_aux_head = (
-            nn.Linear(hidden_size, EMPTY_SQ_IDX + 1) if board_aux else None
-        )
-
-    def embed(self, ids):
-        device = self.act_token.device
-        ids = ids.to(device)
-        board = self.board_embedding(ids)
-        batch = ids.shape[0]
-        hidden = torch.cat(
-            (
-                board.hidden,
-                self.act_token.expand(batch, -1, -1),
-                self.val_token.expand(batch, -1, -1),
-            ),
-            dim=1,
-        )
-        valid = torch.cat(
-            (board.valid, torch.ones(batch, 2, device=device, dtype=torch.bool)),
-            dim=1,
-        )
-        return hidden, valid
-
-    def _predict(self, state, reflected):
-        logits = self.head(state)
-        move = logits[..., 0, MOVE : MOVE + len(IDX_TO_UCI_MOVE)]
-        value = logits[..., 1, VALUE:PAD]
-        move = torch.where(reflected[:, None], move[:, self.reflected_actions], move)
-        return move, value
-
-    def forward(
-        self,
-        fen=None,
-        repetitions=None,
-        *,
-        ids=None,
-        return_backbone=False,
-        capture=False,
-    ):
-        if ids is None:
-            reps = (
-                repetitions.tolist()
-                if isinstance(repetitions, torch.Tensor)
-                else repetitions
-            )
-            ids = torch.from_numpy(encode_boards(fen, reps))
-        hidden, valid = self.embed(ids)
-        output = self.backbone(hidden, valid=valid, capture=capture)
-        reflected = black_to_move(ids).to(output.hidden.device)
-        move, value = self._predict(output.hidden[:, -2:], reflected)
-        return (move, value, output) if return_backbone else (move, value)
-
-    def forward_exits(self, *, ids):
-        """Every core-exit prediction in execution order, for multi-exit training."""
-        hidden, valid = self.embed(ids)
-        output = self.backbone(hidden, valid=valid, capture=True)
-        reflected = black_to_move(ids).to(output.hidden.device)
-        last_layers = tuple(core.config.layers - 1 for core in self.backbone.cores)
-        exits = []
-        for readout in output.readouts:
-            if readout.layer != last_layers[readout.core]:
-                continue
-            normed = self.backbone.final_norm(readout.hidden)
-            state = normed[:, -2:]
-            move, value = self._predict(state, reflected)
-            board_logits = (
-                self.board_aux_head(normed) if self.board_aux_head is not None else None
-            )
-            exits.append(
-                ExitPrediction(
-                    move,
-                    value,
-                    readout.active[:, -2],
-                    board_logits,
-                    readout.active[:, :-2] if board_logits is not None else None,
-                )
-            )
-        return exits, output
-
-
-def sequence_target_positions(board_lengths, trace_width, board_width):
-    """Absolute positions whose hidden state predicts each trace target token.
-
-    The first trace token is predicted from the last position of the
-    canonically sorted prefix; every later trace token is predicted from the
-    preceding trace position. Padded trace slots get in-range indices and are
-    ignored through the loss mask.
-    """
+def trace_target_positions(board_lengths, trace_width, board_width):
     index = torch.arange(trace_width, device=board_lengths.device)
     return torch.where(
         index[None, :] == 0,
@@ -179,18 +24,8 @@ def sequence_target_positions(board_lengths, trace_width, board_width):
     )
 
 
-class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
-    """Board prefix with bidirectional attention followed by a causal trace.
-
-    The prefix is the sparse set of board and metadata atoms stored in the
-    dataset; it carries no positional encoding. Trace tokens add sinusoidal
-    positions. Both read one full-vocabulary embedding table, so the id of a
-    piece on a square means the same thing whether it appears while reading a
-    board prefix or a BOARD observation. The head spans the unified vocabulary
-    and reads the whole sequence; supervision follows the shifted trace
-    contract in sequence_target_positions. Generation prefills the board, then
-    decodes one token at a time from the cached prefix.
-    """
+class PolicyModel(nn.Module, PyTorchModelHubMixin):
+    """Bidirectional board prefix followed by a causally attended trace."""
 
     def __init__(
         self,
@@ -199,11 +34,8 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
         intermediate_size,
         num_heads,
         dropout=0.0,
-        architecture="sequence",
     ):
         super().__init__()
-        if architecture != "sequence":
-            raise ValueError("Unsupported board-policy architecture")
         self.token_embedding = nn.Embedding(
             CHESS_VOCAB_SIZE, hidden_size, padding_idx=PAD
         )
@@ -212,24 +44,16 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
             self.token_embedding.weight[PAD].zero_()
         self.head = nn.Linear(hidden_size, CHESS_VOCAB_SIZE)
         block = BlockConfig(hidden_size, intermediate_size, num_heads, dropout)
-        self.backbone = SequenceBackbone(block, num_blocks)
+        self.backbone = Backbone(block, num_blocks)
 
     def _prefix_embeddings(self, ids):
-        """Canonicalize the sparse prefix and embed it without positions.
-
-        Mirroring maps black-to-move positions into the white frame; sorting
-        then gives every set of atoms one order, so no prediction can depend
-        on how the encoder happened to lay the atoms out. PAD is the largest
-        id, so valid atoms end up contiguous at the front.
-        """
         ids = reflect_board_tokens(ids, black_to_move(ids))
         ids = ids.sort(dim=1).values
         valid = ids != PAD
         hidden = self.token_embedding(ids.long())
         return hidden.masked_fill(~valid.unsqueeze(-1), 0), valid
 
-    def sequence(self, ids, trace_ids=None, trace_positions=None, *, capture=False):
-        """Backbone output over the sparse board prefix and the trace suffix."""
+    def _embed(self, ids, trace_ids=None, trace_positions=None):
         hidden, valid = self._prefix_embeddings(ids)
         board_width = ids.shape[1]
         if trace_ids is not None:
@@ -242,32 +66,20 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
             )
             hidden = torch.cat((hidden, trace), dim=1)
             valid = torch.cat((valid, trace_ids != PAD), dim=1)
-        output = self.backbone(hidden, board_width, valid=valid, capture=capture)
+        output = self.backbone(hidden, board_width, valid=valid)
         return hidden, valid, board_width, output
 
-    def forward(
-        self,
-        ids=None,
-        trace_ids=None,
-        *,
-        return_backbone=False,
-        trace_positions=None,
-        capture=False,
-    ):
+    def forward(self, ids=None, trace_ids=None, *, trace_positions=None):
         if ids is None:
-            raise ValueError("Sequence policies consume encoded board tokens")
-        _, _, _, output = self.sequence(
-            ids, trace_ids, trace_positions, capture=capture
-        )
-        logits = self.head(output.hidden)
-        return (logits, output) if return_backbone else logits
+            raise ValueError("The policy consumes encoded board tokens")
+        *_, output = self._embed(ids, trace_ids, trace_positions)
+        return self.head(output.hidden)
 
     def trace_logits(self, ids, trace_ids=None):
-        """Logits at the supervision position of every trace target token."""
         if trace_ids is None:
             raise ValueError("Trace supervision needs trace tokens")
-        _, valid, board_width, output = self.sequence(ids, trace_ids)
-        target = sequence_target_positions(
+        _, valid, board_width, output = self._embed(ids, trace_ids)
+        target = trace_target_positions(
             valid[:, :board_width].sum(1), trace_ids.shape[1], board_width
         )
         selected = output.hidden.gather(
@@ -277,7 +89,6 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
 
     @torch.no_grad()
     def prefill(self, ids):
-        """Cache the board prefix; returns the logits predicting the first token."""
         if self.training:
             raise ValueError("Generation requires evaluation mode")
         hidden, valid = self._prefix_embeddings(ids)
@@ -290,7 +101,6 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
 
     @torch.no_grad()
     def decode(self, tokens, cache):
-        """Append trace tokens to a cached prefix; returns next-token logits."""
         if self.training:
             raise ValueError("Generation requires evaluation mode")
         positions = torch.arange(tokens.shape[1], device=tokens.device) + (
@@ -303,3 +113,11 @@ class SequencePolicyModel(nn.Module, PyTorchModelHubMixin):
         )
         output = self.backbone.decode(hidden, cache, valid=tokens != PAD)
         return self.head(output.hidden[:, -1]), output.cache
+
+
+def create_model(config):
+    arguments = dict(config)
+    tokenizer_version = arguments.pop("tokenizer_version", CHESS_TOKENIZER_VERSION)
+    if tokenizer_version != CHESS_TOKENIZER_VERSION:
+        raise ValueError("Only the lossless board input format is supported")
+    return PolicyModel(**arguments)

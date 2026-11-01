@@ -782,7 +782,7 @@ class BoardObservationTests(unittest.TestCase):
                     replay(wrong_counter, chess.STARTING_FEN)
                 self.assertEqual(context.exception.tag, "board_mismatch")
 
-    def test_board_atoms_are_a_set_not_a_byte_sequence(self):
+    def test_board_atoms_are_a_set_not_a_byte_trace(self):
         # Replay validates by decoding the observation, so piece atoms may
         # arrive in any order and still describe the same position.
         writer = TraceWriter(chess.STARTING_FEN)

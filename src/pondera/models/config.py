@@ -1,6 +1,6 @@
-"""Configuration for token backbones and independently repeated layer groups."""
+"""Transformer block dimensions."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -17,24 +17,3 @@ class BlockConfig:
             raise ValueError("hidden_size must be divisible by num_heads")
         if not 0 <= self.dropout < 1:
             raise ValueError("Invalid dropout")
-
-
-@dataclass(frozen=True)
-class RepetitionConfig:
-    max_repetitions: int = 1
-
-    def __post_init__(self):
-        if self.max_repetitions < 1:
-            raise ValueError("max_repetitions must be positive")
-
-
-@dataclass(frozen=True)
-class CoreConfig:
-    layers: int = 1
-    repetition: RepetitionConfig = field(default_factory=RepetitionConfig)
-
-    def __post_init__(self):
-        if self.layers < 1:
-            raise ValueError("A core needs at least one layer")
-        if isinstance(self.repetition, dict):
-            object.__setattr__(self, "repetition", RepetitionConfig(**self.repetition))

@@ -8,7 +8,7 @@ import torch
 from huggingface_hub import hf_hub_download
 
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
-from pondera.models.factory import create_model, model_class
+from pondera.models.policy import PolicyModel, create_model
 
 CHECKPOINT_VERSION = 1
 
@@ -45,7 +45,6 @@ def save_checkpoint(path, model, model_config, **training_state) -> None:
 
 
 def load_model(source, device="cpu") -> torch.nn.Module:
-    """Load a checkpoint file or a Hugging Face model directory/repository."""
     path = Path(source)
     if path.is_file():
         checkpoint = read_checkpoint(path)
@@ -57,5 +56,11 @@ def load_model(source, device="cpu") -> torch.nn.Module:
     else:
         repository = str(source)
         config_path = Path(hf_hub_download(repository, "config.json"))
-    model = model_class(json.loads(config_path.read_text())).from_pretrained(repository)
+    config = json.loads(config_path.read_text())
+    if (
+        config.get("tokenizer_version", CHESS_TOKENIZER_VERSION)
+        != CHESS_TOKENIZER_VERSION
+    ):
+        raise ValueError("Only the lossless board input format is supported")
+    model = PolicyModel.from_pretrained(repository)
     return model.to(device).eval()

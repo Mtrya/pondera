@@ -7,6 +7,7 @@ collection stage is required.
 """
 
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -20,7 +21,7 @@ import time
 import tomllib
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,14 +41,12 @@ from pondera.chess.vocabulary import (
     VALUE,
 )
 from pondera.data.dataset import (
-    SEQUENCE_ARRAYS,
-    SEQUENCE_FORMAT_VERSION,
+    DATA_ARRAYS,
+    DATA_FORMAT_VERSION,
     STATE_ARRAYS,
-    content_sha256,
     load_manifest,
-    load_sequence_arrays,
-    sha256,
-    validate_sequence_arrays,
+    load_trace_arrays,
+    validate_trace_arrays,
     write_manifest,
 )
 from pondera.data.trace import (
@@ -128,9 +127,6 @@ class PathsConfig:
     roots: str
     output: str
     engine: str
-    control: str = ""
-    instrumentation: str = ""
-    teacher: str = "docs/data.md"
 
 
 @dataclass(frozen=True)
@@ -144,9 +140,7 @@ class RootsConfig:
 class SearchConfig:
     depth: int
     teacher_width: int
-    threads: int
     hash_mb: int
-    fresh_engine_per_root: bool
 
 
 @dataclass(frozen=True)
@@ -206,15 +200,12 @@ class TraceConfig:
     synthesis: SynthesisConfig
     release: ReleaseConfig
     sampling: SamplingConfig
-    source_path: Path
 
     def search_dict(self):
         return {
             "depth": self.search.depth,
             "teacher_width": self.search.teacher_width,
-            "threads": self.search.threads,
             "hash_mb": self.search.hash_mb,
-            "fresh_engine_per_root": self.search.fresh_engine_per_root,
         }
 
     def board_dict(self):
@@ -322,28 +313,8 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             raise ValueError(f"Missing config section: [{section}]")
     seed = _integer("seed", "seed", values.get("seed", 640))
 
-    paths = _table(
-        values["paths"],
-        "paths",
-        {
-            "archive",
-            "roots",
-            "output",
-            "engine",
-            "control",
-            "instrumentation",
-            "teacher",
-        },
-    )
-    for name in (
-        "archive",
-        "roots",
-        "output",
-        "engine",
-        "control",
-        "instrumentation",
-        "teacher",
-    ):
+    paths = _table(values["paths"], "paths", {"archive", "roots", "output", "engine"})
+    for name in ("archive", "roots", "output", "engine"):
         if not isinstance(paths[name], str) or (
             name in {"roots", "output", "engine"} and not paths[name]
         ):
@@ -359,20 +330,8 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         train, val, _probability("roots", "claimable_share", roots["claimable_share"])
     )
 
-    search = _table(
-        values["search"],
-        "search",
-        {"threads", "hash_mb", "fresh_engine_per_root", "widths", "depths"},
-    )
-    threads = _integer("search", "threads", search["threads"], 1)
-    if threads != 1:
-        raise ValueError("threads must be 1 for a reproducible search record")
+    search = _table(values["search"], "search", {"hash_mb", "widths", "depths"})
     hash_mb = _integer("search", "hash_mb", search["hash_mb"], 1)
-    if (
-        not isinstance(search["fresh_engine_per_root"], bool)
-        or not search["fresh_engine_per_root"]
-    ):
-        raise ValueError("fresh_engine_per_root must be true")
     widths = _distribution("search", "widths", search["widths"], _positive_key)
     depths = _distribution("search", "depths", search["depths"], _positive_key)
 
@@ -416,9 +375,9 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     shard_size = _integer("release", "shard_size", release["shard_size"], 1)
     workers = _integer("release", "workers", release["workers"], 1)
     release = ReleaseConfig(shard_size, workers)
-    search = SearchConfig(depths[0][0], widths[0][0], threads, hash_mb, True)
+    search = SearchConfig(depths[0][0], widths[0][0], hash_mb)
     sampling = SamplingConfig(widths, depths, presentations)
-    return TraceConfig(seed, paths, roots, search, synthesis, release, sampling, path)
+    return TraceConfig(seed, paths, roots, search, synthesis, release, sampling)
 
 
 def _percentiles(values):
@@ -650,7 +609,7 @@ def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
         raise CollectionError(f"Requested depth differs for root {root['root_id']}")
     if sidecar.search_end["depth"] != depth:
         raise CollectionError(f"Search did not complete for root {root['root_id']}")
-    if sidecar.session["options"]["threads"] != config.search.threads:
+    if sidecar.session["options"]["threads"] != 1:
         raise CollectionError(f"Thread count differs for root {root['root_id']}")
     if sidecar.session["options"]["hash_mb"] != config.search.hash_mb:
         raise CollectionError(f"Hash size differs for root {root['root_id']}")
@@ -709,7 +668,7 @@ def _run_engine(engine_path, fen, config, trace_path, width, depth, timeout=900)
         _, banner = read_until("uciok", deadline)
         if not any(line.startswith("option name TraceLog ") for line in banner):
             raise CollectionError(f"Engine does not expose TraceLog: {engine_path}")
-        send(f"setoption name Threads value {config.search.threads}")
+        send(f"setoption name Threads value {1}")
         send(f"setoption name Hash value {config.search.hash_mb}")
         send(f"setoption name MultiPV value {width}")
         send(f"setoption name TraceLog value {trace_path}")
@@ -742,9 +701,7 @@ def _selection_record(root):
     }
 
 
-RELEASE_ONLY_METADATA = frozenset(
-    {"root_selection", "root_selections", "roots", "root_sets", "sidecars"}
-)
+RELEASE_ONLY_METADATA = frozenset({"root_selection"})
 ROOT_ROW_FIELDS = ("split", "fen", "repetition", "turn", "position_key", "source")
 CHAMPION_FIELDS = ("round", "depth", "move", "raw", "wdl", "mate", "value_token", "pv")
 
@@ -854,7 +811,7 @@ def _write_shard(directory, records, metadata, presentations):
             root_rows.append(_root_row(root, synthesized, presentation))
         champion_rows.append(_champion_row(root, synthesized))
     if not boards:
-        raise ValueError("A sequence shard cannot be empty")
+        raise ValueError("A trace shard cannot be empty")
     directory.mkdir(parents=True)
     _array(
         directory,
@@ -882,8 +839,8 @@ def _write_shard(directory, records, metadata, presentations):
         0,
     )
     for name, rows in [
-        ("state_no_tool", no_tool),
-        ("state_tool", tool),
+        ("state_without_board", no_tool),
+        ("state_with_board", tool),
         ("state_best", best),
         ("state_basis", basis),
         ("state_value", values),
@@ -892,14 +849,7 @@ def _write_shard(directory, records, metadata, presentations):
     _one_dimensional(directory, "state_count", counts, np.int32)
     _write_jsonl(directory / "roots.jsonl", root_rows)
     _write_jsonl(directory / "champions.jsonl", champion_rows)
-    files = {
-        path.name: sha256(path)
-        for path in sorted(
-            list(directory.glob("*.npy"))
-            + [directory / "roots.jsonl", directory / "champions.jsonl"]
-        )
-    }
-    payload = {**metadata, "rows": len(boards), "files": files}
+    payload = {**metadata, "rows": len(boards)}
     write_manifest(directory / "manifest.json", payload)
     return payload
 
@@ -917,11 +867,7 @@ def _recover_shard(output, index, roots, metadata, presentations):
     manifest = load_manifest(final / "manifest.json")
     if not isinstance(manifest.get("rows"), int):
         raise FileExistsError(f"Unregistered shard has no valid row count: {final}")
-    published = {
-        "path": final.name,
-        "rows": manifest["rows"],
-        "sha256": sha256(final / "manifest.json"),
-    }
+    published = {"path": final.name, "rows": manifest["rows"]}
     _, rows, _ = verify_shard_files(output, published, metadata)
     if {(row["root_id"], row["presentation"]) for row in rows} != _expected_root_rows(
         roots, presentations
@@ -962,18 +908,13 @@ def _publish_shard(output, index, records, metadata, presentations):
         roots = [record.root for record in records]
         return _recover_shard(output, index, roots, metadata, presentations)
     os.replace(temporary, final)
-    return {
-        "path": final.name,
-        "rows": payload["rows"],
-        "sha256": sha256(final / "manifest.json"),
-    }
+    return {"path": final.name, "rows": payload["rows"]}
 
 
 def _release_metadata(identity):
     return {
-        "format_version": SEQUENCE_FORMAT_VERSION,
+        "format_version": DATA_FORMAT_VERSION,
         "grammar_version": TRACE_GRAMMAR_VERSION,
-        "kind": "teacher-sequence",
         "role_count": ROLE_COUNT,
         "tokenizer_version": CHESS_TOKENIZER_VERSION,
         **identity,
@@ -981,10 +922,7 @@ def _release_metadata(identity):
 
 
 FINAL_SUFFIX_OPS = frozenset({"final", "final_evaluate", "final_pv", "end"})
-ROOT_RECORD_FIELDS = ("split", "fen", "repetition", "turn", "position_key", "source")
-SEARCH_FIELDS = frozenset(
-    {"depth", "teacher_width", "threads", "hash_mb", "fresh_engine_per_root"}
-)
+SEARCH_FIELDS = frozenset({"depth", "teacher_width", "hash_mb"})
 BOARD_FIELDS = frozenset({"board_descent_hazard", "board_frontier_p"})
 PRESENTATION_FIELDS = frozenset(
     {
@@ -997,14 +935,10 @@ PRESENTATION_FIELDS = frozenset(
     }
 )
 SYNTHESIS_FIELDS = frozenset({"confirmatory_repetition", "claim_draw"})
-TEACHER_FIELDS = frozenset(
-    {"schema_version", "contract", "contract_sha256", "value_mate", "max_ply"}
-)
-ENGINE_FIELDS = frozenset(
-    {"name", "sha256", "instrumentation", "instrumentation_sha256", "control"}
-)
+TEACHER_FIELDS = frozenset({"schema_version", "value_mate", "max_ply"})
+ENGINE_FIELDS = frozenset({"name"})
 ROOT_SELECTION_FIELDS = frozenset(
-    {"source", "source_sha256", "algorithm", "seed", "requested", "counts"}
+    {"source", "algorithm", "seed", "requested", "counts"}
 )
 
 
@@ -1014,14 +948,6 @@ def shard_configuration(metadata):
         for key, value in metadata.items()
         if key not in RELEASE_ONLY_METADATA
     }
-
-
-def _is_hex64(value):
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
 
 
 def _is_int(value, minimum=None):
@@ -1038,12 +964,6 @@ def _is_probability(value):
     )
 
 
-def _valid_root_set(identity):
-    if not isinstance(identity, dict) or set(identity) != {"rows", "sha256"}:
-        return False
-    return _is_int(identity["rows"], 1) and _is_hex64(identity["sha256"])
-
-
 def _release_identity_contract(release, root_count):
     metadata = release.get("metadata")
     if not isinstance(metadata, dict):
@@ -1051,7 +971,6 @@ def _release_identity_contract(release, root_count):
     required = {
         "teacher",
         "engine",
-        "config",
         "search",
         "board",
         "presentation",
@@ -1069,36 +988,17 @@ def _release_identity_contract(release, root_count):
         raise ValueError("Release teacher identity is incomplete")
     if teacher["schema_version"] not in (SIDECAR_SCHEMA, SIDECAR_SCHEMA_WIDE):
         raise ValueError("Release teacher schema is unsupported")
-    if not isinstance(teacher["contract"], str):
-        raise ValueError("Release teacher contract path is invalid")
-    if not _is_hex64(teacher["contract_sha256"]):
-        raise ValueError("Release teacher contract hash is invalid")
     if not _is_int(teacher["value_mate"], 1) or not _is_int(teacher["max_ply"], 1):
         raise ValueError("Release teacher mate constants are invalid")
 
     engine = metadata["engine"]
-    if not isinstance(engine, dict) or set(engine) != ENGINE_FIELDS:
-        raise ValueError("Release engine identity is incomplete")
-    if not isinstance(engine["name"], str) or not engine["name"]:
-        raise ValueError("Release engine name is invalid")
-    if not _is_hex64(engine["sha256"]):
-        raise ValueError("Release engine hash is invalid")
-    if not isinstance(engine["instrumentation"], str):
-        raise ValueError("Release instrumentation path is invalid")
-    if not _is_hex64(engine["instrumentation_sha256"]):
-        raise ValueError("Release instrumentation hash is invalid")
-    control = engine["control"]
-    if not isinstance(control, dict) or not _is_hex64(control.get("sha256")):
-        raise ValueError("Release control binary identity is invalid")
-
-    config = metadata["config"]
     if (
-        not isinstance(config, dict)
-        or set(config) != {"path", "sha256"}
-        or not isinstance(config["path"], str)
-        or not _is_hex64(config["sha256"])
+        not isinstance(engine, dict)
+        or set(engine) != ENGINE_FIELDS
+        or not isinstance(engine["name"], str)
+        or not engine["name"]
     ):
-        raise ValueError("Release configuration identity is invalid")
+        raise ValueError("Release engine identity is incomplete")
 
     search = metadata["search"]
     if not isinstance(search, dict) or set(search) != SEARCH_FIELDS:
@@ -1114,10 +1014,6 @@ def _release_identity_contract(release, root_count):
         search["teacher_width"] == 1
     ):
         raise ValueError("Release teacher schema differs from the teacher width")
-    if search["threads"] != 1:
-        raise ValueError("Release must use one search thread")
-    if search["fresh_engine_per_root"] is not True:
-        raise ValueError("Release must restart the engine for every root")
 
     board = metadata["board"]
     if not isinstance(board, dict) or set(board) != BOARD_FIELDS:
@@ -1154,13 +1050,13 @@ def _release_identity_contract(release, root_count):
         or set(root_selection)
         not in (ROOT_SELECTION_FIELDS, ROOT_SELECTION_FIELDS | {"source_counts"})
         or not isinstance(root_selection.get("source"), str)
-        or not _is_hex64(root_selection.get("source_sha256"))
         or not isinstance(root_selection.get("algorithm"), str)
         or not _is_int(root_selection.get("seed"))
         or not _is_int(root_selection.get("requested"), 1)
         or not isinstance(root_selection.get("counts"), dict)
         or set(root_selection["counts"]) != {"train", "val"}
         or not all(_is_int(value, 0) for value in root_selection["counts"].values())
+        or sum(root_selection["counts"].values()) != root_count
     ):
         raise ValueError("Release root selection identity is incomplete")
     source_counts = root_selection.get("source_counts")
@@ -1171,24 +1067,6 @@ def _release_identity_contract(release, root_count):
     ):
         raise ValueError("Release source root counts are invalid")
 
-    if ("roots" in metadata) == ("root_sets" in metadata):
-        raise ValueError("Release identity needs one roots or root_sets record")
-    if "roots" in metadata:
-        root_sets = [metadata["roots"]]
-    else:
-        root_sets = metadata["root_sets"]
-        if not isinstance(root_sets, list) or not root_sets:
-            raise ValueError("Release root_sets must be a nonempty list")
-    if not all(_valid_root_set(root_set) for root_set in root_sets):
-        raise ValueError("Release root identity is malformed")
-    if sum(root_set["rows"] for root_set in root_sets) != root_count:
-        raise ValueError("Release root identity does not match its root count")
-    if "sidecars" in metadata:
-        sidecars = metadata["sidecars"]
-        if not _valid_root_set(sidecars) or sidecars["rows"] != sum(
-            root_set["rows"] for root_set in root_sets
-        ):
-            raise ValueError("Release sidecar identity is malformed")
     for key, value in metadata.items():
         if release.get(key) != value:
             raise ValueError(f"Release metadata {key} differs from its identity")
@@ -1209,25 +1087,13 @@ def validate_release_identity(release):
 def verify_shard_files(release_dir, shard, expected_metadata=None):
     """Verify a published shard and return its manifest, roots, and arrays."""
     directory = Path(release_dir) / shard["path"]
-    manifest_path = directory / "manifest.json"
-    if sha256(manifest_path) != shard["sha256"]:
-        raise ValueError(f"Shard manifest checksum mismatch: {manifest_path}")
-    manifest = load_manifest(manifest_path)
+    manifest = load_manifest(directory / "manifest.json")
     if expected_metadata is not None:
         for key, value in shard_configuration(expected_metadata).items():
             if manifest.get(key) != value:
                 raise ValueError(f"Shard metadata {key} differs from its release")
     if manifest["rows"] != shard["rows"]:
         raise ValueError(f"Shard row count differs from its release: {directory}")
-    expected_files = {f"{name}.npy" for name in SEQUENCE_ARRAYS} | {
-        "roots.jsonl",
-        "champions.jsonl",
-    }
-    if set(manifest.get("files", {})) != expected_files:
-        raise ValueError(f"Shard file inventory is incomplete: {directory}")
-    for name, expected in manifest["files"].items():
-        if sha256(directory / name) != expected:
-            raise ValueError(f"Shard file checksum mismatch: {directory / name}")
     roots = [
         json.loads(line)
         for line in (directory / "roots.jsonl").read_text(encoding="utf-8").splitlines()
@@ -1235,8 +1101,8 @@ def verify_shard_files(release_dir, shard, expected_metadata=None):
     ]
     if len(roots) != manifest["rows"]:
         raise ValueError(f"Shard roots do not match its manifest: {directory}")
-    arrays = load_sequence_arrays(directory, SEQUENCE_ARRAYS)
-    validate_sequence_arrays(arrays, rows=len(roots))
+    arrays = load_trace_arrays(directory, DATA_ARRAYS)
+    validate_trace_arrays(arrays, rows=len(roots))
     return manifest, roots, arrays
 
 
@@ -1399,7 +1265,7 @@ def _expected_states(program, tokens, champions, mirrored):
     states = []
     round_number = 0
     round_candidates = {}
-    round_sequence = {}
+    round_trace = {}
     round_count = 0
     previous = None
     current = None
@@ -1409,7 +1275,7 @@ def _expected_states(program, tokens, champions, mirrored):
         if step.operation == "depth":
             round_number += 1
             round_candidates = {}
-            round_sequence = {}
+            round_trace = {}
             round_count = 0
             current = previous
         elif step.operation == "evaluate" and len(step.path) == 1:
@@ -1425,12 +1291,12 @@ def _expected_states(program, tokens, champions, mirrored):
                     None,
                 )
                 if candidate is not None:
-                    sequence = round_sequence.get(move)
-                    if sequence is None:
+                    trace = round_trace.get(move)
+                    if trace is None:
                         round_count += 1
-                        sequence = round_count
-                        round_sequence[move] = sequence
-                    round_candidates[move] = (sequence, candidate)
+                        trace = round_count
+                        round_trace[move] = trace
+                    round_candidates[move] = (trace, candidate)
                     best = max(
                         round_candidates.values(),
                         key=lambda item: (item[1]["raw"], -item[0]),
@@ -1512,7 +1378,7 @@ def _validate_shard_rows(
             expected = expected_roots.get(root_id)
             if expected is None:
                 raise ValueError(f"Release contains an unselected root: {root_id}")
-            for name in (*ROOT_RECORD_FIELDS, "teacher_width", "depth"):
+            for name in (*ROOT_ROW_FIELDS, "teacher_width", "depth"):
                 if name in expected and row.get(name) != expected.get(name):
                     raise ValueError(
                         f"Release root {name} differs from its selection: {root_id}"
@@ -1597,8 +1463,8 @@ def _validate_shard_rows(
             raise ValueError(f"Truncation-state count is invalid: {root_id}")
         actual_boundaries = list(
             zip(
-                map(int, arrays["state_tool"][index, :count]),
-                map(int, arrays["state_no_tool"][index, :count]),
+                map(int, arrays["state_with_board"][index, :count]),
+                map(int, arrays["state_without_board"][index, :count]),
             )
         )
         if actual_boundaries != expected_boundaries:
@@ -1730,10 +1596,9 @@ def validate_release(directory, roots=None, workers=8):
     if not release:
         raise FileNotFoundError(directory / "release.json")
     expected_metadata = {
-        "format_version": SEQUENCE_FORMAT_VERSION,
+        "format_version": DATA_FORMAT_VERSION,
         "grammar_version": TRACE_GRAMMAR_VERSION,
         "tokenizer_version": CHESS_TOKENIZER_VERSION,
-        "kind": "teacher-sequence",
         "role_count": ROLE_COUNT,
     }
     for key, value in expected_metadata.items():
@@ -1757,14 +1622,6 @@ def validate_release(directory, roots=None, workers=8):
         expected = {row["root_id"]: row for row in root_records}
         if len(expected) != len(root_records):
             raise ValueError("External root records contain duplicate root ids")
-        if "roots" in metadata:
-            identity = metadata["roots"]
-            if (
-                len(root_records) != identity["rows"]
-                or content_sha256([_selection_record(row) for row in root_records])
-                != identity["sha256"]
-            ):
-                raise ValueError("External root records do not match the release hash")
     seen = set()
     seen_roots = set()
     counts = Counter()
@@ -1838,26 +1695,18 @@ def validate_release(directory, roots=None, workers=8):
 
 
 def sample_root_settings(roots, config, seed):
-    """Attach missing per-root samples without changing existing assignments."""
+    """Derive per-root settings from the active recipe and stable root ids."""
     sampled = []
     for root in roots:
         result = dict(root)
-        result.setdefault(
-            "teacher_width",
-            sample_width(
-                config.sampling,
-                seed,
-                root["root_id"],
-                config.search.teacher_width,
-            ),
+        result["teacher_width"] = sample_width(
+            config.sampling, seed, root["root_id"], config.search.teacher_width
         )
-        result.setdefault(
-            "depth",
-            sample_depth(config.sampling, seed, root["root_id"], config.search.depth),
+        result["depth"] = sample_depth(
+            config.sampling, seed, root["root_id"], config.search.depth
         )
-        result.setdefault(
-            "presentation",
-            sample_presentation(config.sampling, seed, root["root_id"]) or "full",
+        result["presentation"] = (
+            sample_presentation(config.sampling, seed, root["root_id"]) or "full"
         )
         sampled.append(result)
     return sampled
@@ -1934,18 +1783,8 @@ def _init_direct_worker(config, engine_path, engine_name, teacher):
     _DIRECT_TEACHER = teacher
 
 
-def _identity_for(config, roots, engine_name="stockfish", engine_path=None):
-    """Build release identity from the active configuration, not a sidecar dir."""
+def _identity_for(config, roots, engine_name="stockfish"):
     root_path = Path(config.paths.roots)
-    engine_path = Path(engine_path) if engine_path is not None else None
-    engine_hash = (
-        sha256(engine_path)
-        if engine_path is not None and engine_path.is_file()
-        else content_sha256(engine_name)
-    )
-    instrumentation = config.paths.instrumentation or "external"
-    control = config.paths.control or "external"
-    contract = config.paths.teacher
     return {
         "teacher": {
             "schema_version": (
@@ -1956,40 +1795,16 @@ def _identity_for(config, roots, engine_name="stockfish", engine_path=None):
                 )
                 else SIDECAR_SCHEMA
             ),
-            "contract": contract,
-            "contract_sha256": sha256(contract)
-            if Path(contract).is_file()
-            else content_sha256(contract),
             "value_mate": 32000,
             "max_ply": 246,
         },
-        "engine": {
-            "name": engine_name,
-            "sha256": engine_hash,
-            "instrumentation": instrumentation,
-            "instrumentation_sha256": sha256(instrumentation)
-            if Path(instrumentation).is_file()
-            else content_sha256(instrumentation),
-            "control": {
-                "path": control,
-                "sha256": sha256(control)
-                if Path(control).is_file()
-                else content_sha256(control),
-            },
-        },
-        "config": {
-            "path": str(config.source_path),
-            "sha256": sha256(config.source_path),
-        },
+        "engine": {"name": engine_name},
         "search": config.search_dict(),
         "board": config.board_dict(),
         "presentation": config.presentation_dict(),
         "synthesis": config.synthesis_dict(),
         "root_selection": {
             "source": str(root_path),
-            "source_sha256": sha256(root_path)
-            if root_path.is_file()
-            else content_sha256(roots),
             "algorithm": "trace.toml",
             "seed": config.seed,
             "requested": len(roots),
@@ -2001,10 +1816,6 @@ def _identity_for(config, roots, engine_name="stockfish", engine_path=None):
                 split: sum(root["split"] == split for root in roots)
                 for split in ("train", "val")
             },
-        },
-        "roots": {
-            "rows": len(roots),
-            "sha256": content_sha256([_selection_record(root) for root in roots]),
         },
         "recipe": config.sampling.identity(),
     }
@@ -2029,10 +1840,7 @@ def _ensure_root_pool(config):
         and manifest.get("kind") == "elite-root-pool"
         and manifest.get("seed") == config.seed
         and manifest.get("parameters") == parameters
-        and (
-            not expected_source.is_file()
-            or manifest.get("source", {}).get("sha256") == sha256(expected_source)
-        )
+        and manifest.get("source", {}).get("file") == expected_source.name
     )
     if not path.is_file() or (manifest and not cache_matches):
         archive = expected_source
@@ -2056,6 +1864,16 @@ def _ensure_root_pool(config):
     return roots
 
 
+@contextmanager
+def _release_lock(output_dir):
+    with (output_dir / ".release.lock").open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def produce_shards(
     roots,
     output_dir,
@@ -2075,9 +1893,9 @@ def produce_shards(
     """
     roots = sample_root_settings(list(roots), config, config.seed)
     if not roots:
-        raise ValueError("A sequence release needs at least one root")
+        raise ValueError("A trace release needs at least one root")
     if len({root["root_id"] for root in roots}) != len(roots):
-        raise ValueError("A sequence release cannot contain duplicate root ids")
+        raise ValueError("A trace release cannot contain duplicate root ids")
     shard_size = config.release.shard_size if shard_size is None else shard_size
     workers = config.release.workers if workers is None else workers
     if shard_size < 1 or workers < 1:
@@ -2091,9 +1909,7 @@ def produce_shards(
         engine_path = _engine_path(config)
         engine_name = "Stockfish 17.1"
         teacher = (32000, 246)
-    identity = identity or _identity_for(
-        config, roots, engine_name=engine_name, engine_path=engine_path
-    )
+    identity = identity or _identity_for(config, roots, engine_name=engine_name)
     release_metadata = _release_metadata(identity)
     shard_metadata = {
         key: value
@@ -2107,13 +1923,9 @@ def produce_shards(
     previous = load_manifest(release_path)
     if previous and previous.get("metadata") != identity:
         raise ValueError("The existing release belongs to a different configuration")
-    shards_by_index = {}
-    complete = set(previous.get("complete_root_ids", []))
-    profile = RootProfile(presentations)
-    for shard in previous.get("shards", []):
-        _profile_shard(output_dir, shard, shard_metadata, profile)
-        index = int(shard["path"].split("-")[-1])
-        shards_by_index[index] = shard
+    shards_by_index = {
+        int(shard["path"].split("-")[-1]): shard for shard in previous.get("shards", [])
+    }
     groups = [
         (index, roots[start : start + shard_size])
         for index, start in enumerate(range(0, len(roots), shard_size))
@@ -2128,8 +1940,6 @@ def produce_shards(
             shard = _recover_shard(
                 output_dir, index, group, shard_metadata, presentations
             )
-            _profile_shard(output_dir, shard, shard_metadata, profile)
-            records = []
         else:
             if sidecar_for_root is not None:
                 records = []
@@ -2162,25 +1972,40 @@ def produce_shards(
             shard = _publish_shard(
                 output_dir, index, records, shard_metadata, presentations
             )
-            for record in records:
-                profile.add(record)
-        shards_by_index[index] = shard
-        complete.update(root["root_id"] for root in group)
-        write_manifest(
-            release_path,
-            {
-                **release_metadata,
-                "metadata": identity,
-                "shards": [shards_by_index[key] for key in sorted(shards_by_index)],
-                "complete_root_ids": sorted(complete),
-            },
-        )
-    statistics = profile.result() if profile.roots else None
-    if statistics is not None:
-        statistics["complete"] = len(complete) == len(roots)
-        write_manifest(output_dir / "statistics.json", statistics)
+        with _release_lock(output_dir):
+            current = load_manifest(release_path)
+            if current and current.get("metadata") != identity:
+                raise ValueError(
+                    "The existing release belongs to a different configuration"
+                )
+            shards_by_index = {
+                int(item["path"].split("-")[-1]): item
+                for item in current.get("shards", [])
+            }
+            shards_by_index[index] = shard
+            complete = set(current.get("complete_root_ids", []))
+            complete.update(root["root_id"] for root in group)
+            write_manifest(
+                release_path,
+                {
+                    **release_metadata,
+                    "metadata": identity,
+                    "shards": [shards_by_index[key] for key in sorted(shards_by_index)],
+                    "complete_root_ids": sorted(complete),
+                },
+            )
+    with _release_lock(output_dir):
+        current = load_manifest(release_path)
+        complete = set(current.get("complete_root_ids", []))
+        profile = RootProfile(presentations)
+        for shard in current.get("shards", []):
+            _profile_shard(output_dir, shard, shard_metadata, profile)
+        statistics = profile.result() if profile.roots else None
+        if statistics is not None:
+            statistics["complete"] = len(complete) == len(roots)
+            write_manifest(output_dir / "statistics.json", statistics)
     return {
-        "shards": [shards_by_index[key] for key in sorted(shards_by_index)],
+        "shards": current.get("shards", []),
         "roots": len(complete),
         "pending": len(roots) - len(complete),
         "release": str(release_path),

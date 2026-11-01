@@ -1,4 +1,4 @@
-"""Rule-only path state machine for sequence thought traces.
+"""Rule-only path state machine for trace thought traces.
 
 A tracker owns the ground truth of one thought path: a root position with its
 repetition count, a stack of absolute UCI moves, and the current python-chess

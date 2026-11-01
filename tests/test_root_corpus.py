@@ -1,4 +1,3 @@
-import hashlib
 import json
 import shutil
 import subprocess
@@ -10,7 +9,7 @@ from pathlib import Path
 
 import chess
 
-from pondera.data.dataset import load_manifest, sha256
+from pondera.data.dataset import load_manifest
 from pondera.data.roots import (
     SOURCE_FILE,
     CorpusError,
@@ -40,8 +39,8 @@ FIXTURE_POOLS = {
     "fivefold.pgn": (3, 0, 1.0),
     "dedup.pgn": (4, 0, 0.0),
     "ties.pgn": (2, 0, 0.0),
-    "corrupt.pgn": (8, 1, 0.0),
-    "terminal.pgn": (24, 0, 0.0),
+    "corrupt.pgn": (9, 0, 0.0),
+    "terminal.pgn": (23, 1, 0.0),
 }
 
 
@@ -113,10 +112,7 @@ class RootPoolTests(unittest.TestCase):
             self.assertEqual(
                 root["source"], {"file": "repetition.pgn", "game": 0, "ply": ply}
             )
-            self.assertEqual(
-                root["root_id"],
-                hashlib.sha256(f"{fen}|{repetition}".encode()).hexdigest(),
-            )
+            self.assertEqual(root["root_id"], f"{fen}|{repetition}")
         self.assertEqual(len({row["root_id"] for row in rows}), 4)
         self.assertEqual(len(validate(rows)), 4)
 
@@ -167,13 +163,7 @@ class RootPoolTests(unittest.TestCase):
             tied[E5_KEY]["source"], {"file": "ties.pgn", "game": 0, "ply": 2}
         )
 
-    def test_split_is_a_position_key_hash_bucket(self):
-        self.assertEqual(split_for(START_KEY), "train")
-        self.assertEqual(split_for(NF3_KEY), "train")
-        self.assertEqual(
-            split_for("rnbqkbnr/pppppppp/8/8/8/P7/1PPPPPPP/RNBQKBNR b KQkq -"),
-            "val",
-        )
+    def test_split_is_a_stable_position_key_draw(self):
         keys = [f"position {index} w - -" for index in range(20000)]
         splits = [split_for(key) for key in keys]
         self.assertEqual(splits, [split_for(key) for key in keys])
@@ -182,7 +172,7 @@ class RootPoolTests(unittest.TestCase):
 
     def test_invalid_setup_variant_and_truncated_games_are_tolerated(self):
         with tempfile.TemporaryDirectory() as directory:
-            manifest, rows = build("corrupt.pgn", directory, train=8, val=1)
+            manifest, rows = build("corrupt.pgn", directory, train=9, val=0)
         self.assertEqual(manifest["build"]["games_read"], 5)
         self.assertEqual(manifest["build"]["games_replayed"], 2)
         self.assertEqual(
@@ -228,12 +218,10 @@ class RootPoolTests(unittest.TestCase):
             self.assertEqual(
                 manifest["parameters"], {"train": 4, "val": 0, "claimable_share": 0.25}
             )
-            self.assertEqual(manifest["source"]["sha256"], sha256(archive))
             self.assertEqual(manifest["source"]["member"], "repetition.pgn")
             self.assertEqual(
-                manifest["files"]["roots.jsonl"]["sha256"], sha256(roots_path)
+                len(roots_path.read_text(encoding="utf-8").splitlines()), 4
             )
-            self.assertEqual(manifest["files"]["roots.jsonl"]["rows"], 4)
             profile = manifest["profile"]
             self.assertEqual(
                 profile["repetition"]["counts"], {"1": 0, "2": 3, "3": 1, "4": 0}
@@ -269,7 +257,6 @@ class RootPoolTests(unittest.TestCase):
                 handle.write(FIXTURES / "repetition.pgn", "month.pgn")
             manifest = build_pool(archive, Path(directory) / "out", 4, 0, 0.25, 640)
         self.assertEqual(manifest["source"]["member"], "month.pgn")
-        self.assertEqual(manifest["files"]["roots.jsonl"]["rows"], 4)
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "empty.zip"
             with zipfile.ZipFile(archive, "w") as handle:
@@ -299,7 +286,7 @@ class RootPoolTests(unittest.TestCase):
                 ["zstd", "-q", "-f", str(FIXTURES / "dedup.pgn"), "-o", str(limited)],
                 check=True,
             )
-            limited_manifest = build_pool(
+            build_pool(
                 limited, Path(directory) / "limited", 2, 0, 0.0, 640, limit_games=1
             )
             limited_rows = [
@@ -308,9 +295,8 @@ class RootPoolTests(unittest.TestCase):
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]
-        self.assertEqual(manifest["files"]["roots.jsonl"]["rows"], 4)
         self.assertEqual(manifest["positions"]["pool_keys"], 4)
-        self.assertEqual(limited_manifest["files"]["roots.jsonl"]["rows"], 2)
+        self.assertEqual(len(limited_rows), 2)
         self.assertEqual({row["source"]["game"] for row in limited_rows}, {0})
 
     def test_download_rejects_an_archive_with_the_pinned_name_but_wrong_bytes(self):
@@ -338,7 +324,7 @@ class RootPoolTests(unittest.TestCase):
             with self.subTest(fixture=fixture):
                 with tempfile.TemporaryDirectory() as directory:
                     if fixture == "corrupt.pgn":
-                        manifest, rows = build(fixture, directory, train=8, val=1)
+                        manifest, rows = build(fixture, directory, train=9, val=0)
                     else:
                         manifest, rows = build(fixture, directory)
                 positions = manifest["positions"]

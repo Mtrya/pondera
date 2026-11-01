@@ -1,7 +1,6 @@
 """Run paired fastchess matches and retain complete machine-readable results."""
 
 import datetime
-import hashlib
 import json
 import math
 import re
@@ -129,7 +128,6 @@ def run_match(
         "search": False,
         "pondering": False,
         "temperature": 0,
-        "openings_sha256": hashlib.sha256(openings.read_bytes()).hexdigest(),
         "command": command,
         "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }

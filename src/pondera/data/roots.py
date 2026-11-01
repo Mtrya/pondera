@@ -16,12 +16,11 @@ is a fivefold-repetition drawn position and is not emitted; such records are
 counted instead. Terminal positions (checkmate or stalemate) are excluded
 because a root must have at least one legal move.
 
-``position_key`` is the first four FEN fields. ``root_id`` is the lowercase hex
-SHA-256 of ``"<fen>|<repetition>"``. Splits are assigned from the position key
-alone: the first eight bytes of its SHA-256, read big-endian, modulo 65; bucket
-0 is validation and the other 64 buckets are training. That reproduces the
-8192/532480 validation share of the previous root release, and the same key
-always lands in the same split.
+``position_key`` is the first four FEN fields. ``root_id`` is the full FEN plus
+the repetition count, ``"<fen>|<repetition>"``. Splits are assigned from the
+position key alone: a deterministic draw over 65 buckets makes bucket 0
+validation and the other 64 training. That reproduces the historical
+8192/532480 validation share, and the same key always lands in the same split.
 
 Position keys use python-chess's default FEN en-passant field, which names the
 en-passant square only when a legal en-passant capture exists.
@@ -33,11 +32,11 @@ imported into the package.
 ``build_pool`` draws a stratified pool directly from the replayed archive. A
 root is claimable when its game state allows a draw claim: the position has occurred
 at least three times or the halfmove clock is at least 100. Every row is
-ranked by the SHA-256 of ``"<seed>:<root_id>:pool"`` and each stratum
-(split × claimable) keeps its lowest ranks, so the selection is uniform
-without replacement, reproducible from the seed, and grows by extension when
-the requested sizes grow. Rows are emitted in the order of an independent
-second hash, ``"<seed>:<root_id>:pool-order"``, so any prefix of the pool
+ranked by a random draw seeded with ``"<seed>:<root_id>:pool"`` and each
+stratum (split × claimable) keeps its lowest ranks, so the selection is
+uniform without replacement, reproducible from the seed, and grows by
+extension when the requested sizes grow. Rows are emitted in the order of an
+independent draw, ``"<seed>:<root_id>:pool-order"``, so any prefix of the pool
 file is a uniform subsample of the whole pool even though the strata are
 selected at different rates.
 """
@@ -46,6 +45,7 @@ import hashlib
 import heapq
 import io
 import json
+import random
 import shutil
 import subprocess
 import time
@@ -59,7 +59,7 @@ from typing import NamedTuple
 import chess
 import chess.pgn
 
-from pondera.data.dataset import sha256, write_manifest
+from pondera.data.dataset import write_manifest
 
 SOURCE_MONTH = "2025-11"
 SOURCE_FILE = f"lichess_elite_{SOURCE_MONTH}.zip"
@@ -144,13 +144,12 @@ class _Candidate(NamedTuple):
 
 def root_id_for(fen, repetition):
     """Return the identity of a root from its full FEN and repetition count."""
-    return hashlib.sha256(f"{fen}|{repetition}".encode()).hexdigest()
+    return f"{fen}|{repetition}"
 
 
 def split_for(position_key):
     """Return the split assigned to a position key."""
-    digest = hashlib.sha256(position_key.encode()).digest()
-    bucket = int.from_bytes(digest[:8], "big") % SPLIT_MODULUS
+    bucket = random.Random(position_key).randrange(SPLIT_MODULUS)
     return "val" if bucket == VAL_REMAINDER else "train"
 
 
@@ -181,7 +180,8 @@ def ensure_archive(directory):
     directory = Path(directory)
     path = directory / SOURCE_FILE
     if path.exists():
-        digest = sha256(path)
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
         if digest != SOURCE_SHA256:
             raise CorpusError(f"{path} has sha256 {digest}, expected {SOURCE_SHA256}")
         return path
@@ -390,8 +390,7 @@ def _claimable(record):
 
 
 def _pool_priority(seed, root_id, domain="pool"):
-    digest = hashlib.sha256(f"{seed}:{root_id}:{domain}".encode()).digest()
-    return int.from_bytes(digest[:8], "big")
+    return random.Random(f"{seed}:{root_id}:{domain}").getrandbits(64)
 
 
 def select_pool(records, train_roots, val_roots, claimable_share, seed):
@@ -545,7 +544,6 @@ def build_pool(
         "source": {
             "file": archive.name,
             "path": str(archive),
-            "sha256": sha256(archive),
             "member": member,
         },
         "build": {
@@ -566,13 +564,6 @@ def build_pool(
         },
         "strata": strata,
         "profile": _profile(pool, raw_repetitions, game_plies),
-        "files": {
-            "roots.jsonl": {
-                "rows": len(selected),
-                "bytes": roots_path.stat().st_size,
-                "sha256": sha256(roots_path),
-            }
-        },
     }
     write_manifest(output / "pool.manifest.json", manifest)
     return manifest

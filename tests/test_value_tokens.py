@@ -103,7 +103,7 @@ class UnifiedVocabularyTests(unittest.TestCase):
 
     def test_value_decoder_rejects_non_value_tokens(self):
         # The metadata atoms end at 948; the move block starts the unified
-        # sequence space and the delimiters close it.
+        # trace space and the delimiters close it.
         self.assertEqual(CHESS_VOCAB_SIZE, DELIM + 8)
         for token in (
             MOVE,

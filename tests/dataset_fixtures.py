@@ -1,6 +1,5 @@
-"""Synthetic sequence datasets for encoder and training tests."""
+"""Synthetic trace datasets for encoder and training tests."""
 
-from hashlib import file_digest
 from pathlib import Path
 
 import chess
@@ -8,7 +7,7 @@ import numpy as np
 
 from pondera.chess.codec import encode_board
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION, PAD
-from pondera.data.dataset import SEQUENCE_FORMAT_VERSION, write_manifest
+from pondera.data.dataset import DATA_FORMAT_VERSION, write_manifest
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 
@@ -23,8 +22,8 @@ def play(moves, repetitions=None, start=chess.STARTING_FEN):
     return records
 
 
-def sequence_row(fen, tokens, roles, repetition=1):
-    """One encoded trace row for write_sequence_dataset."""
+def encoded_row(fen, tokens, roles, repetition=1):
+    """One encoded trace row for write_trace_dataset."""
     return {
         "fen": fen,
         "repetition": repetition,
@@ -33,16 +32,14 @@ def sequence_row(fen, tokens, roles, repetition=1):
     }
 
 
-def write_sequence_dataset(root, splits, depth=16):
-    """Write a sequence dataset directory mirroring the published layout."""
+def write_trace_dataset(root, splits):
+    """Write a trace dataset directory mirroring the published layout."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     manifest = {
-        "format_version": SEQUENCE_FORMAT_VERSION,
-        "kind": "teacher-sequence",
+        "format_version": DATA_FORMAT_VERSION,
         "grammar_version": TRACE_GRAMMAR_VERSION,
         "tokenizer_version": CHESS_TOKENIZER_VERSION,
-        "depth": depth,
     }
     for split, rows in splits.items():
         boards = [encode_board(row["fen"], row.get("repetition", 1)) for row in rows]
@@ -68,9 +65,5 @@ def write_sequence_dataset(root, splits, depth=16):
             np.save(root / f"{name}_{split}.npy", array)
         manifest[f"rows_{split}"] = len(rows)
         manifest[f"t_max_{split}"] = trace_width
-    manifest["files"] = {}
-    for path in sorted(root.glob("*.npy")):
-        with path.open("rb") as handle:
-            manifest["files"][path.name] = file_digest(handle, "sha256").hexdigest()
     write_manifest(root / "manifest.json", manifest)
     return root

@@ -1,75 +1,33 @@
-"""Legal-masked free generation over the sequence trace grammar.
+"""Greedy trace generation under the trace grammar's next-token mask."""
 
-A thought is the trace program of ``pondera.data.trace``: ``<depth>`` opens a
-round, moves walk the path, BACK returns to the parent, RESET returns to the
-root, value and mate tokens evaluate the current node, and ``<refuted>``
-rejects a candidate that fails its reference. ``FINAL`` is the decision point;
-the generated label suffix is the evaluation, an optional mate distance, the
-best line, and ``<end>``. ``BOARD`` is disabled here, so every generated token
-is navigation, a conclusion, the decision, or the label. The generator writes
-through ``TraceWriter.apply``; callers validate a trace with ``assess``, which
-keeps black-to-move roots in the same canonical rank-reflected frame as
-training data. The generation mask and replay share the writer's state machine.
-
-Two protocols bound a thought. A fixed budget masks FINAL until the requested
-number of thinking tokens has been generated, then forces FINAL and continues
-through the label suffix; a budget of zero is a direct answer. Autonomous
-generation allows FINAL at every boundary and stops when the model emits it,
-or at a declared safety cap. Thinking tokens are every generated token before
-FINAL: depths, moves, BACK, RESET, refutations, and evaluations. The FINAL
-delimiter and the whole label suffix never count toward the budget.
-
-The final decision's distribution is the model's post-FINAL distribution
-restricted to the legal root moves. Keeping it on the generated trace lets
-callers score any legal target move without another forward pass.
-"""
-
-import math
 from dataclasses import dataclass
 
 import chess
 import numpy as np
 import torch
 
-from pondera.chess.codec import encode_boards
+from pondera.chess.codec import BOARD_TOKENS_MAX, encode_boards
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import (
-    BOARD,
     CHESS_VOCAB_SIZE,
     FINAL,
     MOVE,
     PAD,
-    SIDE,
     UCI_MOVE_TO_IDX,
 )
-from pondera.data.trace import (
-    CLAIM_DRAW,
-    OBSERVATION_METADATA,
-    TraceError,
-    TraceWriter,
-    replay,
-)
+from pondera.data.trace import CLAIM_DRAW, TraceError, TraceWriter, replay
 
 FIXED = "fixed"
 AUTONOMOUS = "autonomous"
-
-# Why generation stopped: the model emitted FINAL, the fixed budget forced it,
-# or the autonomous safety cap forced it.
 STOP_FINAL = "final"
 STOP_BUDGET = "budget"
 STOP_CAP = "cap"
-
-# Fixed-budget points as fractions of the trace-length bound.
-BUDGET_FRACTIONS = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
-
-# The label suffix is bounded by rule terminals, but a pathological best line
-# can run long, so generation stops with an error instead of looping forever.
 _SUFFIX_STEPS = 256
 
 
 @dataclass(frozen=True)
 class GenerationProtocol:
-    """One fixed-budget or autonomous stopping rule."""
+    """A fixed thinking budget or an autonomous safety cap, in tokens."""
 
     kind: str
     budget: int | None = None
@@ -91,24 +49,21 @@ class GenerationProtocol:
 
     @property
     def limit(self):
-        """The thinking-token count at which FINAL is forced."""
         return self.budget if self.kind == FIXED else self.safety_cap
 
 
 def fixed_budget(budget: int) -> GenerationProtocol:
-    """Mask FINAL before ``budget`` thinking tokens, then force it."""
+    """Force FINAL after exactly ``budget`` thinking tokens."""
     return GenerationProtocol(FIXED, budget=budget)
 
 
 def autonomous(safety_cap: int) -> GenerationProtocol:
-    """Allow FINAL anywhere, forcing it only at the declared safety cap."""
+    """Allow FINAL at any boundary; force it only at ``safety_cap``."""
     return GenerationProtocol(AUTONOMOUS, safety_cap=safety_cap)
 
 
 @dataclass(frozen=True)
 class RootPosition:
-    """One frozen root position, its repetition count, and teacher width."""
-
     fen: str
     repetition: int = 1
     teacher_width: int = 1
@@ -121,22 +76,11 @@ class RootPosition:
 
 
 def _effective_teacher_width(root_fen: str, teacher_width: int) -> int:
-    """The engine's width: the configured width capped by the legal root moves."""
     return min(teacher_width, chess.Board(root_fen).legal_moves.count())
 
 
 @dataclass(frozen=True)
 class GeneratedTrace:
-    """One generated trace and the decision distribution that closed it.
-
-    ``tokens`` is the whole model-generated trace including FINAL, its decision,
-    the label evaluation, the best line, and ``<end>``. ``thinking_tokens``
-    counts only the tokens before FINAL. ``final_move`` is an absolute UCI move
-    or the draw-claim pseudo-move. ``root_move_tokens`` and
-    ``root_move_log_probs`` are aligned over the legal root moves in the
-    canonical frame of this root (rank-reflected for a black-to-move root).
-    """
-
     root_fen: str
     repetition: int
     mirrored: bool
@@ -151,17 +95,6 @@ class GeneratedTrace:
 
 @dataclass(frozen=True)
 class TraceAssessment:
-    """Rule-checked facts about a generated trace.
-
-    ``structural`` reports that ``replay`` accepted the token stream and that
-    its final move agrees with the writer's decision. The remaining fields are
-    derived from the replayed program; on a structural failure they are zero
-    or empty because the program could not be rebuilt. ``copy_first_move`` is
-    the first round's champion: the argmax of its exact root evaluations when
-    that round completed its root scan, otherwise the first root candidate,
-    and ``None`` when the trace has no first round.
-    """
-
     structural: bool
     error: str | None
     final_move: str | None
@@ -175,32 +108,15 @@ class TraceAssessment:
 
 
 def _framed_move_token(uci, mirrored):
-    """Move-vocabulary id of an absolute board move in the trace frame."""
     framed = reflect_uci(uci) if mirrored else uci
     return MOVE + UCI_MOVE_TO_IDX[framed]
 
 
 def legal_tokens(writer: TraceWriter, final_allowed: bool, cache=None) -> tuple:
-    """Token ids the current rule state allows at a thought boundary.
-
-    The writer owns the state machine, so replay, the writer, and this mask
-    cannot disagree about visits, refutation references, round boundaries, or
-    the FINAL suffix. A cache keyed by absolute path avoids recomputing a
-    node's legal set when the same path is revisited.
-    """
     return writer.allowed_tokens(final_allowed, cache)
 
 
-def _generation_tokens(writer: TraceWriter, final_allowed: bool, cache=None) -> tuple:
-    """Tokens the generator may choose; BOARD needs a response it cannot give."""
-    return tuple(
-        token for token in legal_tokens(writer, final_allowed, cache) if token != BOARD
-    )
-
-
 class _GenerationRow:
-    """Rule state and bookkeeping for one row of a generation batch."""
-
     def __init__(self, root: RootPosition, protocol: GenerationProtocol):
         self.fen = root.fen
         self.repetition = root.repetition
@@ -234,7 +150,6 @@ class _GenerationRow:
             raise RuntimeError("TraceWriter emitted a different token")
 
     def apply(self, token, forced):
-        """Consume one selected token, advancing the real rule state."""
         if self.writer.finished:
             return
         if token == FINAL:
@@ -271,7 +186,6 @@ class _GenerationRow:
 
 
 def _choose(rows, logits, protocol):
-    """Select one legal token per row and record post-FINAL move logits."""
     masks = np.zeros((len(rows), CHESS_VOCAB_SIZE), dtype=bool)
     forced = np.zeros(len(rows), dtype=bool)
     for index, row in enumerate(rows):
@@ -283,18 +197,15 @@ def _choose(rows, logits, protocol):
             row.set_move_distribution(logits[index])
             continue
         if row.writer.final_written:
-            ids = _generation_tokens(row.writer, False, row.legal_cache)
+            ids = legal_tokens(row.writer, False, row.legal_cache)
             masks[index, list(ids)] = True
             continue
-        at_limit = row.thinking >= protocol.limit
+        at_limit = row.thinking >= protocol.limit and not row.writer.completing_board
         forced[index] = at_limit
         final_allowed = at_limit or protocol.kind == AUTONOMOUS
-        ids = _generation_tokens(row.writer, final_allowed, row.legal_cache)
+        ids = legal_tokens(row.writer, final_allowed, row.legal_cache)
         if not ids:
-            # The grammar allows a root self-evaluation before any candidate,
-            # after which FINAL is the only exit. A fixed budget that still
-            # masks FINAL must yield rather than stall the row.
-            ids = _generation_tokens(row.writer, True, row.legal_cache)
+            ids = legal_tokens(row.writer, True, row.legal_cache)
         masks[index, list(ids)] = True
     allowed = torch.from_numpy(masks).to(logits.device)
     choices = logits.masked_fill(~allowed, -torch.inf).argmax(-1)
@@ -311,7 +222,8 @@ def _generate_batch(model, roots, protocol):
     ).to(device)
     rows = [_GenerationRow(root, protocol) for root in roots]
     logits, cache = model.prefill(ids)
-    for _ in range(protocol.limit + 1 + _SUFFIX_STEPS):
+    bound = protocol.limit + BOARD_TOKENS_MAX + 1 + _SUFFIX_STEPS
+    for _ in range(bound):
         if all(row.writer.finished for row in rows):
             break
         choices, forced = _choose(rows, logits, protocol)
@@ -336,11 +248,6 @@ def _generate_batch(model, roots, protocol):
 
 @torch.inference_mode()
 def generate(model, roots, protocol, batch_size=32):
-    """Greedy free generation for frozen roots under one protocol.
-
-    Every step selects the highest-scoring token among the rule-legal set; the
-    model is used only through its cached ``prefill``/``decode`` path.
-    """
     if batch_size < 1:
         raise ValueError("Batch size must be positive")
     roots = list(roots)
@@ -353,13 +260,6 @@ def generate(model, roots, protocol, batch_size=32):
 
 
 def _first_round(program):
-    """The first round's champion and the frozen copy-first fallback chain.
-
-    A completed root scan is marked by the round-end root evaluation; its
-    champion is the candidate with the highest last exact evaluation. Without
-    that evaluation the first written root candidate stands in, and a trace
-    with no first round has no copy-first baseline at all.
-    """
     round_number = 0
     moves = []
     evaluations = {}
@@ -392,7 +292,6 @@ def _first_round(program):
 
 
 def assess(trace: GeneratedTrace) -> TraceAssessment:
-    """Replay a generated trace and derive its rule-checked facts."""
     try:
         program = replay(
             trace.tokens,
@@ -441,102 +340,9 @@ def assess(trace: GeneratedTrace) -> TraceAssessment:
 
 
 def move_log_probability(trace: GeneratedTrace, move: str) -> float:
-    """Log probability of an absolute legal root move in the final distribution."""
     token = _framed_move_token(move, trace.mirrored)
     try:
         index = trace.root_move_tokens.index(token)
     except ValueError:
         raise ValueError(f"Not a legal root move: {move}") from None
     return trace.root_move_log_probs[index]
-
-
-def p95_trace_length(lengths) -> int:
-    """Nearest-rank 95th percentile of complete-trace thinking lengths."""
-    values = np.sort(np.asarray(list(lengths), dtype=np.int64))
-    if not len(values):
-        raise ValueError("No trace lengths")
-    rank = max(1, math.ceil(0.95 * len(values)))
-    return int(values[rank - 1])
-
-
-def trace_length_budget(lengths) -> int:
-    """The thinking-length bound: p95 rounded up to a multiple of 8, at least 8."""
-    return max(8, -(-p95_trace_length(lengths) // 8) * 8)
-
-
-def budget_points(lengths) -> tuple:
-    """Fixed-budget thinking-token points for one teacher's trace lengths.
-
-    The bound is a multiple of 8, so every fixed fraction is an integer.
-    """
-    bound = trace_length_budget(lengths)
-    return tuple(sorted({int(fraction * bound) for fraction in BUDGET_FRACTIONS}))
-
-
-def budget_grid(lengths_by_teacher) -> tuple:
-    """Union of per-teacher budget points, in rising order."""
-    points = set()
-    for lengths in lengths_by_teacher.values():
-        points.update(budget_points(lengths))
-    if not points:
-        raise ValueError("No teacher trace lengths for a budget grid")
-    return tuple(sorted(points))
-
-
-def model_token_count(
-    tokens, root_fen: str, repetition: int = 1, teacher_width: int = 1
-) -> int:
-    """Tokens the model generated: everything except BOARD responses.
-
-    A BOARD request stays in the count because the model emitted it; its
-    response is external context.
-    """
-    program = replay(
-        tokens,
-        root_fen,
-        repetition,
-        teacher_width=_effective_teacher_width(root_fen, teacher_width),
-    )
-    removed = sum(
-        step.end - step.start - 1 for step in program.steps if step.operation == "board"
-    )
-    return len(program.tokens) - removed
-
-
-def no_tool_token_count(
-    tokens, root_fen: str, repetition: int = 1, teacher_width: int = 1
-) -> int:
-    """Tokens of the BOARD-free copy: requests and responses both removed."""
-    program = replay(
-        tokens,
-        root_fen,
-        repetition,
-        teacher_width=_effective_teacher_width(root_fen, teacher_width),
-    )
-    removed = sum(
-        step.end - step.start for step in program.steps if step.operation == "board"
-    )
-    return len(program.tokens) - removed
-
-
-def no_tool_length(tokens) -> int:
-    """Thinking tokens of the BOARD-free copy, ending at FINAL.
-
-    The token budget is the p95 of the pre-FINAL thinking length, so the label
-    suffix after FINAL is not counted. BOARD requests and their responses are
-    removed. The scan needs no rule replay, so a large release can be measured
-    without rebuilding every position; ``no_tool_token_count`` is the
-    replay-checked form of the whole-trace count.
-    """
-    values = [int(token) for token in tokens]
-    index, count = 0, 0
-    while index < len(values) and values[index] not in (PAD, FINAL):
-        if values[index] == BOARD:
-            index += 1
-            while index < len(values) and values[index] < SIDE:
-                index += 1
-            index += OBSERVATION_METADATA
-        else:
-            count += 1
-            index += 1
-    return count

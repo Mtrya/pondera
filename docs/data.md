@@ -1,6 +1,6 @@
 # Data synthesis
 
-This page describes the current offline data pipeline. The grammar and array layout are still changing; `pondera.data.trace` and `pondera.data.dataset` are the exact schema authorities. Each release records the SHA-256 of its configuration and of this document.
+This page describes the current offline data pipeline. The grammar and array layout are still changing; `pondera.data.trace` and `pondera.data.dataset` are the exact schema authorities.
 
 Training never runs the engine. Offline production has one entry point, `pondera.data.pipeline`, and one configuration file:
 
@@ -10,15 +10,15 @@ Training never runs the engine. Offline production has one entry point, `pondera
 
 ## Roots
 
-`pondera.data.roots` replays a pinned Lichess Elite archive with python-chess and builds the requested root pool directly. It does not write a full root corpus. A position is keyed by its first four FEN fields and keeps its last in-game occurrence, carrying the highest repetition count and halfmove clock. Across games, higher repetition wins and ties keep the first record. Terminal positions and positions seen five or more times are excluded. Splits come from a hash of the position key.
+`pondera.data.roots` replays a pinned Lichess Elite archive with python-chess and builds the requested root pool directly. It does not write a full root corpus. A position is keyed by its first four FEN fields and keeps its last in-game occurrence, carrying the highest repetition count and halfmove clock. Across games, higher repetition wins and ties keep the first record. Terminal positions and positions seen five or more times are excluded. Splits come from a deterministic draw on the position key.
 
-The pool is stratified by split and whether the root allows a draw claim. Hash-ranked selection is reproducible and grows by extension; an independent hash determines output order. A root record carries `root_id` (SHA-256 of `fen|repetition`), `split`, `fen`, `repetition`, `turn`, `position_key`, source provenance, and its sampled teacher settings and presentation.
+The pool is stratified by split and whether the root allows a draw claim. Ranked selection is reproducible and grows by extension; an independent draw determines output order. A root record carries `root_id` (`fen|repetition`), `split`, `fen`, `repetition`, `turn`, `position_key`, source provenance, and its sampled teacher settings and presentation.
 
 ## Configuration
 
-`configs/trace.toml` is the single authority for production settings. `[paths]` locates the archive, cached root pool, external engine, optional provenance artifacts, and output. `[roots]` sets train/validation sizes and the draw-claimable share. `[search]` sets engine options and independent width/depth distributions. `[synthesis]` sets BOARD probabilities, draw claims, presentation probabilities, and the random-cut interval. `[release]` sets shard size and worker count. The top-level `seed` determines root selection and all per-root samples.
+`configs/trace.toml` is the single authority for production settings. `[paths]` locates the archive, cached root pool, external engine, and output. `[roots]` sets train/validation sizes and the draw-claimable share. `[search]` sets the engine hash-table size and independent width/depth distributions. `[synthesis]` sets BOARD probabilities, draw claims, presentation probabilities, and the random-cut interval. `[release]` sets shard size and worker count. The top-level `seed` determines root selection and all per-root samples.
 
-Width, depth, and presentation accept either one value or a probability table. Each root samples them independently using `random.Random(f"{seed}:{root_id}:<kind>")`. Exactly one of `zero`, `full`, or `random` is materialized for each root. Existing sampled assignments are preserved on resume.
+Width, depth, and presentation accept either one value or a probability table. Each root samples them independently using `random.Random(f"{seed}:{root_id}:<setting>")`. Exactly one of `zero`, `full`, or `random` is materialized for each root. Assignments are recomputed from the active recipe and stable root ids: an identical recipe reproduces them on resume, while a changed recipe replaces them.
 
 ## Teacher and trace synthesis
 
@@ -38,14 +38,14 @@ The presentations are `zero` (suffix only), `full` (complete thought), and `rand
 
 ## Release and validation
 
-A release contains shards and `release.json`. Each shard stores `board_tokens`, `trace_tokens`, `trace_len`, `trace_roles`, the truncation-state arrays, `state_count`, `roots.jsonl`, and `champions.jsonl`, with per-file hashes in its manifest. Shards are published atomically and can be recovered or resumed by root.
+A release contains shards and `release.json`. Each shard stores `board_tokens`, `trace_tokens`, `trace_len`, `trace_roles`, the truncation-state arrays, `state_count`, `roots.jsonl`, and `champions.jsonl`. Shards are published atomically and can be recovered or resumed by root.
 
-Sequence datasets use manifest `format_version = 5` and `grammar_version = 2`. `pondera.data.dataset` reads these arrays for training and lazily memory-maps shard storage. `pondera.data.pipeline.validate_release` checks release identity, manifests, array shapes, checksums, stored states, and every trace replay against python-chess. Validation reconstructs programs from stored tokens rather than trusting synthesis.
+Trace datasets use manifest `format_version = 6` and `grammar_version = 2`. `pondera.data.dataset` reads these arrays for training and lazily memory-maps shard storage. `pondera.data.pipeline.validate_release` checks release identity, manifests, array shapes, stored states, and every trace replay against python-chess. Validation reconstructs programs from stored tokens rather than trusting synthesis.
 
 ## Scope and reproducibility
 
 This repository ships root-pool construction, the Python sidecar consumer and synthesizer, release construction and validation, and training adapters. It deliberately ships no Stockfish source, instrumentation patch, engine binaries, sidecars, or releases. Data synthesis is therefore not reproducible from a clean checkout without external artifacts, by design.
 
-The external instrumentation procedure is an agent skill at `.agents/skills/stockfish-trace/SKILL.md`: prose only, no engine source. It explains how to build and verify the teacher and connect it to the single pipeline entry point. Release identity records the engine, configuration, available provenance artifacts, and this document.
+The external instrumentation procedure is an agent skill at `.agents/skills/stockfish-trace/SKILL.md`: prose only, no engine source. It explains how to build and verify the teacher and connect it to the single pipeline entry point. Release identity records the engine name and effective generation settings.
 
 Trace grammar, presentation options, and release fields may still change together; external consumers should not treat the current arrays as stable.

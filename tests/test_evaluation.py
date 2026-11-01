@@ -10,11 +10,10 @@ import chess
 
 from pondera.evaluation.match import parse_result, run_match
 from pondera.models.checkpoint import save_checkpoint
-from pondera.models.factory import create_model
+from pondera.models.policy import create_model
 
 CONFIG = {
-    "architecture": "depth",
-    "cores": [{"layers": 1, "repetition": {"max_repetitions": 1}}],
+    "num_blocks": 1,
     "hidden_size": 16,
     "intermediate_size": 32,
     "num_heads": 2,

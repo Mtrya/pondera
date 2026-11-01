@@ -44,14 +44,12 @@ from pondera.chess.vocabulary import (
     VALUE_BINS,
 )
 
-# The grammar version recorded in sequence dataset manifests.
+# The grammar version recorded in trace dataset manifests.
 TRACE_GRAMMAR_VERSION = 2
 
-# Per-token roles: the loss sees every generated token, treats a tool response
-# as context only, and separates the FINAL label into its decision, evaluation,
-# and best line. A refutation states a candidate's outcome without a value.
+# Token roles support masked losses and per-segment diagnostics.
 ROLE_PAD = 0
-ROLE_TOOL = 1
+ROLE_BOARD = 1
 ROLE_MOVE = 2
 ROLE_EVAL = 3
 ROLE_CONTROL = 4
@@ -333,6 +331,7 @@ class _TraceState:
         self.round = 0
         self.round_has_candidate = False
         self.visits = []
+        self.pending_board = None
         self.phase = _THOUGHT
         self.suffix = None
         self.value_written = False
@@ -403,6 +402,9 @@ class _TraceState:
         """Token ids the current state allows, in the vocabulary's frame."""
         if self.phase == _DONE:
             return ()
+        if self.pending_board is not None:
+            _, observation, index = self.pending_board
+            return (observation[index],)
         if self.suffix is None:
             return self._thought_tokens(final_allowed, cache)
         return self._suffix_tokens(cache)
@@ -575,40 +577,33 @@ class _TraceState:
         parent.passed_children.discard(child)
         self._step(start, "refuted", self.tracker.path, self.tracker.fen())
 
-    def board(self, observation=None):
-        self._require_thought("board_after_final")
-        if not self.visits or not self.tracker.path:
-            raise _Illegal("board_at_root")
-        visit = self.visits[-1]
-        start = len(self.tokens)
-        true_fen = self.tracker.fen()
-        if observation is None:
-            observation = self.tracker.board_tokens()
-            if self.mirrored:
-                observation = TOKEN_MIRROR[observation]
-            observed = _decode_observation(observation, self.mirrored)[0]
-            repetition = self.tracker.repetition()
-        else:
-            observation = [int(token) for token in observation]
-            try:
-                observed, observed_repetition = _decode_observation(
-                    observation, self.mirrored
-                )
-            except ValueError as error:
-                raise _Illegal("board_invalid", str(error)) from error
-            observed_fields = observed.split()
-            true_fields = true_fen.split()
-            repetition = self.tracker.repetition()
-            if (
-                observed_fields[:4] != true_fields[:4]
-                or observed_fields[4] != str(min(int(true_fields[4]), 100))
-                or observed_repetition != min(repetition, 5)
-            ):
-                raise _Illegal("board_mismatch", observed)
-        self._emit(BOARD, ROLE_CONTROL)
-        for token in observation:
-            self._emit(int(token), ROLE_TOOL)
-        visit.written = True
+    def _expected_board(self):
+        observation = self.tracker.board_tokens()
+        if self.mirrored:
+            observation = TOKEN_MIRROR[observation]
+        return [int(token) for token in observation]
+
+    def _write_board(self, start, observation, emit):
+        try:
+            observed, observed_repetition = _decode_observation(
+                observation, self.mirrored
+            )
+        except ValueError as error:
+            raise _Illegal("board_invalid", str(error)) from error
+        observed_fields = observed.split()
+        true_fields = self.tracker.fen().split()
+        repetition = self.tracker.repetition()
+        if (
+            observed_fields[:4] != true_fields[:4]
+            or observed_fields[4] != str(min(int(true_fields[4]), 100))
+            or observed_repetition != min(repetition, 5)
+        ):
+            raise _Illegal("board_mismatch", observed)
+        if emit:
+            self._emit(BOARD, ROLE_CONTROL)
+            for token in observation:
+                self._emit(int(token), ROLE_BOARD)
+        self.visits[-1].written = True
         self._step(
             start,
             "board",
@@ -617,6 +612,35 @@ class _TraceState:
             observed=observed,
             repetition=repetition,
         )
+
+    def board(self, observation=None):
+        self._require_thought("board_after_final")
+        if not self.visits or not self.tracker.path:
+            raise _Illegal("board_at_root")
+        if observation is None:
+            observation = self._expected_board()
+        else:
+            observation = [int(token) for token in observation]
+        self._write_board(len(self.tokens), observation, True)
+
+    def _begin_board(self):
+        self._require_thought("board_after_final")
+        if not self.visits or not self.tracker.path:
+            raise _Illegal("board_at_root")
+        self.pending_board = (len(self.tokens), self._expected_board(), 0)
+        self._emit(BOARD, ROLE_CONTROL)
+
+    def _continue_board(self, token):
+        start, observation, index = self.pending_board
+        if token != observation[index]:
+            raise _Illegal("board_mismatch", f"token {token}")
+        self._emit(token, ROLE_BOARD)
+        index += 1
+        if index == len(observation):
+            self.pending_board = None
+            self._write_board(start, observation, False)
+        else:
+            self.pending_board = (start, observation, index)
 
     # --- final decision and label suffix --- #
 
@@ -769,6 +793,9 @@ class _TraceState:
         token = int(token)
         if self.phase == _DONE:
             raise _Illegal("trailing_tokens")
+        if self.pending_board is not None:
+            self._continue_board(token)
+            return
         if self.suffix == _DECISION:
             if is_move_token(token):
                 self.final_decision(_absolute_uci(token, self.mirrored))
@@ -799,7 +826,7 @@ class _TraceState:
         elif token == RESET:
             self.reset()
         elif token == BOARD:
-            raise _Illegal("unexpected_token", "BOARD needs a response")
+            self._begin_board()
         elif token == FINAL:
             self.begin_final()
         elif token == END:
@@ -832,6 +859,10 @@ class TraceWriter:
     @property
     def final_written(self):
         return self._state.suffix is not None
+
+    @property
+    def completing_board(self):
+        return self._state.pending_board is not None
 
     @property
     def awaiting_final_move(self):
@@ -919,12 +950,7 @@ class TraceWriter:
         self._state.evaluate_token(token)
 
     def board(self):
-        """Request and write the full observation of the current node.
-
-        The request carries loss; the appended response is external context.
-        A black-to-move root mirrors the response while leaving its side and
-        counter atoms absolute.
-        """
+        """Write BOARD and the current position's encoded board tokens."""
         self._state.board()
 
     def final(self, uci):
@@ -1775,7 +1801,7 @@ class _RootState:
         self.teacher_width = teacher_width
         self.round = 0
         self.current_round = {}
-        self.round_sequence = {}
+        self.round_trace = {}
         self.round_count = 0
         self.previous = None
         self.current = None
@@ -1783,17 +1809,17 @@ class _RootState:
     def begin_round(self, round_number):
         self.round = round_number
         self.current_round = {}
-        self.round_sequence = {}
+        self.round_trace = {}
         self.round_count = 0
         self.current = self.previous
 
     def record_exact(self, move, raw, token):
-        sequence = self.round_sequence.get(move)
-        if sequence is None:
+        trace = self.round_trace.get(move)
+        if trace is None:
             self.round_count += 1
-            sequence = self.round_count
-            self.round_sequence[move] = sequence
-        self.current_round[move] = (raw, token, sequence)
+            trace = self.round_count
+            self.round_trace[move] = trace
+        self.current_round[move] = (raw, token, trace)
         # First to arrive defends the maximum: later equal values do not
         # replace the current champion, and only a strict gain does.
         best_move, best = max(
@@ -1913,7 +1939,7 @@ class _Synthesis:
                     raise SynthesisError(
                         "a checkmate child does not carry a mated engine score"
                     )
-                token = mate_token(0, True)
+                token = mate_token(0, len(child_path) % 2 == 1)
             else:
                 # A draw is a rule verdict, not an engine score. Deeper nodes
                 # return VALUE_DRAW with the +-1 tie-break, but qsearch does

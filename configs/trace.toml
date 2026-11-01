@@ -5,9 +5,6 @@ archive = ".local/data/lichess_elite_2025-11.zip"
 roots = ".local/data/roots.jsonl"
 output = ".local/runs/trace"
 engine = "stockfish"
-control = ""
-instrumentation = ""
-teacher = "docs/data.md"
 
 [roots]
 train = 1000
@@ -15,11 +12,9 @@ val = 0
 claimable_share = 0.03
 
 [search]
-threads = 1
 hash_mb = 256
-fresh_engine_per_root = true
-widths = 1
-depths = 16
+widths = { 1 = 0.50, 2 = 0.25, 3 = 0.25 }
+depths = { 12 = 0.25, 16 = 0.50, 20 = 0.25 }
 
 [synthesis]
 claim_draw = true

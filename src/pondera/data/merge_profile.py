@@ -1,4 +1,4 @@
-"""Merge-vocabulary profile over grammar-v2 sequence releases.
+"""Merge-vocabulary profile over grammar-v2 trace releases.
 
 A profile reads the full-presentation rows of one or more releases, counts
 atom substrings on the training roots, selects merge dictionaries at the
@@ -10,15 +10,15 @@ the same recorded search, so every substring they contain already occurs in
 the full row; counting them would weight shared prefixes without adding
 substring structure.
 
-Roots are split by a bucket of their SHA-256 id: the held-out tenth never
-enters counting or selection and only measures what the curve reports.
+Roots are split by a deterministic draw from their id: the held-out tenth
+never enters counting or selection and only measures what the curve reports.
 Selection itself runs on every fourth training root, which keeps the encoder
 passes affordable without touching held-out data.
 """
 
 import argparse
-import hashlib
 import json
+import random
 from pathlib import Path
 
 import numpy as np
@@ -39,7 +39,6 @@ from pondera.data.dataset import load_manifest
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 FULL_PRESENTATION = "full"
-HOLDOUT_BUCKETS = 1000
 DEFAULT_BUDGETS = (100, 500, 2000, 8000)
 
 
@@ -83,10 +82,8 @@ def load_full_rows(release):
 
 
 def is_held_out(root_id: str, fraction: float) -> bool:
-    """Stable root bucket: the same id always lands on the same side."""
-    digest = hashlib.sha256(root_id.encode("utf-8")).digest()
-    bucket = int.from_bytes(digest[:8], "big") % HOLDOUT_BUCKETS
-    return bucket < round(fraction * HOLDOUT_BUCKETS)
+    """Stable root draw: the same id always lands on the same side."""
+    return random.Random(root_id).random() < fraction
 
 
 def split_roots(rows, fraction):
@@ -316,7 +313,7 @@ def render_report(document, title: str = "Merge dictionary profile") -> str:
             "no substring structure of their own. Counting saw every training root; "
             f"selection tuned on every {corpus['selection']['stride']}th training root "
             f"({corpus['selection']['roots']:,} roots); the held-out "
-            f"{_percent(corpus['holdout_fraction'], 0)} of roots (a SHA-256 bucket of the "
+            f"{_percent(corpus['holdout_fraction'], 0)} of roots (a stable draw on the "
             "root id) measures the curve."
         ),
         "",

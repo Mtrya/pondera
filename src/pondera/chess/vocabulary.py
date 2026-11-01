@@ -13,12 +13,11 @@ the file at import; regenerate the file only when the vocabulary deliberately
 changes (`uv run python -m pondera.chess.vocabulary`) and review the diff.
 """
 
-import hashlib
 from importlib.resources import files
 
 # The version pins the serialized board-token format recorded in data
-# manifests and checkpoints; sequence trace grammars version themselves
-# separately in dataset manifests.
+# manifests and checkpoints; trace grammars version themselves separately in
+# dataset manifests.
 CHESS_TOKENIZER_VERSION = 3
 
 # --- Layout cardinalities --- #
@@ -215,9 +214,8 @@ def main():
     payload = "\n".join(lines) + "\n"
     with _PATH.open("w", encoding="utf-8") as handle:
         handle.write(payload)
-    digest = hashlib.sha256(payload.encode()).hexdigest()
     changed = "initialized" if not old else "rewritten"
-    print(f"{changed}: {len(lines)} tokens, sha256 {digest}")
+    print(f"{changed}: {len(lines)} tokens")
 
 
 if __name__ == "__main__":

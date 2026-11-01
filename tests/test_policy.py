@@ -10,11 +10,9 @@ from pondera.chess.codec import encode_boards
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, PAD, RESET
 from pondera.data.trace import TraceWriter
 from pondera.models.checkpoint import load_model, save_checkpoint
-from pondera.models.factory import create_model
-from pondera.training.cost import sequence_flops
+from pondera.models.policy import create_model
 
 CONFIG = {
-    "architecture": "sequence",
     "num_blocks": 2,
     "hidden_size": 32,
     "intermediate_size": 64,
@@ -49,7 +47,7 @@ def final_trace(fen):
     return torch.from_numpy(np.stack([writer.tokens]))
 
 
-class SequencePolicyTests(unittest.TestCase):
+class TracePolicyTests(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
         torch.manual_seed(17)
@@ -128,46 +126,13 @@ class SequencePolicyTests(unittest.TestCase):
 
     def test_checkpoint_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "sequence.pth"
+            path = Path(directory) / "trace.pth"
             trace = trace_of(chess.STARTING_FEN)
             expected = self.model.trace_logits(self.ids[:1], trace_ids=trace)
             save_checkpoint(path, self.model, CONFIG)
             loaded = load_model(path)
             actual = loaded.trace_logits(self.ids[:1], trace_ids=trace)
             torch.testing.assert_close(actual, expected)
-
-
-class SequenceFlopsTests(unittest.TestCase):
-    def test_hand_derived_literal(self):
-        # Two layers, d=16, f=32, B=10, T=3, V=3006. Linear per layer:
-        # 2*13*(4*16^2 + 3*16*32) = 66560. Attention pairs:
-        # 10^2 + 10*3 + 3*4/2 = 136, costing 4*16*136 = 8704.
-        # Per layer 75264, two layers 150528. Head: 2*3*16*3006 = 288576.
-        # Forward 439104; training counts forward plus two backward passes.
-        config = {
-            "architecture": "sequence",
-            "num_blocks": 2,
-            "hidden_size": 16,
-            "intermediate_size": 32,
-            "num_heads": 2,
-        }
-        self.assertEqual(float(sequence_flops(config, [10], [3])[0]), 1317312.0)
-        self.assertEqual(
-            float(sequence_flops(config, [10], [3], training=False)[0]), 439104.0
-        )
-
-    def test_rejects_other_architectures_and_empty_rows(self):
-        config = {
-            "architecture": "sequence",
-            "num_blocks": 1,
-            "hidden_size": 8,
-            "intermediate_size": 16,
-            "num_heads": 2,
-        }
-        with self.assertRaises(ValueError):
-            sequence_flops({**config, "architecture": "depth"}, [10], [3])
-        with self.assertRaises(ValueError):
-            sequence_flops(config, [10], [0])
 
 
 if __name__ == "__main__":

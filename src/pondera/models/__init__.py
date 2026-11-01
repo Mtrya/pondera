@@ -1,15 +1,7 @@
-"""Token backbones, board policies, and explicit model configurations."""
+"""Policy model components."""
 
-from pondera.models.backbones import DepthBackbone, SequenceBackbone
-from pondera.models.config import BlockConfig, CoreConfig, RepetitionConfig
-from pondera.models.policy import DepthPolicyModel, SequencePolicyModel
+from pondera.models.backbones import Backbone
+from pondera.models.config import BlockConfig
+from pondera.models.policy import PolicyModel
 
-__all__ = [
-    "SequenceBackbone",
-    "DepthBackbone",
-    "BlockConfig",
-    "CoreConfig",
-    "RepetitionConfig",
-    "DepthPolicyModel",
-    "SequencePolicyModel",
-]
+__all__ = ["Backbone", "BlockConfig", "PolicyModel"]

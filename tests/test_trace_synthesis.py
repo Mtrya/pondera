@@ -13,6 +13,7 @@ from pondera.chess.vocabulary import (
     DEPTH,
     END,
     FINAL,
+    MATE_LOSS,
     MATE_WIN,
     MOVE,
     UCI_MOVE_TO_IDX,
@@ -217,7 +218,7 @@ class SynthesisTests(unittest.TestCase):
                         child.push(move)
                     terminal = child.search_terminal()
                     if terminal == "mate":
-                        self.assertEqual(token, mate_token(0, True))
+                        self.assertEqual(token, mate_token(0, len(step.path) % 2 == 1))
                         continue
                     if terminal == "draw":
                         self.assertEqual(token, VALUE + value_bin(0.0))
@@ -277,6 +278,30 @@ class SynthesisTests(unittest.TestCase):
                         value_bin((deepest["wdl"][0] - deepest["wdl"][2]) / 1000),
                     )
                     self.assertIsNone(full.mate_distance)
+
+    def test_even_ply_checkmate_evaluates_as_a_root_loss(self):
+        sidecar, root = load_case("mate_in_2_loss_d2")
+        config = load_config()
+        config = dataclasses.replace(
+            config,
+            search=dataclasses.replace(config.search, depth=2, teacher_width=1),
+        )
+        synthesized = synthesize_root(sidecar, root, config, seed=640)
+        full = synthesized.rows["full"]
+        program = replay(
+            full.tokens,
+            root["fen"],
+            root["repetition"],
+            teacher_width=1,
+        )
+        terminal = next(
+            step
+            for step in program.steps
+            if step.operation == "evaluate" and step.path == ("f4g5", "e4e5")
+        )
+        self.assertEqual(terminal.mate, 0)
+        self.assertFalse(terminal.mate_win)
+        self.assertEqual(full.tokens[terminal.start], MATE_LOSS)
 
     def test_round_end_evaluation_refreshes_the_visible_champion_value(self):
         sidecar, root, synthesized = synthesize_case("mate_in_1_d4")

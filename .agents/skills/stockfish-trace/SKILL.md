@@ -15,7 +15,7 @@ Create a working directory outside the Pondera checkout (or under gitignored `.l
 
 1. Fetch official Stockfish `sf_17.1` source and ensure the default NNUE networks required by that tag are present in `src/`.
 2. Copy the source tree into two sibling directories: an unmodified control tree and a treatment tree.
-3. Build the control binary from the unmodified tree (`make -C src build ARCH=...` or `profile-build` with the same target flags you will use for the treatment). Keep the control binary and record its SHA-256.
+3. Build the control binary from the unmodified tree (`make -C src build ARCH=...` or `profile-build` with the same target flags you will use for the treatment). Keep the control binary for the consistency gates below.
 
 ## 2. Treatment instrumentation architecture
 
@@ -146,7 +146,7 @@ If any gate fails, stop and fix the C++ instrumentation.
 
 ## 5. Connecting to Pondera's pipeline
 
-1. **Configure paths**: copy `configs/trace.toml` outside the repository or edit a working copy. Set `[paths].engine` to the treatment binary, `output` to the release directory, and `instrumentation` and `control` to the external provenance artifacts. Set `archive` and `roots` for automatic root-pool construction. If `roots` already exists, its JSONL records need a unique `root_id`, `split` (`train` or `val`), a legal non-terminal six-field `fen`, and `repetition` in `1..4`; `turn` and `position_key` are checked when present.
+1. **Configure paths**: edit a working copy of `configs/trace.toml`. Set `[paths].engine` to the treatment binary, `output` to the release directory, and `archive`/`roots` for automatic root-pool construction. If `roots` already exists, its JSONL records need a unique `root_id`, `split` (`train` or `val`), a legal non-terminal six-field `fen`, and `repetition` in `1..4`; `turn` and `position_key` are checked when present.
 2. **Configure production**: set the top-level `seed`, `[roots]` sizes and claimable share, `[search]` engine options and `widths`/`depths`, `[synthesis]` BOARD/draw/presentation settings, and `[release]` shard size and workers. Width, depth, and presentation each accept one value or a probability table. There is no separate recipe, smoke, collection, or release configuration.
 3. **Run the single entry point**:
    ```bash
@@ -160,4 +160,4 @@ If any gate fails, stop and fix the C++ instrumentation.
    validate_release("/abs/path/to/release")
    PY
    ```
-   Validation checks manifests, hashes, array layout, stored states, and every trace replay against python-chess.
+   Validation checks manifests, array layout, stored states, and every trace replay against python-chess.

@@ -1,9 +1,10 @@
-import copy
 import json
 import re
 import tempfile
+import threading
 import tomllib
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import chess
@@ -12,16 +13,10 @@ from trace_fixtures import tie_sidecar_lines
 
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
-from pondera.data.dataset import (
-    SEQUENCE_ARRAYS,
-    SequencePositions,
-    load_manifest,
-    sequence_data_identity,
-    sha256,
-)
+from pondera.data.dataset import DATA_ARRAYS, TracePositions, load_manifest
 from pondera.data.pipeline import (
     load_config,
-    load_sequence_arrays,
+    load_trace_arrays,
     produce_shards,
     sample_root_settings,
     validate_release,
@@ -49,15 +44,6 @@ widths = {1 = 0.5, 3 = 0.5}
 depths = {4 = 1.0}
 presentations = {zero = 0.2, full = 0.5, random = 0.3}
 """
-ENGINE_SHA256 = "52498f1a544a7c238c9c6db0614aa5821877b83d157db167d931ec56f4525761"
-WIDE_ENGINE_SHA256 = "1420c314729fa3d40d6e2fda2834d44f422902d9b0d37c5d0fe1bf5d5f1f845b"
-INSTRUMENTATION_SHA256 = (
-    "a8ff707418c820f6f5ad411a2744141286c5d86e4b67553f2373a8c6f4128a67"
-)
-WIDE_INSTRUMENTATION_SHA256 = (
-    "4edea22f905407cbc749e3bc8c3784ecb5de781ec1ed54e37c6dc23b42af3b53"
-)
-CONTROL_SHA256 = "3116251d2cdf84f710b7fe27a037d0b0a390f1f379fb1f32aeace2f41f095b34"
 
 
 def _inline(table):
@@ -143,8 +129,8 @@ def read_release_rows(directory):
                         "state_best",
                         "state_value",
                         "state_basis",
-                        "state_no_tool",
-                        "state_tool",
+                        "state_without_board",
+                        "state_with_board",
                     )
                 },
             }
@@ -174,15 +160,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(len(self.result["shards"]), 3)
         self.assertEqual([shard["rows"] for shard in self.result["shards"]], [2, 2, 1])
         release = load_manifest(self.release / "release.json")
-        self.assertEqual(release["format_version"], 5)
+        self.assertEqual(release["format_version"], 6)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
-        self.assertEqual(release["teacher"]["contract_sha256"], sha256("docs/data.md"))
         self.assertEqual(release["search"]["depth"], 4)
         self.assertEqual(release["search"]["teacher_width"], 1)
         self.assertEqual(release["engine"]["name"], "stockfish")
         self.assertEqual(release["presentation"], self.config.presentation_dict())
-        self.assertEqual(release["roots"]["rows"], len(CASES))
         self.assertEqual(release["metadata"], validate_release_identity(release))
         validation = validate_release(self.release, self.roots, workers=1)
         self.assertTrue(validation["ok"])
@@ -203,7 +187,6 @@ class ReleaseTests(unittest.TestCase):
                 "format_version",
                 "grammar_version",
                 "tokenizer_version",
-                "kind",
                 "role_count",
             )
         }
@@ -216,7 +199,7 @@ class ReleaseTests(unittest.TestCase):
         suffixes = {}
         for shard in release["shards"]:
             manifest, rows, arrays = verify_shard_files(self.release, shard, expected)
-            self.assertIn("champions.jsonl", manifest["files"])
+            self.assertEqual(manifest["rows"], shard["rows"])
             champions = {
                 row["root_id"]: row
                 for row in (
@@ -252,7 +235,7 @@ class ReleaseTests(unittest.TestCase):
                 ]
                 self.assertEqual(int(arrays["state_count"][index]), len(thought))
         self.assertEqual(set(suffixes), {root["root_id"] for root in self.roots})
-        positions = SequencePositions(self.release, "train")
+        positions = TracePositions(self.release, "train")
         self.assertEqual(len(positions), len(CASES))
         row = positions[0]
         self.assertEqual(len(row), 4)
@@ -284,45 +267,44 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(recovered["statistics"], self.result["statistics"])
         self.assertTrue(validate_release(self.release, self.roots, workers=1)["ok"])
 
-    def test_sequence_data_identity_covers_the_training_inputs(self):
-        identity = sequence_data_identity(self.release)
-        self.assertEqual(len(identity), 64)
-        self.assertTrue(all(character in "0123456789abcdef" for character in identity))
+    def test_disjoint_jobs_merge_their_shards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, roots, run, provider = build_run(
+                directory, cases=("start_d4", "middlegame_black_d4")
+            )
+            barrier = threading.Barrier(2)
 
-    def test_validation_detects_a_tampered_shard(self):
-        release = load_manifest(self.release / "release.json")
-        shard = release["shards"][0]
-        path = self.release / shard["path"] / "trace_tokens.npy"
-        with path.open("r+b") as handle:
-            handle.seek(path.stat().st_size // 2)
-            byte = handle.read(1)
-            handle.seek(-1, 1)
-            handle.write(bytes([byte[0] ^ 0xFF]))
-        with self.assertRaises(ValueError):
-            validate_release(self.release, self.roots, workers=1)
+            def synchronized(root):
+                barrier.wait(timeout=10)
+                return provider[root["root_id"]]
 
-    def test_identity_rejects_inconsistent_metadata(self):
-        release = load_manifest(self.release / "release.json")
-        cases = []
-        wrong = copy.deepcopy(release)
-        wrong["metadata"]["search"]["teacher_width"] = 2
-        cases.append(wrong)
-        wrong = copy.deepcopy(release)
-        wrong["metadata"]["presentation"]["zero"] = 0.2
-        cases.append(wrong)
-        wrong = copy.deepcopy(release)
-        wrong["metadata"]["teacher"]["schema_version"] = 2
-        cases.append(wrong)
-        wrong = copy.deepcopy(release)
-        wrong["metadata"]["engine"]["sha256"] = "not-a-checksum"
-        cases.append(wrong)
-        wrong = copy.deepcopy(release)
-        wrong["metadata"]["roots"]["sha256"] = "0" * 64
-        cases.append(wrong)
-        for wrong in cases:
-            with self.subTest(wrong=wrong["metadata"]):
-                with self.assertRaises(ValueError):
-                    validate_release_identity(wrong)
+            release = run / "release"
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(
+                        produce_shards,
+                        roots,
+                        release,
+                        config,
+                        sidecar_for_root=synchronized,
+                        shard_size=1,
+                        workers=1,
+                        start_shard=start,
+                        end_shard=start + 1,
+                    )
+                    for start in (0, 1)
+                ]
+                for future in futures:
+                    future.result()
+            manifest = load_manifest(release / "release.json")
+            self.assertEqual(
+                [shard["path"] for shard in manifest["shards"]],
+                ["shard-000000", "shard-000001"],
+            )
+            self.assertEqual(
+                set(manifest["complete_root_ids"]), {r["root_id"] for r in roots}
+            )
+            self.assertTrue(validate_release(release, roots, workers=1)["ok"])
 
     def test_claim_root_is_materialized_without_a_variation(self):
         release = load_manifest(self.release / "release.json")
@@ -529,15 +511,15 @@ depths = {4 = 1.0}
             validation = validate_release(base / "release", roots, workers=1)
             self.assertTrue(validation["ok"])
             shard = base / "release" / "shard-000000"
-            arrays = load_sequence_arrays(shard, SEQUENCE_ARRAYS)
+            arrays = load_trace_arrays(shard, DATA_ARRAYS)
             self.assertEqual(arrays["trace_tokens"].dtype, np.int16)
             self.assertEqual(arrays["board_tokens"].dtype, np.int16)
             self.assertEqual(arrays["trace_roles"].dtype, np.int8)
             self.assertEqual(arrays["trace_len"].dtype, np.int32)
             self.assertEqual(arrays["state_count"].dtype, np.int32)
             for name in (
-                "state_no_tool",
-                "state_tool",
+                "state_without_board",
+                "state_with_board",
                 "state_best",
                 "state_basis",
                 "state_value",
