@@ -1046,9 +1046,7 @@ class _Synthesis:
                 raise SynthesisError(
                     "the written value of the round champion differs from the rank"
                 )
-            written_max = max(
-                value[0] for value in self.state.current_round.values()
-            )
+            written_max = max(value[0] for value in self.state.current_round.values())
             if written_max > top["raw"]:
                 raise SynthesisError(
                     "a written root candidate exceeds the round champion"

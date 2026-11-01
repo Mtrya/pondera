@@ -551,7 +551,9 @@ def _check_champion_round(root_id, entry, board, value_mate, max_ply):
     if champion_raw != entry["raw"]:
         raise ValueError(f"Champion raw disagrees with its candidate: {root_id}")
     if best_raw != champion_raw:
-        raise ValueError(f"Champion is not a raw maximum among the candidates: {root_id}")
+        raise ValueError(
+            f"Champion is not a raw maximum among the candidates: {root_id}"
+        )
 
 
 def mate_token_for(mate):
