@@ -243,6 +243,11 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(validation["counts"]["train"], len(CASES) * len(PRESENTATIONS))
         self.assertTrue((self.release / "validation.json").exists())
 
+    def test_parallel_validation_matches_sequential(self):
+        sequential = validate_release(self.release, self.roots, workers=1)
+        parallel = validate_release(self.release, self.roots, workers=4)
+        self.assertEqual(parallel, sequential)
+
     def expected_shard_metadata(self, release):
         expected = {
             key: release[key]

@@ -2,7 +2,8 @@
 
 import json
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 
 import chess
@@ -890,6 +891,19 @@ def _validate_shard_rows(
     }
 
 
+_VALIDATION_CONTEXT = None
+
+
+def _init_validation_worker(*context):
+    global _VALIDATION_CONTEXT
+    _VALIDATION_CONTEXT = context
+
+
+def _validate_shard(shard):
+    directory, *arguments = _VALIDATION_CONTEXT
+    return _validate_shard_rows(directory, shard, *arguments)
+
+
 def validate_release(directory, roots=None, workers=8):
     """Validate every file and replay every row of a complete sharded release."""
     if workers < 1:
@@ -941,23 +955,33 @@ def validate_release(directory, roots=None, workers=8):
     max_trace = 0
     max_teacher_width = 0
 
-    def validate(shard):
-        return _validate_shard_rows(
-            directory,
-            shard,
-            presentations,
-            search["teacher_width"],
-            search["depth"],
-            recipe,
-            seed,
-            teacher["value_mate"],
-            teacher["max_ply"],
-            expected_shard_metadata,
-            expected,
-        )
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for result in pool.map(validate, release["shards"]):
+    context = (
+        presentations,
+        search["teacher_width"],
+        search["depth"],
+        recipe,
+        seed,
+        teacher["value_mate"],
+        teacher["max_ply"],
+        expected_shard_metadata,
+        expected,
+    )
+    with ExitStack() as stack:
+        if workers == 1:
+            results = (
+                _validate_shard_rows(directory, shard, *context)
+                for shard in release["shards"]
+            )
+        else:
+            pool = stack.enter_context(
+                ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=_init_validation_worker,
+                    initargs=(directory, *context),
+                )
+            )
+            results = pool.map(_validate_shard, release["shards"])
+        for result in results:
             for root_id, presentation in result["identities"]:
                 key = (root_id, presentation)
                 if key in seen:
