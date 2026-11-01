@@ -8,6 +8,7 @@ from pathlib import Path
 from pondera.data.storage import content_sha256, sha256
 from pondera.data.trace_collect import (
     CollectionError,
+    _check_sidecar,
     _load_roots,
     apply_recipe,
     collect,
@@ -19,6 +20,7 @@ from pondera.data.trace_config import (
     sample_presentation,
     sample_width,
 )
+from pondera.data.trace_synthesis import SynthesisError, load_sidecar
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
 
@@ -222,6 +224,39 @@ class ConfigTests(unittest.TestCase):
         )
         self.check_rejected(text.replace("[smoke]", "[smok]"))
         self.check_rejected(text.replace("depth = 16", "depth = 0"))
+
+
+class CollectorValidationTests(unittest.TestCase):
+    def config(self, depth=4):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.toml"
+            path.write_text(config_text(depth=depth), encoding="utf-8")
+            return load_config(path)
+
+    def test_sidecar_must_match_the_root_recipe_values(self):
+        fixture = FIXTURES / "start_d4"
+        root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
+        sidecar = load_sidecar(fixture / "sidecar.jsonl")
+        config = self.config()
+        self.assertEqual(
+            _check_sidecar(
+                {**root, "teacher_width": 1, "depth": 4},
+                sidecar,
+                config,
+                sidecar.engine,
+            ),
+            1,
+        )
+        self.assertEqual(_check_sidecar(root, sidecar, config, sidecar.engine), 1)
+        for bad in (
+            {**root, "teacher_width": 2, "depth": 4},
+            {**root, "teacher_width": 1, "depth": 5},
+        ):
+            with self.subTest(root=bad):
+                with self.assertRaises(SynthesisError):
+                    _check_sidecar(bad, sidecar, config, sidecar.engine)
+        with self.assertRaises(CollectionError):
+            _check_sidecar(root, sidecar, self.config(depth=5), sidecar.engine)
 
 
 class SelectionTests(unittest.TestCase):
