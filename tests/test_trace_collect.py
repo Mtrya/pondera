@@ -5,8 +5,14 @@ import unittest
 from collections import Counter
 from pathlib import Path
 
-from pondera.data.storage import sha256
-from pondera.data.trace_collect import CollectionError, collect, select_roots
+from pondera.data.storage import content_sha256, sha256
+from pondera.data.trace_collect import (
+    CollectionError,
+    _load_roots,
+    apply_recipe,
+    collect,
+    select_roots,
+)
 from pondera.data.trace_config import (
     load_config,
     sample_depth,
@@ -87,6 +93,57 @@ class RecipeConfigTests(unittest.TestCase):
         self.assertEqual(sample_depth(config.recipe, 640, "root", 16), 16)
         self.assertIsNone(sample_presentation(config.recipe, 640, "root"))
         self.assertFalse(config.recipe.samples_presentations())
+
+    def test_recipe_attaches_sampled_teacher_fields_per_root(self):
+        config = self.load(config_text() + RECIPE_TEXT)
+        roots = [{"root_id": f"root-{index}", "split": "train"} for index in range(200)]
+        sampled = apply_recipe(roots, config, 640)
+        self.assertEqual(len(sampled), len(roots))
+        for root in sampled:
+            self.assertIn(root["teacher_width"], (1, 3))
+            self.assertIn(root["depth"], (8, 16))
+        self.assertEqual(sampled, apply_recipe(roots, config, 640))
+        changed = sum(
+            left["teacher_width"] != right["teacher_width"]
+            or left["depth"] != right["depth"]
+            for left, right in zip(sampled, apply_recipe(roots, config, 641))
+        )
+        self.assertGreater(changed, 0)
+        self.assertNotIn("teacher_width", roots[0])
+
+    def test_plain_config_leaves_roots_untouched(self):
+        config = load_config()
+        roots = [{"root_id": "root", "split": "train"}]
+        self.assertEqual(apply_recipe(roots, config, 640), roots)
+
+    def test_existing_root_samples_win_on_resume(self):
+        existing = {
+            "root_id": "root",
+            "split": "train",
+            "fen": "8/8/8/8/8/8/8/K6k w - - 0 1",
+            "repetition": 1,
+            "turn": "white",
+            "position_key": "8/8/8/8/8/8/8/K6k w - -",
+            "teacher_width": 3,
+            "depth": 8,
+        }
+        fresh = {
+            key: value
+            for key, value in existing.items()
+            if key not in {"teacher_width", "depth"}
+        }
+        fresh.update({"teacher_width": 1, "depth": 16})
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "roots.jsonl").write_text(
+                json.dumps(existing) + "\n", encoding="utf-8"
+            )
+            identity, loaded = _load_roots(output, {"seed": 640}, [fresh])
+            self.assertEqual(loaded, [existing])
+            self.assertEqual(identity["sha256"], content_sha256([existing]))
+            fresh["fen"] = "8/8/8/8/8/8/8/7K b - - 0 1"
+            with self.assertRaises(CollectionError):
+                _load_roots(output, {"seed": 640}, [fresh])
 
     def test_rejects_invalid_recipes(self):
         base = config_text()

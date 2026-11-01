@@ -18,6 +18,7 @@ from pathlib import Path
 import chess
 
 from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
+from pondera.data.trace_config import sample_depth, sample_width
 from pondera.data.trace_synthesis import (
     SIDECAR_SCHEMA,
     SIDECAR_SCHEMA_WIDE,
@@ -207,6 +208,41 @@ def select_roots(source, requested, seed):
     return selected, selection
 
 
+def _root_teacher(root, config):
+    width = root.get("teacher_width", config.search.teacher_width)
+    depth = root.get("depth", config.search.depth)
+    if not isinstance(width, int) or isinstance(width, bool) or width < 1:
+        raise CollectionError(f"Root {root['root_id']} has an invalid teacher width")
+    if not isinstance(depth, int) or isinstance(depth, bool) or depth < 1:
+        raise CollectionError(f"Root {root['root_id']} has an invalid depth")
+    return width, depth
+
+
+def apply_recipe(roots, config, seed):
+    """Attach each root's sampled teacher width and depth from the recipe."""
+    if config.recipe is None:
+        return list(roots)
+    sampled = []
+    for root in roots:
+        sampled.append(
+            {
+                **root,
+                "teacher_width": sample_width(
+                    config.recipe, seed, root["root_id"], config.search.teacher_width
+                ),
+                "depth": sample_depth(
+                    config.recipe, seed, root["root_id"], config.search.depth
+                ),
+            }
+        )
+    return sampled
+
+
+def _teacher_schema(roots, config):
+    widths = [root.get("teacher_width", config.search.teacher_width) for root in roots]
+    return SIDECAR_SCHEMA_WIDE if max(widths) > 1 else SIDECAR_SCHEMA
+
+
 def _engine_path(config):
     path = Path(config.engine.path)
     if path.is_file():
@@ -218,6 +254,7 @@ def _engine_path(config):
 
 
 def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
+    width, depth = _root_teacher(root, config)
     repetition = validate_root(root, sidecar)
     if sidecar.engine != engine_name:
         raise CollectionError(f"Engine name differs for root {root['root_id']}")
@@ -225,20 +262,20 @@ def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
         sidecar.value_mate != teacher[0] or sidecar.max_ply != teacher[1]
     ):
         raise CollectionError(f"Teacher constants differ for root {root['root_id']}")
-    if sidecar.search_start["depth"] != config.search.depth:
+    if sidecar.search_start["depth"] != depth:
         raise CollectionError(f"Requested depth differs for root {root['root_id']}")
-    if sidecar.search_end["depth"] != config.search.depth:
+    if sidecar.search_end["depth"] != depth:
         raise CollectionError(f"Search did not complete for root {root['root_id']}")
     if sidecar.session["options"]["threads"] != config.search.threads:
         raise CollectionError(f"Thread count differs for root {root['root_id']}")
     if sidecar.session["options"]["hash_mb"] != config.search.hash_mb:
         raise CollectionError(f"Hash size differs for root {root['root_id']}")
-    if sidecar.session["options"]["multipv"] != config.search.teacher_width:
+    if sidecar.configured_width != width:
         raise CollectionError(f"Teacher width differs for root {root['root_id']}")
     return repetition
 
 
-def _run_engine(engine_path, fen, config, trace_path, depth, timeout=900):
+def _run_engine(engine_path, fen, config, trace_path, width, depth, timeout=900):
     """Drive one engine over raw UCI in the contract's exact command order.
 
     python-chess manages MultiPV itself and refuses to configure it, so the
@@ -290,7 +327,7 @@ def _run_engine(engine_path, fen, config, trace_path, depth, timeout=900):
             raise CollectionError(f"Engine does not expose TraceLog: {engine_path}")
         send(f"setoption name Threads value {config.search.threads}")
         send(f"setoption name Hash value {config.search.hash_mb}")
-        send(f"setoption name MultiPV value {config.search.teacher_width}")
+        send(f"setoption name MultiPV value {width}")
         send(f"setoption name TraceLog value {trace_path}")
         send("isready")
         read_until("readyok", deadline)
@@ -321,12 +358,11 @@ def collect_root(root, output, config, engine_path, engine_name=None, teacher=No
     temporary = directory / ".sidecar.jsonl.tmp"
     if temporary.exists():
         temporary.unlink()
-    bestmove = _run_engine(
-        engine_path, root["fen"], config, temporary, config.search.depth
-    )
+    width, depth = _root_teacher(root, config)
+    bestmove = _run_engine(engine_path, root["fen"], config, temporary, width, depth)
     if not temporary.exists():
         raise CollectionError(f"Engine wrote no sidecar for root {root['root_id']}")
-    sidecar = load_sidecar(temporary, teacher_width=config.search.teacher_width)
+    sidecar = load_sidecar(temporary, teacher_width=width)
     if engine_name is not None and sidecar.engine != engine_name:
         raise CollectionError(f"Engine name differs for root {root['root_id']}")
     _check_sidecar(root, sidecar, config, sidecar.engine, teacher)
@@ -345,9 +381,7 @@ def collect_root(root, output, config, engine_path, engine_name=None, teacher=No
         "contract_sha256": None,
         "value_mate": sidecar.value_mate,
         "max_ply": sidecar.max_ply,
-        "schema_version": SIDECAR_SCHEMA
-        if config.search.teacher_width == 1
-        else SIDECAR_SCHEMA_WIDE,
+        "schema_version": SIDECAR_SCHEMA if width == 1 else SIDECAR_SCHEMA_WIDE,
     }
     write_manifest(directory / "meta.json", meta)
     return meta
@@ -375,6 +409,14 @@ def _write_roots(output, roots):
     return {"path": path.name, "rows": len(roots), "sha256": content_sha256(roots)}
 
 
+def _selection_record(root):
+    return {
+        key: value
+        for key, value in root.items()
+        if key not in {"teacher_width", "depth"}
+    }
+
+
 def _load_roots(output, selection, roots):
     path = _roots_path(output)
     if path.exists():
@@ -383,18 +425,20 @@ def _load_roots(output, selection, roots):
             for line in path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        if content_sha256(existing) != content_sha256(roots):
+        if content_sha256(
+            [_selection_record(root) for root in existing]
+        ) != content_sha256([_selection_record(root) for root in roots]):
             raise CollectionError("Existing root selection differs from this run")
         return {
             "path": path.name,
             "rows": len(existing),
             "sha256": content_sha256(existing),
-        }
-    return _write_roots(output, roots)
+        }, existing
+    return _write_roots(output, roots), roots
 
 
 def _static_identity(config, selection, roots_identity, engine, teacher):
-    return {
+    identity = {
         "teacher": teacher,
         "engine": engine,
         "config": {
@@ -408,6 +452,9 @@ def _static_identity(config, selection, roots_identity, engine, teacher):
         "root_selection": selection,
         "roots": roots_identity,
     }
+    if config.recipe is not None:
+        identity["recipe"] = config.recipe.identity()
+    return identity
 
 
 def _write_collection(output, identity, sidecars):
@@ -443,7 +490,18 @@ def collect(
     for path in (engine_path, instrumentation_path, control_path, contract_path):
         if not path.is_file():
             raise FileNotFoundError(path)
-    roots_identity = _load_roots(output, selection, roots)
+    sampled = apply_recipe(roots, config, selection["seed"])
+    roots_identity, roots = _load_roots(output, selection, sampled)
+    if config.recipe is not None:
+        missing = [
+            root["root_id"]
+            for root in roots
+            if "teacher_width" not in root or "depth" not in root
+        ]
+        if missing:
+            raise CollectionError(
+                f"Existing roots have no recipe samples: {missing[0]}"
+            )
     roots_by_id = {root["root_id"]: root for root in roots}
     if len(roots_by_id) != len(roots):
         raise CollectionError("Selected roots contain duplicate ids")
@@ -461,9 +519,7 @@ def collect(
         "control": {"path": str(control_path), "sha256": sha256(control_path)},
     }
     teacher = {
-        "schema_version": SIDECAR_SCHEMA
-        if config.search.teacher_width == 1
-        else SIDECAR_SCHEMA_WIDE,
+        "schema_version": _teacher_schema(roots, config),
         "contract": str(contract_path),
         "contract_sha256": sha256(contract_path),
         "value_mate": previous.get("teacher", {}).get("value_mate"),
@@ -506,20 +562,14 @@ def collect(
             .read_text(encoding="utf-8")
             .splitlines()[0]
         )["engine"]
-        session = load_sidecar(
-            output / "roots" / first["root_id"] / "sidecar.jsonl",
-            teacher_width=config.search.teacher_width,
-        )
+        session = load_sidecar(output / "roots" / first["root_id"] / "sidecar.jsonl")
         teacher["value_mate"] = session.value_mate
         teacher["max_ply"] = session.max_ply
         if not teacher["value_mate"] or not teacher["max_ply"]:
             raise CollectionError("The first sidecar has no mate constants")
     elif sidecars:
         sample_id = next(iter(sidecars))
-        sample = load_sidecar(
-            output / "roots" / sample_id / "sidecar.jsonl",
-            teacher_width=config.search.teacher_width,
-        )
+        sample = load_sidecar(output / "roots" / sample_id / "sidecar.jsonl")
         engine_identity["name"] = sample.engine
         teacher["value_mate"] = sample.value_mate
         teacher["max_ply"] = sample.max_ply

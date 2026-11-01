@@ -184,6 +184,11 @@ class Sidecar:
         return self.search_start["multi_pv"]
 
     @property
+    def configured_width(self):
+        """The MultiPV value the engine was configured with for this root."""
+        return self.session["options"]["multipv"]
+
+    @property
     def value_mate(self):
         return self.session["value_mate"]
 
@@ -594,10 +599,32 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
     )
 
 
-def load_sidecar(path, teacher_width=1):
+def _sidecar_configured_width(lines, source):
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SynthesisError(f"{source}:{index}: invalid JSON") from error
+        if not isinstance(event, dict) or event.get("type") != "session":
+            raise SynthesisError(f"{source}: session must be first")
+        options = event.get("options")
+        width = options.get("multipv") if isinstance(options, dict) else None
+        if not isinstance(width, int) or isinstance(width, bool) or width < 1:
+            raise SynthesisError(f"{source}: session has no valid multipv")
+        return width
+    raise SynthesisError(f"{source}: empty sidecar")
+
+
+def load_sidecar(path, teacher_width=None):
+    """Load a sidecar, inferring the configured width from its session line."""
     path = Path(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if teacher_width is None:
+        teacher_width = _sidecar_configured_width(lines, str(path))
     return parse_sidecar(
-        path.read_text(encoding="utf-8").splitlines(),
+        lines,
         teacher_width=teacher_width,
         source=str(path),
     )
@@ -1243,7 +1270,7 @@ class _Synthesis:
         return {
             "rounds": len(audits),
             "depth": audits[-1].depth,
-            "teacher_width": self.config.search.teacher_width,
+            "teacher_width": self.sidecar.configured_width,
             "champions": champions,
             "overturned_rounds": len(changes),
             "overturn_rate": len(changes) / max(len(audits) - 1, 1),
@@ -1291,6 +1318,14 @@ def validate_root(root, sidecar):
             raise SynthesisError("root position_key differs from the sidecar FEN")
     if repetition != int(root["repetition"]):
         raise SynthesisError("root repetition is invalid")
+    if "teacher_width" in root:
+        width = _number(root["teacher_width"], "root.teacher_width", 1)
+        if width != sidecar.configured_width:
+            raise SynthesisError("root teacher width differs from the sidecar")
+    if "depth" in root:
+        depth = _number(root["depth"], "root.depth", 1)
+        if depth != sidecar.search_start["depth"]:
+            raise SynthesisError("root depth differs from the sidecar")
     return repetition
 
 
@@ -1299,10 +1334,6 @@ def synthesize_root(sidecar, root, config, seed=None):
     validate_root(root, sidecar)
     if sidecar.search_start["depth"] != sidecar.round_ends[-1]["depth"]:
         raise SynthesisError("the recorded search did not complete its requested depth")
-    if sidecar.search_start["depth"] != config.search.depth:
-        raise SynthesisError(
-            "the sidecar depth differs from the configured collection depth"
-        )
     return _Synthesis(sidecar, root, config, seed).synthesize()
 
 
