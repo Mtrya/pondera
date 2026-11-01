@@ -150,6 +150,42 @@ class GenerationTests(unittest.TestCase):
         writer.move("c2c4")
         self.assertIn(REFUTED, set(legal_tokens(writer, final_allowed=True)))
 
+    def test_assess_replays_with_the_declared_teacher_width(self):
+        board = chess.Board(chess.STARTING_FEN)
+        legal = sorted(move.uci() for move in board.legal_moves)
+        writer = TraceWriter(chess.STARTING_FEN, teacher_width=1)
+        writer.depth()
+        writer.move(legal[0])
+        writer.evaluate(value=0.1)
+        writer.reset()
+        writer.move(legal[1])
+        writer.refuted()
+        writer.reset()
+        writer.final(legal[2])
+        writer.final_evaluate(value=0.1)
+        writer.end()
+        tokens = tuple(int(token) for token in writer.tokens)
+        final_start = tokens.index(FINAL)
+
+        def trace(teacher_width):
+            return GeneratedTrace(
+                chess.STARTING_FEN,
+                1,
+                writer.mirrored,
+                tokens,
+                final_start,
+                STOP_FINAL,
+                legal[2],
+                (),
+                (),
+                teacher_width,
+            )
+
+        # The refutation follows one exact child, which is legal at width one
+        # and illegal at width three: replay must use the declared width.
+        self.assertTrue(assess(trace(1)).structural)
+        self.assertFalse(assess(trace(3)).structural)
+
     def test_black_to_move_legal_tokens_use_the_canonical_frame(self):
         writer = TraceWriter(BLACK_TO_MOVE)
         writer.depth()

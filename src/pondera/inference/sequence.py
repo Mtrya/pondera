@@ -27,6 +27,7 @@ callers score any legal target move without another forward pass.
 import math
 from dataclasses import dataclass
 
+import chess
 import numpy as np
 import torch
 
@@ -106,14 +107,22 @@ def autonomous(safety_cap: int) -> GenerationProtocol:
 
 @dataclass(frozen=True)
 class RootPosition:
-    """One frozen root position and its repetition count."""
+    """One frozen root position, its repetition count, and teacher width."""
 
     fen: str
     repetition: int = 1
+    teacher_width: int = 1
 
     def __post_init__(self):
         if self.repetition < 1:
             raise ValueError("Root repetition must be positive")
+        if self.teacher_width < 1:
+            raise ValueError("Teacher width must be positive")
+
+
+def _effective_teacher_width(root_fen: str, teacher_width: int) -> int:
+    """The engine's width: the configured width capped by the legal root moves."""
+    return min(teacher_width, chess.Board(root_fen).legal_moves.count())
 
 
 @dataclass(frozen=True)
@@ -137,6 +146,7 @@ class GeneratedTrace:
     final_move: str
     root_move_tokens: tuple
     root_move_log_probs: tuple
+    teacher_width: int = 1
 
 
 @dataclass(frozen=True)
@@ -187,8 +197,13 @@ class _GenerationRow:
     def __init__(self, root: RootPosition, protocol: GenerationProtocol):
         self.fen = root.fen
         self.repetition = root.repetition
+        self.teacher_width = root.teacher_width
         self.protocol = protocol
-        self.writer = TraceWriter(root.fen, root.repetition)
+        self.writer = TraceWriter(
+            root.fen,
+            root.repetition,
+            teacher_width=_effective_teacher_width(root.fen, root.teacher_width),
+        )
         self.decision_tokens = self.writer.decision_tokens
         self.root_move_tokens = tuple(
             sorted(token for token in self.decision_tokens if token != CLAIM_DRAW)
@@ -244,6 +259,7 @@ class _GenerationRow:
             self.final_move,
             self.root_move_tokens,
             self.root_move_log_probs,
+            self.teacher_width,
         )
 
 
@@ -371,7 +387,12 @@ def _first_round(program):
 def assess(trace: GeneratedTrace) -> TraceAssessment:
     """Replay a generated trace and derive its rule-checked facts."""
     try:
-        program = replay(trace.tokens, trace.root_fen, trace.repetition)
+        program = replay(
+            trace.tokens,
+            trace.root_fen,
+            trace.repetition,
+            teacher_width=_effective_teacher_width(trace.root_fen, trace.teacher_width),
+        )
     except TraceError as error:
         return TraceAssessment(False, str(error), None, 0, 0, 0, 0, 0, None, None)
     structural = program.final_move == trace.final_move
@@ -455,22 +476,36 @@ def budget_grid(lengths_by_teacher) -> tuple:
     return tuple(sorted(points))
 
 
-def model_token_count(tokens, root_fen: str, repetition: int = 1) -> int:
+def model_token_count(
+    tokens, root_fen: str, repetition: int = 1, teacher_width: int = 1
+) -> int:
     """Tokens the model generated: everything except BOARD responses.
 
     A BOARD request stays in the count because the model emitted it; its
     response is external context.
     """
-    program = replay(tokens, root_fen, repetition)
+    program = replay(
+        tokens,
+        root_fen,
+        repetition,
+        teacher_width=_effective_teacher_width(root_fen, teacher_width),
+    )
     removed = sum(
         step.end - step.start - 1 for step in program.steps if step.operation == "board"
     )
     return len(program.tokens) - removed
 
 
-def no_tool_token_count(tokens, root_fen: str, repetition: int = 1) -> int:
+def no_tool_token_count(
+    tokens, root_fen: str, repetition: int = 1, teacher_width: int = 1
+) -> int:
     """Tokens of the BOARD-free copy: requests and responses both removed."""
-    program = replay(tokens, root_fen, repetition)
+    program = replay(
+        tokens,
+        root_fen,
+        repetition,
+        teacher_width=_effective_teacher_width(root_fen, teacher_width),
+    )
     removed = sum(
         step.end - step.start for step in program.steps if step.operation == "board"
     )
