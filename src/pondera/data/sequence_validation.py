@@ -493,7 +493,8 @@ def _check_champion_round(root_id, entry, board, value_mate, max_ply):
     if not isinstance(candidates, list) or not candidates:
         raise ValueError(f"Champion round has no exact candidates: {root_id}")
     seen_moves = set()
-    best = None
+    champion_raw = None
+    best_raw = None
     for candidate in candidates:
         if set(candidate) != {
             "move",
@@ -539,11 +540,18 @@ def _check_champion_round(root_id, entry, board, value_mate, max_ply):
             )
         if candidate["value_token"] != expected:
             raise ValueError(f"Champion candidate token disagrees: {root_id}")
-        key = (candidate["raw"], -candidate["order"])
-        if best is None or key > best[0]:
-            best = (key, candidate["move"])
-    if best[1] != move:
-        raise ValueError(f"Champion is not the raw-argmax candidate: {root_id}")
+        if candidate["move"] == move:
+            champion_raw = candidate["raw"]
+        if best_raw is None or candidate["raw"] > best_raw:
+            best_raw = candidate["raw"]
+    # Equal root values are possible; the engine's rank names one of the tied
+    # maximums, and its tie-break is not carried by the trace.
+    if champion_raw is None:
+        raise ValueError(f"Champion move is not a written candidate: {root_id}")
+    if champion_raw != entry["raw"]:
+        raise ValueError(f"Champion raw disagrees with its candidate: {root_id}")
+    if best_raw != champion_raw:
+        raise ValueError(f"Champion is not a raw maximum among the candidates: {root_id}")
 
 
 def mate_token_for(mate):
@@ -583,7 +591,12 @@ def _expected_states(program, tokens, champions, mirrored):
                     round_candidates[move] = candidate
                     best = max(
                         round_candidates.values(),
-                        key=lambda candidate: (candidate["raw"], -candidate["order"]),
+                        key=lambda candidate: (
+                            candidate["raw"],
+                            -candidate["order"],
+                            candidate["move"],
+                            candidate["value_token"],
+                        ),
                     )
                     current = (
                         _move_token(best["move"], mirrored),
