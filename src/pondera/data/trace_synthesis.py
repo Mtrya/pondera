@@ -1037,13 +1037,21 @@ class _Synthesis:
                     raise SynthesisError(
                         "a rank entry has no written exact root candidate"
                     )
-            best_move = max(
-                self.state.current_round.items(),
-                key=lambda item: (item[1][0], -item[1][2]),
-            )[0]
-            if best_move != top["move"]:
+            # The engine's rank is the authoritative order (docs/teacher.md).
+            # Equal root values are possible, and the engine breaks the tie with
+            # a previous-iteration score that the trace does not carry, so the
+            # written candidates can only be required to agree on values: the
+            # champion is a written maximum, and nothing written exceeds it.
+            if self.state.current_round[top["move"]][0] != top["raw"]:
                 raise SynthesisError(
-                    "the written root candidates do not reproduce the round champion"
+                    "the written value of the round champion differs from the rank"
+                )
+            written_max = max(
+                value[0] for value in self.state.current_round.values()
+            )
+            if written_max > top["raw"]:
+                raise SynthesisError(
+                    "a written root candidate exceeds the round champion"
                 )
             raw, wdl = top["raw"], top.get("wdl")
             token = _thought_token(

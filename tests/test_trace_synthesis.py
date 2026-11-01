@@ -331,6 +331,69 @@ class SynthesisTests(unittest.TestCase):
                 self.assertEqual(full.final_move, deepest["move"])
                 self.assertEqual(program.final_move, deepest["move"])
 
+    def test_wide_tie_defers_to_the_engine_rank(self):
+        directory = FIXTURES / "middlegame_black_w3"
+        events = [
+            json.loads(line)
+            for line in (directory / "sidecar.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+
+        def event(**fields):
+            matches = [
+                item
+                for item in events
+                if all(item.get(key) == value for key, value in fields.items())
+            ]
+            self.assertEqual(len(matches), 1, fields)
+            return matches[0]
+
+        # Round one ranks f6e4 (-2360) over c5f2 (-2458). Give the rank to
+        # c5f2 and make the values equal: c5f2 is written after f6e4, so the
+        # written values alone cannot name the champion. The engine's rank is
+        # the authoritative order (docs/teacher.md); its tie-break is not
+        # carried by the trace.
+        promote = event(
+            type="candidate", round=1, attempt=2, call="promote", move="c5f2"
+        )
+        promote["raw"], promote["cp"] = 2360, 624
+        frontier = event(type="frontier", round=1, attempt=2, path=["c5f2"])
+        frontier["raw"], frontier["cp"] = 2360, 624
+        attempt = event(type="attempt", round=1, attempt=2)
+        attempt["raw"], attempt["cp"] = -2360, -624
+        end = event(type="round_end", round=1)
+        rank = {entry["move"]: entry for entry in end["rank"]}
+        rank["c5f2"].update(raw=-2360, cp=-624)
+        end["rank"] = [rank["c5f2"], rank["f6e4"], rank["c6d4"]]
+
+        sidecar = parse_sidecar(
+            [json.dumps(item, separators=(",", ":")) for item in events],
+            teacher_width=3,
+        )
+        root = json.loads((directory / "root.json").read_text(encoding="utf-8"))
+        config = load_config()
+        config = dataclasses.replace(
+            config,
+            search=dataclasses.replace(
+                config.search,
+                depth=W3_CASES["middlegame_black_w3"],
+                teacher_width=3,
+            ),
+        )
+        synthesized = synthesize_root(sidecar, root, config, seed=640)
+        first = synthesized.round_audits[0]
+        self.assertEqual(first.move, "c5f2")
+        self.assertEqual(first.move, end["rank"][0]["move"])
+        written = {candidate.move: candidate.raw for candidate in first.candidates}
+        self.assertEqual(written["c5f2"], written["f6e4"])
+        replay(
+            synthesized.rows["full"].tokens,
+            root["fen"],
+            root["repetition"],
+            teacher_width=3,
+        )
+
     def test_wide_teacher_mate_suffix_matches_the_deepest_rank(self):
         sidecar, root, synthesized = synthesize_case("mate_in_1_w3", teacher_width=3)
         full = synthesized.rows["full"]
