@@ -3,6 +3,7 @@ import json
 import unittest
 from pathlib import Path
 
+import chess
 from trace_fixtures import tie_sidecar_lines
 
 from pondera.chess.codec import mate_token, value_bin
@@ -41,6 +42,7 @@ CASES = {
 W3_CASES = {
     "middlegame_black_w3": 4,
     "mate_in_1_w3": 4,
+    "two_moves_w3": 4,
 }
 
 
@@ -330,16 +332,43 @@ class SynthesisTests(unittest.TestCase):
                 sidecar, root, synthesized = synthesize_case(name, teacher_width=3)
                 full = synthesized.rows["full"]
                 program = replay(
-                    full.tokens, root["fen"], root["repetition"], teacher_width=3
+                    full.tokens,
+                    root["fen"],
+                    root["repetition"],
+                    teacher_width=sidecar.width,
                 )
                 for audit, end in zip(synthesized.round_audits, sidecar.round_ends):
                     written = {candidate.move for candidate in audit.candidates}
                     for entry in end["rank"]:
                         self.assertIn(entry["move"], written)
-                    self.assertGreaterEqual(len(written), 3)
+                    self.assertGreaterEqual(len(written), sidecar.width)
                 deepest = sidecar.round_ends[-1]["rank"][0]
                 self.assertEqual(full.final_move, deepest["move"])
                 self.assertEqual(program.final_move, deepest["move"])
+
+    def test_wide_teacher_width_is_capped_by_the_legal_root_moves(self):
+        sidecar, root, synthesized = synthesize_case("two_moves_w3", teacher_width=3)
+        board = chess.Board(root["fen"])
+        self.assertFalse(board.is_checkmate() or board.is_stalemate())
+        self.assertEqual(board.legal_moves.count(), 2)
+        self.assertEqual(sidecar.events[0]["schema"], 4)
+        self.assertEqual(sidecar.session["options"]["multipv"], 3)
+        self.assertEqual(sidecar.search_start["multi_pv"], 2)
+        self.assertEqual(sidecar.width, 2)
+        self.assertEqual(set(synthesized.rows), set(PRESENTATIONS))
+        for row in synthesized.rows.values():
+            replay(
+                row.tokens,
+                root["fen"],
+                root["repetition"],
+                teacher_width=sidecar.width,
+            )
+        for end in sidecar.round_ends:
+            self.assertEqual(len(end["rank"]), sidecar.width)
+        self.assertEqual(
+            [audit.move for audit in synthesized.round_audits],
+            [end["rank"][0]["move"] for end in sidecar.round_ends],
+        )
 
     def test_wide_tie_defers_to_the_engine_rank(self):
         directory = FIXTURES / "middlegame_black_w3"

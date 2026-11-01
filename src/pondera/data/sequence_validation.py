@@ -675,6 +675,7 @@ def _validate_shard_rows(
         board = chess.Board(row["fen"])
         if board.turn != (row["turn"] == "white"):
             raise ValueError(f"Root turn disagrees with FEN: {root_id}")
+        effective_width = min(teacher_width, board.legal_moves.count())
         repetition = row["repetition"]
         if not _is_int(repetition, 1) or repetition > 4:
             raise ValueError(f"Root repetition is out of range: {root_id}")
@@ -701,7 +702,7 @@ def _validate_shard_rows(
             tokens,
             row["fen"],
             repetition,
-            teacher_width=teacher_width,
+            teacher_width=effective_width,
         )
         if not np.array_equal(program.roles, arrays["trace_roles"][index, :length]):
             raise ValueError(f"Trace roles disagree with replay: {root_id}")
@@ -720,7 +721,7 @@ def _validate_shard_rows(
             no_tool_tokens,
             row["fen"],
             repetition,
-            teacher_width=teacher_width,
+            teacher_width=effective_width,
         )
         expected_boundaries = []
         operation = 0

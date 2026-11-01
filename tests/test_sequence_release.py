@@ -36,6 +36,7 @@ CASES = (
 W3_CASES = (
     "middlegame_black_w3",
     "mate_in_1_w3",
+    "two_moves_w3",
 )
 ENGINE_SHA256 = "52498f1a544a7c238c9c6db0614aa5821877b83d157db167d931ec56f4525761"
 WIDE_ENGINE_SHA256 = "1420c314729fa3d40d6e2fda2834d44f422902d9b0d37c5d0fe1bf5d5f1f845b"

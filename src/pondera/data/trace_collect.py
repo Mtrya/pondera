@@ -218,7 +218,7 @@ def _engine_path(config):
 
 
 def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
-    repetition = validate_root(root, sidecar, config.search.teacher_width)
+    repetition = validate_root(root, sidecar)
     if sidecar.engine != engine_name:
         raise CollectionError(f"Engine name differs for root {root['root_id']}")
     if teacher is not None and (

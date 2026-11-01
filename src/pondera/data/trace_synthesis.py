@@ -161,7 +161,7 @@ def _legal_line(root_fen, repetition, moves, stop_at_terminal=True):
 
 @dataclass(frozen=True)
 class Sidecar:
-    """A validated schema-3 record, indexed by event type."""
+    """A validated schema-3 or schema-4 record, indexed by event type."""
 
     events: tuple
     session: dict
@@ -177,6 +177,11 @@ class Sidecar:
     @property
     def fen(self):
         return self.position["fen"]
+
+    @property
+    def width(self):
+        """The effective teacher width: min(configured width, legal root moves)."""
+        return self.search_start["multi_pv"]
 
     @property
     def value_mate(self):
@@ -196,7 +201,12 @@ class Sidecar:
 
 
 def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
-    """Parse and independently validate one sidecar JSONL stream."""
+    """Parse and independently validate one sidecar JSONL stream.
+
+    ``teacher_width`` is the configured MultiPV value. The engine caps each
+    search at the number of legal root moves and records the capped value as
+    the effective width; ``Sidecar.width`` exposes it.
+    """
     if teacher_width < 1:
         raise SynthesisError("teacher width must be at least one")
     expected_schema = SIDECAR_SCHEMA if teacher_width == 1 else SIDECAR_SCHEMA_WIDE
@@ -257,9 +267,18 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
         raise SynthesisError("position.fen is not a valid FEN") from error
     if root_board.is_checkmate() or root_board.is_stalemate():
         raise SynthesisError("a terminal root is not a valid trace root")
+    # The engine caps MultiPV at the number of legal root moves and records the
+    # capped value as the effective width of the search.
+    effective_width = min(teacher_width, root_board.legal_moves.count())
     depth = _number(search_start.get("depth"), "search_start.depth", 1)
-    if search_start.get("multi_pv") != teacher_width:
-        raise SynthesisError("search_start.multi_pv differs from the teacher width")
+    _number(search_start.get("multi_pv"), "search_start.multi_pv", 1)
+    if search_start["multi_pv"] != effective_width:
+        raise SynthesisError(
+            "search_start.multi_pv differs from the capped teacher width"
+        )
+    # The schema and the presence of line numbers follow the configured width;
+    # the line and rank bounds follow the effective width.
+    configured_wide = teacher_width > 1
 
     round_starts = [event for event in events if event["type"] == "round_start"]
     attempts = [event for event in events if event["type"] == "attempt"]
@@ -304,10 +323,10 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
             raise SynthesisError("attempt references an unknown round")
         _number(event.get("attempt"), "attempt.attempt", 1)
         line = event.get("line")
-        if teacher_width > 1:
+        if configured_wide:
             if line is None:
                 raise SynthesisError("a wide-teacher attempt has no line")
-            _number(line, "attempt.line", 0, teacher_width - 1)
+            _number(line, "attempt.line", 0, effective_width - 1)
         elif line is not None:
             raise SynthesisError("a width-one attempt carries a line")
         alpha, beta = _window(event.get("window"), "attempt.window")
@@ -327,7 +346,7 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
                 f"round {round_number} attempts are not contiguous from one"
             )
         _number(end_event.get("attempt"), "round_end.attempt", 1)
-        if teacher_width > 1:
+        if configured_wide:
             if end_event["attempt"] != len(round_attempts):
                 raise SynthesisError(
                     f"round {round_number} does not count its attempts"
@@ -338,6 +357,10 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
             if sorted(by_line) != list(range(len(by_line))):
                 raise SynthesisError(
                     f"round {round_number} lines are not contiguous from zero"
+                )
+            if len(by_line) != effective_width:
+                raise SynthesisError(
+                    f"round {round_number} does not run its effective width"
                 )
             for line, line_attempts in by_line.items():
                 exact = [event for event in line_attempts if event["bound"] == "exact"]
@@ -356,14 +379,14 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
                 raise SynthesisError(
                     f"round {round_number} does not accept its exact attempt"
                 )
-        if teacher_width > 1:
+        if configured_wide:
             accepted_by_round[round_number] = {
                 line: line_attempts[-1] for line, line_attempts in by_line.items()
             }
         else:
             accepted_by_round[round_number] = {0: exact[0]}
         rank = end_event.get("rank")
-        if not isinstance(rank, list) or not rank or len(rank) > teacher_width:
+        if not isinstance(rank, list) or len(rank) != effective_width:
             raise SynthesisError(f"round {round_number} rank is invalid")
         previous_raw = None
         for entry in rank:
@@ -800,10 +823,10 @@ class _Synthesis:
         self.writer = TraceWriter(
             sidecar.fen,
             int(root["repetition"]),
-            teacher_width=config.search.teacher_width,
+            teacher_width=sidecar.width,
         )
         self.tracker = PathTracker(sidecar.fen, int(root["repetition"]))
-        self.state = _RootState(self.writer.mirrored, config.search.teacher_width)
+        self.state = _RootState(self.writer.mirrored, sidecar.width)
         self.board_rng = random.Random(f"{self.seed}:{root['root_id']}:board")
         self.boundaries = []
         self.previous_len = 0
@@ -939,7 +962,7 @@ class _Synthesis:
         self._write_eval(token)
 
     def _write_children(self, round_number, attempt, parent, candidates, groups):
-        needed = self.config.search.teacher_width if parent == () else 1
+        needed = self.sidecar.width if parent == () else 1
         exact_written = 0
         for candidate in candidates:
             if candidate.exact is not None:
@@ -999,8 +1022,9 @@ class _Synthesis:
                 self.tracker.reset()
                 self._record()
         # Refutations come after all W exact values, and the only evidence is
-        # a null-window fail-low in the last line's accepted pass, whose window
-        # brackets the final W-th value.
+        # a null-window fail-low in the last line's accepted pass. Its window
+        # is that line's best-so-far, the leading score line when the
+        # statement is written (D18), not necessarily the W-th value.
         last_attempt = accepted[max(accepted)]
         for candidate in _candidate_groups(
             self.sidecar, round_number, last_attempt
@@ -1031,7 +1055,7 @@ class _Synthesis:
             self.current_refutations = 0
             self._record()
             self._recorded_root_candidates = []
-            if self.config.search.teacher_width == 1:
+            if self.sidecar.width == 1:
                 groups = _candidate_groups(
                     self.sidecar, round_number, round_end["attempt"]
                 )
@@ -1248,7 +1272,7 @@ class _Synthesis:
         }
 
 
-def validate_root(root, sidecar, teacher_width=1):
+def validate_root(root, sidecar):
     """Check root metadata against its sidecar and the collection contract."""
     if root.get("fen") != sidecar.fen:
         raise SynthesisError("root metadata FEN differs from the sidecar")
@@ -1272,7 +1296,7 @@ def validate_root(root, sidecar, teacher_width=1):
 
 def synthesize_root(sidecar, root, config, seed=None):
     """Synthesize one root, its four presentation rows, and its audit trail."""
-    validate_root(root, sidecar, config.search.teacher_width)
+    validate_root(root, sidecar)
     if sidecar.search_start["depth"] != sidecar.round_ends[-1]["depth"]:
         raise SynthesisError("the recorded search did not complete its requested depth")
     if sidecar.search_start["depth"] != config.search.depth:
