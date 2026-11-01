@@ -31,6 +31,7 @@ from pondera.data.trace import (
 from pondera.data.trace_synthesis import (
     PRESENTATIONS,
     SIDECAR_SCHEMA,
+    SIDECAR_SCHEMA_WIDE,
     mate_distance_moves,
 )
 
@@ -134,7 +135,7 @@ def _release_identity_contract(release, root_count):
     teacher = metadata["teacher"]
     if not isinstance(teacher, dict) or set(teacher) != TEACHER_FIELDS:
         raise ValueError("Release teacher identity is incomplete")
-    if teacher["schema_version"] != SIDECAR_SCHEMA:
+    if teacher["schema_version"] not in (SIDECAR_SCHEMA, SIDECAR_SCHEMA_WIDE):
         raise ValueError("Release teacher schema is unsupported")
     if not isinstance(teacher["contract"], str):
         raise ValueError("Release teacher contract path is invalid")
@@ -172,8 +173,10 @@ def _release_identity_contract(release, root_count):
         raise ValueError("Release identity has incomplete search settings")
     if not _is_int(search["depth"], 1) or not _is_int(search["hash_mb"], 1):
         raise ValueError("Release search limits are invalid")
-    if search["teacher_width"] != 1:
-        raise ValueError("Release teacher width must be one")
+    if not _is_int(search["teacher_width"], 1):
+        raise ValueError("Release teacher width is invalid")
+    if (teacher["schema_version"] == SIDECAR_SCHEMA) != (search["teacher_width"] == 1):
+        raise ValueError("Release teacher schema differs from the teacher width")
     if search["threads"] != 1:
         raise ValueError("Release must use one search thread")
     if search["fresh_engine_per_root"] is not True:

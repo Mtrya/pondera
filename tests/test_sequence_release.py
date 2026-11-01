@@ -26,31 +26,42 @@ CASES = (
     "claim_draw_d4",
     "stalemate_d4",
 )
+W3_CASES = (
+    "middlegame_black_w3",
+    "mate_in_1_w3",
+)
 ENGINE_SHA256 = "52498f1a544a7c238c9c6db0614aa5821877b83d157db167d931ec56f4525761"
+WIDE_ENGINE_SHA256 = "1420c314729fa3d40d6e2fda2834d44f422902d9b0d37c5d0fe1bf5d5f1f845b"
 INSTRUMENTATION_SHA256 = (
     "a8ff707418c820f6f5ad411a2744141286c5d86e4b67553f2373a8c6f4128a67"
+)
+WIDE_INSTRUMENTATION_SHA256 = (
+    "4edea22f905407cbc749e3bc8c3784ecb5de781ec1ed54e37c6dc23b42af3b53"
 )
 CONTROL_SHA256 = "3116251d2cdf84f710b7fe27a037d0b0a390f1f379fb1f32aeace2f41f095b34"
 
 
-def config_text():
-    return (
+def config_text(width=1):
+    text = (
         Path("configs/trace_v2.toml")
         .read_text(encoding="utf-8")
         .replace("depth = 16", "depth = 4")
     )
+    if width != 1:
+        text = text.replace("teacher_width = 1", f"teacher_width = {width}")
+    return text
 
 
-def build_run(directory):
+def build_run(directory, cases=CASES, width=1):
     directory = Path(directory)
     config_path = directory / "trace_v2.toml"
-    config_path.write_text(config_text(), encoding="utf-8")
+    config_path.write_text(config_text(width), encoding="utf-8")
     config = load_config(config_path)
     run = directory / "run"
     (run / "roots").mkdir(parents=True)
     roots = []
     mapping = {}
-    for case in CASES:
+    for case in cases:
         fixture = FIXTURES / case
         root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
         roots.append(root)
@@ -65,13 +76,13 @@ def build_run(directory):
     )
     write_manifest(run / "sidecars.json", mapping)
     session = json.loads(
-        (FIXTURES / CASES[0] / "sidecar.jsonl")
+        (FIXTURES / cases[0] / "sidecar.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()[0]
     )
     identity = {
         "teacher": {
-            "schema_version": 3,
+            "schema_version": 3 if width == 1 else 4,
             "contract": "docs/teacher.md",
             "contract_sha256": sha256("docs/teacher.md"),
             "value_mate": session["value_mate"],
@@ -79,9 +90,11 @@ def build_run(directory):
         },
         "engine": {
             "name": session["engine"],
-            "sha256": ENGINE_SHA256,
+            "sha256": ENGINE_SHA256 if width == 1 else WIDE_ENGINE_SHA256,
             "instrumentation": "instrumentation.patch",
-            "instrumentation_sha256": INSTRUMENTATION_SHA256,
+            "instrumentation_sha256": INSTRUMENTATION_SHA256
+            if width == 1
+            else WIDE_INSTRUMENTATION_SHA256,
             "control": {"path": "control", "sha256": CONTROL_SHA256},
         },
         "config": {"path": str(config_path), "sha256": sha256(config_path)},
@@ -307,6 +320,33 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(row["mate_distance"], None)
         claim = json.loads((FIXTURES / "claim_draw_d4" / "root.json").read_text())
         self.assertEqual(claim_roots, {claim["root_id"]})
+
+
+class WideReleaseTests(unittest.TestCase):
+    def test_wide_teacher_release_and_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, roots, collection_path, run = build_run(
+                directory, cases=W3_CASES, width=3
+            )
+            _collection, selected, identity, base = load_collection(collection_path)
+            self.assertEqual(selected, roots)
+            produce_shards(
+                roots,
+                base,
+                base / "release",
+                config,
+                identity,
+                contract_path=Path("docs/teacher.md"),
+                shard_size=1,
+                workers=1,
+            )
+            release = load_manifest(base / "release" / "release.json")
+            self.assertEqual(release["teacher"]["schema_version"], 4)
+            self.assertEqual(release["search"]["teacher_width"], 3)
+            self.assertEqual(release["engine"]["sha256"], WIDE_ENGINE_SHA256)
+            validation = validate_release(base / "release", roots, workers=1)
+            self.assertTrue(validation["ok"])
+            self.assertEqual(validation["rows"], len(W3_CASES) * len(PRESENTATIONS))
 
 
 if __name__ == "__main__":

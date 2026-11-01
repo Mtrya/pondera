@@ -28,6 +28,7 @@ from pondera.data.trace_config import DEFAULT_TEACHER_PATH
 from pondera.data.trace_synthesis import (
     PRESENTATIONS,
     SIDECAR_SCHEMA,
+    SIDECAR_SCHEMA_WIDE,
     load_sidecar,
     profile_roots,
     synthesize_root,
@@ -73,7 +74,7 @@ def _root_row(root, synthesized, presentation):
     payload = {
         "root_id": root["root_id"],
         "presentation": presentation,
-        "teacher_width": 1,
+        "teacher_width": synthesized.stats["teacher_width"],
         "depth": synthesized.stats["depth"],
         "rounds": row.rounds,
         "thinking_tokens": row.thinking_tokens,
@@ -299,7 +300,10 @@ def _verify_identity(identity, roots, sidecar_dir, config, contract_path):
         raise ValueError("Release synthesis settings differ from the configuration")
     if identity["config"].get("sha256") != sha256(config.source_path):
         raise ValueError("Release configuration checksum differs from the file")
-    if identity["teacher"].get("schema_version") != SIDECAR_SCHEMA:
+    expected_schema = (
+        SIDECAR_SCHEMA if config.search.teacher_width == 1 else SIDECAR_SCHEMA_WIDE
+    )
+    if identity["teacher"].get("schema_version") != expected_schema:
         raise ValueError("Release teacher schema is unsupported")
     if identity["teacher"].get("contract_sha256") != sha256(contract_path):
         raise ValueError("Release teacher contract checksum differs from the file")

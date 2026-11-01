@@ -40,6 +40,7 @@ from pondera.chess.vocabulary import (
 from pondera.data.trace import CLAIM_DRAW_UCI, DRAW_CLAIM_BOUND, TraceWriter
 
 SIDECAR_SCHEMA = 3
+SIDECAR_SCHEMA_WIDE = 4  # MultiPV teacher: per-line attempts (docs/teacher.md)
 PRESENTATIONS = ("zero", "full", "random", "last_root")
 EVENT_TYPES = frozenset(
     {
@@ -196,8 +197,9 @@ class Sidecar:
 
 def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
     """Parse and independently validate one sidecar JSONL stream."""
-    if teacher_width != 1:
-        raise SynthesisError("sidecar translation is defined for teacher width one")
+    if teacher_width < 1:
+        raise SynthesisError("teacher width must be at least one")
+    expected_schema = SIDECAR_SCHEMA if teacher_width == 1 else SIDECAR_SCHEMA_WIDE
     events = []
     for index, line in enumerate(lines, 1):
         if not line.strip():
@@ -208,7 +210,7 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
             raise SynthesisError(f"{source}:{index}: invalid JSON") from error
         if not isinstance(event, dict):
             raise SynthesisError(f"{source}:{index}: event is not an object")
-        if event.get("schema") != SIDECAR_SCHEMA:
+        if event.get("schema") != expected_schema:
             raise SynthesisError(f"{source}:{index}: unsupported schema")
         if event.get("seq") != index:
             raise SynthesisError(
@@ -295,11 +297,19 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
         raise SynthesisError("a round is deeper than the requested depth")
 
     attempts_by_round = {round_number: [] for round_number in rounds}
+    accepted_by_round = {}
     for event in attempts:
         round_number = _number(event.get("round"), "attempt.round", 1)
         if round_number not in attempts_by_round:
             raise SynthesisError("attempt references an unknown round")
         _number(event.get("attempt"), "attempt.attempt", 1)
+        line = event.get("line")
+        if teacher_width > 1:
+            if line is None:
+                raise SynthesisError("a wide-teacher attempt has no line")
+            _number(line, "attempt.line", 0, teacher_width - 1)
+        elif line is not None:
+            raise SynthesisError("a width-one attempt carries a line")
         alpha, beta = _window(event.get("window"), "attempt.window")
         raw, cp, wdl = _check_cp_wdl(event, value_mate, max_ply, "attempt")
         bound = event.get("bound")
@@ -311,16 +321,47 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
         round_attempts = attempts_by_round[round_number]
         if not round_attempts:
             raise SynthesisError(f"round {round_number} has no attempt")
-        exact = [event for event in round_attempts if event["bound"] == "exact"]
-        if len(exact) != 1:
+        numbers = [event["attempt"] for event in round_attempts]
+        if numbers != list(range(1, len(numbers) + 1)):
             raise SynthesisError(
-                f"round {round_number} has {len(exact)} exact attempts"
-            )
-        if end_event.get("attempt") != exact[0]["attempt"]:
-            raise SynthesisError(
-                f"round {round_number} does not accept its exact attempt"
+                f"round {round_number} attempts are not contiguous from one"
             )
         _number(end_event.get("attempt"), "round_end.attempt", 1)
+        if teacher_width > 1:
+            if end_event["attempt"] != len(round_attempts):
+                raise SynthesisError(
+                    f"round {round_number} does not count its attempts"
+                )
+            by_line = {}
+            for event in round_attempts:
+                by_line.setdefault(event["line"], []).append(event)
+            if sorted(by_line) != list(range(len(by_line))):
+                raise SynthesisError(
+                    f"round {round_number} lines are not contiguous from zero"
+                )
+            for line, line_attempts in by_line.items():
+                exact = [event for event in line_attempts if event["bound"] == "exact"]
+                if len(exact) != 1 or exact[0] is not line_attempts[-1]:
+                    raise SynthesisError(
+                        f"round {round_number} line {line} does not accept "
+                        "exactly its last attempt"
+                    )
+        else:
+            exact = [event for event in round_attempts if event["bound"] == "exact"]
+            if len(exact) != 1:
+                raise SynthesisError(
+                    f"round {round_number} has {len(exact)} exact attempts"
+                )
+            if end_event.get("attempt") != exact[0]["attempt"]:
+                raise SynthesisError(
+                    f"round {round_number} does not accept its exact attempt"
+                )
+        if teacher_width > 1:
+            accepted_by_round[round_number] = {
+                line: line_attempts[-1] for line, line_attempts in by_line.items()
+            }
+        else:
+            accepted_by_round[round_number] = {0: exact[0]}
         rank = end_event.get("rank")
         if not isinstance(rank, list) or not rank or len(rank) > teacher_width:
             raise SynthesisError(f"round {round_number} rank is invalid")
@@ -341,13 +382,15 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
         top_raw, top_cp, top_wdl = _check_cp_wdl(
             top, value_mate, max_ply, "round_end.rank[0]"
         )
-        accepted = exact[0]
-        if top_raw != accepted["raw"]:
-            raise SynthesisError("rank[0].raw differs from the accepted attempt")
-        if "cp" in accepted and top_cp != accepted["cp"]:
-            raise SynthesisError("rank[0].cp differs from the accepted attempt")
-        if "wdl" in accepted and list(top_wdl) != list(accepted["wdl"]):
-            raise SynthesisError("rank[0].wdl differs from the accepted attempt")
+        establishing = max(
+            accepted_by_round[round_number].values(), key=lambda event: event["raw"]
+        )
+        if top_raw != establishing["raw"]:
+            raise SynthesisError("rank[0].raw differs from the accepted attempts")
+        if "cp" in establishing and top_cp != establishing["cp"]:
+            raise SynthesisError("rank[0].cp differs from the accepted attempts")
+        if "wdl" in establishing and list(top_wdl) != list(establishing["wdl"]):
+            raise SynthesisError("rank[0].wdl differs from the accepted attempts")
 
     # Every candidate and frontier belongs to an attempt of its round.
     for event in events:
@@ -453,10 +496,12 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
     # A root null-window fail-high must be re-searched in the same attempt.
     for end_event in round_ends:
         round_number = end_event["round"]
-        accepted = end_event["attempt"]
+        accepted = {
+            event["attempt"] for event in accepted_by_round[round_number].values()
+        }
         groups = {}
         for event in candidates:
-            if event["round"] == round_number and event["attempt"] == accepted:
+            if event["round"] == round_number and event["attempt"] in accepted:
                 groups.setdefault((tuple(event["path"]), event["move"]), []).append(
                     event
                 )
@@ -476,32 +521,34 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
                     "a root null-window fail-high has no full-window follow-up"
                 )
 
-    # The accepted root call establishes the round value exactly.
+    # Every rank entry has an exact establishing call in an accepted pass.
     for end_event in round_ends:
         round_number = end_event["round"]
-        accepted = end_event["attempt"]
-        top = end_event["rank"][0]
-        establishing = [
-            event
-            for event in candidates
-            if event["round"] == round_number
-            and event["attempt"] == accepted
-            and event["ply"] == 1
-            and event["move"] == top["move"]
-            and event["call"] in {"first", "promote"}
-            and event["bound"] == "exact"
-        ]
-        if not establishing:
-            raise SynthesisError("the root establishing call is not exact")
-        call = establishing[-1]
-        if call["raw"] != -top["raw"]:
-            raise SynthesisError("the root establishing call does not negate rank[0]")
-        if call.get("pv") != top.get("pv"):
-            raise SynthesisError("the root establishing call pv differs from rank[0]")
-        # No wdl symmetry is asserted here: candidate wdl is child-relative and
-        # rank wdl root-relative, and the engine's win-rate model scales with
-        # the material of the position it describes, so a capture's child wdl
-        # is not the exact mirror of the root wdl (docs/teacher.md).
+        accepted = {
+            event["attempt"] for event in accepted_by_round[round_number].values()
+        }
+        for top in end_event["rank"]:
+            establishing = [
+                event
+                for event in candidates
+                if event["round"] == round_number
+                and event["attempt"] in accepted
+                and event["ply"] == 1
+                and event["move"] == top["move"]
+                and event["call"] in {"first", "promote"}
+                and event["bound"] == "exact"
+            ]
+            if not establishing:
+                raise SynthesisError("a rank entry has no exact establishing call")
+            call = establishing[-1]
+            if call["raw"] != -top["raw"]:
+                raise SynthesisError("an establishing call does not negate its rank")
+            if call.get("pv") != top.get("pv"):
+                raise SynthesisError("an establishing call pv differs from its rank")
+            # No wdl symmetry is asserted here: candidate wdl is child-relative and
+            # rank wdl root-relative, and the engine's win-rate model scales with
+            # the material of the position it describes, so a capture's child wdl
+            # is not the exact mirror of the root wdl (docs/teacher.md).
 
     if search_end.get("bestmove") is None:
         raise SynthesisError("search_end has no bestmove")
@@ -912,6 +959,53 @@ class _Synthesis:
                 continue
             self.omitted["bound"] += 1
 
+    def _write_wide_round(self, round_number):
+        attempts = [
+            event for event in self.sidecar.attempts if event["round"] == round_number
+        ]
+        accepted = {}
+        for event in attempts:
+            accepted[event["line"]] = event["attempt"]
+        # A root candidate is narrated once, from the accepted pass of the
+        # line that produced its last exact call of the round.
+        last_exact = {}
+        for attempt in accepted.values():
+            for candidate in _candidate_groups(self.sidecar, round_number, attempt).get(
+                (), []
+            ):
+                if candidate.exact is not None:
+                    last_exact[candidate.move] = attempt
+        for line in sorted(accepted):
+            attempt = accepted[line]
+            groups = _candidate_groups(self.sidecar, round_number, attempt)
+            for candidate in groups.get((), []):
+                if candidate.exact is None or last_exact[candidate.move] != attempt:
+                    continue
+                self._write_exact_child(round_number, attempt, candidate, groups)
+                self.writer.reset()
+                self.tracker.reset()
+                self._record()
+        # Refutations come after all W exact values, and the only evidence is
+        # a null-window fail-low in the last line's accepted pass, whose window
+        # brackets the final W-th value.
+        last_attempt = accepted[max(accepted)]
+        for candidate in _candidate_groups(
+            self.sidecar, round_number, last_attempt
+        ).get((), []):
+            if candidate.move in last_exact:
+                continue
+            if candidate.refuted is None:
+                self.omitted["bound"] += 1
+                continue
+            self._write_move(candidate.move, spine=False)
+            self.writer.refuted()
+            self.refutations += 1
+            self.current_refutations += 1
+            self._record()
+            self.writer.reset()
+            self.tracker.reset()
+            self._record()
+
     def synthesize(self):
         self._recorded_root_candidates = []
         for round_start, round_end in zip(
@@ -923,20 +1017,26 @@ class _Synthesis:
             self.plies_since_board = 0
             self.current_refutations = 0
             self._record()
-            groups = _candidate_groups(self.sidecar, round_number, round_end["attempt"])
             self._recorded_root_candidates = []
-            self._write_children(
-                round_number,
-                round_end["attempt"],
-                (),
-                groups.get((), []),
-                groups,
-            )
-            top = round_end["rank"][0]
-            if top["move"] not in self.state.current_round:
-                raise SynthesisError(
-                    "the round champion has no written exact root candidate"
+            if self.config.search.teacher_width == 1:
+                groups = _candidate_groups(
+                    self.sidecar, round_number, round_end["attempt"]
                 )
+                self._write_children(
+                    round_number,
+                    round_end["attempt"],
+                    (),
+                    groups.get((), []),
+                    groups,
+                )
+            else:
+                self._write_wide_round(round_number)
+            top = round_end["rank"][0]
+            for entry in round_end["rank"]:
+                if entry["move"] not in self.state.current_round:
+                    raise SynthesisError(
+                        "a rank entry has no written exact root candidate"
+                    )
             best_move = max(
                 self.state.current_round.items(),
                 key=lambda item: (item[1][0], -item[1][2]),
@@ -1100,6 +1200,7 @@ class _Synthesis:
         return {
             "rounds": len(audits),
             "depth": audits[-1].depth,
+            "teacher_width": self.config.search.teacher_width,
             "champions": champions,
             "overturned_rounds": len(changes),
             "overturn_rate": len(changes) / max(len(audits) - 1, 1),
@@ -1147,8 +1248,6 @@ def validate_root(root, sidecar, teacher_width=1):
             raise SynthesisError("root position_key differs from the sidecar FEN")
     if repetition != int(root["repetition"]):
         raise SynthesisError("root repetition is invalid")
-    if teacher_width != 1:
-        raise SynthesisError("teacher width one is required")
     return repetition
 
 

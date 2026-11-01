@@ -179,11 +179,6 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     fresh = search["fresh_engine_per_root"]
     if not isinstance(fresh, bool):
         raise ValueError("[search] fresh_engine_per_root must be a boolean")
-    if width != 1:
-        raise ValueError(
-            "teacher_width must be 1: the instrumented record is defined only "
-            "for MultiPV one, and wider translation is not calibrated"
-        )
     if threads != 1:
         raise ValueError("threads must be 1 for a reproducible search record")
     if not fresh:

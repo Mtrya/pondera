@@ -1,0 +1,13 @@
+{
+  "root_id": "5ac5f4093256fc9a7e31d03070ba295f94b5d09f1ddbca44c2a66ec7d1e8f01d",
+  "split": "train",
+  "fen": "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1",
+  "repetition": 1,
+  "turn": "white",
+  "position_key": "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - -",
+  "source": {
+    "case": "mate_in_1_w3",
+    "depth": 4,
+    "teacher_width": 3
+  }
+}

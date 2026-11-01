@@ -49,7 +49,7 @@ class ConfigTests(unittest.TestCase):
     def test_rejects_unknown_and_inconsistent_values(self):
         text = config_text()
         self.check_rejected(text.replace("[engine]", "[engine]\nunknown = 1"))
-        self.check_rejected(text.replace("teacher_width = 1", "teacher_width = 2"))
+        self.check_rejected(text.replace("teacher_width = 1", 'teacher_width = "a"'))
         self.check_rejected(text.replace("threads = 1", "threads = 2"))
         self.check_rejected(
             text.replace(

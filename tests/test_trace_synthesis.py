@@ -6,7 +6,7 @@ from pathlib import Path
 from pondera.chess.codec import mate_token, value_bin
 from pondera.chess.tracker import PathTracker
 from pondera.chess.vocabulary import DEPTH, END, FINAL, VALUE
-from pondera.data.trace import replay
+from pondera.data.trace import DRAW_CLAIM_BOUND, replay
 from pondera.data.trace_config import load_config
 from pondera.data.trace_synthesis import (
     PRESENTATIONS,
@@ -28,21 +28,28 @@ CASES = {
     "rule_draw_d4": 4,
     "stalemate_d4": 4,
 }
+W3_CASES = {
+    "middlegame_black_w3": 4,
+    "mate_in_1_w3": 4,
+}
 
 
-def load_case(name):
+def load_case(name, teacher_width=1):
     directory = FIXTURES / name
-    sidecar = load_sidecar(directory / "sidecar.jsonl")
+    sidecar = load_sidecar(directory / "sidecar.jsonl", teacher_width=teacher_width)
     root = json.loads((directory / "root.json").read_text(encoding="utf-8"))
     return sidecar, root
 
 
-def synthesize_case(name, seed=640):
-    sidecar, root = load_case(name)
+def synthesize_case(name, seed=640, teacher_width=1):
+    sidecar, root = load_case(name, teacher_width)
     config = load_config()
+    depth = CASES.get(name, W3_CASES.get(name))
     config = dataclasses.replace(
         config,
-        search=dataclasses.replace(config.search, depth=CASES[name]),
+        search=dataclasses.replace(
+            config.search, depth=depth, teacher_width=teacher_width
+        ),
     )
     return sidecar, root, synthesize_root(sidecar, root, config, seed=seed)
 
@@ -242,7 +249,7 @@ class SynthesisTests(unittest.TestCase):
                 deepest = sidecar.round_ends[-1]["rank"][0]
                 if full.claim_draw:
                     self.assertEqual(full.final_move, "<claim_draw>")
-                    self.assertLessEqual(deepest["raw"], 0)
+                    self.assertLessEqual(deepest["raw"], DRAW_CLAIM_BOUND)
                 else:
                     self.assertEqual(full.final_move, deepest["move"])
                 final_start = full.thinking_tokens
@@ -306,6 +313,40 @@ class SynthesisTests(unittest.TestCase):
         self.assertTrue(full.claim_draw)
         self.assertEqual(full.final_move, "<claim_draw>")
         replay(full.tokens, root["fen"], root["repetition"], teacher_width=1)
+
+    def test_wide_teacher_writes_one_exact_line_per_pv_line(self):
+        for name in W3_CASES:
+            with self.subTest(case=name):
+                sidecar, root, synthesized = synthesize_case(name, teacher_width=3)
+                full = synthesized.rows["full"]
+                program = replay(
+                    full.tokens, root["fen"], root["repetition"], teacher_width=3
+                )
+                for audit, end in zip(synthesized.round_audits, sidecar.round_ends):
+                    written = {candidate.move for candidate in audit.candidates}
+                    for entry in end["rank"]:
+                        self.assertIn(entry["move"], written)
+                    self.assertGreaterEqual(len(written), 3)
+                deepest = sidecar.round_ends[-1]["rank"][0]
+                self.assertEqual(full.final_move, deepest["move"])
+                self.assertEqual(program.final_move, deepest["move"])
+
+    def test_wide_teacher_mate_suffix_matches_the_deepest_rank(self):
+        sidecar, root, synthesized = synthesize_case("mate_in_1_w3", teacher_width=3)
+        full = synthesized.rows["full"]
+        deepest = sidecar.round_ends[-1]["rank"][0]
+        self.assertEqual(
+            full.mate_distance, mate_distance_moves(deepest["raw"], 32000, 246)
+        )
+        self.assertEqual(full.final_value_bin, 19 if deepest["raw"] > 0 else 0)
+
+    def test_schema_must_match_the_teacher_width(self):
+        for name in W3_CASES:
+            with self.subTest(case=name):
+                with self.assertRaises(SynthesisError):
+                    load_case(name)
+        with self.assertRaises(SynthesisError):
+            load_case("start_d4", teacher_width=3)
         sidecar, root, synthesized = synthesize_case("middlegame_black_d4")
         self.assertEqual(root["turn"], "black")
         full = synthesized.rows["full"]
