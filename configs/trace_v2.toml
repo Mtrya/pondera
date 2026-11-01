@@ -66,6 +66,22 @@ fresh_engine_per_root = true
 # of the data identity, only as an execution detail.
 workers = 8
 
+# Optional per-root recipe. Without a [recipe] table every root uses the
+# [search] teacher_width and depth, and the release writes all four
+# presentations, so an unchanged file reproduces the existing pipeline.
+# With the table, each distribution is sampled once per root from
+# random.Random(f"{seed}:{root_id}:<table>"), where seed is the [smoke] seed.
+# Width and depth are chosen before the engine starts, recorded per root, and
+# used for that root's MultiPV and go depth; presentation selects one row at
+# release time instead of writing all four. The three tables are independent;
+# an omitted table falls back to the [search] width, the [search] depth, or
+# all four presentations. Each table's probabilities must sum to 1. Width and
+# depth keys are positive integers; presentation keys are zero, full, random.
+# [recipe]
+# widths = {1 = 0.50, 3 = 0.50}
+# depths = {16 = 1.0}
+# presentations = {zero = 0.10, full = 0.60, random = 0.30}
+
 [board]
 # Per-ply hazard of inserting a BOARD observation on the downward spine. After
 # each written spine move, measured from the previous observation or from the

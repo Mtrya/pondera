@@ -2,11 +2,17 @@ import json
 import os
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 from pondera.data.storage import sha256
 from pondera.data.trace_collect import CollectionError, collect, select_roots
-from pondera.data.trace_config import load_config
+from pondera.data.trace_config import (
+    load_config,
+    sample_depth,
+    sample_presentation,
+    sample_width,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
 
@@ -18,6 +24,90 @@ def config_text(depth=None, engine=None):
     if engine is not None:
         text = text.replace('path = "stockfish"', f'path = "{engine}"')
     return text
+
+
+RECIPE_TEXT = """
+[recipe]
+widths = {1 = 0.25, 3 = 0.75}
+depths = {8 = 0.5, 16 = 0.5}
+presentations = {zero = 0.2, full = 0.5, random = 0.3}
+"""
+
+
+class RecipeConfigTests(unittest.TestCase):
+    def load(self, text):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.toml"
+            path.write_text(text, encoding="utf-8")
+            return load_config(path)
+
+    def test_default_config_has_no_recipe(self):
+        self.assertIsNone(load_config().recipe)
+
+    def test_recipe_distributions_are_sampled_deterministically(self):
+        config = self.load(config_text() + RECIPE_TEXT)
+        self.assertEqual(
+            config.recipe.identity(),
+            {
+                "widths": {"1": 0.25, "3": 0.75},
+                "depths": {"8": 0.5, "16": 0.5},
+                "presentations": {"zero": 0.2, "full": 0.5, "random": 0.3},
+            },
+        )
+        self.assertEqual(config.recipe.widest(config.search.teacher_width), 3)
+        roots = [f"root-{index}" for index in range(10000)]
+        widths = Counter(sample_width(config.recipe, 640, root, 1) for root in roots)
+        depths = Counter(sample_depth(config.recipe, 640, root, 16) for root in roots)
+        presentations = Counter(
+            sample_presentation(config.recipe, 640, root) for root in roots
+        )
+        self.assertAlmostEqual(widths[1] / len(roots), 0.25, delta=0.02)
+        self.assertAlmostEqual(widths[3] / len(roots), 0.75, delta=0.02)
+        self.assertAlmostEqual(depths[8] / len(roots), 0.5, delta=0.02)
+        self.assertAlmostEqual(depths[16] / len(roots), 0.5, delta=0.02)
+        self.assertAlmostEqual(presentations["zero"] / len(roots), 0.2, delta=0.02)
+        self.assertAlmostEqual(presentations["full"] / len(roots), 0.5, delta=0.02)
+        self.assertAlmostEqual(presentations["random"] / len(roots), 0.3, delta=0.02)
+        root = "stable-root"
+        self.assertEqual(
+            sample_width(config.recipe, 640, root, 1),
+            sample_width(config.recipe, 640, root, 1),
+        )
+        changed = sum(
+            sample_width(config.recipe, 1, key, 1)
+            != sample_width(config.recipe, 2, key, 1)
+            for key in roots[:64]
+        )
+        self.assertGreater(changed, 0)
+
+    def test_omitted_recipe_tables_fall_back_to_search_settings(self):
+        config = self.load(config_text() + "\n[recipe]\nwidths = {3 = 1.0}\n")
+        self.assertEqual(config.recipe.identity(), {"widths": {"3": 1.0}})
+        self.assertEqual(sample_width(config.recipe, 640, "root", 1), 3)
+        self.assertEqual(sample_depth(config.recipe, 640, "root", 16), 16)
+        self.assertIsNone(sample_presentation(config.recipe, 640, "root"))
+        self.assertFalse(config.recipe.samples_presentations())
+
+    def test_rejects_invalid_recipes(self):
+        base = config_text()
+        cases = [
+            base + "\n[recipe]\n",
+            base + "\n[recipe]\nfoo = 1\n",
+            base + "\n[recipe]\nwidths = {1 = 0.5}\n",
+            base + "\n[recipe]\nwidths = {1 = -0.1, 3 = 1.1}\n",
+            base + "\n[recipe]\nwidths = {0 = 1.0}\n",
+            base + "\n[recipe]\nwidths = {1 = 0.5, 3 = 0.5}\ndepths = {16 = 0.5}\n",
+            base + "\n[recipe]\npresentations = {last_root = 1.0}\n",
+            base + "\n[recipe]\npresentations = {foo = 1.0}\n",
+            base + "\n[recpe]\n",
+        ]
+        for text in cases:
+            with self.subTest(recipe=text.rsplit("[recipe]", 1)[-1]):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "trace.toml"
+                    path.write_text(text, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_config(path)
 
 
 class ConfigTests(unittest.TestCase):

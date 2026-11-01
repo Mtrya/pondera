@@ -1,6 +1,8 @@
 """Validated TOML configuration for trace-v2 collection and synthesis."""
 
 import math
+import random
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +31,11 @@ _SECTIONS = {
     },
     "synthesis": {"confirmatory_repetition", "claim_draw"},
     "smoke": {"roots", "seed", "output"},
+    "recipe": {"widths", "depths", "presentations"},
 }
+_OPTIONAL_SECTIONS = {"recipe"}
+_RECIPE_PRESENTATIONS = ("zero", "full", "random")
+_DIGITS = re.compile(r"^[1-9][0-9]*$")
 
 
 def _reject_unknown(section, values):
@@ -98,6 +104,119 @@ class PresentationConfig:
 
 
 @dataclass(frozen=True)
+class RecipeConfig:
+    """Optional per-root distributions over teacher width, depth, presentation."""
+
+    widths: tuple = None
+    depths: tuple = None
+    presentations: tuple = None
+
+    def identity(self):
+        payload = {}
+        for name, distribution in (
+            ("widths", self.widths),
+            ("depths", self.depths),
+            ("presentations", self.presentations),
+        ):
+            if distribution is not None:
+                payload[name] = {
+                    str(key): probability for key, probability in distribution
+                }
+        return payload
+
+    def widest(self, default_width):
+        return max((key for key, _ in self.widths), default=default_width)
+
+    def samples_presentations(self):
+        return self.presentations is not None
+
+
+def _recipe_key(name, value):
+    if not isinstance(value, str) or not _DIGITS.match(value):
+        raise ValueError(f"[recipe] {name} keys must be positive integers")
+    return int(value)
+
+
+def _presentation_key(name, value):
+    if value not in _RECIPE_PRESENTATIONS:
+        raise ValueError(f"[recipe] {name} keys must be one of {_RECIPE_PRESENTATIONS}")
+    return value
+
+
+def _recipe_distribution(name, values, key_parser):
+    if not isinstance(values, dict) or not values:
+        raise ValueError(f"[recipe] {name} must be a nonempty table")
+    distribution = {}
+    for raw_key, probability in values.items():
+        key = key_parser(name, raw_key)
+        if key in distribution:
+            raise ValueError(f"[recipe] {name} repeats a key")
+        distribution[key] = _probability("recipe", f"{name}.{raw_key}", probability)
+    total = sum(distribution.values())
+    if not math.isclose(total, 1.0, abs_tol=1e-9):
+        raise ValueError(f"[recipe] {name} probabilities must sum to 1")
+    return tuple(sorted(distribution.items()))
+
+
+def parse_recipe(values):
+    """Validate one recipe table, whether from TOML or a release manifest."""
+    if not isinstance(values, dict):
+        raise ValueError("[recipe] must be a table")
+    unknown = set(values) - _SECTIONS["recipe"]
+    if unknown:
+        raise ValueError(f"Unknown config key in [recipe]: {sorted(unknown)[0]}")
+    if not values:
+        raise ValueError("[recipe] must define at least one distribution")
+    return RecipeConfig(
+        widths=_recipe_distribution("widths", values["widths"], _recipe_key)
+        if "widths" in values
+        else None,
+        depths=_recipe_distribution("depths", values["depths"], _recipe_key)
+        if "depths" in values
+        else None,
+        presentations=_recipe_distribution(
+            "presentations", values["presentations"], _presentation_key
+        )
+        if "presentations" in values
+        else None,
+    )
+
+
+def sample_distribution(rng, distribution):
+    """Draw one key from a frozen sorted distribution."""
+    roll = rng.random()
+    cumulative = 0.0
+    for key, probability in distribution:
+        cumulative += probability
+        if roll < cumulative:
+            return key
+    return distribution[-1][0]
+
+
+def sample_width(recipe, seed, root_id, default_width):
+    """Sample the configured width for one root, independent of other tables."""
+    if recipe is None or recipe.widths is None:
+        return default_width
+    return sample_distribution(random.Random(f"{seed}:{root_id}:width"), recipe.widths)
+
+
+def sample_depth(recipe, seed, root_id, default_depth):
+    """Sample the search depth for one root, independent of other tables."""
+    if recipe is None or recipe.depths is None:
+        return default_depth
+    return sample_distribution(random.Random(f"{seed}:{root_id}:depth"), recipe.depths)
+
+
+def sample_presentation(recipe, seed, root_id):
+    """Sample the release presentation for one root, or None for all four."""
+    if recipe is None or recipe.presentations is None:
+        return None
+    return sample_distribution(
+        random.Random(f"{seed}:{root_id}:presentation"), recipe.presentations
+    )
+
+
+@dataclass(frozen=True)
 class SynthesisConfig:
     confirmatory_repetition: str
     claim_draw: bool
@@ -119,6 +238,7 @@ class TraceConfig:
     synthesis: SynthesisConfig
     smoke: SmokeConfig
     source_path: Path
+    recipe: RecipeConfig = None
 
     def search_dict(self):
         return {
@@ -160,12 +280,14 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     unknown = set(values) - set(_SECTIONS)
     if unknown:
         raise ValueError(f"Unknown config section: {sorted(unknown)[0]}")
-    for section in _SECTIONS:
+    for section in set(_SECTIONS) - _OPTIONAL_SECTIONS:
         if section not in values:
             raise ValueError(f"Missing config section: [{section}]")
         if not isinstance(values[section], dict):
             raise ValueError(f"Config section [{section}] must be a table")
         _reject_unknown(section, values[section])
+    if "recipe" in values and not isinstance(values["recipe"], dict):
+        raise ValueError("Config section [recipe] must be a table")
 
     engine = values["engine"]
     if not isinstance(engine["path"], str) or not engine["path"]:
@@ -219,6 +341,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     if not isinstance(smoke["output"], str) or not smoke["output"]:
         raise ValueError("[smoke] output must be a nonempty string")
 
+    recipe = parse_recipe(values["recipe"]) if "recipe" in values else None
     return TraceConfig(
         engine=EngineConfig(engine["path"]),
         search=SearchConfig(depth, width, threads, hash_mb, fresh, workers),
@@ -236,4 +359,5 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         ),
         smoke=SmokeConfig(roots, seed, smoke["output"]),
         source_path=path,
+        recipe=recipe,
     )
