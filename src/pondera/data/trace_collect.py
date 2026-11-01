@@ -461,7 +461,9 @@ def collect(
         "control": {"path": str(control_path), "sha256": sha256(control_path)},
     }
     teacher = {
-        "schema_version": SIDECAR_SCHEMA,
+        "schema_version": SIDECAR_SCHEMA
+        if config.search.teacher_width == 1
+        else SIDECAR_SCHEMA_WIDE,
         "contract": str(contract_path),
         "contract_sha256": sha256(contract_path),
         "value_mate": previous.get("teacher", {}).get("value_mate"),
