@@ -139,6 +139,24 @@ class SequenceTrainingTests(unittest.TestCase):
         self.assertEqual(checkpoint["step"], 4)
         self.assertEqual(checkpoint["examples_seen"], 16)
 
+    def test_microbatch_regrouping_keeps_the_token_mean_objective(self):
+        full = replace(
+            self.config,
+            batch_size=2,
+            accumulation_steps=1,
+            epochs=1,
+            val_every=100,
+            save_every=100,
+        )
+        split = replace(full, batch_size=1, accumulation_steps=2)
+        first = read_checkpoint(train(full, self.data, self.root / "regroup-full"))
+        second = read_checkpoint(train(split, self.data, self.root / "regroup-split"))
+        difference = max(
+            float((first["model_state_dict"][name] - value).abs().max())
+            for name, value in second["model_state_dict"].items()
+        )
+        self.assertLess(difference, 1e-5)
+
     def test_direct_answer_dataset_trains(self):
         data = self.root / "data-direct"
         write_sequence_dataset(

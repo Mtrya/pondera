@@ -384,7 +384,7 @@ def train(
     @torch.no_grad()
     def evaluate(data, indices, prefix):
         model.eval()
-        loss_sum, correct, count = 0.0, 0, 0
+        loss_sum, token_count, correct, count = 0.0, 0, 0, 0
         role_totals = {name: [0.0, 0] for name in ROLE_LOSS_NAMES}
         for start in range(0, len(indices), config.batch_size):
             selected = indices[start : start + config.batch_size]
@@ -393,8 +393,9 @@ def train(
                 for key, value in eval_collate([data[i] for i in selected]).items()
             }
             with autocast():
-                loss, ce, logits, _ = trace_loss_parts(model, inputs)
-            loss_sum += float(loss) * len(selected)
+                _, ce, logits, generated = trace_loss_parts(model, inputs)
+            loss_sum += float((ce * generated).sum())
+            token_count += int(generated.sum())
             for name, (total, tokens) in role_loss_totals(
                 ce, inputs["trace_roles"]
             ).items():
@@ -413,7 +414,7 @@ def train(
             count += len(selected)
         model.train()
         values = {
-            f"{prefix}/loss": loss_sum / max(count, 1),
+            f"{prefix}/loss": loss_sum / max(token_count, 1),
             f"{prefix}/final_move_top1": correct / count,
             f"{prefix}/rows": count,
         }
@@ -523,7 +524,8 @@ def train(
                     else {}
                 ),
             )
-            loss_sum = torch.zeros((), device=device)
+            step_loss_sum = torch.zeros((), device=device)
+            step_tokens = 0
             for micro, inputs in enumerate(loader):
                 if micro >= steps_per_epoch * config.accumulation_steps:
                     break
@@ -542,11 +544,18 @@ def train(
                     for key, value in inputs.items()
                 }
                 with autocast():
-                    loss, _, _ = trace_loss(model, inputs)
-                (loss / config.accumulation_steps).backward()
-                loss_sum += loss.detach()
+                    _, ce, _, generated = trace_loss_parts(model, inputs)
+                micro_sum = (ce * generated).sum()
+                micro_sum.backward()
+                step_loss_sum += micro_sum.detach()
+                step_tokens += int(generated.sum())
                 if (micro + 1) % config.accumulation_steps:
                     continue
+                # The optimizer batch is one token-mean loss over all
+                # supervised tokens, not the mean of per-microbatch means.
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(max(step_tokens, 1))
                 token_grad = model.token_embedding.weight.grad
                 token_grad_norm = (
                     None if token_grad is None else token_grad.norm().item()
@@ -567,7 +576,7 @@ def train(
                     values = {
                         "step": step,
                         "epoch": epoch,
-                        "train/loss": (loss_sum / config.accumulation_steps).item(),
+                        "train/loss": (step_loss_sum / max(step_tokens, 1)).item(),
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/lr_fraction": optimizer.param_groups[0]["lr"]
                         / config.learning_rate,
@@ -601,7 +610,8 @@ def train(
                     print(json.dumps(values), flush=True)
                     if tracker:
                         tracker.log(values, step=step)
-                loss_sum.zero_()
+                step_loss_sum.zero_()
+                step_tokens = 0
                 if step % config.save_every == 0:
                     save(f"step-{step:06d}.pth", epoch, cursor)
                 if step >= limit or (
