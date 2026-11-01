@@ -1,14 +1,15 @@
 """Recurrent-depth supervised training with per-exit move and value targets.
 
-Follows the supervised.py training skeleton (resume, schedule, tracking) under
-the depth contract: targets are per-depth rank-1 teacher labels, supervision
+Follows the common training skeleton (resume, schedule, tracking) under the
+depth contract: targets are per-depth rank-1 teacher labels, supervision
 lands on core repetition exits chosen by the schedule, and each supervised exit
 contributes an equally weighted masked mean of move CE plus value CE. Optional
 additions per exit: a value MSE term (expectation over the value bins against
 the unquantized teacher value, mate rows excluded) and a horizon-1 future
 placement auxiliary (changed/unchanged square CE averaged with equal weight).
-This trainer intentionally duplicates the supervised.py boilerplate instead of
-sharing it: the two data and model contracts evolve independently.
+This trainer intentionally duplicates the boilerplate used by
+``training/sequence.py`` instead of sharing it: the two data and model
+contracts evolve independently.
 """
 
 import argparse

@@ -1,6 +1,6 @@
 # Repository architecture
 
-Pondera is an installable Python package rooted at `src/pondera`. It is a library: training and UCI serving expose `python -m` entry points, and experiment orchestration lives in run directories outside the package. Imports do not start engines, download checkpoints, or create outputs.
+Pondera is an installable Python package rooted at `src/pondera`. It is a library: training, trace data preparation, and UCI serving expose `python -m` entry points, and experiment orchestration lives in run directories outside the package. Imports do not start engines, download checkpoints, or create outputs.
 
 | Location | Responsibility |
 |---|---|
@@ -8,14 +8,14 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 | `models/` | Neural model and checkpoint serialization |
 | `data/` | Offline trace grammar, release validation, encoded training arrays, merge-vocabulary profiling, and root corpus construction and stratified pool sampling from game archives |
 | `training/` | Supervised optimization and resumable training state |
-| `inference/` | Legal move selection and UCI protocol |
+| `inference/` | Legal move selection, masked trace generation and budget assessment, and the UCI protocol |
 | `evaluation/` | External match orchestration and opening assets |
 | `tests/` | Behavioral and integration tests |
 | `results/` | Reviewed summaries of completed evaluations |
 
-Representation code does not import application layers. Models depend on representation, while training and inference depend on models. Training does not call search, data preparation, or evaluation code. Evaluation orchestrates inference and external engines. Data and evaluation do not import training. Import contracts enforce these boundaries.
+Representation code does not import application layers. Models depend on representation, while training and inference depend on models. Training reads encoded datasets and dataset identity checks from `data`; it does not call collection, synthesis, search, or evaluation code. Evaluation orchestrates inference and external engines. Data and evaluation do not import training. Import contracts enforce these boundaries.
 
-The board tokenizer has one format shared by offline data preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving piece placement and the first four FEN fields exactly. The fullmove counter is not encoded; halfmove clocks above 100 and repetition counts above four share their respective top atoms. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
+The board tokenizer has one format shared by offline data preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving piece placement and the first four FEN fields exactly. The fullmove counter is not encoded; halfmove clocks of 100 and above and repetition counts above four share their respective top atoms. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
 
 Token backbones compose attention blocks, repeated cores, and explicit KV access policies. Board policies attach lossless board embeddings and action/value readouts. Sequence backbones accept embeddings without prescribing thought-token semantics or training-only heads. Their contracts and examples are described in [token backbones](backbones.md).
 

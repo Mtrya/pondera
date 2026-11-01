@@ -7,7 +7,7 @@ rejects a candidate that fails its reference. ``FINAL`` is the decision point;
 the generated label suffix is the evaluation, an optional mate distance, the
 best line, and ``<end>``. ``BOARD`` is disabled here, so every generated token
 is navigation, a conclusion, the decision, or the label. The generator writes
-through ``TraceWriter.apply`` and validates the result with ``replay``, which
+through ``TraceWriter.apply``; callers validate a trace with ``assess``, which
 keeps black-to-move roots in the same canonical rank-reflected frame as
 training data. The generation mask and replay share the writer's state machine.
 

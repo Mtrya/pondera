@@ -5,8 +5,8 @@ in a1..h8 scan order, followed by eight metadata atoms: side to move, four
 castling rights, en passant, halfmove clock, and repetition count. Every atom
 is one complete statement; an empty square is the absence of an atom. The
 encoding preserves placement and the first four FEN fields exactly. The
-fullmove counter is not encoded; halfmove clocks above 100 and repetition
-counts above four share their respective top atoms.
+fullmove counter is not encoded; halfmove clocks of 100 and above and
+repetition counts above four share their respective top atoms.
 
 The id layout itself lives in `pondera.chess.vocabulary`; this module only
 converts. Value-bin boundaries and representatives are the numeric semantics
@@ -132,7 +132,7 @@ def encode_board(fen: str, repetition: int = 1) -> np.ndarray:
     """Encode a FEN as occupied-square atoms plus self-contained metadata.
 
     The fullmove counter is not part of the vocabulary; callers keep the
-    source FEN when it matters. Halfmove clocks above 100 and repetition
+    source FEN when it matters. Halfmove clocks of 100 and above and repetition
     counts above four share their respective top atoms.
     """
     placement, side, castling, ep, halfmove, fullmove = fen.split()

@@ -1,4 +1,4 @@
-"""Memory-mapped board tokens, moves, and legal action sets used by training."""
+"""Memory-mapped depth targets and sequence traces used by training."""
 
 import json
 from collections import OrderedDict

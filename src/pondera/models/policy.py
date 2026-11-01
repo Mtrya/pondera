@@ -46,8 +46,8 @@ class DepthPolicyModel(nn.Module, PyTorchModelHubMixin):
     """Recurrent-depth policy; one shared vocabulary head read at every core exit.
 
     The head spans the unified token vocabulary. The action readout consumes its
-    MOVE segment, the value readout its VALUE/MATE segment; both sit at the same
-    trailing readout positions as the fixed-depth policy. Exits are the core
+    MOVE segment, the value readout its VALUE/MATE segment; both read the two
+    trailing readout tokens appended to the board prefix. Exits are the core
     repetition boundaries in execution order; the final answer is the last exit.
     With board_aux, a shared 13-class head additionally reads every sequence
     position at each exit, predicting the square contents after replaying the

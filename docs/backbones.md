@@ -34,7 +34,7 @@ Cache entries are keyed by physical core, physical layer, and repetition. Three 
 
 These rules apply during both parallel full-sequence computation and incremental decoding. They never expose a previous token's later repetition merely because it has already been computed in a sequential execution. A cache contains projected keys and values rather than a full hidden-state trace. Current storage uses tensors padded within each batch chunk; individual inference chunks retain only executed repetitions.
 
-In evaluation mode, `prefill(board_embeddings)` returns a cache; `decode(new_embeddings, cache)` returns outputs for new tokens and an extended cache. The input cache is unchanged, allowing continuation from the same prefix. Supplying identical embedded inputs to full-sequence and cached execution should agree within numerical tolerance. The board prefix cannot attend to thoughts, and thoughts cannot attend to future thoughts. Sequence termination is handled by a designated token in the eventual thought vocabulary, not a separate sequence-length controller.
+In evaluation mode, `prefill(board_embeddings)` returns a cache; `decode(new_embeddings, cache)` returns outputs for new tokens and an extended cache. The input cache is unchanged, allowing continuation from the same prefix. Supplying identical embedded inputs to full-sequence and cached execution should agree within numerical tolerance. The board prefix cannot attend to thoughts, and thoughts cannot attend to future thoughts. Sequence termination is handled by the `<end>` trace token, not a separate sequence-length controller.
 
 ## Board policies
 
