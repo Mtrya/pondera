@@ -828,10 +828,14 @@ class _RootState:
         self.current = (_move_token(best_move, self.mirrored), best[1], best[0])
 
     def finish_round(self, move, raw, token):
-        if self.current is None or raw > self.current[2]:
-            self.previous = (_move_token(move, self.mirrored), token, raw)
-        else:
-            self.previous = self.current
+        # The round-end root evaluation refreshes the visible value even when
+        # the champion move keeps its place on an equal raw score.
+        best = (
+            _move_token(move, self.mirrored)
+            if self.current is None or raw > self.current[2]
+            else self.current[0]
+        )
+        self.previous = (best, token, raw)
         self.current = self.previous
 
     def snapshot(self):

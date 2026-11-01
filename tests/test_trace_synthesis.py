@@ -13,6 +13,7 @@ from pondera.chess.vocabulary import (
     DEPTH,
     END,
     FINAL,
+    MATE_WIN,
     MOVE,
     UCI_MOVE_TO_IDX,
     VALUE,
@@ -281,6 +282,25 @@ class SynthesisTests(unittest.TestCase):
                         value_bin((deepest["wdl"][0] - deepest["wdl"][2]) / 1000),
                     )
                     self.assertIsNone(full.mate_distance)
+
+    def test_round_end_evaluation_refreshes_the_visible_champion_value(self):
+        sidecar, root, synthesized = synthesize_case("mate_in_1_d4")
+        # Hand-derived from the fixture: all four rounds rank e1e8 at raw
+        # 31999, mate in (32000 - 31999 + 1) / 2 = 1 move, while the terminal
+        # child evaluation is mate in 0 moves. The round-end root evaluation,
+        # not the inherited child token, is the visible value at the boundary.
+        self.assertEqual(len(sidecar.round_ends), 4)
+        self.assertEqual({end["rank"][0]["raw"] for end in sidecar.round_ends}, {31999})
+        full = synthesized.rows["full"]
+        move = MOVE + UCI_MOVE_TO_IDX["e1e8"]
+        for round_number in range(1, 5):
+            values = [b.value for b in full.boundaries if b.basis == round_number]
+            self.assertIn(MATE_WIN, values)
+            self.assertEqual(values[-1], MATE_WIN + 1)
+            self.assertEqual(
+                [b.best for b in full.boundaries if b.basis == round_number][-1],
+                move,
+            )
 
     def test_claimable_root_with_a_nonpositive_value_claims_a_draw(self):
         sidecar, root, synthesized = synthesize_case("claim_draw_d4")

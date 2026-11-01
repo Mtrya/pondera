@@ -622,12 +622,13 @@ def _expected_states(program, tokens, champions, mirrored):
                     )
         elif step.operation == "evaluate" and not step.path:
             entry = entries.get(round_number)
-            if entry is not None and (current is None or entry["raw"] > current[2]):
-                current = (
-                    _move_token(entry["move"], mirrored),
-                    entry["value_token"],
-                    entry["raw"],
+            if entry is not None:
+                best = (
+                    _move_token(entry["move"], mirrored)
+                    if current is None or entry["raw"] > current[2]
+                    else current[0]
                 )
+                current = (best, entry["value_token"], entry["raw"])
             previous = current
         if current is None:
             states.append((-1, -1, round_number))
