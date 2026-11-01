@@ -23,6 +23,7 @@ from pondera.chess.vocabulary import (
 from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
 from pondera.data.trace import (
     CLAIM_DRAW_UCI,
+    DRAW_CLAIM_BOUND,
     ROLE_COUNT,
     TRACE_GRAMMAR_VERSION,
     replay,
@@ -778,7 +779,7 @@ def _validate_shard_rows(
             raise ValueError(f"Champion rounds are not contiguous: {root_id}")
         if final_move == CLAIM_DRAW_UCI:
             claimable = repetition >= 3 or board.halfmove_clock >= 100
-            if not claimable or deepest["raw"] > 0:
+            if not claimable or deepest["raw"] > DRAW_CLAIM_BOUND:
                 raise ValueError(f"Draw claim is not justified: {root_id}")
         elif final_move != deepest["move"]:
             raise ValueError(f"FINAL move differs from the deepest champion: {root_id}")

@@ -126,13 +126,16 @@ confirmatory_repetition = "faithful"
 # Root draw claims. When true and a draw is claimable at the root from the
 # source game's history (the position has occurred at least three times, or
 # the halfmove clock is at least 100) and the champion's raw root value is at
-# most zero, the final action is a draw claim with no variation. A claimable
-# but winning root keeps the normal move, evaluation, and variation. This is
-# the only action label not emitted by the engine; it is derived from rule
-# facts plus the engine's real value. False removes the label entirely,
+# most +1, the final action is a draw claim with no variation. The bound is +1
+# rather than 0 because the engine's rule-draw score is a ±1 anti-cycling
+# jitter (VALUE_DRAW - 1 + (nodes & 0x2)): the whole band means "not better
+# than a draw", so losing and draw-valued claimable roots claim, and only a
+# genuinely winning root keeps the normal move, evaluation, and variation.
+# This is the only action label not emitted by the engine; it is derived from
+# rule facts plus the engine's real value. False removes the label entirely,
 # leaving that token unsupervised and hiding the claimable-but-losing
 # contrast. The calibration probe is: claim exactly when the reported root
-# evaluation is at most zero.
+# evaluation is at most a draw (the jitter band quantizes to the zero bin).
 claim_draw = true
 
 [smoke]

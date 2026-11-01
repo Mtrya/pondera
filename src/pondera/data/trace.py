@@ -90,6 +90,11 @@ OBSERVATION_METADATA = 8
 CLAIM_DRAW_UCI = "<claim_draw>"
 CLAIM_DRAW = MOVE + UCI_MOVE_TO_IDX[CLAIM_DRAW_UCI]
 
+# The engine's rule-draw score is VALUE_DRAW - 1 + (nodes & 0x2) ∈ {-1, +1},
+# an anti-cycling jitter rather than an evaluation, so the draw-claim gate
+# treats raw values up to this bound as "not better than a draw".
+DRAW_CLAIM_BOUND = 1
+
 _THOUGHT = "thought"
 _SUFFIX = "suffix"
 _DONE = "done"

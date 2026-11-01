@@ -37,7 +37,7 @@ from pondera.chess.vocabulary import (
     UCI_MOVE_TO_IDX,
     VALUE,
 )
-from pondera.data.trace import CLAIM_DRAW_UCI, TraceWriter
+from pondera.data.trace import CLAIM_DRAW_UCI, DRAW_CLAIM_BOUND, TraceWriter
 
 SIDECAR_SCHEMA = 3
 PRESENTATIONS = ("zero", "full", "random", "last_root")
@@ -978,7 +978,11 @@ class _Synthesis:
             self.tracker.root_repetition >= 3
             or chess.Board(self.sidecar.fen).halfmove_clock >= 100
         )
-        claim = self.config.synthesis.claim_draw and claimable and top["raw"] <= 0
+        claim = (
+            self.config.synthesis.claim_draw
+            and claimable
+            and top["raw"] <= DRAW_CLAIM_BOUND
+        )
         if claim:
             self.writer.final(CLAIM_DRAW_UCI)
         else:

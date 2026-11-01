@@ -290,7 +290,22 @@ class SynthesisTests(unittest.TestCase):
         )
         self.assertIsNone(full.mate_distance)
 
-    def test_black_root_is_mirrored_but_replays_absolutely(self):
+    def test_claim_gate_treats_the_draw_score_jitter_as_a_draw(self):
+        sidecar, root, unmodified = synthesize_case("rule_draw_d4")
+        self.assertEqual(sidecar.round_ends[-1]["rank"][0]["raw"], 1)
+        # As recorded (repetition 1, halfmove 99) the root is not claimable.
+        self.assertFalse(unmodified.rows["full"].claim_draw)
+        root["repetition"] = 3
+        config = load_config()
+        config = dataclasses.replace(
+            config,
+            search=dataclasses.replace(config.search, depth=CASES["rule_draw_d4"]),
+        )
+        claimed = synthesize_root(sidecar, root, config, seed=640)
+        full = claimed.rows["full"]
+        self.assertTrue(full.claim_draw)
+        self.assertEqual(full.final_move, "<claim_draw>")
+        replay(full.tokens, root["fen"], root["repetition"], teacher_width=1)
         sidecar, root, synthesized = synthesize_case("middlegame_black_d4")
         self.assertEqual(root["turn"], "black")
         full = synthesized.rows["full"]
