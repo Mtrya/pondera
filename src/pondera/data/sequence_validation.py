@@ -568,6 +568,8 @@ def _expected_states(program, tokens, champions, mirrored):
     states = []
     round_number = 0
     round_candidates = {}
+    round_sequence = {}
+    round_count = 0
     previous = None
     current = None
     for step in program.steps:
@@ -576,6 +578,8 @@ def _expected_states(program, tokens, champions, mirrored):
         if step.operation == "depth":
             round_number += 1
             round_candidates = {}
+            round_sequence = {}
+            round_count = 0
             current = previous
         elif step.operation == "evaluate" and len(step.path) == 1:
             move = step.path[-1]
@@ -590,25 +594,30 @@ def _expected_states(program, tokens, champions, mirrored):
                     None,
                 )
                 if candidate is not None:
-                    round_candidates[move] = candidate
+                    sequence = round_sequence.get(move)
+                    if sequence is None:
+                        round_count += 1
+                        sequence = round_count
+                        round_sequence[move] = sequence
+                    round_candidates[move] = (sequence, candidate)
                     best = max(
                         round_candidates.values(),
-                        key=lambda candidate: (
-                            candidate["raw"],
-                            -candidate["order"],
-                            candidate["move"],
-                            candidate["value_token"],
-                        ),
-                    )
+                        key=lambda item: (item[1]["raw"], -item[0]),
+                    )[1]
                     current = (
                         _move_token(best["move"], mirrored),
                         best["value_token"],
+                        best["raw"],
                     )
         elif step.operation == "evaluate" and not step.path:
             entry = entries.get(round_number)
-            if entry is not None:
-                current = (_move_token(entry["move"], mirrored), entry["value_token"])
-                previous = current
+            if entry is not None and (current is None or entry["raw"] > current[2]):
+                current = (
+                    _move_token(entry["move"], mirrored),
+                    entry["value_token"],
+                    entry["raw"],
+                )
+            previous = current
         if current is None:
             states.append((-1, -1, round_number))
         else:

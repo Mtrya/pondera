@@ -750,25 +750,38 @@ class _RootState:
         self.teacher_width = teacher_width
         self.round = 0
         self.current_round = {}
+        self.round_sequence = {}
+        self.round_count = 0
         self.previous = None
         self.current = None
 
     def begin_round(self, round_number):
         self.round = round_number
         self.current_round = {}
+        self.round_sequence = {}
+        self.round_count = 0
         self.current = self.previous
 
-    def record_exact(self, move, raw, token, order):
-        self.current_round[move] = (raw, token, order)
-        candidates = [
-            (raw, -order, move, token)
-            for move, (raw, token, order) in self.current_round.items()
-        ]
-        best_raw, _, best_move, best_token = max(candidates)
-        self.current = (_move_token(best_move, self.mirrored), best_token, best_raw)
+    def record_exact(self, move, raw, token):
+        sequence = self.round_sequence.get(move)
+        if sequence is None:
+            self.round_count += 1
+            sequence = self.round_count
+            self.round_sequence[move] = sequence
+        self.current_round[move] = (raw, token, sequence)
+        # First to arrive defends the maximum: later equal values do not
+        # replace the current champion, and only a strict gain does.
+        best_move, best = max(
+            self.current_round.items(),
+            key=lambda item: (item[1][0], -item[1][2]),
+        )
+        self.current = (_move_token(best_move, self.mirrored), best[1], best[0])
 
     def finish_round(self, move, raw, token):
-        self.previous = (_move_token(move, self.mirrored), token, raw)
+        if self.current is None or raw > self.current[2]:
+            self.previous = (_move_token(move, self.mirrored), token, raw)
+        else:
+            self.previous = self.current
         self.current = self.previous
 
     def snapshot(self):
@@ -839,7 +852,7 @@ class _Synthesis:
         if candidate.parent != ():
             return
         raw = -candidate.exact["raw"]
-        self.state.record_exact(candidate.move, raw, token, candidate.order)
+        self.state.record_exact(candidate.move, raw, token)
         wdl = None if draw else candidate.exact.get("wdl")
         self._recorded_root_candidates.append(
             CandidateAudit(

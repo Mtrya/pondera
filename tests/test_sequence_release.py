@@ -5,9 +5,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+from trace_fixtures import tie_sidecar_lines
+
+from pondera.chess.symmetry import reflect_uci
+from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
 from pondera.data.positions import SequencePositions
 from pondera.data.sequence_release import load_collection, produce_shards
 from pondera.data.sequence_validation import (
+    SEQUENCE_ARRAYS,
+    load_sequence_arrays,
     sequence_data_identity,
     validate_release,
     validate_release_identity,
@@ -52,7 +59,7 @@ def config_text(width=1):
     return text
 
 
-def build_run(directory, cases=CASES, width=1):
+def build_run(directory, cases=CASES, width=1, sidecar_mutator=None):
     directory = Path(directory)
     config_path = directory / "trace_v2.toml"
     config_path.write_text(config_text(width), encoding="utf-8")
@@ -67,7 +74,13 @@ def build_run(directory, cases=CASES, width=1):
         roots.append(root)
         target = run / "roots" / root["root_id"]
         target.mkdir()
-        shutil.copyfile(fixture / "sidecar.jsonl", target / "sidecar.jsonl")
+        if sidecar_mutator is None:
+            shutil.copyfile(fixture / "sidecar.jsonl", target / "sidecar.jsonl")
+        else:
+            lines = (fixture / "sidecar.jsonl").read_text(encoding="utf-8").splitlines()
+            target.joinpath("sidecar.jsonl").write_text(
+                "\n".join(sidecar_mutator(case, lines)) + "\n", encoding="utf-8"
+            )
         mapping[root["root_id"]] = sha256(target / "sidecar.jsonl")
     roots_path = run / "roots.jsonl"
     roots_path.write_text(
@@ -347,6 +360,61 @@ class WideReleaseTests(unittest.TestCase):
             validation = validate_release(base / "release", roots, workers=1)
             self.assertTrue(validation["ok"])
             self.assertEqual(validation["rows"], len(W3_CASES) * len(PRESENTATIONS))
+
+    def test_tied_wide_round_releases_with_first_come_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, roots, collection_path, run = build_run(
+                directory,
+                cases=("middlegame_black_w3",),
+                width=3,
+                sidecar_mutator=tie_sidecar_lines,
+            )
+            _collection, selected, identity, base = load_collection(collection_path)
+            self.assertEqual(selected, roots)
+            produce_shards(
+                roots,
+                base,
+                base / "release",
+                config,
+                identity,
+                contract_path=Path("docs/teacher.md"),
+                shard_size=1,
+                workers=1,
+            )
+            validation = validate_release(base / "release", roots, workers=1)
+            self.assertTrue(validation["ok"])
+            shard = base / "release" / "shard-000000"
+            arrays = load_sequence_arrays(shard, SEQUENCE_ARRAYS)
+            self.assertEqual(arrays["trace_tokens"].dtype, np.int16)
+            self.assertEqual(arrays["board_tokens"].dtype, np.int16)
+            self.assertEqual(arrays["trace_roles"].dtype, np.int8)
+            self.assertEqual(arrays["trace_len"].dtype, np.int32)
+            self.assertEqual(arrays["state_count"].dtype, np.int32)
+            for name in (
+                "state_no_tool",
+                "state_tool",
+                "state_best",
+                "state_basis",
+                "state_value",
+            ):
+                self.assertEqual(arrays[name].dtype, np.int32)
+            rows = [
+                json.loads(line)
+                for line in (shard / "roots.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            full = next(
+                index for index, row in enumerate(rows) if row["presentation"] == "full"
+            )
+            count = int(arrays["state_count"][full])
+            basis = arrays["state_basis"][full, :count]
+            best = arrays["state_best"][full, :count]
+            last_round_one = max(
+                index for index in range(count) if int(basis[index]) == 1
+            )
+            kept = MOVE + UCI_MOVE_TO_IDX[reflect_uci("f6e4")]
+            self.assertEqual(int(best[last_round_one]), kept)
 
 
 if __name__ == "__main__":
