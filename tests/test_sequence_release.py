@@ -57,7 +57,7 @@ CONTROL_SHA256 = "3116251d2cdf84f710b7fe27a037d0b0a390f1f379fb1f32aeace2f41f095b
 
 def config_text(width=1, recipe_text=None):
     text = (
-        Path("configs/trace_v2.toml")
+        Path("configs/trace.toml")
         .read_text(encoding="utf-8")
         .replace("depth = 16", "depth = 4")
     )
@@ -115,8 +115,8 @@ def build_run(
     identity = {
         "teacher": {
             "schema_version": schema,
-            "contract": "docs/teacher.md",
-            "contract_sha256": sha256("docs/teacher.md"),
+            "contract": "docs/data.md",
+            "contract_sha256": sha256("docs/data.md"),
             "value_mate": session["value_mate"],
             "max_ply": session["max_ply"],
         },
@@ -210,7 +210,7 @@ class ReleaseTests(unittest.TestCase):
             base / "release",
             self.config,
             identity,
-            contract_path=Path("docs/teacher.md"),
+            contract_path=Path("docs/data.md"),
             shard_size=2,
             workers=1,
         )
@@ -225,9 +225,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release["format_version"], 5)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
-        self.assertEqual(
-            release["teacher"]["contract_sha256"], sha256("docs/teacher.md")
-        )
+        self.assertEqual(release["teacher"]["contract_sha256"], sha256("docs/data.md"))
         self.assertEqual(release["search"]["depth"], 4)
         self.assertEqual(release["search"]["teacher_width"], 1)
         self.assertEqual(release["engine"]["sha256"], ENGINE_SHA256)
@@ -317,7 +315,7 @@ class ReleaseTests(unittest.TestCase):
             self.release,
             self.config,
             identity,
-            contract_path=Path("docs/teacher.md"),
+            contract_path=Path("docs/data.md"),
             shard_size=2,
             workers=1,
         )
@@ -330,7 +328,7 @@ class ReleaseTests(unittest.TestCase):
             self.release,
             self.config,
             identity,
-            contract_path=Path("docs/teacher.md"),
+            contract_path=Path("docs/data.md"),
             shard_size=2,
             workers=1,
         )
@@ -406,7 +404,7 @@ class WideReleaseTests(unittest.TestCase):
                 base / "release",
                 config,
                 identity,
-                contract_path=Path("docs/teacher.md"),
+                contract_path=Path("docs/data.md"),
                 shard_size=1,
                 workers=1,
             )
@@ -451,7 +449,7 @@ class WideReleaseTests(unittest.TestCase):
                 base / "release",
                 config,
                 identity,
-                contract_path=Path("docs/teacher.md"),
+                contract_path=Path("docs/data.md"),
                 shard_size=2,
                 workers=1,
             )
@@ -502,7 +500,7 @@ depths = {4 = 1.0}
                 base / "release",
                 config,
                 identity,
-                contract_path=Path("docs/teacher.md"),
+                contract_path=Path("docs/data.md"),
                 shard_size=1,
                 workers=1,
             )
@@ -544,7 +542,7 @@ depths = {4 = 1.0}
                         base / "release",
                         config,
                         identity,
-                        contract_path=Path("docs/teacher.md"),
+                        contract_path=Path("docs/data.md"),
                         shard_size=1,
                         workers=1,
                     )
@@ -570,7 +568,7 @@ depths = {4 = 1.0}
                         base / "release",
                         config,
                         identity,
-                        contract_path=Path("docs/teacher.md"),
+                        contract_path=Path("docs/data.md"),
                         shard_size=2,
                         workers=1,
                     )
@@ -597,7 +595,7 @@ depths = {4 = 1.0}
                 base / "release",
                 config,
                 identity,
-                contract_path=Path("docs/teacher.md"),
+                contract_path=Path("docs/data.md"),
                 shard_size=1,
                 workers=1,
             )

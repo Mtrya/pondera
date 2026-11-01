@@ -515,7 +515,7 @@ class _Synthesis:
                     raise SynthesisError(
                         "a rank entry has no written exact root candidate"
                     )
-            # The engine's rank is the authoritative order (docs/teacher.md).
+            # The engine's rank is the authoritative order (docs/data.md).
             # Equal root values are possible, and the engine breaks the tie with
             # a previous-iteration score that the trace does not carry, so the
             # written candidates can only be required to agree on values: the

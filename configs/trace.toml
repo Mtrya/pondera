@@ -1,0 +1,31 @@
+[engine]
+path = "stockfish"
+
+[search]
+depth = 16
+teacher_width = 1
+threads = 1
+hash_mb = 256
+fresh_engine_per_root = true
+workers = 8
+
+[board]
+board_descent_hazard = 0.15
+board_frontier_p = 0.5
+
+[presentation]
+zero = 0.10
+full = 0.50
+random = 0.30
+last_root = 0.10
+random_min_fraction = 0.05
+random_max_fraction = 0.95
+
+[synthesis]
+confirmatory_repetition = "faithful"
+claim_draw = true
+
+[smoke]
+roots = 1000
+seed = 640
+output = ".local/runs/trace-v2-smoke"

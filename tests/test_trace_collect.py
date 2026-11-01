@@ -26,7 +26,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
 
 
 def config_text(depth=None, engine=None):
-    text = Path("configs/trace_v2.toml").read_text(encoding="utf-8")
+    text = Path("configs/trace.toml").read_text(encoding="utf-8")
     if depth is not None:
         text = text.replace("depth = 16", f"depth = {depth}")
     if engine is not None:
@@ -386,7 +386,7 @@ class CollectorIntegrationTests(unittest.TestCase):
                 config,
                 Path(patch),
                 Path(control),
-                Path("docs/teacher.md"),
+                Path("docs/data.md"),
                 selection,
             )
             self.assertEqual(result["roots"], 1)
@@ -403,7 +403,7 @@ class CollectorIntegrationTests(unittest.TestCase):
                 config,
                 Path(patch),
                 Path(control),
-                Path("docs/teacher.md"),
+                Path("docs/data.md"),
                 selection,
             )
             self.assertEqual(again["pending"], 0)

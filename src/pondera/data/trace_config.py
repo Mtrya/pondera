@@ -7,8 +7,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_CONFIG_PATH = Path("configs/trace_v2.toml")
-DEFAULT_TEACHER_PATH = Path("docs/teacher.md")
+DEFAULT_CONFIG_PATH = Path("configs/trace.toml")
+DEFAULT_TEACHER_PATH = Path("docs/data.md")
 
 _SECTIONS = {
     "engine": {"path"},

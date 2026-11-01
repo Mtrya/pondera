@@ -4,7 +4,7 @@
 
 ## docs/ 里有什么
 
-- 稳定、自足、适合公开读者的文档：模块边界（architecture.md）、token backbone 契约（backbones.md）、用法与数据格式（usage.md）、teacher 搜索记录契约（teacher.md）、已收敛研究结论（research/）。
+- 自足、适合公开读者的文档：模块边界（architecture.md）、当前数据合成管线（data.md）、已收敛研究结论（research/）。
 - 不收录：进行中的工作、session 笔记、机器特定说明、内部术语与指代。这些属于本地研究层（`.local/research/`），不入 git。
 
 ## 写作标准

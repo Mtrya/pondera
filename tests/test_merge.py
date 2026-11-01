@@ -39,7 +39,7 @@ def release_rows(cases=CASES):
     with tempfile.TemporaryDirectory() as directory:
         config_path = Path(directory) / "trace_v2.toml"
         config_path.write_text(
-            Path("configs/trace_v2.toml")
+            Path("configs/trace.toml")
             .read_text(encoding="utf-8")
             .replace("depth = 16", "depth = 4"),
             encoding="utf-8",

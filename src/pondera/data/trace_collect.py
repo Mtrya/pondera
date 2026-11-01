@@ -663,7 +663,7 @@ def main():
     from pondera.data.trace_config import DEFAULT_TEACHER_PATH, load_config
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/trace_v2.toml", type=Path)
+    parser.add_argument("--config", default="configs/trace.toml", type=Path)
     parser.add_argument("--roots", required=True, type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--instrumentation", required=True, type=Path)

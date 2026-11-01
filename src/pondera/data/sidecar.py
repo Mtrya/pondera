@@ -1,7 +1,7 @@
 """Parse and validate one instrumented Stockfish search record.
 
 The sidecar is the only source of teacher statements. This module checks the
-record against the schema in docs/teacher.md and exposes the indexed events;
+record against the schema described in docs/data.md and exposes the indexed events;
 it does not translate them into trace tokens.
 """
 
@@ -14,7 +14,7 @@ import chess
 from pondera.chess.tracker import PathTracker
 
 SIDECAR_SCHEMA = 3
-SIDECAR_SCHEMA_WIDE = 4  # MultiPV teacher: per-line attempts (docs/teacher.md)
+SIDECAR_SCHEMA_WIDE = 4  # MultiPV teacher: per-line attempts (docs/data.md)
 EVENT_TYPES = frozenset(
     {
         "session",
@@ -549,7 +549,7 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
             # No wdl symmetry is asserted here: candidate wdl is child-relative and
             # rank wdl root-relative, and the engine's win-rate model scales with
             # the material of the position it describes, so a capture's child wdl
-            # is not the exact mirror of the root wdl (docs/teacher.md).
+            # is not the exact mirror of the root wdl (docs/data.md).
 
     if search_end.get("bestmove") is None:
         raise SynthesisError("search_end has no bestmove")

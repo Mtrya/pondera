@@ -6,7 +6,7 @@ import training, inference, or evaluation code.
 
 | File | Responsibility |
 |---|---|
-| `sidecar.py` | Parse and validate one schema-3 or schema-4 instrumented Stockfish record. This module checks the record against `docs/teacher.md`; it does not translate it. |
+| `sidecar.py` | Parse and validate one schema-3 or schema-4 instrumented Stockfish record. This module checks the record against `docs/data.md`; it does not translate it. |
 | `trace_synthesis.py` | Translate a validated sidecar into grammar-v2 trace tokens: rounds, refutations, draw claims, truncation boundaries, and the four presentations. |
 | `trace_profile.py` | Streaming statistics over synthesized roots: lengths, champion overturns, refutation density, claim counts, and value trajectories. |
 | `trace.py` | The trace grammar itself: `TraceWriter`, `replay`, the shared visit state machine, roles, and the label suffix. |

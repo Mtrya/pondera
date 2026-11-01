@@ -17,7 +17,7 @@ Representation code does not import application layers. Models depend on represe
 
 The board tokenizer has one format shared by offline data preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving piece placement and the first four FEN fields exactly. The fullmove counter is not encoded; halfmove clocks of 100 and above and repetition counts above four share their respective top atoms. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
 
-Token backbones compose attention blocks, repeated cores, and explicit KV access policies. Board policies attach lossless board embeddings and action/value readouts. Sequence backbones accept embeddings without prescribing thought-token semantics or training-only heads. Their contracts and examples are described in [token backbones](backbones.md).
+Token backbones compose attention blocks, repeated cores, and explicit KV access policies. Board policies attach lossless board embeddings and action/value readouts. Sequence backbones accept embeddings without prescribing thought-token semantics or training-only heads. Their contracts live in the module docstrings.
 
 ## Repository hygiene
 
