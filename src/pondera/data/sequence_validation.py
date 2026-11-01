@@ -28,7 +28,12 @@ from pondera.data.trace import (
     TRACE_GRAMMAR_VERSION,
     replay,
 )
-from pondera.data.trace_config import parse_recipe, sample_presentation
+from pondera.data.trace_config import (
+    parse_recipe,
+    sample_depth,
+    sample_presentation,
+    sample_width,
+)
 from pondera.data.trace_synthesis import (
     PRESENTATIONS,
     SIDECAR_SCHEMA,
@@ -659,16 +664,6 @@ def _validate_shard_rows(
     board_responses = 0
     max_trace = 0
     max_teacher_width = 0
-    recipe_widths = (
-        {key for key, _ in recipe.widths}
-        if recipe is not None and recipe.widths is not None
-        else None
-    )
-    recipe_depths = (
-        {key for key, _ in recipe.depths}
-        if recipe is not None and recipe.depths is not None
-        else None
-    )
     presentations_seen = Counter()
     expected_presentations = {}
     suffixes = {}
@@ -683,20 +678,10 @@ def _validate_shard_rows(
         depth = row.get("depth")
         if not _is_int(teacher_width, 1) or not _is_int(depth, 1):
             raise ValueError(f"Release teacher settings are invalid: {root_id}")
-        if recipe is None:
-            if teacher_width != default_width or depth != default_depth:
-                raise ValueError(f"Release teacher settings differ: {root_id}")
-        else:
-            if recipe_widths is None:
-                if teacher_width != default_width:
-                    raise ValueError(f"Release teacher width differs: {root_id}")
-            elif teacher_width not in recipe_widths:
-                raise ValueError(f"Release teacher width differs: {root_id}")
-            if recipe_depths is None:
-                if depth != default_depth:
-                    raise ValueError(f"Release depth differs: {root_id}")
-            elif depth not in recipe_depths:
-                raise ValueError(f"Release depth differs: {root_id}")
+        if teacher_width != sample_width(recipe, seed, root_id, default_width):
+            raise ValueError(f"Release teacher width differs: {root_id}")
+        if depth != sample_depth(recipe, seed, root_id, default_depth):
+            raise ValueError(f"Release depth differs: {root_id}")
         if root_id not in expected_presentations:
             expected_presentations[root_id] = sample_presentation(recipe, seed, root_id)
         expected_presentation = expected_presentations[root_id]

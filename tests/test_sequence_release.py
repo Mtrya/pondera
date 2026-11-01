@@ -69,7 +69,9 @@ def config_text(width=1, recipe_text=None):
     return text
 
 
-def build_run(directory, cases=CASES, width=1, sidecar_mutator=None, recipe_text=None):
+def build_run(
+    directory, cases=CASES, width=1, sidecar_mutator=None, recipe_text=None, seed=640
+):
     directory = Path(directory)
     config_path = directory / "trace_v2.toml"
     config_path.write_text(config_text(width, recipe_text), encoding="utf-8")
@@ -137,7 +139,7 @@ def build_run(directory, cases=CASES, width=1, sidecar_mutator=None, recipe_text
             "source": str(roots_path),
             "source_sha256": sha256(roots_path),
             "algorithm": "fixture",
-            "seed": 640,
+            "seed": seed,
             "requested": len(roots),
             "counts": {"train": len(roots), "val": 0},
             "source_counts": {"train": len(roots), "val": 0},
@@ -414,9 +416,11 @@ class WideReleaseTests(unittest.TestCase):
 
     def test_mixed_width_recipe_release_and_validation(self):
         cases = ("start_d4", "middlegame_black_w3", "two_moves_w3")
+        # Seed 6 samples the widths these fixtures were recorded at (1, 3, 3)
+        # and the presentations frozen below.
         expected_presentations = {
             "bc6ae1d761cf700dfb66ef956ac17bef4a90e0f4846624e57d22ba65f92426c7": "random",
-            "23fd2fbf6d032131267d358c35ba053a17fecb87facfabf0b3331e01e0bb8c55": "random",
+            "23fd2fbf6d032131267d358c35ba053a17fecb87facfabf0b3331e01e0bb8c55": "full",
             "6c9691cab19e3988acbe741a28cf1739fe971be60fdba32fe431f2e43c89a59a": "zero",
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -425,6 +429,7 @@ class WideReleaseTests(unittest.TestCase):
                 cases=cases,
                 width=1,
                 recipe_text=MIXED_RECIPE,
+                seed=6,
             )
             self.assertEqual(
                 {root["root_id"]: root["teacher_width"] for root in roots},
@@ -472,6 +477,75 @@ class WideReleaseTests(unittest.TestCase):
                 root for root in roots if root["root_id"].startswith("6c9691")
             )
             self.assertEqual(chess.Board(capped["fen"]).legal_moves.count(), 2)
+
+    def test_recipe_width_one_under_a_wider_fallback_uses_schema_three(self):
+        recipe = """
+[recipe]
+widths = {1 = 1.0}
+depths = {4 = 1.0}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            config, roots, collection_path, run = build_run(
+                directory, cases=("start_d4",), width=3, recipe_text=recipe
+            )
+            self.assertEqual(config.search.teacher_width, 3)
+            self.assertEqual({root["teacher_width"] for root in roots}, {1})
+            _collection, selected, identity, base = load_collection(collection_path)
+            self.assertEqual(selected, roots)
+            produce_shards(
+                roots,
+                base,
+                base / "release",
+                config,
+                identity,
+                contract_path=Path("docs/teacher.md"),
+                shard_size=1,
+                workers=1,
+            )
+            release = load_manifest(base / "release" / "release.json")
+            self.assertEqual(release["search"]["teacher_width"], 3)
+            self.assertEqual(release["teacher"]["schema_version"], 3)
+            validation = validate_release(base / "release", roots, workers=1)
+            self.assertTrue(validation["ok"])
+
+    def test_validation_rejects_recipe_keys_that_cannot_be_sampled(self):
+        # A zero probability makes the recorded setting unreachable: the
+        # recipe always draws width 3 (depth 5), never the recorded 1 (4).
+        cases = (
+            ("widths = {1 = 0.0, 3 = 1.0}", None),
+            (None, "depths = {4 = 0.0, 5 = 1.0}"),
+        )
+        for widths, depths in cases:
+            with self.subTest(widths=widths, depths=depths):
+                recipe = "[recipe]\n"
+                recipe += (
+                    f"{widths}\n" if widths is not None else "widths = {1 = 1.0}\n"
+                )
+                recipe += (
+                    f"{depths}\n" if depths is not None else "depths = {4 = 1.0}\n"
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    config, roots, collection_path, run = build_run(
+                        directory,
+                        cases=("start_d4",),
+                        recipe_text=recipe,
+                    )
+                    _collection, selected, identity, base = load_collection(
+                        collection_path
+                    )
+                    self.assertEqual(selected, roots)
+                    produce_shards(
+                        roots,
+                        base,
+                        base / "release",
+                        config,
+                        identity,
+                        contract_path=Path("docs/teacher.md"),
+                        shard_size=1,
+                        workers=1,
+                    )
+                    with self.assertRaises(ValueError):
+                        validate_release(base / "release", workers=1)
 
     def test_presentation_sampling_selects_existing_rows(self):
         cases = ("start_d4", "middlegame_black_w3", "two_moves_w3")
