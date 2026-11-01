@@ -191,6 +191,13 @@ def legal_tokens(writer: TraceWriter, final_allowed: bool, cache=None) -> tuple:
     return writer.allowed_tokens(final_allowed, cache)
 
 
+def _generation_tokens(writer: TraceWriter, final_allowed: bool, cache=None) -> tuple:
+    """Tokens the generator may choose; BOARD needs a response it cannot give."""
+    return tuple(
+        token for token in legal_tokens(writer, final_allowed, cache) if token != BOARD
+    )
+
+
 class _GenerationRow:
     """Rule state and bookkeeping for one row of a generation batch."""
 
@@ -276,18 +283,18 @@ def _choose(rows, logits, protocol):
             row.set_move_distribution(logits[index])
             continue
         if row.writer.final_written:
-            ids = legal_tokens(row.writer, False, row.legal_cache)
+            ids = _generation_tokens(row.writer, False, row.legal_cache)
             masks[index, list(ids)] = True
             continue
         at_limit = row.thinking >= protocol.limit
         forced[index] = at_limit
         final_allowed = at_limit or protocol.kind == AUTONOMOUS
-        ids = legal_tokens(row.writer, final_allowed, row.legal_cache)
+        ids = _generation_tokens(row.writer, final_allowed, row.legal_cache)
         if not ids:
             # The grammar allows a root self-evaluation before any candidate,
             # after which FINAL is the only exit. A fixed budget that still
             # masks FINAL must yield rather than stall the row.
-            ids = legal_tokens(row.writer, True, row.legal_cache)
+            ids = _generation_tokens(row.writer, True, row.legal_cache)
         masks[index, list(ids)] = True
     allowed = torch.from_numpy(masks).to(logits.device)
     choices = logits.masked_fill(~allowed, -torch.inf).argmax(-1)

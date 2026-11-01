@@ -12,6 +12,7 @@ from pondera.chess.codec import encode_boards, value_bin
 from pondera.chess.vocabulary import (
     BACK,
     BOARD,
+    CHESS_VOCAB_SIZE,
     DEPTH,
     END,
     FINAL,
@@ -29,6 +30,8 @@ from pondera.inference.sequence import (
     STOP_FINAL,
     GeneratedTrace,
     RootPosition,
+    _choose,
+    _GenerationRow,
     assess,
     autonomous,
     budget_grid,
@@ -149,6 +152,17 @@ class GenerationTests(unittest.TestCase):
         writer.back()
         writer.move("c2c4")
         self.assertIn(REFUTED, set(legal_tokens(writer, final_allowed=True)))
+
+    def test_generation_mask_never_offers_board(self):
+        row = _GenerationRow(RootPosition(chess.STARTING_FEN), fixed_budget(10))
+        row.writer.depth()
+        row.writer.move("e2e4")
+        logits = torch.zeros((1, CHESS_VOCAB_SIZE))
+        logits[0, BOARD] = 1.0
+        choices, forced = _choose([row], logits, fixed_budget(10))
+        self.assertFalse(bool(forced[0]))
+        self.assertNotEqual(int(choices[0]), BOARD)
+        self.assertIn(int(choices[0]), legal_tokens(row.writer, False, row.legal_cache))
 
     def test_assess_replays_with_the_declared_teacher_width(self):
         board = chess.Board(chess.STARTING_FEN)
