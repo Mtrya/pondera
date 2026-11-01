@@ -2,10 +2,13 @@
 
 Follows the depth.py training skeleton (resume, schedule, tracking) under the
 sequence contract: the board prefix is attended bidirectionally, the trace
-suffix causally, and supervision is shifted next-token CE on every generated
-trace token with equal weight. Tool responses are context only. Evaluation
-reports the aggregate loss and top-1 accuracy for validation and a frozen
-evenly spaced train probe, their gaps, per-role cross-entropy, and optional
+suffix causally, and supervision is shifted next-token CE on the generated
+trace tokens. The current mask excludes tool responses and padding and
+weights the remaining tokens equally; loss coverage and weighting are not
+yet finalized (D13 only adopts vanilla equal-weight CE as the starting
+point). Evaluation reports the aggregate loss and top-1 accuracy for
+validation and a frozen evenly spaced train probe, their gaps, per-role
+cross-entropy, and optional
 internal health probes. Training accounts actual board and trace tokens plus
 analytical FLOPs; ``train_flops_budget`` replaces the step-count schedule and
 stop with that compute budget while checkpoints retain step and compute
@@ -180,8 +183,8 @@ def load_config(path):
         return SequenceTrainConfig(**tomllib.load(handle))
 
 
-# Per-role reporting names for the supervised token classes. Tool responses and
-# padding carry no loss and therefore no role entry.
+# Per-role diagnostic names. Tool responses and padding have no role entry
+# under the current supervision mask.
 ROLE_LOSS_NAMES = {
     "move": ROLE_MOVE,
     "evaluation": ROLE_EVAL,
@@ -194,14 +197,14 @@ ROLE_LOSS_NAMES = {
 
 
 def trace_loss_parts(model, inputs):
-    """Token CE and masks behind the equal-weight trace loss.
+    """Token CE and the current supervision mask.
 
-    Every generated token is one next-token target, so the loss is the plain
-    mean CE over all roles except tool responses and padding. Thought tokens,
-    the FINAL decision, the label evaluation, the best line, and ``<end>``
-    carry the same weight; trace length and role mix do not rescale any part.
-    A BOARD request is a control token and is supervised; its response is
-    context only. The per-role sums are diagnostics and do not enter the loss.
+    Every counted token is one next-token target, so the current loss is the
+    plain mean CE over generated trace tokens whose roles are not padding or
+    tool responses. Thought tokens, the FINAL decision, the label evaluation,
+    the best line, and ``<end>`` currently carry the same weight; the per-role
+    sums are diagnostics and do not enter the loss. Loss coverage and weighting
+    remain open: D13 adopts only vanilla equal-weight CE as the starting point.
     """
     trace_ids = inputs["trace_ids"]
     roles = inputs["trace_roles"]
