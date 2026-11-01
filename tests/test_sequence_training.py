@@ -11,7 +11,7 @@ from sequence_fixtures import play, sequence_row, write_sequence_dataset
 from torch.nn import functional as F
 
 from pondera.chess.vocabulary import PAD
-from pondera.data.positions import SequencePositions
+from pondera.data.dataset import SequencePositions
 from pondera.data.trace import (
     ROLE_CONTROL,
     ROLE_EVAL,

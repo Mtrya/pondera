@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pondera.data.storage import load_manifest, write_manifest
+from pondera.data.dataset import load_manifest, write_manifest
 
 
 class StorageTests(unittest.TestCase):

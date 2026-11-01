@@ -10,21 +10,21 @@ from pathlib import Path
 
 import chess
 
-from pondera.data.root_corpus import (
+from pondera.data.dataset import load_manifest, sha256
+from pondera.data.roots import (
     SOURCE_FILE,
     CorpusError,
     _Candidate,
     _claimable,
     _position_key,
     _profile,
-    build_corpus,
+    build_pool,
     ensure_archive,
     root_id_for,
-    sample_pool,
+    select_pool,
     split_for,
+    validate_record,
 )
-from pondera.data.storage import load_manifest, sha256, write_manifest
-from pondera.data.trace_collect import _validated_root
 
 FIXTURES = Path(__file__).parent / "fixtures" / "root_corpus"
 START_KEY = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -"
@@ -35,9 +35,26 @@ E4_KEY = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -"
 E5_KEY = "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -"
 
 
-def build(fixture, directory, limit_games=None):
+FIXTURE_POOLS = {
+    "repetition.pgn": (4, 0, 0.25),
+    "fivefold.pgn": (3, 0, 1.0),
+    "dedup.pgn": (4, 0, 0.0),
+    "ties.pgn": (2, 0, 0.0),
+    "corrupt.pgn": (8, 1, 0.0),
+    "terminal.pgn": (24, 0, 0.0),
+}
+
+
+def build(fixture, directory, limit_games=None, train=None, val=None, share=None):
+    if fixture == "corrupt.pgn" and limit_games == 2 and train is None:
+        default_train, default_val, default_share = 3, 0, 0.0
+    else:
+        default_train, default_val, default_share = FIXTURE_POOLS[fixture]
+    train = default_train if train is None else train
+    val = default_val if val is None else val
+    share = default_share if share is None else share
     archive = FIXTURES / fixture
-    manifest = build_corpus(archive, directory, limit_games)
+    manifest = build_pool(archive, directory, train, val, share, 640, limit_games)
     path = Path(directory) / "roots.jsonl"
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     return manifest, rows
@@ -48,10 +65,10 @@ def by_key(rows):
 
 
 def validate(rows):
-    return [_validated_root(row, index) for index, row in enumerate(rows)]
+    return [validate_record(row, index) for index, row in enumerate(rows)]
 
 
-class RootCorpusTests(unittest.TestCase):
+class RootPoolTests(unittest.TestCase):
     def test_repetition_counts_match_the_hand_counted_game(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest, rows = build("repetition.pgn", directory)
@@ -110,10 +127,11 @@ class RootCorpusTests(unittest.TestCase):
         self.assertEqual(manifest["positions"]["unique_per_game"], 4)
         self.assertEqual(manifest["positions"]["pool_keys"], 3)
         self.assertEqual(manifest["positions"]["skipped_repetition_ge_5"], 1)
-        self.assertNotIn(START_KEY, by_key(rows))
+        roots = by_key(rows)
+        self.assertNotIn(START_KEY, roots)
         self.assertEqual(sorted(row["repetition"] for row in rows), [4, 4, 4])
         self.assertEqual(
-            [(row["position_key"], row["source"]["ply"]) for row in rows],
+            [(key, roots[key]["source"]["ply"]) for key in (NF3_KEY, NF6_KEY, NG1_KEY)],
             [(NF3_KEY, 13), (NF6_KEY, 14), (NG1_KEY, 15)],
         )
         self.assertEqual(
@@ -164,7 +182,7 @@ class RootCorpusTests(unittest.TestCase):
 
     def test_invalid_setup_variant_and_truncated_games_are_tolerated(self):
         with tempfile.TemporaryDirectory() as directory:
-            manifest, rows = build("corrupt.pgn", directory)
+            manifest, rows = build("corrupt.pgn", directory, train=8, val=1)
         self.assertEqual(manifest["build"]["games_read"], 5)
         self.assertEqual(manifest["build"]["games_replayed"], 2)
         self.assertEqual(
@@ -201,19 +219,21 @@ class RootCorpusTests(unittest.TestCase):
     def test_manifest_records_identity_counts_and_profile(self):
         archive = FIXTURES / "repetition.pgn"
         with tempfile.TemporaryDirectory() as directory:
-            build_corpus(archive, directory)
-            manifest = load_manifest(Path(directory) / "roots.manifest.json")
+            build_pool(archive, directory, 4, 0, 0.25, 640)
+            manifest = load_manifest(Path(directory) / "pool.manifest.json")
             roots_path = Path(directory) / "roots.jsonl"
-            self.assertEqual(manifest["kind"], "elite-root-corpus")
-            self.assertEqual(manifest["format_version"], 1)
+            self.assertEqual(manifest["kind"], "elite-root-pool")
+            self.assertEqual(manifest["format_version"], 2)
+            self.assertEqual(manifest["seed"], 640)
+            self.assertEqual(
+                manifest["parameters"], {"train": 4, "val": 0, "claimable_share": 0.25}
+            )
             self.assertEqual(manifest["source"]["sha256"], sha256(archive))
-            self.assertEqual(manifest["source"]["bytes"], archive.stat().st_size)
             self.assertEqual(manifest["source"]["member"], "repetition.pgn")
             self.assertEqual(
                 manifest["files"]["roots.jsonl"]["sha256"], sha256(roots_path)
             )
             self.assertEqual(manifest["files"]["roots.jsonl"]["rows"], 4)
-            self.assertEqual(manifest["splits"], {"train": 4, "val": 0})
             profile = manifest["profile"]
             self.assertEqual(
                 profile["repetition"]["counts"], {"1": 0, "2": 3, "3": 1, "4": 0}
@@ -247,7 +267,7 @@ class RootCorpusTests(unittest.TestCase):
             archive = Path(directory) / "month.zip"
             with zipfile.ZipFile(archive, "w") as handle:
                 handle.write(FIXTURES / "repetition.pgn", "month.pgn")
-            manifest = build_corpus(archive, Path(directory) / "out")
+            manifest = build_pool(archive, Path(directory) / "out", 4, 0, 0.25, 640)
         self.assertEqual(manifest["source"]["member"], "month.pgn")
         self.assertEqual(manifest["files"]["roots.jsonl"]["rows"], 4)
         with tempfile.TemporaryDirectory() as directory:
@@ -256,7 +276,7 @@ class RootCorpusTests(unittest.TestCase):
                 handle.writestr("a.pgn", "")
                 handle.writestr("b.pgn", "")
             with self.assertRaises(CorpusError):
-                build_corpus(archive, Path(directory) / "out")
+                build_pool(archive, Path(directory) / "out", 1, 0, 0.0, 640)
 
     @unittest.skipUnless(shutil.which("zstd"), "zstd binary is unavailable")
     def test_zst_archive_is_streamed_through_the_system_binary(self):
@@ -273,21 +293,14 @@ class RootCorpusTests(unittest.TestCase):
                 ],
                 check=True,
             )
-            manifest = build_corpus(archive, Path(directory) / "out")
+            manifest = build_pool(archive, Path(directory) / "out", 4, 0, 0.25, 640)
             limited = Path(directory) / "limited.zst"
             subprocess.run(
-                [
-                    "zstd",
-                    "-q",
-                    "-f",
-                    str(FIXTURES / "dedup.pgn"),
-                    "-o",
-                    str(limited),
-                ],
+                ["zstd", "-q", "-f", str(FIXTURES / "dedup.pgn"), "-o", str(limited)],
                 check=True,
             )
-            limited_manifest = build_corpus(
-                limited, Path(directory) / "limited", limit_games=1
+            limited_manifest = build_pool(
+                limited, Path(directory) / "limited", 2, 0, 0.0, 640, limit_games=1
             )
             limited_rows = [
                 json.loads(line)
@@ -324,7 +337,10 @@ class RootCorpusTests(unittest.TestCase):
         ):
             with self.subTest(fixture=fixture):
                 with tempfile.TemporaryDirectory() as directory:
-                    manifest, rows = build(fixture, directory)
+                    if fixture == "corrupt.pgn":
+                        manifest, rows = build(fixture, directory, train=8, val=1)
+                    else:
+                        manifest, rows = build(fixture, directory)
                 positions = manifest["positions"]
                 self.assertEqual(
                     positions["unique_per_game"],
@@ -349,9 +365,7 @@ class RootCorpusTests(unittest.TestCase):
                 )
 
 
-def synthetic_corpus(directory, specs=None):
-    """Write a small corpus with a known split-by-claimable layout."""
-    directory = Path(directory)
+def synthetic_records(specs=None):
     if specs is None:
         specs = (
             [("train", 1, 0)] * 20
@@ -360,36 +374,21 @@ def synthetic_corpus(directory, specs=None):
             + [("val", 1, 0)] * 8
             + [("val", 3, 0)] * 4
         )
-    lines = []
+    records = []
     for index, (split, repetition, halfmove) in enumerate(specs):
         fen = f"8/8/8/8/8/8/8/K6k w - - {halfmove} {index + 1}"
-        record = {
-            "root_id": root_id_for(fen, repetition),
-            "split": split,
-            "fen": fen,
-            "repetition": repetition,
-            "turn": "white",
-            "position_key": _position_key(fen),
-            "source": {"file": "synthetic.pgn", "game": 0, "ply": index + 1},
-        }
-        lines.append(json.dumps(record, separators=(",", ":")))
-    roots_path = directory / "roots.jsonl"
-    roots_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    write_manifest(
-        directory / "roots.manifest.json",
-        {
-            "kind": "elite-root-corpus",
-            "source": {"file": "synthetic.pgn", "sha256": "0" * 64},
-            "files": {
-                "roots.jsonl": {
-                    "rows": len(lines),
-                    "bytes": roots_path.stat().st_size,
-                    "sha256": sha256(roots_path),
-                }
-            },
-        },
-    )
-    return lines
+        records.append(
+            {
+                "root_id": root_id_for(fen, repetition),
+                "split": split,
+                "fen": fen,
+                "repetition": repetition,
+                "turn": "white",
+                "position_key": _position_key(fen),
+                "source": {"file": "synthetic.pgn", "game": 0, "ply": index + 1},
+            }
+        )
+    return records
 
 
 class PoolSamplingTests(unittest.TestCase):
@@ -400,35 +399,18 @@ class PoolSamplingTests(unittest.TestCase):
                 "repetition": repetition,
             }
 
-        # The claim criterion is the frozen design contract: threefold
-        # repetition established (repetition >= 3) or halfmove clock >= 100.
         self.assertFalse(_claimable(record(2, 99)))
         self.assertTrue(_claimable(record(3, 0)))
         self.assertTrue(_claimable(record(1, 100)))
         self.assertFalse(_claimable(record(1, 99)))
 
-    def test_sample_pool_selects_strata_deterministically_and_verbatim(self):
-        with tempfile.TemporaryDirectory() as directory:
-            corpus = Path(directory) / "corpus"
-            corpus.mkdir()
-            lines = synthetic_corpus(corpus)
-            first = Path(directory) / "first"
-            manifest = sample_pool(corpus, first, 10, 5, 0.4, 7)
-            second = Path(directory) / "second"
-            sample_pool(corpus, second, 10, 5, 0.4, 7)
-            third = Path(directory) / "third"
-            sample_pool(corpus, third, 10, 5, 0.4, 8)
-            rows = [
-                json.loads(line)
-                for line in (first / "roots.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-            ]
-            same_seed = (first / "roots.jsonl").read_bytes()
-            rerun = (second / "roots.jsonl").read_bytes()
-            other_seed = (third / "roots.jsonl").read_bytes()
+    def test_select_pool_selects_strata_deterministically_and_verbatim(self):
+        records = synthetic_records()
+        rows, strata = select_pool(records, 10, 5, 0.4, 7)
+        same_seed, _ = select_pool(records, 10, 5, 0.4, 7)
+        other_seed, _ = select_pool(records, 10, 5, 0.4, 8)
         self.assertEqual(
-            manifest["strata"],
+            strata,
             {
                 "train:plain": {"available": 20, "selected": 6},
                 "train:claimable": {"available": 8, "selected": 4},
@@ -438,8 +420,7 @@ class PoolSamplingTests(unittest.TestCase):
         )
         self.assertEqual(len(rows), 15)
         self.assertEqual(len({row["root_id"] for row in rows}), 15)
-        verbatim = {json.dumps(row, separators=(",", ":")) for row in rows}
-        self.assertTrue(verbatim <= set(lines))
+        self.assertTrue(all(row in records for row in rows))
         self.assertEqual(
             sum(1 for row in rows if row["split"] == "train" and _claimable(row)), 4
         )
@@ -447,58 +428,29 @@ class PoolSamplingTests(unittest.TestCase):
             sum(1 for row in rows if row["split"] == "val" and _claimable(row)), 2
         )
         self.assertEqual(len(validate(rows)), 15)
-        self.assertEqual(same_seed, rerun)
-        self.assertNotEqual(same_seed, other_seed)
+        self.assertEqual(rows, same_seed)
+        self.assertNotEqual(rows, other_seed)
 
-    def test_sample_pool_grows_smaller_requests_by_extension(self):
-        with tempfile.TemporaryDirectory() as directory:
-            corpus = Path(directory) / "corpus"
-            corpus.mkdir()
-            synthetic_corpus(corpus)
-            small = Path(directory) / "small"
-            sample_pool(corpus, small, 10, 0, 0.4, 7)
-            large = Path(directory) / "large"
-            sample_pool(corpus, large, 20, 0, 0.4, 7)
-            small_ids = {
-                json.loads(line)["root_id"]
-                for line in (small / "roots.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-            }
-            large_ids = {
-                json.loads(line)["root_id"]
-                for line in (large / "roots.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-            }
+    def test_select_pool_grows_smaller_requests_by_extension(self):
+        records = synthetic_records()
+        small, _ = select_pool(records, 10, 0, 0.4, 7)
+        large, _ = select_pool(records, 20, 0, 0.4, 7)
+        small_ids = {row["root_id"] for row in small}
+        large_ids = {row["root_id"] for row in large}
         self.assertEqual(len(large_ids), 20)
         self.assertTrue(small_ids < large_ids)
 
-    def test_sample_pool_prefixes_are_not_stratified_by_selection_rate(self):
-        # The claimable stratum is oversampled (9 of 10 kept) while the plain
-        # stratum is thinned (9 of 100 kept). If the output order followed the
-        # selection rank, claimable rows would cluster at the back; the
-        # independent order hash must spread them through the file.
-        with tempfile.TemporaryDirectory() as directory:
-            corpus = Path(directory) / "corpus"
-            corpus.mkdir()
-            synthetic_corpus(corpus, [("train", 1, 0)] * 100 + [("train", 3, 0)] * 10)
-            halves = []
-            for seed in (7, 8):
-                output = Path(directory) / f"pool-{seed}"
-                sample_pool(corpus, output, 18, 0, 0.5, seed)
-                rows = [
-                    json.loads(line)
-                    for line in (output / "roots.jsonl")
-                    .read_text(encoding="utf-8")
-                    .splitlines()
-                ]
-                halves.append(
-                    (
-                        sum(1 for row in rows[:9] if _claimable(row)),
-                        sum(1 for row in rows[9:] if _claimable(row)),
-                    )
+    def test_select_pool_prefixes_are_not_stratified_by_selection_rate(self):
+        records = synthetic_records([("train", 1, 0)] * 100 + [("train", 3, 0)] * 10)
+        halves = []
+        for seed in (7, 8):
+            rows, _ = select_pool(records, 18, 0, 0.5, seed)
+            halves.append(
+                (
+                    sum(1 for row in rows[:9] if _claimable(row)),
+                    sum(1 for row in rows[9:] if _claimable(row)),
                 )
+            )
         self.assertEqual(sum(halves[0]), 9)
         for first_half, second_half in halves:
             self.assertGreater(first_half, 0)
@@ -506,34 +458,9 @@ class PoolSamplingTests(unittest.TestCase):
             self.assertLess(first_half, 9)
             self.assertLess(second_half, 9)
 
-    def test_sample_pool_refuses_an_undersupplied_stratum(self):
-        with tempfile.TemporaryDirectory() as directory:
-            corpus = Path(directory) / "corpus"
-            corpus.mkdir()
-            synthetic_corpus(corpus)
-            with self.assertRaises(CorpusError):
-                sample_pool(corpus, Path(directory) / "pool", 30, 0, 0.5, 7)
-            self.assertFalse((Path(directory) / "pool" / "roots.jsonl").exists())
-
-    def test_sample_pool_manifest_records_identity(self):
-        with tempfile.TemporaryDirectory() as directory:
-            corpus = Path(directory) / "corpus"
-            corpus.mkdir()
-            synthetic_corpus(corpus)
-            output = Path(directory) / "pool"
-            sample_pool(corpus, output, 10, 5, 0.4, 7)
-            manifest = load_manifest(output / "pool.manifest.json")
-            pool_sha = sha256(output / "roots.jsonl")
-            corpus_sha = sha256(corpus / "roots.jsonl")
-        self.assertEqual(manifest["kind"], "elite-root-pool")
-        self.assertEqual(manifest["seed"], 7)
-        self.assertEqual(
-            manifest["parameters"], {"train": 10, "val": 5, "claimable_share": 0.4}
-        )
-        self.assertEqual(manifest["corpus"]["roots_sha256"], corpus_sha)
-        self.assertEqual(manifest["corpus"]["roots_rows"], 40)
-        self.assertEqual(manifest["files"]["roots.jsonl"]["rows"], 15)
-        self.assertEqual(manifest["files"]["roots.jsonl"]["sha256"], pool_sha)
+    def test_select_pool_refuses_an_undersupplied_stratum(self):
+        with self.assertRaises(CorpusError):
+            select_pool(synthetic_records(), 30, 0, 0.5, 7)
 
 
 if __name__ == "__main__":

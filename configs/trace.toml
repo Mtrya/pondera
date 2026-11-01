@@ -1,31 +1,34 @@
-[engine]
-path = "stockfish"
+seed = 640
+
+[paths]
+archive = ".local/data/lichess_elite_2025-11.zip"
+roots = ".local/data/roots.jsonl"
+output = ".local/runs/trace"
+engine = "stockfish"
+control = ""
+instrumentation = ""
+teacher = "docs/data.md"
+
+[roots]
+train = 1000
+val = 0
+claimable_share = 0.03
 
 [search]
-depth = 16
-teacher_width = 1
 threads = 1
 hash_mb = 256
 fresh_engine_per_root = true
-workers = 8
+widths = 1
+depths = 16
 
-[board]
+[synthesis]
+claim_draw = true
 board_descent_hazard = 0.15
 board_frontier_p = 0.5
-
-[presentation]
-zero = 0.10
-full = 0.50
-random = 0.30
-last_root = 0.10
+presentations = { zero = 0.10, full = 0.50, random = 0.40 }
 random_min_fraction = 0.05
 random_max_fraction = 0.95
 
-[synthesis]
-confirmatory_repetition = "faithful"
-claim_draw = true
-
-[smoke]
-roots = 1000
-seed = 640
-output = ".local/runs/trace-v2-smoke"
+[release]
+shard_size = 1024
+workers = 8

@@ -5,10 +5,10 @@ atom substrings on the training roots, selects merge dictionaries at the
 requested budgets, and writes the compression curve, the top composites of
 every budget, and the dictionary files.
 
-Only full rows are used. The zero, random, and last_root presentations are
-truncations of the same recorded search, so every substring they contain
-already occurs in the full row; counting them would weight shared prefixes
-without adding substring structure.
+Only full rows are used. The zero and random presentations are truncations of
+the same recorded search, so every substring they contain already occurs in
+the full row; counting them would weight shared prefixes without adding
+substring structure.
 
 Roots are split by a bucket of their SHA-256 id: the held-out tenth never
 enters counting or selection and only measures what the curve reports.
@@ -35,7 +35,7 @@ from pondera.chess.vocabulary import (
     CHESS_VOCAB_SIZE,
     LINES,
 )
-from pondera.data.storage import load_manifest
+from pondera.data.dataset import load_manifest
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 FULL_PRESENTATION = "full"
@@ -311,8 +311,8 @@ def render_report(document, title: str = "Merge dictionary profile") -> str:
         f"# {title}",
         "",
         (
-            "The corpus is the full-presentation rows of the releases below. The zero, "
-            "random, and last_root presentations truncate the same search, so they add "
+            "The corpus is the full-presentation rows of the releases below. The zero "
+            "and random presentations truncate the same search, so they add "
             "no substring structure of their own. Counting saw every training root; "
             f"selection tuned on every {corpus['selection']['stride']}th training root "
             f"({corpus['selection']['roots']:,} roots); the held-out "

@@ -1,13 +1,13 @@
 ---
 name: stockfish-trace
-description: Implement, build, and verify the external instrumented Stockfish 17.1 producer that emits Pondera's trace sidecars, then hand the sidecars to Pondera's collector and release pipeline. Use when building a teacher producer from a clean Pondera checkout or extending offline teacher collection; never add Stockfish source, patches, or binaries to the Pondera repository.
+description: Implement, build, and verify the external instrumented Stockfish 17.1 producer that emits Pondera's trace sidecars, then connect it to Pondera's single data pipeline. Use when building a teacher producer from a clean Pondera checkout or extending offline teacher production; never add Stockfish source, patches, or binaries to the Pondera repository.
 ---
 
 # Stockfish trace producer
 
-Pondera ships only the Python consumer under `src/pondera/data/`: configuration schema, sidecar validator, trace synthesizer, release builder, release validator, and dataset adapters. It does not ship Stockfish source, an instrumentation patch, engine binaries, sidecars, or releases.
+Pondera ships only the Python consumer under `src/pondera/data/`: root-pool construction, configuration, sidecar validation, trace synthesis and replay, release construction and validation, and dataset adapters. It does not ship Stockfish source, an instrumentation patch, engine binaries, sidecars, or releases.
 
-When you start from a clean Pondera clone, you build the producer outside the repository from upstream Stockfish 17.1 and this specification. `src/pondera/data/sidecar.py` and `src/pondera/data/trace_synthesis.py` are the acceptance tests: if `parse_sidecar` or `synthesize` rejects your output, fix the producer. Do not copy Stockfish code into this skill or into the repository.
+When you start from a clean Pondera clone, build the producer outside the repository from upstream Stockfish 17.1 and this specification. `src/pondera/data/trace.py` is the consumer contract: if `parse_sidecar`, `synthesize_root`, or `replay` rejects your output, fix the producer. Do not copy Stockfish code into this skill or into the repository.
 
 ## 1. External workspace and control binary
 
@@ -88,7 +88,7 @@ Key rules:
 
 ## 3. Exact JSONL sidecar specification
 
-Format rules enforced by `src/pondera/data/sidecar.py`:
+Format rules enforced by `src/pondera/data/trace.py`:
 
 - UTF-8 JSON Lines, one JSON object per line, `\n` line endings, no blank lines, no floats anywhere (all numbers are integers; `parse_float` is rejected).
 - Every event starts with `"schema": 3` (if configured `MultiPV == 1`) or `"schema": 4` (if configured `MultiPV > 1`), `"seq": <1-based line number>`, `"type": "<event_type>"`.
@@ -135,41 +135,29 @@ Generate a unified diff between the unmodified Stockfish 17.1 directory and your
 
 ## 4. Consistency gates
 
-Before collecting any dataset, verify on a set of test roots (covering ordinary midgames, mates, constrained-legal-move roots, and both `MultiPV = 1` and `MultiPV > 1`):
+Before producing a dataset, verify on test roots covering ordinary midgames, mates, constrained-legal-move roots, and both `MultiPV = 1` and `MultiPV > 1`:
 
 1. **Handshake diff**: between `uci` and `uciok`, the only stdout difference between control and treatment is the single `option name TraceLog type string default` line.
 2. **Zero search perturbation**: after `uciok`, for identical UCI commands (`Threads=1`, fixed `Hash`, fixed `MultiPV`, `position fen ...`, `go depth D`), stdout of control, treatment with `TraceLog` empty, and treatment with `TraceLog` set must be byte-identical after stripping only wall-clock `time <int>` and `nps <int>` tokens from `info` lines.
 3. **Determinism**: two fresh treatment processes with the same commands produce byte-identical sidecar files.
-4. **Consumer validation**: every test sidecar passes `parse_sidecar(lines, teacher_width=W)` in `src/pondera/data/sidecar.py` and `synthesize_sidecar(...)` in `src/pondera/data/trace_synthesis.py`.
+4. **Consumer validation**: every test sidecar passes `parse_sidecar(lines, teacher_width=W)` in `src/pondera/data/trace.py`; `synthesize_root` and `replay` accept the resulting traces.
 
 If any gate fails, stop and fix the C++ instrumentation.
 
 ## 5. Connecting to Pondera's pipeline
 
-1. **Root pool JSONL (`ROOTS.jsonl`)**: each line is a JSON object with at least:
-   - `"root_id"`: unique string ID
-   - `"split"`: `"train"` or `"val"`
-   - `"fen"`: legal non-terminal 6-field FEN
-   - `"repetition"`: integer `>= 1`
-   (Optional `"position_key"` is the first 4 FEN fields; `trace_collect` computes and checks it and excludes train roots whose position key appears in `val`.)
-2. **Config TOML**: copy or edit `configs/trace.toml`. Point `[engine].path` to the external treatment binary, configure `[search]` (`depth`, `teacher_width`, `threads = 1`, `hash_mb`, `fresh_engine_per_root = true`, `workers`), `[smoke]` (`roots`, `seed`, `output`), and optional `[recipe]` distributions.
-3. **Collect sidecars**:
+1. **Configure paths**: copy `configs/trace.toml` outside the repository or edit a working copy. Set `[paths].engine` to the treatment binary, `output` to the release directory, and `instrumentation` and `control` to the external provenance artifacts. Set `archive` and `roots` for automatic root-pool construction. If `roots` already exists, its JSONL records need a unique `root_id`, `split` (`train` or `val`), a legal non-terminal six-field `fen`, and `repetition` in `1..4`; `turn` and `position_key` are checked when present.
+2. **Configure production**: set the top-level `seed`, `[roots]` sizes and claimable share, `[search]` engine options and `widths`/`depths`, `[synthesis]` BOARD/draw/presentation settings, and `[release]` shard size and workers. Width, depth, and presentation each accept one value or a probability table. There is no separate recipe, smoke, collection, or release configuration.
+3. **Run the single entry point**:
    ```bash
-   uv run python -m pondera.data.trace_collect \
-       --config CONFIG.toml \
-       --roots ROOTS.jsonl \
-       --output COLLECTION_DIR \
-       --instrumentation /abs/path/to/instrumentation.patch \
-       --control /abs/path/to/control-stockfish
+   uv run python -m pondera.data.pipeline --config /abs/path/to/trace.toml
    ```
-   `trace_collect` runs each root in a fresh engine process (`Threads` -> `Hash` -> `MultiPV` -> `TraceLog` -> `position fen` -> `go depth`), validates every sidecar via `parse_sidecar`, writes per-root `sidecar.jsonl` and `meta.json`, and writes resumable `sidecars.json` and `collection.json` manifests.
-4. **Build and validate the sequence release**:
+   The pipeline builds or loads the root pool, runs each root in a fresh engine process (`Threads` -> `Hash` -> `MultiPV` -> `TraceLog` -> `position fen` -> `go depth`), validates and synthesizes each sidecar in memory, replays the selected trace, and atomically publishes shards. Sidecars exist only in temporary directories. `--start-shard` and `--end-shard` optionally select a shard range for job scheduling; `--workers` overrides worker count without changing trace semantics.
+4. **Independently validate the completed release**:
    ```bash
-   uv run python -m pondera.data.sequence_release \
-       --collection COLLECTION_DIR \
-       --output RELEASE_DIR \
-       --config CONFIG.toml
-   uv run python -m pondera.data.sequence_validation \
-       --release RELEASE_DIR
+   uv run python - <<'PY'
+   from pondera.data.pipeline import validate_release
+   validate_release("/abs/path/to/release")
+   PY
    ```
-   `sequence_release` synthesizes token traces and writes sharded numpy arrays plus `manifest.json`; `sequence_validation` independently replays every trace against `python-chess`.
+   Validation checks manifests, hashes, array layout, stored states, and every trace replay against python-chess.

@@ -1,7 +1,8 @@
 import copy
 import json
-import shutil
+import re
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -11,19 +12,23 @@ from trace_fixtures import tie_sidecar_lines
 
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
-from pondera.data.positions import SequencePositions, sequence_data_identity
-from pondera.data.sequence_format import SEQUENCE_ARRAYS
-from pondera.data.sequence_release import load_collection, produce_shards
-from pondera.data.sequence_validation import (
+from pondera.data.dataset import (
+    SEQUENCE_ARRAYS,
+    SequencePositions,
+    load_manifest,
+    sequence_data_identity,
+    sha256,
+)
+from pondera.data.pipeline import (
+    load_config,
     load_sequence_arrays,
+    produce_shards,
+    sample_root_settings,
     validate_release,
     validate_release_identity,
     verify_shard_files,
 )
-from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
 from pondera.data.trace import replay
-from pondera.data.trace_config import load_config
-from pondera.data.trace_synthesis import PRESENTATIONS
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
 CASES = (
@@ -55,16 +60,37 @@ WIDE_INSTRUMENTATION_SHA256 = (
 CONTROL_SHA256 = "3116251d2cdf84f710b7fe27a037d0b0a390f1f379fb1f32aeace2f41f095b34"
 
 
+def _inline(table):
+    return "{ " + ", ".join(f'"{key}" = {value}' for key, value in table.items()) + " }"
+
+
 def config_text(width=1, recipe_text=None):
-    text = (
-        Path("configs/trace.toml")
-        .read_text(encoding="utf-8")
-        .replace("depth = 16", "depth = 4")
-    )
-    if width != 1:
-        text = text.replace("teacher_width = 1", f"teacher_width = {width}")
+    text = Path("configs/trace.toml").read_text(encoding="utf-8")
+    text = re.sub(r"^depths =.*$", "depths = 4", text, flags=re.MULTILINE)
+    text = re.sub(r"^widths =.*$", f"widths = {width}", text, flags=re.MULTILINE)
     if recipe_text is not None:
-        text = text.rstrip() + "\n\n" + recipe_text.strip() + "\n"
+        recipe = tomllib.loads(recipe_text)["recipe"]
+        if "widths" in recipe:
+            text = re.sub(
+                r"^widths =.*$",
+                f"widths = {_inline(recipe['widths'])}",
+                text,
+                flags=re.MULTILINE,
+            )
+        if "depths" in recipe:
+            text = re.sub(
+                r"^depths =.*$",
+                f"depths = {_inline(recipe['depths'])}",
+                text,
+                flags=re.MULTILINE,
+            )
+        if "presentations" in recipe:
+            text = re.sub(
+                r"^presentations =.*$",
+                f"presentations = {_inline(recipe['presentations'])}",
+                text,
+                flags=re.MULTILINE,
+            )
     return text
 
 
@@ -72,92 +98,26 @@ def build_run(
     directory, cases=CASES, width=1, sidecar_mutator=None, recipe_text=None, seed=640
 ):
     directory = Path(directory)
-    config_path = directory / "trace_v2.toml"
-    config_path.write_text(config_text(width, recipe_text), encoding="utf-8")
+    config_path = directory / "trace.toml"
+    config_path.write_text(
+        config_text(width, recipe_text).replace("seed = 640", f"seed = {seed}"),
+        encoding="utf-8",
+    )
     config = load_config(config_path)
     run = directory / "run"
-    (run / "roots").mkdir(parents=True)
+    run.mkdir(parents=True)
     roots = []
-    mapping = {}
+    provider = {}
     for case in cases:
         fixture = FIXTURES / case
         root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
-        target = run / "roots" / root["root_id"]
-        target.mkdir()
-        if sidecar_mutator is None:
-            shutil.copyfile(fixture / "sidecar.jsonl", target / "sidecar.jsonl")
-        else:
-            lines = (fixture / "sidecar.jsonl").read_text(encoding="utf-8").splitlines()
-            target.joinpath("sidecar.jsonl").write_text(
-                "\n".join(sidecar_mutator(case, lines)) + "\n", encoding="utf-8"
-            )
-        if recipe_text is not None:
-            session = json.loads(
-                (target / "sidecar.jsonl").read_text(encoding="utf-8").splitlines()[0]
-            )
-            root["teacher_width"] = session["options"]["multipv"]
-            root["depth"] = config.search.depth
+        lines = (fixture / "sidecar.jsonl").read_text(encoding="utf-8").splitlines()
+        if sidecar_mutator is not None:
+            lines = sidecar_mutator(case, lines)
+        provider[root["root_id"]] = lines
         roots.append(root)
-        mapping[root["root_id"]] = sha256(target / "sidecar.jsonl")
-    roots_path = run / "roots.jsonl"
-    roots_path.write_text(
-        "".join(json.dumps(root, separators=(",", ":")) + "\n" for root in roots),
-        encoding="utf-8",
-    )
-    write_manifest(run / "sidecars.json", mapping)
-    session = json.loads(
-        (FIXTURES / cases[0] / "sidecar.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()[0]
-    )
-    widths = [root.get("teacher_width", config.search.teacher_width) for root in roots]
-    schema = 4 if max(widths) > 1 else 3
-    identity = {
-        "teacher": {
-            "schema_version": schema,
-            "contract": "docs/data.md",
-            "contract_sha256": sha256("docs/data.md"),
-            "value_mate": session["value_mate"],
-            "max_ply": session["max_ply"],
-        },
-        "engine": {
-            "name": session["engine"],
-            "sha256": ENGINE_SHA256 if schema == 3 else WIDE_ENGINE_SHA256,
-            "instrumentation": "instrumentation.patch",
-            "instrumentation_sha256": INSTRUMENTATION_SHA256
-            if schema == 3
-            else WIDE_INSTRUMENTATION_SHA256,
-            "control": {"path": "control", "sha256": CONTROL_SHA256},
-        },
-        "config": {"path": str(config_path), "sha256": sha256(config_path)},
-        "search": config.search_dict(),
-        "board": config.board_dict(),
-        "presentation": config.presentation_dict(),
-        "synthesis": config.synthesis_dict(),
-        "root_selection": {
-            "source": str(roots_path),
-            "source_sha256": sha256(roots_path),
-            "algorithm": "fixture",
-            "seed": seed,
-            "requested": len(roots),
-            "counts": {"train": len(roots), "val": 0},
-            "source_counts": {"train": len(roots), "val": 0},
-        },
-        "roots": {
-            "path": "roots.jsonl",
-            "rows": len(roots),
-            "sha256": content_sha256(roots),
-        },
-        "sidecars": {"rows": len(mapping), "sha256": content_sha256(mapping)},
-    }
-    if config.recipe is not None:
-        identity["recipe"] = config.recipe.identity()
-    collection_path = run / "collection.json"
-    write_manifest(
-        collection_path,
-        {"kind": "trace-v2-collection", "format_version": 1, **identity},
-    )
-    return config, roots, collection_path, run
+    roots = sample_root_settings(roots, config, seed)
+    return config, roots, run, provider
 
 
 def read_release_rows(directory):
@@ -196,21 +156,13 @@ class ReleaseTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        (
-            self.config,
-            self.roots,
-            self.collection_path,
-            self.run,
-        ) = build_run(self.root)
-        _collection, selected, identity, base = load_collection(self.collection_path)
-        self.assertEqual(selected, self.roots)
+        self.config, self.roots, self.run, self.provider = build_run(self.root)
+        base = self.run
         self.result = produce_shards(
             self.roots,
-            base,
             base / "release",
             self.config,
-            identity,
-            contract_path=Path("docs/data.md"),
+            sidecar_for_root=self.provider,
             shard_size=2,
             workers=1,
         )
@@ -218,9 +170,9 @@ class ReleaseTests(unittest.TestCase):
 
     def test_release_layout_identity_and_validation(self):
         self.assertEqual(self.result["roots"], len(CASES))
-        # Five roots, shard_size two: 2 + 2 + 1 roots, 8 + 8 + 4 rows.
+        # One presentation per root: five roots produce 2 + 2 + 1 rows.
         self.assertEqual(len(self.result["shards"]), 3)
-        self.assertEqual([shard["rows"] for shard in self.result["shards"]], [8, 8, 4])
+        self.assertEqual([shard["rows"] for shard in self.result["shards"]], [2, 2, 1])
         release = load_manifest(self.release / "release.json")
         self.assertEqual(release["format_version"], 5)
         self.assertEqual(release["grammar_version"], 2)
@@ -228,16 +180,15 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release["teacher"]["contract_sha256"], sha256("docs/data.md"))
         self.assertEqual(release["search"]["depth"], 4)
         self.assertEqual(release["search"]["teacher_width"], 1)
-        self.assertEqual(release["engine"]["sha256"], ENGINE_SHA256)
+        self.assertEqual(release["engine"]["name"], "stockfish")
         self.assertEqual(release["presentation"], self.config.presentation_dict())
         self.assertEqual(release["roots"]["rows"], len(CASES))
-        self.assertEqual(release["sidecars"]["rows"], len(CASES))
         self.assertEqual(release["metadata"], validate_release_identity(release))
         validation = validate_release(self.release, self.roots, workers=1)
         self.assertTrue(validation["ok"])
         self.assertEqual(validation["roots"], len(CASES))
-        self.assertEqual(validation["rows"], len(CASES) * len(PRESENTATIONS))
-        self.assertEqual(validation["counts"]["train"], len(CASES) * len(PRESENTATIONS))
+        self.assertEqual(validation["rows"], len(CASES))
+        self.assertEqual(validation["counts"]["train"], len(CASES))
         self.assertTrue((self.release / "validation.json").exists())
 
     def test_parallel_validation_matches_sequential(self):
@@ -302,37 +253,35 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(int(arrays["state_count"][index]), len(thought))
         self.assertEqual(set(suffixes), {root["root_id"] for root in self.roots})
         positions = SequencePositions(self.release, "train")
-        self.assertEqual(len(positions), len(CASES) * len(PRESENTATIONS))
+        self.assertEqual(len(positions), len(CASES))
         row = positions[0]
         self.assertEqual(len(row), 4)
         self.assertGreater(int(row[2]), 0)
 
     def test_resume_and_shard_recovery(self):
-        _, _, identity, _ = load_collection(self.collection_path)
+
         again = produce_shards(
             self.roots,
-            self.run,
             self.release,
             self.config,
-            identity,
-            contract_path=Path("docs/data.md"),
+            sidecar_for_root=self.provider,
             shard_size=2,
             workers=1,
         )
         self.assertEqual(again["roots"], len(CASES))
         self.assertEqual(len(again["shards"]), 3)
+        self.assertEqual(again["statistics"], self.result["statistics"])
         (self.release / "release.json").unlink()
         recovered = produce_shards(
             self.roots,
-            self.run,
             self.release,
             self.config,
-            identity,
-            contract_path=Path("docs/data.md"),
+            sidecar_for_root=self.provider,
             shard_size=2,
             workers=1,
         )
         self.assertEqual(recovered["roots"], len(CASES))
+        self.assertEqual(recovered["statistics"], self.result["statistics"])
         self.assertTrue(validate_release(self.release, self.roots, workers=1)["ok"])
 
     def test_sequence_data_identity_covers_the_training_inputs(self):
@@ -393,28 +342,23 @@ class ReleaseTests(unittest.TestCase):
 class WideReleaseTests(unittest.TestCase):
     def test_wide_teacher_release_and_validation(self):
         with tempfile.TemporaryDirectory() as directory:
-            config, roots, collection_path, run = build_run(
-                directory, cases=W3_CASES, width=3
-            )
-            _collection, selected, identity, base = load_collection(collection_path)
-            self.assertEqual(selected, roots)
+            config, roots, run, provider = build_run(directory, cases=W3_CASES, width=3)
+            base = run
             produce_shards(
                 roots,
-                base,
                 base / "release",
                 config,
-                identity,
-                contract_path=Path("docs/data.md"),
+                sidecar_for_root=provider,
                 shard_size=1,
                 workers=1,
             )
             release = load_manifest(base / "release" / "release.json")
             self.assertEqual(release["teacher"]["schema_version"], 4)
             self.assertEqual(release["search"]["teacher_width"], 3)
-            self.assertEqual(release["engine"]["sha256"], WIDE_ENGINE_SHA256)
+            self.assertEqual(release["engine"]["name"], "stockfish")
             validation = validate_release(base / "release", roots, workers=1)
             self.assertTrue(validation["ok"])
-            self.assertEqual(validation["rows"], len(W3_CASES) * len(PRESENTATIONS))
+            self.assertEqual(validation["rows"], len(W3_CASES))
 
     def test_mixed_width_recipe_release_and_validation(self):
         cases = ("start_d4", "middlegame_black_w3", "two_moves_w3")
@@ -426,7 +370,7 @@ class WideReleaseTests(unittest.TestCase):
             "6c9691cab19e3988acbe741a28cf1739fe971be60fdba32fe431f2e43c89a59a": "zero",
         }
         with tempfile.TemporaryDirectory() as directory:
-            config, roots, collection_path, run = build_run(
+            config, roots, run, provider = build_run(
                 directory,
                 cases=cases,
                 width=1,
@@ -441,22 +385,19 @@ class WideReleaseTests(unittest.TestCase):
                     "6c9691cab19e3988acbe741a28cf1739fe971be60fdba32fe431f2e43c89a59a": 3,
                 },
             )
-            _collection, selected, identity, base = load_collection(collection_path)
-            self.assertEqual(selected, roots)
+            base = run
             produce_shards(
                 roots,
-                base,
                 base / "release",
                 config,
-                identity,
-                contract_path=Path("docs/data.md"),
+                sidecar_for_root=provider,
                 shard_size=2,
                 workers=1,
             )
             release = load_manifest(base / "release" / "release.json")
             self.assertEqual(release["teacher"]["schema_version"], 4)
             self.assertEqual(release["search"]["teacher_width"], 1)
-            self.assertEqual(release["recipe"], config.recipe.identity())
+            self.assertEqual(release["recipe"], config.sampling.identity())
             validation = validate_release(base / "release", roots, workers=1)
             self.assertTrue(validation["ok"])
             self.assertEqual(validation["rows"], len(cases))
@@ -480,32 +421,29 @@ class WideReleaseTests(unittest.TestCase):
             )
             self.assertEqual(chess.Board(capped["fen"]).legal_moves.count(), 2)
 
-    def test_recipe_width_one_under_a_wider_fallback_uses_schema_three(self):
+    def test_single_width_distribution_uses_schema_three(self):
         recipe = """
 [recipe]
 widths = {1 = 1.0}
 depths = {4 = 1.0}
 """
         with tempfile.TemporaryDirectory() as directory:
-            config, roots, collection_path, run = build_run(
+            config, roots, run, provider = build_run(
                 directory, cases=("start_d4",), width=3, recipe_text=recipe
             )
-            self.assertEqual(config.search.teacher_width, 3)
+            self.assertEqual(config.search.teacher_width, 1)
             self.assertEqual({root["teacher_width"] for root in roots}, {1})
-            _collection, selected, identity, base = load_collection(collection_path)
-            self.assertEqual(selected, roots)
+            base = run
             produce_shards(
                 roots,
-                base,
                 base / "release",
                 config,
-                identity,
-                contract_path=Path("docs/data.md"),
+                sidecar_for_root=provider,
                 shard_size=1,
                 workers=1,
             )
             release = load_manifest(base / "release" / "release.json")
-            self.assertEqual(release["search"]["teacher_width"], 3)
+            self.assertEqual(release["search"]["teacher_width"], 1)
             self.assertEqual(release["teacher"]["schema_version"], 3)
             validation = validate_release(base / "release", roots, workers=1)
             self.assertTrue(validation["ok"])
@@ -527,75 +465,64 @@ depths = {4 = 1.0}
                     f"{depths}\n" if depths is not None else "depths = {4 = 1.0}\n"
                 )
                 with tempfile.TemporaryDirectory() as directory:
-                    config, roots, collection_path, run = build_run(
+                    config, roots, run, provider = build_run(
                         directory,
                         cases=("start_d4",),
                         recipe_text=recipe,
                     )
-                    _collection, selected, identity, base = load_collection(
-                        collection_path
-                    )
-                    self.assertEqual(selected, roots)
-                    produce_shards(
-                        roots,
-                        base,
-                        base / "release",
-                        config,
-                        identity,
-                        contract_path=Path("docs/data.md"),
-                        shard_size=1,
-                        workers=1,
-                    )
+                    base = run
                     with self.assertRaises(ValueError):
-                        validate_release(base / "release", workers=1)
+                        produce_shards(
+                            roots,
+                            base / "release",
+                            config,
+                            sidecar_for_root=provider,
+                            shard_size=1,
+                            workers=1,
+                        )
 
-    def test_presentation_sampling_selects_existing_rows(self):
+    def test_presentation_sampling_is_deterministic_on_resume(self):
         cases = ("start_d4", "middlegame_black_w3", "two_moves_w3")
-        with tempfile.TemporaryDirectory() as plain_directory:
-            with tempfile.TemporaryDirectory() as recipe_directory:
-                runs = []
-                for text, directory in (
-                    (None, plain_directory),
-                    (MIXED_RECIPE, recipe_directory),
-                ):
-                    config, roots, collection_path, run = build_run(
-                        directory, cases=cases, recipe_text=text
-                    )
-                    _, _, identity, base = load_collection(collection_path)
-                    produce_shards(
-                        roots,
-                        base,
-                        base / "release",
-                        config,
-                        identity,
-                        contract_path=Path("docs/data.md"),
-                        shard_size=2,
-                        workers=1,
-                    )
-                    runs.append(base / "release")
-                plain = read_release_rows(runs[0])
-                sampled = read_release_rows(runs[1])
-                self.assertEqual(len(sampled), len(cases))
-                for key, record in sampled.items():
-                    self.assertEqual(record, plain[key])
+        with tempfile.TemporaryDirectory() as directory:
+            config, roots, run, provider = build_run(
+                directory, cases=cases, recipe_text=MIXED_RECIPE, seed=6
+            )
+            produce_shards(
+                roots,
+                run / "release",
+                config,
+                sidecar_for_root=provider,
+                shard_size=2,
+                workers=1,
+            )
+            first = read_release_rows(run / "release")
+            produce_shards(
+                roots,
+                run / "release",
+                config,
+                sidecar_for_root=provider,
+                shard_size=2,
+                workers=1,
+            )
+            second = read_release_rows(run / "release")
+            self.assertEqual(first, second)
+            self.assertEqual(len(second), len(cases))
 
     def test_tied_wide_round_releases_with_first_come_state(self):
         with tempfile.TemporaryDirectory() as directory:
-            config, roots, collection_path, run = build_run(
+            config, roots, run, provider = build_run(
                 directory,
                 cases=("middlegame_black_w3",),
                 width=3,
                 sidecar_mutator=tie_sidecar_lines,
+                recipe_text="[recipe]\npresentations = {full = 1.0}",
             )
-            _collection, selected, identity, base = load_collection(collection_path)
-            self.assertEqual(selected, roots)
+            base = run
             produce_shards(
                 roots,
-                base,
                 base / "release",
                 config,
-                identity,
-                contract_path=Path("docs/data.md"),
+                sidecar_for_root=provider,
                 shard_size=1,
                 workers=1,
             )

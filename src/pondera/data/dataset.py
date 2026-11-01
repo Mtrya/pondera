@@ -1,21 +1,121 @@
-"""Memory-mapped depth targets and sequence traces used by training."""
+"""Read-only training datasets and the shared sequence-array contract."""
 
+import hashlib
 import json
 from collections import OrderedDict
 from pathlib import Path
+from typing import Dict
 
 import numpy as np
 from torch.utils.data import Dataset
 
 from pondera.chess.codec import BOARD_TOKENS_MAX
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
-from pondera.data.sequence_format import SEQUENCE_FORMAT_VERSION, TRACE_ARRAYS
-from pondera.data.sequence_validation import (
-    load_sequence_arrays,
-    validate_sequence_arrays,
+from pondera.data.trace import ROLE_COUNT, TRACE_GRAMMAR_VERSION
+
+SEQUENCE_FORMAT_VERSION = 5
+TRACE_ARRAYS = ("board_tokens", "trace_tokens", "trace_len", "trace_roles")
+STATE_ARRAYS = (
+    "state_no_tool",
+    "state_tool",
+    "state_best",
+    "state_basis",
+    "state_value",
 )
-from pondera.data.storage import content_sha256, load_manifest, sha256
-from pondera.data.trace import TRACE_GRAMMAR_VERSION
+SEQUENCE_ARRAYS = (*TRACE_ARRAYS, *STATE_ARRAYS, "state_count")
+
+
+def sha256(path: Path) -> str:
+    with Path(path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def content_sha256(payload) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def write_manifest(path: Path, payload: Dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_manifest(path: Path) -> Dict:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def validate_sequence_arrays(arrays, rows=None):
+    """Check the shared array contract without interpreting individual traces."""
+    if not arrays:
+        raise ValueError("A Sequence dataset needs token arrays")
+    row_count = len(next(iter(arrays.values())))
+    if rows is not None and row_count != rows:
+        raise ValueError("Sequence arrays do not match the declared row count")
+    for name, array in arrays.items():
+        if len(array) != row_count:
+            raise ValueError(f"Sequence array {name} has a different row count")
+
+    boards = arrays.get("board_tokens")
+    if boards is not None and (
+        boards.ndim != 2
+        or boards.dtype != np.int16
+        or boards.shape[1] > BOARD_TOKENS_MAX
+    ):
+        raise ValueError("Board token array does not match its declared format")
+
+    trace = arrays.get("trace_tokens")
+    if trace is not None and (trace.ndim != 2 or trace.dtype != np.int16):
+        raise ValueError("Trace token array does not match its examples")
+    lengths = arrays.get("trace_len")
+    if lengths is not None:
+        if lengths.shape != (row_count,) or lengths.dtype != np.int32:
+            raise ValueError("Trace lengths do not match their examples")
+        if trace is not None and trace.ndim == 2:
+            if np.any(lengths < 1) or np.any(lengths > trace.shape[1]):
+                raise ValueError("Trace lengths fall outside their token array")
+    roles = arrays.get("trace_roles")
+    if roles is not None:
+        if trace is not None and roles.shape != trace.shape:
+            raise ValueError("Trace roles do not match their examples")
+        if roles.dtype != np.int8 or np.any((roles < 0) | (roles >= ROLE_COUNT)):
+            raise ValueError("Trace roles do not match their declared format")
+
+    best = arrays.get("state_best")
+    if best is not None and (best.ndim != 2 or best.dtype != np.int32):
+        raise ValueError("Truncation-state arrays do not match their examples")
+    for name in STATE_ARRAYS:
+        array = arrays.get(name)
+        if array is not None and (
+            array.dtype != np.int32 or (best is not None and array.shape != best.shape)
+        ):
+            raise ValueError(f"Truncation-state array {name} has inconsistent shape")
+    counts = arrays.get("state_count")
+    if counts is not None:
+        if counts.shape != (row_count,) or counts.dtype != np.int32:
+            raise ValueError("Truncation-state counts do not match their examples")
+        if best is not None and best.ndim == 2:
+            if np.any(counts < 0) or np.any(counts > best.shape[1]):
+                raise ValueError("Truncation-state counts fall outside their arrays")
+
+
+def load_sequence_arrays(directory, names=TRACE_ARRAYS):
+    arrays = {
+        name: np.load(
+            Path(directory) / f"{name}.npy", mmap_mode="r", allow_pickle=False
+        )
+        for name in names
+    }
+    validate_sequence_arrays(arrays)
+    return arrays
 
 
 class DepthPositions(Dataset):

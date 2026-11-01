@@ -22,9 +22,8 @@ from pondera.chess.merge import (
     usage_counts,
 )
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
-from pondera.data.sidecar import load_sidecar
-from pondera.data.trace_config import load_config
-from pondera.data.trace_synthesis import synthesize_root
+from pondera.data.pipeline import load_config
+from pondera.data.trace import load_sidecar, synthesize_root
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
 CASES = ("start_d4", "middlegame_black_d4", "mate_in_1_d4")
@@ -37,11 +36,11 @@ def release_rows(cases=CASES):
     the same rows a release shard would carry, only without the release shell.
     """
     with tempfile.TemporaryDirectory() as directory:
-        config_path = Path(directory) / "trace_v2.toml"
+        config_path = Path(directory) / "trace.toml"
         config_path.write_text(
             Path("configs/trace.toml")
             .read_text(encoding="utf-8")
-            .replace("depth = 16", "depth = 4"),
+            .replace("depths = 16", "depths = 4"),
             encoding="utf-8",
         )
         config = load_config(config_path)

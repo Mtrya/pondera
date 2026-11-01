@@ -30,8 +30,8 @@ Archives may be ``.zip`` (the Lichess Elite distribution), ``.zst`` (decoded
 with the system ``zstd`` binary), or plain ``.pgn``. No decompression module is
 imported into the package.
 
-``sample_pool`` draws a stratified pool from a built corpus. A root is
-claimable when its game state allows a draw claim: the position has occurred
+``build_pool`` draws a stratified pool directly from the replayed archive. A
+root is claimable when its game state allows a draw claim: the position has occurred
 at least three times or the halfmove clock is at least 100. Every row is
 ranked by the SHA-256 of ``"<seed>:<root_id>:pool"`` and each stratum
 (split × claimable) keeps its lowest ranks, so the selection is uniform
@@ -42,7 +42,6 @@ file is a uniform subsample of the whole pool even though the strata are
 selected at different rates.
 """
 
-import argparse
 import hashlib
 import heapq
 import io
@@ -60,7 +59,7 @@ from typing import NamedTuple
 import chess
 import chess.pgn
 
-from pondera.data.storage import load_manifest, sha256, write_manifest
+from pondera.data.dataset import sha256, write_manifest
 
 SOURCE_MONTH = "2025-11"
 SOURCE_FILE = f"lichess_elite_{SOURCE_MONTH}.zip"
@@ -82,7 +81,57 @@ FULLMOVE_PHASES = (
 
 
 class CorpusError(RuntimeError):
-    """A corpus build that cannot be reproduced from its inputs."""
+    """A root pool that cannot be reproduced from its inputs."""
+
+
+def validate_record(record, index=0):
+    root_id = record.get("root_id")
+    split = record.get("split")
+    fen = record.get("fen")
+    repetition = record.get("repetition")
+    if not isinstance(root_id, str) or not root_id:
+        raise CorpusError(f"Root on line {index + 1} has no root_id")
+    if split not in {"train", "val"}:
+        raise CorpusError(f"Root {root_id} has an unknown split")
+    if not isinstance(fen, str) or len(fen.split()) != 6:
+        raise CorpusError(f"Root {root_id} has an invalid FEN")
+    if (
+        not isinstance(repetition, int)
+        or isinstance(repetition, bool)
+        or not 1 <= repetition < FIVEFOLD
+    ):
+        raise CorpusError(f"Root {root_id} has an invalid repetition count")
+    position_key = _position_key(fen)
+    if record.get("position_key", position_key) != position_key:
+        raise CorpusError(f"Root {root_id} has an inconsistent position key")
+    board = chess.Board(fen)
+    if board.is_checkmate() or board.is_stalemate() or not board.legal_moves:
+        raise CorpusError(f"Root {root_id} has no legal move")
+    turn = "white" if board.turn == chess.WHITE else "black"
+    if record.get("turn") not in (None, turn):
+        raise CorpusError(f"Root {root_id} has a turn inconsistent with its FEN")
+    return {**record, "turn": turn, "position_key": position_key}
+
+
+def read_roots(path):
+    roots = []
+    seen = set()
+    with Path(path).open(encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise CorpusError(f"Invalid root JSON on line {index + 1}") from error
+            if not isinstance(record, dict):
+                raise CorpusError(f"Root record on line {index + 1} is not an object")
+            root = validate_record(record, index)
+            if root["root_id"] in seen:
+                raise CorpusError(f"Duplicate root id: {root['root_id']}")
+            seen.add(root["root_id"])
+            roots.append(root)
+    return roots
 
 
 class _Candidate(NamedTuple):
@@ -334,23 +383,81 @@ def _profile(pool, raw_repetitions, game_plies):
     }
 
 
-def build_corpus(archive, output, limit_games=None, report=None, report_every=20000):
-    """Replay an archive and write ``roots.jsonl`` plus its manifest."""
+def _claimable(record):
+    """Whether a root record's game state allows a draw claim."""
+    halfmove = int(record["fen"].split()[4])
+    return record["repetition"] >= 3 or halfmove >= CLAIM_HALFMOVE
+
+
+def _pool_priority(seed, root_id, domain="pool"):
+    digest = hashlib.sha256(f"{seed}:{root_id}:{domain}".encode()).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def select_pool(records, train_roots, val_roots, claimable_share, seed):
+    """Select a reproducible stratified sample from root records in memory."""
+    if not 0.0 <= claimable_share <= 1.0:
+        raise CorpusError("claimable_share must lie in [0, 1]")
+    if train_roots < 0 or val_roots < 0 or train_roots + val_roots == 0:
+        raise CorpusError("Pool sizes must be nonnegative and not both zero")
+    targets = {}
+    for split, size in (("train", train_roots), ("val", val_roots)):
+        claimable = round(size * claimable_share)
+        targets[split, True] = claimable
+        targets[split, False] = size - claimable
+    heaps = {stratum: [] for stratum in targets}
+    available = Counter()
+    for sequence, record in enumerate(records):
+        stratum = record["split"], _claimable(record)
+        available[stratum] += 1
+        target = targets[stratum]
+        if target == 0:
+            continue
+        entry = (
+            -_pool_priority(seed, record["root_id"]),
+            sequence,
+            record["root_id"],
+            record,
+        )
+        heap = heaps[stratum]
+        if len(heap) < target:
+            heapq.heappush(heap, entry)
+        elif entry > heap[0]:
+            heapq.heapreplace(heap, entry)
+    selected = []
+    strata = {}
+    for stratum, heap in heaps.items():
+        target = targets[stratum]
+        supply = available[stratum]
+        split, claimable = stratum
+        name = f"{split}:{'claimable' if claimable else 'plain'}"
+        if supply < target:
+            raise CorpusError(
+                f"Stratum {name} holds {supply} roots, fewer than the requested {target}"
+            )
+        strata[name] = {"available": supply, "selected": len(heap)}
+        for _, _, root_id, record in heap:
+            selected.append((_pool_priority(seed, root_id, "pool-order"), record))
+    selected.sort(key=lambda item: item[0])
+    return [record for _, record in selected], strata
+
+
+def build_pool(
+    archive, output, train_roots, val_roots, claimable_share, seed, limit_games=None
+):
+    """Stream an archive directly into the requested stratified root pool."""
     if limit_games is not None and limit_games < 1:
         raise CorpusError("limit_games must be positive")
+    if not 0.0 <= claimable_share <= 1.0:
+        raise CorpusError("claimable_share must lie in [0, 1]")
+    if train_roots < 0 or val_roots < 0 or train_roots + val_roots == 0:
+        raise CorpusError("Pool sizes must be nonnegative and not both zero")
     archive = Path(archive)
     output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
-    games_read = 0
-    games_replayed = 0
+    games_read = games_replayed = occurrences = unique_per_game = 0
     skipped = Counter()
-    occurrences = 0
-    unique_per_game = 0
-    skipped_repetition = 0
-    skipped_terminal = 0
-    duplicates = 0
-    replacements = 0
+    skipped_repetition = skipped_terminal = duplicates = replacements = 0
     raw_repetitions = Counter()
     game_plies = []
     pool = {}
@@ -393,69 +500,60 @@ def build_corpus(archive, output, limit_games=None, report=None, report_every=20
                     replacements += 1
                 else:
                     duplicates += 1
-            if report is not None and report_every and games_read % report_every == 0:
-                report(
-                    {
-                        "games_read": games_read,
-                        "games_replayed": games_replayed,
-                        "pool_keys": len(pool),
-                        "elapsed_seconds": round(time.perf_counter() - started, 1),
-                    }
-                )
         member = source.member
+
+    records = []
+    for key, candidate in pool.items():
+        fen = f"{key} {candidate.halfmove} {candidate.fullmove}"
+        records.append(
+            {
+                "root_id": root_id_for(fen, candidate.repetition),
+                "split": split_for(key),
+                "fen": fen,
+                "repetition": candidate.repetition,
+                "turn": "white" if key.split()[1] == "w" else "black",
+                "position_key": key,
+                "source": {
+                    "file": member,
+                    "game": candidate.game,
+                    "ply": candidate.ply,
+                },
+            }
+        )
+    selected, strata = select_pool(
+        records, train_roots, val_roots, claimable_share, seed
+    )
+    output.mkdir(parents=True, exist_ok=True)
     roots_path = output / "roots.jsonl"
     temporary = roots_path.with_name(f".{roots_path.name}.tmp")
-    splits = Counter()
     try:
         with temporary.open("w", encoding="utf-8") as handle:
-            for key, candidate in pool.items():
-                fen = f"{key} {candidate.halfmove} {candidate.fullmove}"
-                split = split_for(key)
-                splits[split] += 1
-                record = {
-                    "root_id": root_id_for(fen, candidate.repetition),
-                    "split": split,
-                    "fen": fen,
-                    "repetition": candidate.repetition,
-                    "turn": "white" if key.split()[1] == "w" else "black",
-                    "position_key": key,
-                    "source": {
-                        "file": member,
-                        "game": candidate.game,
-                        "ply": candidate.ply,
-                    },
-                }
+            for record in selected:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
         temporary.replace(roots_path)
     finally:
         temporary.unlink(missing_ok=True)
-    elapsed = time.perf_counter() - started
-    pinned = archive.name == SOURCE_FILE
-    source = {
-        "file": archive.name,
-        "sha256": sha256(archive),
-        "bytes": archive.stat().st_size,
-        "member": member,
-    }
-    if pinned:
-        source.update(
-            {
-                "database": "Lichess Elite Database",
-                "month": SOURCE_MONTH,
-                "url": SOURCE_URL,
-                "pinned_sha256": SOURCE_SHA256,
-            }
-        )
     manifest = {
-        "kind": "elite-root-corpus",
-        "format_version": 1,
-        "source": source,
+        "kind": "elite-root-pool",
+        "format_version": 2,
+        "seed": seed,
+        "parameters": {
+            "train": train_roots,
+            "val": val_roots,
+            "claimable_share": claimable_share,
+        },
+        "source": {
+            "file": archive.name,
+            "path": str(archive),
+            "sha256": sha256(archive),
+            "member": member,
+        },
         "build": {
             "limit_games": limit_games,
             "games_read": games_read,
             "games_replayed": games_replayed,
             "games_skipped": dict(sorted(skipped.items())),
-            "elapsed_seconds": round(elapsed, 3),
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
         },
         "positions": {
             "occurrences": occurrences,
@@ -466,192 +564,15 @@ def build_corpus(archive, output, limit_games=None, report=None, report_every=20
             "skipped_repetition_ge_5": skipped_repetition,
             "skipped_terminal": skipped_terminal,
         },
-        "splits": {
-            "train": splits.get("train", 0),
-            "val": splits.get("val", 0),
-        },
+        "strata": strata,
         "profile": _profile(pool, raw_repetitions, game_plies),
-        "root_id": 'sha256("<fen>|<repetition>")',
-        "split_rule": (
-            "sha256(position_key)[:8] big-endian modulo 65; bucket 0 is val"
-        ),
-        "within_game_dedup": "last occurrence, which carries the maximum count",
-        "cross_game_dedup": (
-            "higher repetition wins; a tie keeps the first record in file order"
-        ),
         "files": {
             "roots.jsonl": {
-                "rows": len(pool),
+                "rows": len(selected),
                 "bytes": roots_path.stat().st_size,
                 "sha256": sha256(roots_path),
             }
         },
     }
-    write_manifest(output / "roots.manifest.json", manifest)
-    return manifest
-
-
-def _claimable(record):
-    """Whether a root record's game state allows a draw claim."""
-    halfmove = int(record["fen"].split()[4])
-    return record["repetition"] >= 3 or halfmove >= CLAIM_HALFMOVE
-
-
-def _pool_priority(seed, root_id, domain="pool"):
-    digest = hashlib.sha256(f"{seed}:{root_id}:{domain}".encode()).digest()
-    return int.from_bytes(digest[:8], "big")
-
-
-def sample_pool(corpus, output, train_roots, val_roots, claimable_share, seed):
-    """Select a stratified pool from a built corpus and write its manifest."""
-    if not 0.0 <= claimable_share <= 1.0:
-        raise CorpusError("claimable_share must lie in [0, 1]")
-    if train_roots < 0 or val_roots < 0 or train_roots + val_roots == 0:
-        raise CorpusError("Pool sizes must be nonnegative and not both zero")
-    corpus = Path(corpus)
-    corpus_manifest = load_manifest(corpus / "roots.manifest.json")
-    if corpus_manifest.get("kind") != "elite-root-corpus":
-        raise CorpusError(f"{corpus} does not hold an elite root corpus")
-    targets = {}
-    for split, size in (("train", train_roots), ("val", val_roots)):
-        claimable = round(size * claimable_share)
-        targets[split, True] = claimable
-        targets[split, False] = size - claimable
-    heaps = {stratum: [] for stratum in targets}
-    available = Counter()
-    with (corpus / "roots.jsonl").open(encoding="utf-8") as handle:
-        for sequence, line in enumerate(handle):
-            record = json.loads(line)
-            stratum = record["split"], _claimable(record)
-            available[stratum] += 1
-            target = targets[stratum]
-            if target == 0:
-                continue
-            heap = heaps[stratum]
-            entry = (
-                -_pool_priority(seed, record["root_id"]),
-                sequence,
-                record["root_id"],
-                line,
-            )
-            if len(heap) < target:
-                heapq.heappush(heap, entry)
-            elif entry > heap[0]:
-                heapq.heapreplace(heap, entry)
-    selected = []
-    strata = {}
-    for stratum, heap in heaps.items():
-        target = targets[stratum]
-        supply = available[stratum]
-        split, claimable = stratum
-        name = f"{split}:{'claimable' if claimable else 'plain'}"
-        if supply < target:
-            raise CorpusError(
-                f"Stratum {name} holds {supply} roots, fewer than "
-                f"the requested {target}"
-            )
-        strata[name] = {"available": supply, "selected": len(heap)}
-        for _, _, root_id, line in heap:
-            selected.append((_pool_priority(seed, root_id, "pool-order"), line))
-    selected.sort()
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
-    pool_path = output / "roots.jsonl"
-    temporary = pool_path.with_name(f".{pool_path.name}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            for _, line in selected:
-                handle.write(line if line.endswith("\n") else f"{line}\n")
-        temporary.replace(pool_path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    manifest = {
-        "kind": "elite-root-pool",
-        "format_version": 1,
-        "seed": seed,
-        "parameters": {
-            "train": train_roots,
-            "val": val_roots,
-            "claimable_share": claimable_share,
-        },
-        "claimable_rule": "repetition >= 3 or halfmove clock >= 100",
-        "rank_rule": (
-            'selection: sha256("<seed>:<root_id>:pool")[:8] big-endian, lowest kept;'
-            ' output order: sha256("<seed>:<root_id>:pool-order")[:8] big-endian'
-        ),
-        "corpus": {
-            "path": str(corpus),
-            "roots_sha256": corpus_manifest["files"]["roots.jsonl"]["sha256"],
-            "roots_rows": corpus_manifest["files"]["roots.jsonl"]["rows"],
-            "source": corpus_manifest["source"],
-        },
-        "strata": strata,
-        "files": {
-            "roots.jsonl": {
-                "rows": len(selected),
-                "bytes": pool_path.stat().st_size,
-                "sha256": sha256(pool_path),
-            }
-        },
-    }
     write_manifest(output / "pool.manifest.json", manifest)
     return manifest
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    commands = parser.add_subparsers(dest="command", required=True)
-    build = commands.add_parser("build", help="replay an archive into a root corpus")
-    build.add_argument("--output", type=Path, default=Path(".local/data/roots-elite"))
-    build.add_argument("--archive", type=Path)
-    build.add_argument("--limit-games", type=int)
-    sample = commands.add_parser("sample", help="draw a stratified pool from a corpus")
-    sample.add_argument("--corpus", type=Path, default=Path(".local/data/roots-elite"))
-    sample.add_argument("--output", type=Path, required=True)
-    sample.add_argument("--train", type=int, required=True)
-    sample.add_argument("--val", type=int, default=0)
-    sample.add_argument("--claimable-share", type=float, required=True)
-    sample.add_argument("--seed", type=int, default=640)
-    args = parser.parse_args()
-    if args.command == "build":
-        archive = args.archive or ensure_archive(args.output)
-        manifest = build_corpus(
-            archive,
-            args.output,
-            args.limit_games,
-            report=lambda progress: print(json.dumps(progress), flush=True),
-        )
-        print(
-            json.dumps(
-                {
-                    "roots": manifest["files"]["roots.jsonl"]["rows"],
-                    "splits": manifest["splits"],
-                    "elapsed_seconds": manifest["build"]["elapsed_seconds"],
-                    "roots_sha256": manifest["files"]["roots.jsonl"]["sha256"],
-                },
-                indent=2,
-            )
-        )
-    else:
-        manifest = sample_pool(
-            args.corpus,
-            args.output,
-            args.train,
-            args.val,
-            args.claimable_share,
-            args.seed,
-        )
-        print(
-            json.dumps(
-                {
-                    "roots": manifest["files"]["roots.jsonl"]["rows"],
-                    "strata": manifest["strata"],
-                    "roots_sha256": manifest["files"]["roots.jsonl"]["sha256"],
-                },
-                indent=2,
-            )
-        )
-
-
-if __name__ == "__main__":
-    main()

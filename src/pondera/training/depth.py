@@ -34,7 +34,7 @@ from pondera.chess.vocabulary import (
     PAD,
     VALUE,
 )
-from pondera.data.positions import DepthPositions
+from pondera.data.dataset import DepthPositions
 from pondera.models.board import black_to_move
 from pondera.models.checkpoint import read_checkpoint, save_checkpoint
 from pondera.models.factory import create_model

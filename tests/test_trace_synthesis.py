@@ -18,13 +18,15 @@ from pondera.chess.vocabulary import (
     UCI_MOVE_TO_IDX,
     VALUE,
 )
-from pondera.data.sidecar import SynthesisError, load_sidecar, parse_sidecar
-from pondera.data.trace import DRAW_CLAIM_BOUND, replay
-from pondera.data.trace_config import load_config
-from pondera.data.trace_profile import profile_roots
-from pondera.data.trace_synthesis import (
+from pondera.data.pipeline import load_config, profile_roots
+from pondera.data.trace import (
+    DRAW_CLAIM_BOUND,
     PRESENTATIONS,
+    SynthesisError,
+    load_sidecar,
     mate_distance_moves,
+    parse_sidecar,
+    replay,
     synthesize_root,
 )
 
@@ -104,7 +106,7 @@ class MateConversionTests(unittest.TestCase):
 
 
 class SynthesisTests(unittest.TestCase):
-    def test_four_presentations_replay_and_share_the_suffix(self):
+    def test_presentations_replay_and_share_the_suffix(self):
         for name in CASES:
             with self.subTest(case=name):
                 sidecar, root, synthesized = synthesize_case(name)
@@ -138,11 +140,6 @@ class SynthesisTests(unittest.TestCase):
                 )
                 self.assertEqual(synthesized.rows["zero"].thinking_tokens, 0)
                 self.assertEqual(synthesized.rows["zero"].boundaries, ())
-                self.assertEqual(
-                    synthesized.rows["last_root"].tokens,
-                    full.tokens[: full.boundaries[-2].tool_end]
-                    + full.tokens[full.thinking_tokens :],
-                )
                 random = synthesized.rows["random"]
                 self.assertLessEqual(random.thinking_tokens, full.thinking_tokens)
                 self.assertEqual(
@@ -471,7 +468,7 @@ class SynthesisTests(unittest.TestCase):
             self.assertIn(name, stats)
         profile = profile_roots([synthesized])
         self.assertEqual(profile["roots"], 1)
-        self.assertEqual(profile["rows"], 4)
+        self.assertEqual(profile["rows"], 3)
         self.assertEqual(profile["split_counts"], {"train": 1})
         self.assertEqual(profile["presentation_counts"]["full"], 1)
         self.assertGreater(profile["thinking_tokens"]["median"], 0)
