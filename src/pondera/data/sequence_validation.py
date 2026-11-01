@@ -178,13 +178,10 @@ def _release_identity_contract(release, root_count):
         raise ValueError("Release search limits are invalid")
     if not _is_int(search["teacher_width"], 1):
         raise ValueError("Release teacher width is invalid")
-    if "recipe" in metadata:
-        if (
-            search["teacher_width"] > 1
-            and teacher["schema_version"] != SIDECAR_SCHEMA_WIDE
-        ):
-            raise ValueError("Release teacher schema differs from the teacher width")
-    elif (teacher["schema_version"] == SIDECAR_SCHEMA) != (
+    # A recipe samples the width per root, so the fallback search width does
+    # not name the sidecar schema; the rows' recorded widths do, and
+    # validate_release checks the schema against them after reading a shard.
+    if "recipe" not in metadata and (teacher["schema_version"] == SIDECAR_SCHEMA) != (
         search["teacher_width"] == 1
     ):
         raise ValueError("Release teacher schema differs from the teacher width")
