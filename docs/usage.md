@@ -31,6 +31,8 @@ uv run python -m pondera.data.sequence_release --config configs/trace_v2.toml \
 
 Validate a completed release with `uv run python -m pondera.data.sequence_validation --release RELEASE --roots ROOTS.jsonl --workers 8`. This checks file hashes and array shapes, then replays every trace with python-chess to verify board observations, token roles, visit and refutation rules, the FINAL suffix, tool/no-tool equivalence, truncation boundaries, and the stored truncation states. `--roots`, `--start`, and `--end` are optional; without them, validation checks internal completeness rather than equality with an external root selection. When external roots are supplied, validation also checks their content hash where available and every stored provenance field, including the train/validation split. Training reads only the four board/trace arrays directly; the remaining arrays describe the search state at each truncation boundary, and each shard's `champions.jsonl` records the per-round champion audit used to validate those states.
 
+Root-corpus construction and merge-dictionary profiling are module entry points too: `python -m pondera.data.root_corpus --help` and `python -m pondera.data.merge_profile --help`.
+
 ## Train and resume
 
 ```bash
