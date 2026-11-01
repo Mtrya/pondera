@@ -135,11 +135,15 @@ class SearchTerminalTests(unittest.TestCase):
         self.assertEqual(tracker.board.halfmove_clock, 100)
         self.assertEqual(tracker.search_terminal(), "mate")
 
-        # In check with an escape is still a 50-move draw.
+        # The 50-move rule is claimable at the root, so the root is searched;
+        # the child reached by a non-capturing escape is a rule terminal.
         fen = "4k3/4R3/8/8/8/8/8/4K3 b - - 100 1"
         self.assertTrue(chess.Board(fen).is_check())
         self.assertFalse(chess.Board(fen).is_checkmate())
-        self.assertEqual(PathTracker(fen).search_terminal(), "draw")
+        tracker = PathTracker(fen)
+        self.assertIsNone(tracker.search_terminal())
+        tracker.push("e8d8")
+        self.assertEqual(tracker.search_terminal(), "draw")
 
     def test_stalemate_and_insufficient_material(self):
         stalemate = "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1"

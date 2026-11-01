@@ -109,9 +109,12 @@ class PathTracker:
         the written path counts: the root's pre-history repetition is ignored,
         and a second occurrence of the root position is not a draw while a
         third is. A position that occurred once strictly after the root is a
-        draw. Checkmate takes precedence over the 50-move rule, and
-        insufficient material is not a terminal: the engine keeps searching
-        there, so ``board.is_game_over()`` must not stand in for this rule.
+        draw. The 50-move rule is a claim, not an automatic root terminal: the
+        root is still searched so its candidates and claim can be recorded,
+        while a node below the root stops there. Checkmate takes precedence
+        over the 50-move rule, and insufficient material is not a terminal:
+        the engine keeps searching there, so ``board.is_game_over()`` must not
+        stand in for this rule.
         """
         if self.board.is_checkmate():
             return "mate"
@@ -123,7 +126,7 @@ class PathTracker:
         )
         if prior >= 2 or (prior == 1 and current != self._root_key):
             return "draw"
-        if self.board.halfmove_clock >= 100:
+        if self._path and self.board.halfmove_clock >= 100:
             return "draw"
         return None
 

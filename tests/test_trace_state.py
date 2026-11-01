@@ -342,10 +342,19 @@ class RuleTerminalTests(unittest.TestCase):
             replay([DEPTH, move_token("h1h2"), move_token("h8g8")], FIFTY_MOVE_ROOT)
         self.assertEqual(context.exception.tag, "move_after_terminal")
 
-    def test_a_terminal_root_cannot_be_expanded(self):
-        with self.assertRaises(TraceError) as context:
-            replay([DEPTH, move_token("h1h2")], FIFTY_MOVE_DRAWN_ROOT)
-        self.assertEqual(context.exception.tag, "move_after_terminal")
+    def test_a_fifty_move_root_is_claimable_but_expandable(self):
+        tokens = [
+            DEPTH,
+            move_token("h1h2"),
+            value_token(0.0),
+            BACK,
+            FINAL,
+            move_token("<claim_draw>"),
+            value_token(0.0),
+            END,
+        ]
+        program = replay(tokens, FIFTY_MOVE_DRAWN_ROOT)
+        self.assertEqual(program.final_move, "<claim_draw>")
 
     def test_checkmate_child_is_a_terminal(self):
         # f7g7 is mate; checkmate wins over the 50-move clock.
@@ -568,13 +577,12 @@ class FinalSuffixTests(unittest.TestCase):
             repetition=3,
         )
 
-    def test_halfmove_clock_claim_and_terminal_root(self):
+    def test_halfmove_clock_claim_and_root_decision(self):
         claim = [FINAL, move_token("<claim_draw>"), value_token(0.0), END]
         replay(claim, FIFTY_MOVE_DRAWN_ROOT)
-        self.assertIllegal(
-            [FINAL, move_token("h1h2"), value_token(0.0), END],
-            "final_illegal",
-            fen=FIFTY_MOVE_DRAWN_ROOT,
+        # The claim is optional: the root is searched, so a move is legal too.
+        replay(
+            [FINAL, move_token("h1h2"), value_token(0.0), END], FIFTY_MOVE_DRAWN_ROOT
         )
         # The claim token is not rank-reflected with a black root.
         claim = [FINAL, move_token("<claim_draw>"), value_token(0.0), END]
