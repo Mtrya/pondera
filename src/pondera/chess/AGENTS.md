@@ -9,6 +9,7 @@
 - `codec.py`：FEN/重复计数与 token 数组之间的编解码、合法走法索引，以及 value/mate token 的数值语义（分箱边界、代表值、mate 覆盖）。
 - `symmetry.py`：黑白镜像——token 镜像表、UCI 走法反射、走法置换表。
 - `tracker.py`：纯规则路径状态机——根局面与两种重复口径（观察编码含根前历史，搜索终局只看已写路径）、绝对 UCI 路径、当前 python-chess 局面、合法走法与 BOARD 观测编码。不做评估与搜索，不 import data/models/training。
+- `merge.py`：复合 token 层的纯序列函数——候选子串计数、按编码器实际用量生长的字典遴选、min-cost DP 编解码、merge-dictionary v1 TSV 读写。复合 id 从 `CHESS_VOCAB_SIZE` 起递增，PAD 保持最大原子 id；不 import data/。
 
 ## 稳定性提示
 

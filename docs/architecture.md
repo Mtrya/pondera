@@ -4,9 +4,9 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 
 | Location | Responsibility |
 |---|---|
-| `chess/` | Action vocabulary, rule-only path tracking, lossless board token encoding, and exact symmetry transforms |
+| `chess/` | Action vocabulary, rule-only path tracking, lossless board token encoding, exact symmetry transforms, and min-cost merge dictionaries |
 | `models/` | Neural model and checkpoint serialization |
-| `data/` | Offline trace grammar, release validation, and encoded training arrays |
+| `data/` | Offline trace grammar, release validation, encoded training arrays, and merge-vocabulary profiling |
 | `training/` | Supervised optimization and resumable training state |
 | `inference/` | Legal move selection and UCI protocol |
 | `evaluation/` | External match orchestration and opening assets |
