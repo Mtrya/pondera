@@ -540,6 +540,13 @@ def collect(
                 "max_ply": previous["teacher"]["max_ply"],
             },
         )
+        previous_identity = {
+            key: value
+            for key, value in previous.items()
+            if key not in {"kind", "format_version", "sidecars"}
+        }
+        if set(previous_identity) != set(expected):
+            raise CollectionError("Existing collection identity differs from this run")
         for key, value in expected.items():
             if previous.get(key) != value:
                 raise CollectionError(
