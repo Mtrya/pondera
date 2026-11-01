@@ -1,0 +1,51 @@
+[Event "Illegal"]
+[Site "?"]
+[Date "????.??.??"]
+[Round "?"]
+[White "?"]
+[Black "?"]
+[Result "*"]
+
+1. e4 e5 2. Qh5 Nc6 3. Qxd8 Nf6 4. Nf3 *
+
+[Event "Valid"]
+[Site "?"]
+[Date "????.??.??"]
+[Round "?"]
+[White "?"]
+[Black "?"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 *
+
+[Event "Setup"]
+[Site "?"]
+[Date "????.??.??"]
+[Round "?"]
+[White "?"]
+[Black "?"]
+[Result "*"]
+[FEN "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"]
+
+1. O-O *
+
+[Event "Variant"]
+[Site "?"]
+[Date "????.??.??"]
+[Round "?"]
+[White "?"]
+[Black "?"]
+[Result "*"]
+[Variant "Chess960"]
+
+1. e4 *
+
+[Event "Truncated"]
+[Site "?"]
+[Date "????.??.??"]
+[Round "?"]
+[White "?"]
+[Black "?"]
+[Result "*"]
+
+1. d4 d5 2. c4 e6 3. Nc3
