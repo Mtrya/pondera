@@ -30,8 +30,8 @@ from pondera.data.trace_synthesis import (
     PRESENTATIONS,
     SIDECAR_SCHEMA,
     SIDECAR_SCHEMA_WIDE,
+    RootProfile,
     load_sidecar,
-    profile_roots,
     synthesize_root,
 )
 
@@ -390,7 +390,6 @@ def produce_shards(
     contract_path=DEFAULT_TEACHER_PATH,
     shard_size=1024,
     workers=None,
-    seed=None,
 ):
     """Synthesize roots into independently published, resumable shards."""
     if shard_size < 1:
@@ -426,11 +425,11 @@ def produce_shards(
     )
     pending = [root for root in roots if root["root_id"] not in complete]
     sidecar_dir = Path(sidecar_dir)
-    seed = config.smoke.seed if seed is None else seed
+    seed = config.smoke.seed
     workers = config.search.workers if workers is None else workers
     if workers < 1:
         raise ValueError("Workers must be positive")
-    synthesized = []
+    profile = RootProfile(presentations)
     for start in range(0, len(pending), shard_size):
         group = pending[start : start + shard_size]
         index = len(shards)
@@ -463,7 +462,8 @@ def produce_shards(
             shard = _publish_shard(
                 output_dir, index, records, shard_metadata, presentations
             )
-            synthesized.extend(records)
+            for record in records:
+                profile.add(record)
         shards.append(shard)
         complete.update(root["root_id"] for root in group)
         write_manifest(
@@ -475,9 +475,9 @@ def produce_shards(
                 "complete_root_ids": sorted(complete),
             },
         )
-    statistics = profile_roots(synthesized, presentations) if synthesized else None
+    statistics = profile.result() if profile.roots else None
     if statistics is not None:
-        statistics["complete"] = len(synthesized) == len(roots)
+        statistics["complete"] = profile.roots == len(roots)
         write_manifest(output_dir / "statistics.json", statistics)
     return {
         "shards": shards,

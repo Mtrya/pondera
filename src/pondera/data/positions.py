@@ -1,6 +1,7 @@
 """Memory-mapped board tokens, moves, and legal action sets used by training."""
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,6 @@ from pondera.chess.codec import BOARD_TOKENS_MAX
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
 from pondera.data.sequence_validation import (
     SEQUENCE_FORMAT_VERSION,
-    TRACE_ARRAYS,
     load_sequence_arrays,
     validate_sequence_arrays,
 )
@@ -93,28 +93,52 @@ class DepthPositions(Dataset):
 
 
 class _ShardedSequenceArrays:
+    """Lazily memory-map shards so open descriptors stay bounded.
+
+    Every shard is validated once at construction. Arrays are then reopened on
+    demand through a small LRU cache; holding all four mappings of every shard
+    open would exhaust the descriptor limit of a large release.
+    """
+
+    CACHE_SHARDS = 32
+
     def __init__(self, directory, manifest, split):
         self.index = []
-        self.arrays = {name: [] for name in TRACE_ARRAYS}
+        self.shards = []
+        self.cache = OrderedDict()
         for shard in manifest["shards"]:
             shard_dir = directory / shard["path"]
             arrays = load_sequence_arrays(shard_dir)
             validate_sequence_arrays(arrays, rows=shard["rows"])
-            for name in self.arrays:
-                self.arrays[name].append(arrays[name])
+            del arrays
             with (shard_dir / "roots.jsonl").open(encoding="utf-8") as handle:
                 rows = [json.loads(line) for line in handle if line.strip()]
             if len(rows) != shard["rows"]:
                 raise ValueError(f"Shard roots do not match its release: {shard_dir}")
+            shard_index = len(self.shards)
+            self.shards.append((shard_dir, shard["rows"]))
             for row_index, row in enumerate(rows):
                 if row["split"] not in {"train", "val"}:
                     raise ValueError(f"Unknown shard split: {row['split']}")
                 if row["split"] == split:
-                    self.index.append((len(self.arrays["board_tokens"]) - 1, row_index))
+                    self.index.append((shard_index, row_index))
+
+    def _arrays(self, shard_index):
+        arrays = self.cache.get(shard_index)
+        if arrays is not None:
+            self.cache.move_to_end(shard_index)
+            return arrays
+        directory, rows = self.shards[shard_index]
+        arrays = load_sequence_arrays(directory)
+        validate_sequence_arrays(arrays, rows=rows)
+        self.cache[shard_index] = arrays
+        if len(self.cache) > self.CACHE_SHARDS:
+            self.cache.popitem(last=False)
+        return arrays
 
     def get(self, name, index):
         shard, row = self.index[index]
-        return self.arrays[name][shard][row].copy()
+        return self._arrays(shard)[name][row].copy()
 
 
 class SequencePositions(Dataset):
