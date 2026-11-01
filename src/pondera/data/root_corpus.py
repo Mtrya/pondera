@@ -29,10 +29,20 @@ en-passant square only when a legal en-passant capture exists.
 Archives may be ``.zip`` (the Lichess Elite distribution), ``.zst`` (decoded
 with the system ``zstd`` binary), or plain ``.pgn``. No decompression module is
 imported into the package.
+
+``sample_pool`` draws a stratified pool from a built corpus. A root is
+claimable when its game state allows a draw claim: the position has occurred
+at least three times or the halfmove clock is at least 100. Every row is
+ranked by the SHA-256 of ``"<seed>:<root_id>:pool"`` and each stratum
+(split × claimable) keeps its lowest ranks, so the selection is uniform
+without replacement, reproducible from the seed, and grows by extension when
+the requested sizes grow. Rows are emitted in global rank order, so any
+prefix of the pool file is itself a uniform subsample.
 """
 
 import argparse
 import hashlib
+import heapq
 import io
 import json
 import shutil
@@ -48,7 +58,7 @@ from typing import NamedTuple
 import chess
 import chess.pgn
 
-from pondera.data.storage import sha256, write_manifest
+from pondera.data.storage import load_manifest, sha256, write_manifest
 
 SOURCE_MONTH = "2025-11"
 SOURCE_FILE = f"lichess_elite_{SOURCE_MONTH}.zip"
@@ -479,30 +489,158 @@ def build_corpus(archive, output, limit_games=None, report=None, report_every=20
     return manifest
 
 
+def _claimable(record):
+    """Whether a root record's game state allows a draw claim."""
+    halfmove = int(record["fen"].split()[4])
+    return record["repetition"] >= 3 or halfmove >= CLAIM_HALFMOVE
+
+
+def _pool_priority(seed, root_id):
+    digest = hashlib.sha256(f"{seed}:{root_id}:pool".encode()).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def sample_pool(corpus, output, train_roots, val_roots, claimable_share, seed):
+    """Select a stratified pool from a built corpus and write its manifest."""
+    if not 0.0 <= claimable_share <= 1.0:
+        raise CorpusError("claimable_share must lie in [0, 1]")
+    if train_roots < 0 or val_roots < 0 or train_roots + val_roots == 0:
+        raise CorpusError("Pool sizes must be nonnegative and not both zero")
+    corpus = Path(corpus)
+    corpus_manifest = load_manifest(corpus / "roots.manifest.json")
+    if corpus_manifest.get("kind") != "elite-root-corpus":
+        raise CorpusError(f"{corpus} does not hold an elite root corpus")
+    targets = {}
+    for split, size in (("train", train_roots), ("val", val_roots)):
+        claimable = round(size * claimable_share)
+        targets[split, True] = claimable
+        targets[split, False] = size - claimable
+    heaps = {stratum: [] for stratum in targets}
+    available = Counter()
+    with (corpus / "roots.jsonl").open(encoding="utf-8") as handle:
+        for sequence, line in enumerate(handle):
+            record = json.loads(line)
+            stratum = record["split"], _claimable(record)
+            available[stratum] += 1
+            target = targets[stratum]
+            if target == 0:
+                continue
+            heap = heaps[stratum]
+            entry = (-_pool_priority(seed, record["root_id"]), sequence, line)
+            if len(heap) < target:
+                heapq.heappush(heap, entry)
+            elif entry > heap[0]:
+                heapq.heapreplace(heap, entry)
+    selected = []
+    strata = {}
+    for stratum, heap in heaps.items():
+        target = targets[stratum]
+        supply = available[stratum]
+        split, claimable = stratum
+        name = f"{split}:{'claimable' if claimable else 'plain'}"
+        if supply < target:
+            raise CorpusError(
+                f"Stratum {name} holds {supply} roots, fewer than "
+                f"the requested {target}"
+            )
+        strata[name] = {"available": supply, "selected": len(heap)}
+        for negated, _, line in heap:
+            selected.append((-negated, line))
+    selected.sort()
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    pool_path = output / "roots.jsonl"
+    temporary = pool_path.with_name(f".{pool_path.name}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            for _, line in selected:
+                handle.write(line if line.endswith("\n") else f"{line}\n")
+        temporary.replace(pool_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    manifest = {
+        "kind": "elite-root-pool",
+        "format_version": 1,
+        "seed": seed,
+        "parameters": {
+            "train": train_roots,
+            "val": val_roots,
+            "claimable_share": claimable_share,
+        },
+        "claimable_rule": "repetition >= 3 or halfmove clock >= 100",
+        "rank_rule": 'sha256("<seed>:<root_id>:pool")[:8] big-endian, lowest kept',
+        "corpus": {
+            "path": str(corpus),
+            "roots_sha256": corpus_manifest["files"]["roots.jsonl"]["sha256"],
+            "roots_rows": corpus_manifest["files"]["roots.jsonl"]["rows"],
+            "source": corpus_manifest["source"],
+        },
+        "strata": strata,
+        "files": {
+            "roots.jsonl": {
+                "rows": len(selected),
+                "bytes": pool_path.stat().st_size,
+                "sha256": sha256(pool_path),
+            }
+        },
+    }
+    write_manifest(output / "pool.manifest.json", manifest)
+    return manifest
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--output", type=Path, default=Path(".local/data/roots-elite"))
-    parser.add_argument("--archive", type=Path)
-    parser.add_argument("--limit-games", type=int)
+    commands = parser.add_subparsers(dest="command", required=True)
+    build = commands.add_parser("build", help="replay an archive into a root corpus")
+    build.add_argument("--output", type=Path, default=Path(".local/data/roots-elite"))
+    build.add_argument("--archive", type=Path)
+    build.add_argument("--limit-games", type=int)
+    sample = commands.add_parser("sample", help="draw a stratified pool from a corpus")
+    sample.add_argument("--corpus", type=Path, default=Path(".local/data/roots-elite"))
+    sample.add_argument("--output", type=Path, required=True)
+    sample.add_argument("--train", type=int, required=True)
+    sample.add_argument("--val", type=int, default=0)
+    sample.add_argument("--claimable-share", type=float, required=True)
+    sample.add_argument("--seed", type=int, default=640)
     args = parser.parse_args()
-    archive = args.archive or ensure_archive(args.output)
-    manifest = build_corpus(
-        archive,
-        args.output,
-        args.limit_games,
-        report=lambda progress: print(json.dumps(progress), flush=True),
-    )
-    print(
-        json.dumps(
-            {
-                "roots": manifest["files"]["roots.jsonl"]["rows"],
-                "splits": manifest["splits"],
-                "elapsed_seconds": manifest["build"]["elapsed_seconds"],
-                "roots_sha256": manifest["files"]["roots.jsonl"]["sha256"],
-            },
-            indent=2,
+    if args.command == "build":
+        archive = args.archive or ensure_archive(args.output)
+        manifest = build_corpus(
+            archive,
+            args.output,
+            args.limit_games,
+            report=lambda progress: print(json.dumps(progress), flush=True),
         )
-    )
+        print(
+            json.dumps(
+                {
+                    "roots": manifest["files"]["roots.jsonl"]["rows"],
+                    "splits": manifest["splits"],
+                    "elapsed_seconds": manifest["build"]["elapsed_seconds"],
+                    "roots_sha256": manifest["files"]["roots.jsonl"]["sha256"],
+                },
+                indent=2,
+            )
+        )
+    else:
+        manifest = sample_pool(
+            args.corpus,
+            args.output,
+            args.train,
+            args.val,
+            args.claimable_share,
+            args.seed,
+        )
+        print(
+            json.dumps(
+                {
+                    "roots": manifest["files"]["roots.jsonl"]["rows"],
+                    "strata": manifest["strata"],
+                    "roots_sha256": manifest["files"]["roots.jsonl"]["sha256"],
+                },
+                indent=2,
+            )
+        )
 
 
 if __name__ == "__main__":
