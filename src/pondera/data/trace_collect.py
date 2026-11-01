@@ -8,15 +8,22 @@ reuses valid sidecars and re-runs missing or invalid ones.
 
 import json
 import random
+import select
 import shutil
+import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import chess
-import chess.engine
 
 from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
-from pondera.data.trace_synthesis import SIDECAR_SCHEMA, load_sidecar, validate_root
+from pondera.data.trace_synthesis import (
+    SIDECAR_SCHEMA,
+    SIDECAR_SCHEMA_WIDE,
+    load_sidecar,
+    validate_root,
+)
 
 SELECTION_ALGORITHM = (
     "random.Random(f'{seed}:{split}') reservoir sampling in source order; "
@@ -231,6 +238,81 @@ def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
     return repetition
 
 
+def _run_engine(engine_path, fen, config, trace_path, depth, timeout=900):
+    """Drive one engine over raw UCI in the contract's exact command order.
+
+    python-chess manages MultiPV itself and refuses to configure it, so the
+    collector speaks plain UCI: options first, TraceLog last, a readiness
+    barrier, then position and a depth-limited go.
+    """
+    process = subprocess.Popen(
+        [str(engine_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        bufsize=0,
+    )
+
+    def send(line):
+        process.stdin.write((line + "\n").encode())
+        process.stdin.flush()
+
+    buffer = b""
+
+    def read_line(deadline):
+        nonlocal buffer
+        while b"\n" not in buffer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CollectionError("engine timed out")
+            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            if not ready:
+                continue
+            chunk = process.stdout.read(65536)
+            if not chunk:
+                raise CollectionError("engine closed its output")
+            buffer += chunk
+        line, buffer = buffer.split(b"\n", 1)
+        return line.decode(errors="replace").strip()
+
+    def read_until(prefix, deadline):
+        seen = []
+        while True:
+            line = read_line(deadline)
+            seen.append(line)
+            if line.startswith(prefix):
+                return line, seen
+
+    deadline = time.monotonic() + timeout
+    try:
+        send("uci")
+        _, banner = read_until("uciok", deadline)
+        if not any(line.startswith("option name TraceLog ") for line in banner):
+            raise CollectionError(f"Engine does not expose TraceLog: {engine_path}")
+        send(f"setoption name Threads value {config.search.threads}")
+        send(f"setoption name Hash value {config.search.hash_mb}")
+        send(f"setoption name MultiPV value {config.search.teacher_width}")
+        send(f"setoption name TraceLog value {trace_path}")
+        send("isready")
+        read_until("readyok", deadline)
+        send(f"position fen {fen}")
+        send(f"go depth {depth}")
+        bestmove, _ = read_until("bestmove", deadline)
+    finally:
+        try:
+            send("quit")
+        except (BrokenPipeError, ValueError):
+            pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    parts = bestmove.split()
+    if len(parts) < 2:
+        raise CollectionError(f"engine returned no bestmove: {bestmove!r}")
+    return parts[1]
+
+
 def collect_root(root, output, config, engine_path, engine_name=None, teacher=None):
     """Run one fresh engine process and return its validated root metadata."""
     directory = Path(output) / "roots" / root["root_id"]
@@ -239,30 +321,16 @@ def collect_root(root, output, config, engine_path, engine_name=None, teacher=No
     temporary = directory / ".sidecar.jsonl.tmp"
     if temporary.exists():
         temporary.unlink()
-    engine = chess.engine.SimpleEngine.popen_uci(str(engine_path), timeout=120)
-    try:
-        if "TraceLog" not in engine.options:
-            raise CollectionError(f"Engine does not expose TraceLog: {engine_path}")
-        engine.configure(
-            {
-                "Threads": config.search.threads,
-                "Hash": config.search.hash_mb,
-                "TraceLog": str(temporary),
-            }
-        )
-        result = engine.play(
-            chess.Board(root["fen"]),
-            chess.engine.Limit(depth=config.search.depth),
-        )
-    finally:
-        engine.quit()
+    bestmove = _run_engine(
+        engine_path, root["fen"], config, temporary, config.search.depth
+    )
     if not temporary.exists():
         raise CollectionError(f"Engine wrote no sidecar for root {root['root_id']}")
     sidecar = load_sidecar(temporary, teacher_width=config.search.teacher_width)
     if engine_name is not None and sidecar.engine != engine_name:
         raise CollectionError(f"Engine name differs for root {root['root_id']}")
     _check_sidecar(root, sidecar, config, sidecar.engine, teacher)
-    if sidecar.search_end["bestmove"] != result.move.uci():
+    if sidecar.search_end["bestmove"] != bestmove:
         raise CollectionError(
             f"bestmove differs from the sidecar for {root['root_id']}"
         )
@@ -271,13 +339,15 @@ def collect_root(root, output, config, engine_path, engine_name=None, teacher=No
         **root,
         "sidecar": sidecar_path.name,
         "sidecar_sha256": sha256(sidecar_path),
-        "bestmove": result.move.uci(),
+        "bestmove": bestmove,
         "engine_sha256": sha256(engine_path),
         "config_sha256": sha256(config.source_path),
         "contract_sha256": None,
         "value_mate": sidecar.value_mate,
         "max_ply": sidecar.max_ply,
-        "schema_version": SIDECAR_SCHEMA,
+        "schema_version": SIDECAR_SCHEMA
+        if config.search.teacher_width == 1
+        else SIDECAR_SCHEMA_WIDE,
     }
     write_manifest(directory / "meta.json", meta)
     return meta
