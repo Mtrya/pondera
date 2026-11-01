@@ -198,7 +198,8 @@ class _PgnStream:
             stderr = self._process.stderr.read().decode("utf-8", "replace")
             self._process.stderr.close()
             code = self._process.wait()
-            if code != 0 and exc_type is None:
+            # Closing the pipe early after a game limit sends SIGPIPE.
+            if code != 0 and code != -13 and exc_type is None:
                 raise CorpusError(f"zstd failed with status {code}: {stderr.strip()}")
         return False
 

@@ -270,8 +270,31 @@ class RootCorpusTests(unittest.TestCase):
                 check=True,
             )
             manifest = build_corpus(archive, Path(directory) / "out")
+            limited = Path(directory) / "limited.zst"
+            subprocess.run(
+                [
+                    "zstd",
+                    "-q",
+                    "-f",
+                    str(FIXTURES / "dedup.pgn"),
+                    "-o",
+                    str(limited),
+                ],
+                check=True,
+            )
+            limited_manifest = build_corpus(
+                limited, Path(directory) / "limited", limit_games=1
+            )
+            limited_rows = [
+                json.loads(line)
+                for line in (Path(directory) / "limited" / "roots.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
         self.assertEqual(manifest["files"]["roots.jsonl"]["rows"], 4)
         self.assertEqual(manifest["positions"]["pool_keys"], 4)
+        self.assertEqual(limited_manifest["files"]["roots.jsonl"]["rows"], 2)
+        self.assertEqual({row["source"]["game"] for row in limited_rows}, {0})
 
     def test_download_rejects_an_archive_with_the_pinned_name_but_wrong_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
