@@ -148,6 +148,15 @@ class EncodingTests(unittest.TestCase):
             decode(encode([0, 0, 0, 0], dictionary), dictionary).tolist(), [0, 0, 0, 0]
         )
 
+    def test_shorter_match_can_beat_the_longest_match_ending_here(self):
+        # Hand-derived: (1,2,3,4)+(5,6,7) is the two-token optimum; the
+        # longest entry ending at 7, (3,4,5,6,7), forces three tokens.
+        dictionary = MergeDictionary(((1, 2, 3, 4), (3, 4, 5, 6, 7), (5, 6, 7)))
+        base = MERGE_ID_BASE
+        self.assertEqual(
+            encode([1, 2, 3, 4, 5, 6, 7], dictionary).tolist(), [base, base + 2]
+        )
+
     def test_encoding_matches_exhaustive_search_on_a_real_prefix(self):
         row = max(release_rows(("start_d4",)), key=len)
         prefix = row[:20]

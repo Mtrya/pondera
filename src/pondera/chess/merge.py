@@ -24,10 +24,11 @@ do nearly as well with far fewer passes.
 
 Encoding is a shortest-path segmentation of one atom stream into atoms and
 dictionary entries under a unit cost per emitted token, so the optimum is the
-fewest tokens. At each position only the longest entry ending there can be
-optimal: the distance to a prefix is non-decreasing in its length, so a longer
-entry is never worse than a shorter one ending at the same place. Ties prefer
-the composite, which together with a fixed candidate ordering makes the
+fewest tokens. Every entry ending at a position is a candidate: prefix
+distances are not monotone, because an entry can jump over atoms and make a
+later prefix cheaper than an earlier one, so the longest entry ending at a
+position is not always the best one. Ties prefer the composite and then the
+longer entry, which together with a fixed candidate ordering makes the
 encoding a function of the atom stream and the dictionary alone.
 """
 
@@ -290,52 +291,63 @@ def _entry_tables(dictionary: MergeDictionary) -> list:
     return tables
 
 
-def _match(body: np.ndarray, dictionary: MergeDictionary):
-    """Longest dictionary entry ending at every body position.
+def _match(stream: np.ndarray, tables) -> tuple:
+    """Every dictionary entry ending at each position of one stream.
 
-    Returns, for each position, the composite id and its length (0 when no
-    entry ends there). Entries of increasing length overwrite, so only the
-    longest end at a position survives.
+    Returns ``(size + 1, slots)`` entry lengths and composite ids (padding 0
+    and -1) plus the number of entries ending at each position. Columns fill
+    in ascending length order, and no window crosses a stream boundary.
     """
-    size = body.size
-    token_at = np.full(size + 1, -1, dtype=np.int32)
-    length_at = np.zeros(size + 1, dtype=np.int8)
-    for length, keys, ids in _entry_tables(dictionary):
-        if body.size < length:
+    size = stream.size
+    length_at = np.zeros((size + 1, len(tables)), dtype=np.int8)
+    token_at = np.full((size + 1, len(tables)), -1, dtype=np.int32)
+    count_at = np.zeros(size + 1, dtype=np.int8)
+    for length, keys, ids in tables:
+        if stream.size < length:
             continue
-        windows = np.lib.stride_tricks.sliding_window_view(body, length)
-        inside = windows.min(axis=1) >= 0
-        if not inside.any():
-            continue
-        keys_of_body = _pack(windows)
-        position = np.searchsorted(keys, keys_of_body)
+        windows = np.lib.stride_tricks.sliding_window_view(stream, length)
+        keys_of_stream = _pack(windows)
+        position = np.searchsorted(keys, keys_of_stream)
         clipped = np.minimum(position, keys.size - 1)
-        hit = inside & (keys[clipped] == keys_of_body)
+        hit = keys[clipped] == keys_of_stream
         starts = np.flatnonzero(hit)
         if starts.size == 0:
             continue
         ends = starts + length
-        token_at[ends] = ids[clipped[starts]]
-        length_at[ends] = length
-    return token_at, length_at
+        columns = count_at[ends]
+        length_at[ends, columns] = length
+        token_at[ends, columns] = ids[clipped[starts]]
+        count_at[ends] += 1
+    return length_at, token_at, count_at
 
 
-def _encode_stream(stream, offset, token_at, length_at) -> np.ndarray:
-    """Minimum-token segmentation of one stream; ties take the composite."""
+def _encode_stream(stream, length_at, token_at, count_at) -> np.ndarray:
+    """Minimum-token segmentation of one stream; ties take the composite.
+
+    Among composites of equal cost the longest wins, matching the previous
+    longest-per-end rule whenever that rule found an optimum.
+    """
     size = stream.size
-    lengths = length_at[offset : offset + size + 1].tolist()
-    tokens = token_at[offset : offset + size + 1].tolist()
+    lengths = length_at.tolist()
+    tokens = token_at.tolist()
+    counts = count_at.tolist()
     distance = [0] * (size + 1)
     choice = [-1] * (size + 1)
+    chosen_length = [0] * (size + 1)
     for index in range(1, size + 1):
         best = distance[index - 1] + 1
         token = -1
-        length = lengths[index]
-        if length and distance[index - length] + 1 <= best:
-            best = distance[index - length] + 1
-            token = tokens[index]
+        length = 0
+        for slot in range(counts[index]):
+            entry_length = lengths[index][slot]
+            candidate = distance[index - entry_length] + 1
+            if candidate < best or (candidate == best and entry_length > length):
+                best = candidate
+                token = tokens[index][slot]
+                length = entry_length
         distance[index] = best
         choice[index] = token
+        chosen_length[index] = length
     encoded = []
     index = size
     while index:
@@ -345,7 +357,7 @@ def _encode_stream(stream, offset, token_at, length_at) -> np.ndarray:
             index -= 1
         else:
             encoded.append(token)
-            index -= lengths[index]
+            index -= chosen_length[index]
     encoded.reverse()
     return np.asarray(encoded, dtype=np.int32)
 
@@ -355,17 +367,8 @@ def encode_corpus(sequences, dictionary: MergeDictionary) -> list:
     streams = _streams(sequences)
     if not streams:
         return []
-    body = _join(streams)
-    token_at, length_at = _match(body, dictionary)
-    offsets = []
-    position = 0
-    for stream in streams:
-        offsets.append(position)
-        position += len(stream) + 1
-    return [
-        _encode_stream(stream, offset, token_at, length_at)
-        for stream, offset in zip(streams, offsets)
-    ]
+    tables = _entry_tables(dictionary)
+    return [_encode_stream(stream, *_match(stream, tables)) for stream in streams]
 
 
 def encode(tokens, dictionary: MergeDictionary) -> np.ndarray:
