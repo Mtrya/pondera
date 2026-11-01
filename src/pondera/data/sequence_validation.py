@@ -35,7 +35,7 @@ from pondera.data.trace_synthesis import (
     mate_distance_moves,
 )
 
-SEQUENCE_FORMAT_VERSION = 4
+SEQUENCE_FORMAT_VERSION = 5
 TRACE_ARRAYS = ("board_tokens", "trace_tokens", "trace_len", "trace_roles")
 STATE_ARRAYS = (
     "state_no_tool",
@@ -293,7 +293,7 @@ def validate_sequence_arrays(arrays, rows=None):
         raise ValueError("Trace token array does not match its examples")
     lengths = arrays.get("trace_len")
     if lengths is not None:
-        if lengths.shape != (row_count,) or lengths.dtype != np.int16:
+        if lengths.shape != (row_count,) or lengths.dtype != np.int32:
             raise ValueError("Trace lengths do not match their examples")
         if trace is not None and trace.ndim == 2:
             if np.any(lengths < 1) or np.any(lengths > trace.shape[1]):
@@ -306,17 +306,17 @@ def validate_sequence_arrays(arrays, rows=None):
             raise ValueError("Trace roles do not match their declared format")
 
     best = arrays.get("state_best")
-    if best is not None and (best.ndim != 2 or best.dtype != np.int16):
+    if best is not None and (best.ndim != 2 or best.dtype != np.int32):
         raise ValueError("Truncation-state arrays do not match their examples")
     for name in STATE_ARRAYS:
         array = arrays.get(name)
         if array is not None and (
-            array.dtype != np.int16 or (best is not None and array.shape != best.shape)
+            array.dtype != np.int32 or (best is not None and array.shape != best.shape)
         ):
             raise ValueError(f"Truncation-state array {name} has inconsistent shape")
     counts = arrays.get("state_count")
     if counts is not None:
-        if counts.shape != (row_count,) or counts.dtype != np.int16:
+        if counts.shape != (row_count,) or counts.dtype != np.int32:
             raise ValueError("Truncation-state counts do not match their examples")
         if best is not None and best.ndim == 2:
             if np.any(counts < 0) or np.any(counts > best.shape[1]):

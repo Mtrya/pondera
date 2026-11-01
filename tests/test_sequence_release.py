@@ -157,7 +157,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(len(self.result["shards"]), 3)
         self.assertEqual([shard["rows"] for shard in self.result["shards"]], [8, 8, 4])
         release = load_manifest(self.release / "release.json")
-        self.assertEqual(release["format_version"], 4)
+        self.assertEqual(release["format_version"], 5)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
         self.assertEqual(

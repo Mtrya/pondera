@@ -164,7 +164,7 @@ def _write_shard(directory, records, metadata):
         np.int16,
         PAD,
     )
-    _one_dimensional(directory, "trace_len", lengths, np.int16)
+    _one_dimensional(directory, "trace_len", lengths, np.int32)
     _array(
         directory,
         "trace_roles",
@@ -180,8 +180,8 @@ def _write_shard(directory, records, metadata):
         ("state_basis", basis),
         ("state_value", values),
     ]:
-        _array(directory, name, rows, max(map(len, rows)), np.int16, -1)
-    _one_dimensional(directory, "state_count", counts, np.int16)
+        _array(directory, name, rows, max(map(len, rows)), np.int32, -1)
+    _one_dimensional(directory, "state_count", counts, np.int32)
     _write_jsonl(directory / "roots.jsonl", root_rows)
     _write_jsonl(directory / "champions.jsonl", champion_rows)
     files = {

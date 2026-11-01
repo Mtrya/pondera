@@ -78,7 +78,7 @@ class DatasetContractTests(unittest.TestCase):
         self.assertEqual(manifest["grammar_version"], TRACE_GRAMMAR_VERSION)
         self.assertEqual(manifest["grammar_version"], 2)
         self.assertEqual(manifest["format_version"], SEQUENCE_FORMAT_VERSION)
-        self.assertEqual(manifest["format_version"], 4)
+        self.assertEqual(manifest["format_version"], 5)
         self.assertEqual(manifest["tokenizer_version"], CHESS_TOKENIZER_VERSION)
         for retired in ("level", "line_bounds", "max_lines", "pv_limit"):
             self.assertNotIn(retired, manifest)
@@ -210,7 +210,7 @@ def write_shard(directory, index, fen):
     shard.mkdir()
     np.save(shard / "board_tokens.npy", encode_board(fen)[None, :])
     np.save(shard / "trace_tokens.npy", writer.tokens[None, :])
-    np.save(shard / "trace_len.npy", np.asarray([len(writer.tokens)], dtype=np.int16))
+    np.save(shard / "trace_len.npy", np.asarray([len(writer.tokens)], dtype=np.int32))
     np.save(shard / "trace_roles.npy", writer.roles[None, :])
     for name in (
         "state_no_tool",
@@ -219,8 +219,8 @@ def write_shard(directory, index, fen):
         "state_basis",
         "state_value",
     ):
-        np.save(shard / f"{name}.npy", np.zeros((1, 0), dtype=np.int16))
-    np.save(shard / "state_count.npy", np.zeros(1, dtype=np.int16))
+        np.save(shard / f"{name}.npy", np.zeros((1, 0), dtype=np.int32))
+    np.save(shard / "state_count.npy", np.zeros(1, dtype=np.int32))
     (shard / "roots.jsonl").write_text(json.dumps({"split": "train"}) + "\n")
     return shard.name
 

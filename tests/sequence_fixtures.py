@@ -53,7 +53,7 @@ def write_sequence_dataset(root, splits, depth=16):
             board_array[index, : len(board)] = board
         trace_width = max(len(row["trace"]) for row in rows)
         trace_array = np.full((len(rows), trace_width), PAD, dtype=np.int16)
-        length_array = np.zeros(len(rows), dtype=np.int16)
+        length_array = np.zeros(len(rows), dtype=np.int32)
         role_array = np.full((len(rows), trace_width), 0, dtype=np.int8)
         for index, row in enumerate(rows):
             tokens, roles = row["trace"], row["roles"]
