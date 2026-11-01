@@ -12,7 +12,7 @@ import select
 import shutil
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import chess
@@ -387,6 +387,31 @@ def collect_root(root, output, config, engine_path, engine_name=None, teacher=No
     return meta
 
 
+_WORKER = {}
+
+
+def _init_worker(config, output, engine_path, engine_name, teacher):
+    _WORKER.update(
+        config=config,
+        output=output,
+        engine_path=engine_path,
+        engine_name=engine_name,
+        teacher=teacher,
+    )
+
+
+def _collect_worker(root):
+    meta = collect_root(
+        root,
+        _WORKER["output"],
+        _WORKER["config"],
+        _WORKER["engine_path"],
+        _WORKER["engine_name"],
+        _WORKER["teacher"],
+    )
+    return root["root_id"], meta["sidecar_sha256"]
+
+
 def _collection_path(output):
     return Path(output) / "collection.json"
 
@@ -597,27 +622,33 @@ def collect(
     )
     write_manifest(_sidecars_path(output), sidecars)
 
-    def run(root):
-        meta = collect_root(
-            root,
+    def flush():
+        write_manifest(_sidecars_path(output), sidecars)
+        _write_collection(
             output,
-            config,
-            engine_path,
-            engine_identity["name"],
-            (teacher["value_mate"], teacher["max_ply"]),
+            identity,
+            {"rows": len(sidecars), "sha256": content_sha256(sidecars)},
         )
-        return root["root_id"], meta["sidecar_sha256"]
 
     if pending:
-        with ThreadPoolExecutor(max_workers=config.search.workers) as pool:
-            for root_id, digest in pool.map(run, pending):
+        written = 0
+        with ProcessPoolExecutor(
+            max_workers=min(config.search.workers, len(pending)),
+            initializer=_init_worker,
+            initargs=(
+                config,
+                output,
+                engine_path,
+                engine_identity["name"],
+                (teacher["value_mate"], teacher["max_ply"]),
+            ),
+        ) as pool:
+            for root_id, digest in pool.map(_collect_worker, pending):
                 sidecars[root_id] = digest
-                write_manifest(_sidecars_path(output), sidecars)
-                _write_collection(
-                    output,
-                    identity,
-                    {"rows": len(sidecars), "sha256": content_sha256(sidecars)},
-                )
+                written += 1
+                if written % 100 == 0:
+                    flush()
+        flush()
     return {
         "roots": len(sidecars),
         "pending": len(pending),
