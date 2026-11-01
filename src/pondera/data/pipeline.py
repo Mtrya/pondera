@@ -28,7 +28,7 @@ from pathlib import Path
 import chess
 import numpy as np
 
-from pondera.chess.codec import encode_board, value_bin
+from pondera.chess.codec import cap_mate_distance, encode_board, value_bin
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import (
     CHESS_TOKENIZER_VERSION,
@@ -1172,7 +1172,10 @@ def _check_champion_round(root_id, entry, board, value_mate, max_ply):
         expected = mate_token_for(mate)
         if value_token != expected:
             raise ValueError(f"Champion mate token disagrees: {root_id}")
-        if mate_distance_moves(entry["raw"], value_mate, max_ply) != mate:
+        expected_mate = cap_mate_distance(
+            mate_distance_moves(entry["raw"], value_mate, max_ply)
+        )
+        if expected_mate != mate:
             raise ValueError(f"Champion mate distance disagrees: {root_id}")
     else:
         if (

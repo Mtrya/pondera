@@ -93,7 +93,8 @@ VALUE_BIN_REPRESENTATIVES = (
     1.0,
 )
 # Frozen mate coverage of the pinned teacher data; distance 0 is reserved for
-# the terminal position after perspective normalization.
+# the terminal position after perspective normalization. The last token in
+# each direction is the open-ended bucket (28+ wins, 30+ losses).
 MATE_WIN_MAX = 28
 MATE_LOSS_MAX = 30
 
@@ -105,11 +106,20 @@ def value_bin(value: float) -> int:
     return bisect.bisect_left(VALUE_BIN_BOUNDARIES, value)
 
 
+def cap_mate_distance(distance: int) -> int:
+    """Clamp a signed mate distance into the frozen open-ended coverage."""
+    if distance >= 0:
+        return min(distance, MATE_WIN_MAX)
+    return max(distance, -MATE_LOSS_MAX)
+
+
 def mate_token(distance: int, win: bool) -> int:
     """Token id for a mate announcement from the moving side's perspective."""
-    if not 0 <= distance <= (MATE_WIN_MAX if win else MATE_LOSS_MAX):
-        raise ValueError("Mate distance outside the frozen coverage")
-    return (MATE_WIN if win else MATE_LOSS) + distance
+    if distance < 0:
+        raise ValueError("Mate distance must be nonnegative")
+    if win:
+        return MATE_WIN + min(distance, MATE_WIN_MAX)
+    return MATE_LOSS + min(distance, MATE_LOSS_MAX)
 
 
 def decode_value_token(token: int) -> float:

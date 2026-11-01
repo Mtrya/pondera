@@ -4,9 +4,9 @@
 id; the line number is the id. The layout is arithmetic: 768 occupied-square
 atoms (square * 12 + piece over a1..h8 and PNBRQKpnbrqk), then self-contained
 metadata atoms (side, castling, en passant, halfmove clock, repetition count),
-then the move block, 20 value bins, mate-distance tokens (win 0-28, loss 0-30),
-and the eight trace delimiters PAD, BACK, RESET, BOARD, FINAL, REFUTED, DEPTH,
-END.
+then the move block, 20 value bins, mate-distance tokens (win 0-27 and 28+,
+loss 0-29 and 30+), and the eight trace delimiters PAD, BACK, RESET, BOARD,
+FINAL, REFUTED, DEPTH, END.
 
 The file is the contract. This module validates the arithmetic layout against
 the file at import; regenerate the file only when the vocabulary deliberately
@@ -31,8 +31,8 @@ HALFMOVE_CLOCKS = 101  # 0..99 and >=100
 REPETITION_COUNTS = 5  # 1, 2, 3, 4, >=5
 MOVES = 1969  # geometrically possible moves plus the draw claim
 VALUE_BINS = 20
-MATE_WINS = 29  # distance 0..28; 0 is the terminal position
-MATE_LOSSES = 31  # distance 0..30
+MATE_WINS = 29  # distance 0..28; 28 is the open-ended 28+ bucket
+MATE_LOSSES = 31  # distance 0..30; 30 is the open-ended 30+ bucket
 DELIMITERS = 8
 
 # --- Segment offsets --- #

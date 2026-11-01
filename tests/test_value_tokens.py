@@ -125,7 +125,10 @@ class UnifiedVocabularyTests(unittest.TestCase):
         self.assertEqual(mate_token(28, win=True), MATE_WIN + 28)
         self.assertEqual(mate_token(0, win=False), MATE_LOSS)
         self.assertEqual(mate_token(30, win=False), MATE_LOSS + 30)
-        for distance, win in ((-1, True), (29, True), (-1, False), (31, False)):
+        # The last token in each direction is the open-ended bucket.
+        self.assertEqual(mate_token(29, win=True), MATE_WIN + 28)
+        self.assertEqual(mate_token(31, win=False), MATE_LOSS + 30)
+        for distance, win in ((-1, True), (-1, False)):
             with self.subTest(distance=distance, win=win):
                 with self.assertRaises(ValueError):
                     mate_token(distance, win)

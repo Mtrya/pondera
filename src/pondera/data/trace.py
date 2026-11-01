@@ -2135,11 +2135,7 @@ class _Synthesis:
                     top["move"],
                     raw,
                     None if wdl is None else tuple(wdl),
-                    None
-                    if wdl is not None
-                    else mate_distance_moves(
-                        raw, self.sidecar.value_mate, self.sidecar.max_ply
-                    ),
+                    None if wdl is not None else _token_mate(token),
                     token,
                     tuple(top["pv"]),
                     tuple(self._recorded_root_candidates),
