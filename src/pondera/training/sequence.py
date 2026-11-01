@@ -4,9 +4,9 @@ Follows the depth.py training skeleton (resume, schedule, tracking) under the
 sequence contract: the board prefix is attended bidirectionally, the trace
 suffix causally, and supervision is shifted next-token CE on the generated
 trace tokens. The current mask excludes tool responses and padding and
-weights the remaining tokens equally; loss coverage and weighting are not
-yet finalized (D13 only adopts vanilla equal-weight CE as the starting
-point). Evaluation reports the aggregate loss and top-1 accuracy for
+weights the remaining tokens equally; this mask is a provisional training
+choice, not part of the data contract, and loss coverage and weighting remain
+open. Evaluation reports the aggregate loss and top-1 accuracy for
 validation and a frozen evenly spaced train probe, their gaps, per-role
 cross-entropy, and optional
 internal health probes. Training accounts actual board and trace tokens plus
@@ -204,7 +204,7 @@ def trace_loss_parts(model, inputs):
     tool responses. Thought tokens, the FINAL decision, the label evaluation,
     the best line, and ``<end>`` currently carry the same weight; the per-role
     sums are diagnostics and do not enter the loss. Loss coverage and weighting
-    remain open: D13 adopts only vanilla equal-weight CE as the starting point.
+    remain open; vanilla equal-weight CE is only the starting point.
     """
     trace_ids = inputs["trace_ids"]
     roles = inputs["trace_roles"]

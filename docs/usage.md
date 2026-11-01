@@ -18,9 +18,9 @@ A node visit runs from the move that enters the node to the BACK or RESET that l
 
 `FINAL` is the decision point, not the end of the trace. It may follow any operation boundary and implicitly returns to the root. It is followed by a root move, a value token, an optional mate-distance token, the best line, and `<end>`. A root that can claim a draw writes the draw claim in place of the move and has no line: `FINAL <claim_draw> <value> [<mate>] <end>`. The suffix is a prediction region, so a truncated trace carries the final answer of its complete search regardless of where its thought was cut. `pondera.data.trace.TraceWriter` produces traces and `replay` rebuilds and validates them with python-chess from the root FEN alone. The writer, replay, and the generation mask share one visit state machine.
 
-Sequence datasets store `board_tokens`, `trace_tokens`, `trace_len`, and `trace_roles` arrays with manifest `format_version = 4` and `grammar_version = 2`. Roles mark thought moves, evaluations, controls, refutations, the FINAL decision, the label evaluation, and the best line; tool responses carry no loss. Every trace ends with `<end>`, and the FINAL decision is not the last token.
+Sequence datasets store `board_tokens`, `trace_tokens`, `trace_len`, and `trace_roles` arrays with manifest `format_version = 4` and `grammar_version = 2`. Roles mark thought moves, evaluations, controls, refutations, the FINAL decision, the label evaluation, and the best line. Every trace ends with `<end>`, and the FINAL decision is not the last token.
 
-Offline collection and synthesis are driven by `configs/trace_v2.toml`. The collector samples roots from an existing root release, runs one fresh instrumented engine process per root, and keeps the sidecar and root metadata in a run directory. The release builder turns those records into four presentation rows per root and publishes independently hashed shards, resuming existing shards by root. Both commands are library entry points:
+Offline collection and synthesis are driven by `configs/trace_v2.toml`. The collector samples roots from an existing root release, runs one fresh instrumented engine process per root, and keeps the sidecar and root metadata in a run directory. The release builder turns those records into presentation rows — four per root without a recipe, or the single presentation selected by the recipe — and publishes independently hashed shards, resuming existing shards by root. Both commands are library entry points:
 
 ```bash
 uv run python -m pondera.data.trace_collect --config configs/trace_v2.toml --roots ROOTS.jsonl \
@@ -35,10 +35,13 @@ Validate a completed release with `uv run python -m pondera.data.sequence_valida
 
 ```bash
 uv run python -m pondera.training.depth --config CONFIG.toml --data-dir DATA --output-dir RUN --device cuda
-uv run python -m pondera.training.depth --config CONFIG.toml --data-dir DATA --output-dir RUN --device cuda --resume RUN/final.pth
+uv run python -m pondera.training.sequence --config CONFIG.toml --data-dir DATA --output-dir RUN --device cuda
+uv run python -m pondera.training.sequence --config CONFIG.toml --data-dir DATA --output-dir RUN --device cuda --resume RUN/final.pth
 ```
 
-Choose `--device cpu` for CPU execution. `--track` enables SwanLab; local metrics are always written. `--max-steps` stops at a positive absolute optimizer step without changing the configured schedule: resuming from step 100 with `--max-steps 110` runs 10 more steps, and a limit already reached runs none. Resume requires the same training configuration and input arrays. Checkpoints store optimizer, scheduler, progress, and random-number state. Partial accumulation groups at an epoch boundary are discarded.
+`depth` trains board policies from position arrays; `sequence` trains causal trace policies from a release. Choose `--device cpu` for CPU execution. `--track` enables SwanLab; local metrics are always written. `--max-steps` stops at a positive absolute optimizer step without changing the configured schedule: resuming from step 100 with `--max-steps 110` runs 10 more steps, and a limit already reached runs none. Resume requires the same training configuration and input arrays. Checkpoints store optimizer, scheduler, progress, and random-number state. Partial accumulation groups at an epoch boundary are discarded.
+
+Sequence training applies shifted next-token cross-entropy over generated trace tokens; the current mask excludes padding and tool responses and weights all other roles equally. Masking is a training choice, not part of the data format.
 
 Microbatch size and gradient accumulation may be regrouped on resume when their product stays unchanged. The trainer converts the saved position cursor to the new microbatch size and preserves example order, optimizer updates, and the learning-rate schedule. Other configuration changes remain rejected. `execution.json` and checkpoint `execution_history` record regrouping. Floating-point reductions and dropout execution can differ after regrouping, so bitwise equivalence is not guaranteed.
 

@@ -1054,8 +1054,8 @@ class _Synthesis:
                 self._record()
         # Refutations come after all W exact values, and the only evidence is
         # a null-window fail-low in the last line's accepted pass. Its window
-        # is that line's best-so-far, the leading score line when the
-        # statement is written (D18), not necessarily the W-th value.
+        # is that line's best-so-far at the moment the statement is written,
+        # not necessarily the W-th value.
         last_attempt = accepted[max(accepted)]
         for candidate in _candidate_groups(
             self.sidecar, round_number, last_attempt
