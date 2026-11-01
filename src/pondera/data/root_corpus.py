@@ -36,8 +36,10 @@ at least three times or the halfmove clock is at least 100. Every row is
 ranked by the SHA-256 of ``"<seed>:<root_id>:pool"`` and each stratum
 (split × claimable) keeps its lowest ranks, so the selection is uniform
 without replacement, reproducible from the seed, and grows by extension when
-the requested sizes grow. Rows are emitted in global rank order, so any
-prefix of the pool file is itself a uniform subsample.
+the requested sizes grow. Rows are emitted in the order of an independent
+second hash, ``"<seed>:<root_id>:pool-order"``, so any prefix of the pool
+file is a uniform subsample of the whole pool even though the strata are
+selected at different rates.
 """
 
 import argparse
@@ -495,8 +497,8 @@ def _claimable(record):
     return record["repetition"] >= 3 or halfmove >= CLAIM_HALFMOVE
 
 
-def _pool_priority(seed, root_id):
-    digest = hashlib.sha256(f"{seed}:{root_id}:pool".encode()).digest()
+def _pool_priority(seed, root_id, domain="pool"):
+    digest = hashlib.sha256(f"{seed}:{root_id}:{domain}".encode()).digest()
     return int.from_bytes(digest[:8], "big")
 
 
@@ -526,7 +528,12 @@ def sample_pool(corpus, output, train_roots, val_roots, claimable_share, seed):
             if target == 0:
                 continue
             heap = heaps[stratum]
-            entry = (-_pool_priority(seed, record["root_id"]), sequence, line)
+            entry = (
+                -_pool_priority(seed, record["root_id"]),
+                sequence,
+                record["root_id"],
+                line,
+            )
             if len(heap) < target:
                 heapq.heappush(heap, entry)
             elif entry > heap[0]:
@@ -544,8 +551,8 @@ def sample_pool(corpus, output, train_roots, val_roots, claimable_share, seed):
                 f"the requested {target}"
             )
         strata[name] = {"available": supply, "selected": len(heap)}
-        for negated, _, line in heap:
-            selected.append((-negated, line))
+        for _, _, root_id, line in heap:
+            selected.append((_pool_priority(seed, root_id, "pool-order"), line))
     selected.sort()
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -568,7 +575,10 @@ def sample_pool(corpus, output, train_roots, val_roots, claimable_share, seed):
             "claimable_share": claimable_share,
         },
         "claimable_rule": "repetition >= 3 or halfmove clock >= 100",
-        "rank_rule": 'sha256("<seed>:<root_id>:pool")[:8] big-endian, lowest kept',
+        "rank_rule": (
+            'selection: sha256("<seed>:<root_id>:pool")[:8] big-endian, lowest kept;'
+            ' output order: sha256("<seed>:<root_id>:pool-order")[:8] big-endian'
+        ),
         "corpus": {
             "path": str(corpus),
             "roots_sha256": corpus_manifest["files"]["roots.jsonl"]["sha256"],

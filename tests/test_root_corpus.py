@@ -349,16 +349,17 @@ class RootCorpusTests(unittest.TestCase):
                 )
 
 
-def synthetic_corpus(directory):
+def synthetic_corpus(directory, specs=None):
     """Write a small corpus with a known split-by-claimable layout."""
     directory = Path(directory)
-    specs = (
-        [("train", 1, 0)] * 20
-        + [("train", 3, 0)] * 4
-        + [("train", 1, 100)] * 4
-        + [("val", 1, 0)] * 8
-        + [("val", 3, 0)] * 4
-    )
+    if specs is None:
+        specs = (
+            [("train", 1, 0)] * 20
+            + [("train", 3, 0)] * 4
+            + [("train", 1, 100)] * 4
+            + [("val", 1, 0)] * 8
+            + [("val", 3, 0)] * 4
+        )
     lines = []
     for index, (split, repetition, halfmove) in enumerate(specs):
         fen = f"8/8/8/8/8/8/8/K6k w - - {halfmove} {index + 1}"
@@ -472,6 +473,38 @@ class PoolSamplingTests(unittest.TestCase):
             }
         self.assertEqual(len(large_ids), 20)
         self.assertTrue(small_ids < large_ids)
+
+    def test_sample_pool_prefixes_are_not_stratified_by_selection_rate(self):
+        # The claimable stratum is oversampled (9 of 10 kept) while the plain
+        # stratum is thinned (9 of 100 kept). If the output order followed the
+        # selection rank, claimable rows would cluster at the back; the
+        # independent order hash must spread them through the file.
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Path(directory) / "corpus"
+            corpus.mkdir()
+            synthetic_corpus(corpus, [("train", 1, 0)] * 100 + [("train", 3, 0)] * 10)
+            halves = []
+            for seed in (7, 8):
+                output = Path(directory) / f"pool-{seed}"
+                sample_pool(corpus, output, 18, 0, 0.5, seed)
+                rows = [
+                    json.loads(line)
+                    for line in (output / "roots.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                halves.append(
+                    (
+                        sum(1 for row in rows[:9] if _claimable(row)),
+                        sum(1 for row in rows[9:] if _claimable(row)),
+                    )
+                )
+        self.assertEqual(sum(halves[0]), 9)
+        for first_half, second_half in halves:
+            self.assertGreater(first_half, 0)
+            self.assertGreater(second_half, 0)
+            self.assertLess(first_half, 9)
+            self.assertLess(second_half, 9)
 
     def test_sample_pool_refuses_an_undersupplied_stratum(self):
         with tempfile.TemporaryDirectory() as directory:
