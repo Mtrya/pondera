@@ -28,6 +28,7 @@ from pondera.data.trace import (
     TRACE_GRAMMAR_VERSION,
     replay,
 )
+from pondera.data.trace_config import parse_recipe, sample_presentation
 from pondera.data.trace_synthesis import (
     PRESENTATIONS,
     SIDECAR_SCHEMA,
@@ -131,6 +132,8 @@ def _release_identity_contract(release, root_count):
     missing = required - set(metadata)
     if missing:
         raise ValueError(f"Release identity is missing {sorted(missing)[0]}")
+    if "recipe" in metadata:
+        parse_recipe(metadata["recipe"])
 
     teacher = metadata["teacher"]
     if not isinstance(teacher, dict) or set(teacher) != TEACHER_FIELDS:
@@ -175,7 +178,15 @@ def _release_identity_contract(release, root_count):
         raise ValueError("Release search limits are invalid")
     if not _is_int(search["teacher_width"], 1):
         raise ValueError("Release teacher width is invalid")
-    if (teacher["schema_version"] == SIDECAR_SCHEMA) != (search["teacher_width"] == 1):
+    if "recipe" in metadata:
+        if (
+            search["teacher_width"] > 1
+            and teacher["schema_version"] != SIDECAR_SCHEMA_WIDE
+        ):
+            raise ValueError("Release teacher schema differs from the teacher width")
+    elif (teacher["schema_version"] == SIDECAR_SCHEMA) != (
+        search["teacher_width"] == 1
+    ):
         raise ValueError("Release teacher schema differs from the teacher width")
     if search["threads"] != 1:
         raise ValueError("Release must use one search thread")
@@ -629,8 +640,10 @@ def _validate_shard_rows(
     release_dir,
     shard,
     presentations,
-    teacher_width,
-    depth,
+    default_width,
+    default_depth,
+    recipe,
+    seed,
     value_mate,
     max_ply,
     expected_metadata=None,
@@ -647,7 +660,19 @@ def _validate_shard_rows(
     state_total = 0
     board_responses = 0
     max_trace = 0
+    max_teacher_width = 0
+    recipe_widths = (
+        {key for key, _ in recipe.widths}
+        if recipe is not None and recipe.widths is not None
+        else None
+    )
+    recipe_depths = (
+        {key for key, _ in recipe.depths}
+        if recipe is not None and recipe.depths is not None
+        else None
+    )
     presentations_seen = Counter()
+    expected_presentations = {}
     suffixes = {}
     roots_seen = set()
     checked_champions = set()
@@ -656,10 +681,29 @@ def _validate_shard_rows(
         presentation = row.get("presentation")
         if not isinstance(root_id, str) or presentation not in presentations:
             raise ValueError(f"Release row identity is invalid: {directory}")
-        if row.get("teacher_width") != teacher_width:
-            raise ValueError(f"Release teacher width differs: {root_id}")
-        if row.get("depth") != depth:
-            raise ValueError(f"Release depth differs: {root_id}")
+        teacher_width = row.get("teacher_width")
+        depth = row.get("depth")
+        if not _is_int(teacher_width, 1) or not _is_int(depth, 1):
+            raise ValueError(f"Release teacher settings are invalid: {root_id}")
+        if recipe is None:
+            if teacher_width != default_width or depth != default_depth:
+                raise ValueError(f"Release teacher settings differ: {root_id}")
+        else:
+            if recipe_widths is None:
+                if teacher_width != default_width:
+                    raise ValueError(f"Release teacher width differs: {root_id}")
+            elif teacher_width not in recipe_widths:
+                raise ValueError(f"Release teacher width differs: {root_id}")
+            if recipe_depths is None:
+                if depth != default_depth:
+                    raise ValueError(f"Release depth differs: {root_id}")
+            elif depth not in recipe_depths:
+                raise ValueError(f"Release depth differs: {root_id}")
+        if root_id not in expected_presentations:
+            expected_presentations[root_id] = sample_presentation(recipe, seed, root_id)
+        expected_presentation = expected_presentations[root_id]
+        if expected_presentation is not None and presentation != expected_presentation:
+            raise ValueError(f"Release presentation differs from the recipe: {root_id}")
         champion = champions.get(root_id)
         if champion is None:
             raise ValueError(f"Release row has no champion record: {root_id}")
@@ -667,7 +711,7 @@ def _validate_shard_rows(
             expected = expected_roots.get(root_id)
             if expected is None:
                 raise ValueError(f"Release contains an unselected root: {root_id}")
-            for name in ROOT_RECORD_FIELDS:
+            for name in (*ROOT_RECORD_FIELDS, "teacher_width", "depth"):
                 if name in expected and row.get(name) != expected.get(name):
                     raise ValueError(
                         f"Release root {name} differs from its selection: {root_id}"
@@ -676,6 +720,7 @@ def _validate_shard_rows(
         if board.turn != (row["turn"] == "white"):
             raise ValueError(f"Root turn disagrees with FEN: {root_id}")
         effective_width = min(teacher_width, board.legal_moves.count())
+        max_teacher_width = max(max_teacher_width, teacher_width)
         repetition = row["repetition"]
         if not _is_int(repetition, 1) or repetition > 4:
             raise ValueError(f"Root repetition is out of range: {root_id}")
@@ -842,14 +887,15 @@ def _validate_shard_rows(
         roots_seen.add(root_id)
     if roots_seen != set(champions):
         raise ValueError(f"Shard rows do not cover its champion records: {directory}")
-    if any(count != len(presentations) for count in presentations_seen.values()):
-        raise ValueError(f"A shard root is missing a presentation: {directory}")
+    for root_id, count in presentations_seen.items():
+        wanted = (
+            1 if expected_presentations[root_id] is not None else len(PRESENTATIONS)
+        )
+        if count != wanted:
+            raise ValueError(f"A shard root has the wrong row count: {directory}")
     for champion in champions.values():
-        if len(champion["rounds"]) != depth:
-            raise ValueError(f"Champion record has the wrong depth: {directory}")
-        if [entry["round"] for entry in champion["rounds"]] != list(
-            range(1, depth + 1)
-        ):
+        rounds = champion["rounds"]
+        if [entry["round"] for entry in rounds] != list(range(1, len(rounds) + 1)):
             raise ValueError(f"Champion rounds are not contiguous: {directory}")
     return {
         "identities": identities,
@@ -857,6 +903,7 @@ def _validate_shard_rows(
         "states": state_total,
         "board_responses": board_responses,
         "max_trace": max_trace,
+        "max_teacher_width": max_teacher_width,
     }
 
 
@@ -882,6 +929,13 @@ def validate_release(directory, roots=None, workers=8):
     metadata = validate_release_identity(release)
     teacher = metadata["teacher"]
     search = metadata["search"]
+    recipe = parse_recipe(metadata["recipe"]) if "recipe" in metadata else None
+    seed = metadata["root_selection"]["seed"]
+    presentations = (
+        tuple(name for name, _ in recipe.presentations)
+        if recipe is not None and recipe.presentations is not None
+        else PRESENTATIONS
+    )
     expected_shard_metadata = {**expected_metadata, **shard_configuration(metadata)}
     expected = None
     if roots is not None:
@@ -902,14 +956,17 @@ def validate_release(directory, roots=None, workers=8):
     states = 0
     board_responses = 0
     max_trace = 0
+    max_teacher_width = 0
 
     def validate(shard):
         return _validate_shard_rows(
             directory,
             shard,
-            PRESENTATIONS,
+            presentations,
             search["teacher_width"],
             search["depth"],
+            recipe,
+            seed,
             teacher["value_mate"],
             teacher["max_ply"],
             expected_shard_metadata,
@@ -928,14 +985,29 @@ def validate_release(directory, roots=None, workers=8):
             states += result["states"]
             board_responses += result["board_responses"]
             max_trace = max(max_trace, result["max_trace"])
-    if seen_roots != set(complete) or len(seen) != len(complete) * len(PRESENTATIONS):
+            max_teacher_width = max(max_teacher_width, result["max_teacher_width"])
+    expected_schema = SIDECAR_SCHEMA_WIDE if max_teacher_width > 1 else SIDECAR_SCHEMA
+    if teacher["schema_version"] != expected_schema:
+        raise ValueError("Release teacher schema differs from its rows")
+    rows_per_root = (
+        1
+        if recipe is not None and recipe.samples_presentations()
+        else len(PRESENTATIONS)
+    )
+    if seen_roots != set(complete) or len(seen) != len(complete) * rows_per_root:
         raise ValueError("Release rows do not match its roots and presentations")
     if expected is not None:
-        wanted = {
-            (root_id, presentation)
-            for root_id in expected
-            for presentation in PRESENTATIONS
-        }
+        if rows_per_root == 1:
+            wanted = {
+                (root_id, sample_presentation(recipe, seed, root_id))
+                for root_id in expected
+            }
+        else:
+            wanted = {
+                (root_id, presentation)
+                for root_id in expected
+                for presentation in PRESENTATIONS
+            }
         if seen != wanted or set(complete) != set(expected):
             raise ValueError("Release does not contain exactly the selected roots")
     result = {

@@ -1,10 +1,11 @@
 """Sharded, resumable grammar-v2 sequence releases.
 
-A release row is one presentation of one root. All four presentations of a
-root share the complete search's label suffix, so they predict the same final
-move, evaluation, and variation. The builder is resumable by root: a published
-shard is verified and reused, and the release manifest is updated after each
-shard.
+A release row is one presentation of one root. By default all four
+presentations are written; a recipe may sample one presentation per root.
+Every written presentation of a root shares the complete search's label
+suffix, so they predict the same final move, evaluation, and variation. The
+builder is resumable by root: a published shard is verified and reused, and
+the release manifest is updated after each shard.
 """
 
 import json
@@ -24,7 +25,7 @@ from pondera.data.sequence_validation import (
 )
 from pondera.data.storage import content_sha256, load_manifest, sha256, write_manifest
 from pondera.data.trace import ROLE_COUNT, TRACE_GRAMMAR_VERSION
-from pondera.data.trace_config import DEFAULT_TEACHER_PATH
+from pondera.data.trace_config import DEFAULT_TEACHER_PATH, sample_presentation
 from pondera.data.trace_synthesis import (
     PRESENTATIONS,
     SIDECAR_SCHEMA,
@@ -123,7 +124,7 @@ def _champion_row(root, synthesized):
     }
 
 
-def _write_shard(directory, records, metadata):
+def _write_shard(directory, records, metadata, presentations):
     boards, traces, roles, lengths = [], [], [], []
     no_tool, tool, best, basis, values, counts = [], [], [], [], [], []
     root_rows = []
@@ -131,7 +132,7 @@ def _write_shard(directory, records, metadata):
     for synthesized in records:
         root = synthesized.root
         board = encode_board(root["fen"], int(root["repetition"]))
-        for presentation in PRESENTATIONS:
+        for presentation in presentations[root["root_id"]]:
             row = synthesized.rows[presentation]
             boards.append(board)
             traces.append(row.tokens)
@@ -196,15 +197,22 @@ def _write_shard(directory, records, metadata):
     return payload
 
 
-def _expected_root_rows(roots):
+def _presentations_for(recipe, seed, root_id):
+    presentation = sample_presentation(recipe, seed, root_id)
+    if presentation is None:
+        return PRESENTATIONS
+    return (presentation,)
+
+
+def _expected_root_rows(roots, presentations):
     return {
         (root["root_id"], presentation)
         for root in roots
-        for presentation in PRESENTATIONS
+        for presentation in presentations[root["root_id"]]
     }
 
 
-def _recover_shard(output, index, roots, metadata):
+def _recover_shard(output, index, roots, metadata, presentations):
     final = output / f"shard-{index:06d}"
     manifest = load_manifest(final / "manifest.json")
     if not isinstance(manifest.get("rows"), int):
@@ -216,13 +224,13 @@ def _recover_shard(output, index, roots, metadata):
     }
     _, rows, _ = verify_shard_files(output, published, metadata)
     if {(row["root_id"], row["presentation"]) for row in rows} != _expected_root_rows(
-        roots
+        roots, presentations
     ):
         raise FileExistsError(f"Unregistered shard has different roots: {final}")
     expected = {root["root_id"]: root for root in roots}
     for row in rows:
         root = expected[row["root_id"]]
-        for name in ROOT_ROW_FIELDS:
+        for name in (*ROOT_ROW_FIELDS, "teacher_width", "depth"):
             if name in root and row.get(name) != root[name]:
                 raise FileExistsError(
                     f"Unregistered shard root {name} differs: {final}"
@@ -230,16 +238,16 @@ def _recover_shard(output, index, roots, metadata):
     return published
 
 
-def _publish_shard(output, index, records, metadata):
+def _publish_shard(output, index, records, metadata, presentations):
     final = output / f"shard-{index:06d}"
     temporary = output / f".shard-{index:06d}.tmp"
     if temporary.exists():
         shutil.rmtree(temporary)
-    payload = _write_shard(temporary, records, metadata)
+    payload = _write_shard(temporary, records, metadata, presentations)
     if final.exists():
         shutil.rmtree(temporary)
         roots = [record.root for record in records]
-        return _recover_shard(output, index, roots, metadata)
+        return _recover_shard(output, index, roots, metadata, presentations)
     os.replace(temporary, final)
     return {
         "path": final.name,
@@ -300,9 +308,21 @@ def _verify_identity(identity, roots, sidecar_dir, config, contract_path):
         raise ValueError("Release synthesis settings differ from the configuration")
     if identity["config"].get("sha256") != sha256(config.source_path):
         raise ValueError("Release configuration checksum differs from the file")
-    expected_schema = (
-        SIDECAR_SCHEMA if config.search.teacher_width == 1 else SIDECAR_SCHEMA_WIDE
-    )
+    if config.recipe is None:
+        if "recipe" in identity:
+            raise ValueError("Release identity has a recipe the configuration omits")
+    else:
+        if identity.get("recipe") != config.recipe.identity():
+            raise ValueError("Release recipe differs from the configuration")
+        missing = [
+            root["root_id"]
+            for root in roots
+            if "teacher_width" not in root or "depth" not in root
+        ]
+        if missing:
+            raise ValueError(f"Release root has no recipe sample: {missing[0]}")
+    widths = [root.get("teacher_width", config.search.teacher_width) for root in roots]
+    expected_schema = SIDECAR_SCHEMA_WIDE if max(widths) > 1 else SIDECAR_SCHEMA
     if identity["teacher"].get("schema_version") != expected_schema:
         raise ValueError("Release teacher schema is unsupported")
     if identity["teacher"].get("contract_sha256") != sha256(contract_path):
@@ -318,7 +338,7 @@ def _verify_identity(identity, roots, sidecar_dir, config, contract_path):
 
 def _synthesize_one(payload):
     root, path, config, seed = payload
-    sidecar = load_sidecar(path, teacher_width=config.search.teacher_width)
+    sidecar = load_sidecar(path)
     return synthesize_root(sidecar, root, config, seed=seed)
 
 
@@ -333,7 +353,7 @@ def _worker(payload):
     return _synthesize_one((root, path, _WORKER_CONFIG, _WORKER_SEED))
 
 
-def _validate_completed_release(output, identity, roots, metadata):
+def _validate_completed_release(output, identity, roots, metadata, presentations):
     release_path = output / "release.json"
     if not release_path.exists():
         return set(), []
@@ -347,7 +367,7 @@ def _validate_completed_release(output, identity, roots, metadata):
     expected = {
         (root_id, presentation)
         for root_id in complete
-        for presentation in PRESENTATIONS
+        for presentation in presentations[root_id]
     }
     published = Counter()
     for shard in shards:
@@ -385,6 +405,13 @@ def produce_shards(
     identity = _verify_identity(
         identity, roots, Path(sidecar_dir), config, Path(contract_path)
     )
+    collection_seed = identity["root_selection"]["seed"]
+    presentations = {
+        root["root_id"]: _presentations_for(
+            config.recipe, collection_seed, root["root_id"]
+        )
+        for root in roots
+    }
     release_metadata = _release_metadata(identity)
     shard_metadata = {
         key: value
@@ -395,7 +422,7 @@ def produce_shards(
     output_dir.mkdir(parents=True, exist_ok=True)
     release_path = output_dir / "release.json"
     complete, shards = _validate_completed_release(
-        output_dir, identity, roots, release_metadata
+        output_dir, identity, roots, release_metadata, presentations
     )
     pending = [root for root in roots if root["root_id"] not in complete]
     sidecar_dir = Path(sidecar_dir)
@@ -409,7 +436,9 @@ def produce_shards(
         index = len(shards)
         final = output_dir / f"shard-{index:06d}"
         if final.exists():
-            shard = _recover_shard(output_dir, index, group, shard_metadata)
+            shard = _recover_shard(
+                output_dir, index, group, shard_metadata, presentations
+            )
             records = []
         else:
             payloads = [
@@ -431,7 +460,9 @@ def produce_shards(
                     initargs=(config, seed),
                 ) as pool:
                     records = list(pool.map(_worker, payloads))
-            shard = _publish_shard(output_dir, index, records, shard_metadata)
+            shard = _publish_shard(
+                output_dir, index, records, shard_metadata, presentations
+            )
             synthesized.extend(records)
         shards.append(shard)
         complete.update(root["root_id"] for root in group)
@@ -444,7 +475,7 @@ def produce_shards(
                 "complete_root_ids": sorted(complete),
             },
         )
-    statistics = profile_roots(synthesized) if synthesized else None
+    statistics = profile_roots(synthesized, presentations) if synthesized else None
     if statistics is not None:
         statistics["complete"] = len(synthesized) == len(roots)
         write_manifest(output_dir / "statistics.json", statistics)
@@ -487,6 +518,7 @@ def load_collection(path):
             "root_selection",
             "roots",
             "sidecars",
+            "recipe",
         }
     }
     identity["roots"] = {

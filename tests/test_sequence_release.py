@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import chess
 import numpy as np
 from trace_fixtures import tie_sidecar_lines
 
@@ -38,6 +39,12 @@ W3_CASES = (
     "mate_in_1_w3",
     "two_moves_w3",
 )
+MIXED_RECIPE = """
+[recipe]
+widths = {1 = 0.5, 3 = 0.5}
+depths = {4 = 1.0}
+presentations = {zero = 0.2, full = 0.5, random = 0.3}
+"""
 ENGINE_SHA256 = "52498f1a544a7c238c9c6db0614aa5821877b83d157db167d931ec56f4525761"
 WIDE_ENGINE_SHA256 = "1420c314729fa3d40d6e2fda2834d44f422902d9b0d37c5d0fe1bf5d5f1f845b"
 INSTRUMENTATION_SHA256 = (
@@ -49,7 +56,7 @@ WIDE_INSTRUMENTATION_SHA256 = (
 CONTROL_SHA256 = "3116251d2cdf84f710b7fe27a037d0b0a390f1f379fb1f32aeace2f41f095b34"
 
 
-def config_text(width=1):
+def config_text(width=1, recipe_text=None):
     text = (
         Path("configs/trace_v2.toml")
         .read_text(encoding="utf-8")
@@ -57,13 +64,15 @@ def config_text(width=1):
     )
     if width != 1:
         text = text.replace("teacher_width = 1", f"teacher_width = {width}")
+    if recipe_text is not None:
+        text = text.rstrip() + "\n\n" + recipe_text.strip() + "\n"
     return text
 
 
-def build_run(directory, cases=CASES, width=1, sidecar_mutator=None):
+def build_run(directory, cases=CASES, width=1, sidecar_mutator=None, recipe_text=None):
     directory = Path(directory)
     config_path = directory / "trace_v2.toml"
-    config_path.write_text(config_text(width), encoding="utf-8")
+    config_path.write_text(config_text(width, recipe_text), encoding="utf-8")
     config = load_config(config_path)
     run = directory / "run"
     (run / "roots").mkdir(parents=True)
@@ -72,7 +81,6 @@ def build_run(directory, cases=CASES, width=1, sidecar_mutator=None):
     for case in cases:
         fixture = FIXTURES / case
         root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
-        roots.append(root)
         target = run / "roots" / root["root_id"]
         target.mkdir()
         if sidecar_mutator is None:
@@ -82,6 +90,13 @@ def build_run(directory, cases=CASES, width=1, sidecar_mutator=None):
             target.joinpath("sidecar.jsonl").write_text(
                 "\n".join(sidecar_mutator(case, lines)) + "\n", encoding="utf-8"
             )
+        if recipe_text is not None:
+            session = json.loads(
+                (target / "sidecar.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+            root["teacher_width"] = session["options"]["multipv"]
+            root["depth"] = config.search.depth
+        roots.append(root)
         mapping[root["root_id"]] = sha256(target / "sidecar.jsonl")
     roots_path = run / "roots.jsonl"
     roots_path.write_text(
@@ -94,9 +109,11 @@ def build_run(directory, cases=CASES, width=1, sidecar_mutator=None):
         .read_text(encoding="utf-8")
         .splitlines()[0]
     )
+    widths = [root.get("teacher_width", config.search.teacher_width) for root in roots]
+    schema = 4 if max(widths) > 1 else 3
     identity = {
         "teacher": {
-            "schema_version": 3 if width == 1 else 4,
+            "schema_version": schema,
             "contract": "docs/teacher.md",
             "contract_sha256": sha256("docs/teacher.md"),
             "value_mate": session["value_mate"],
@@ -104,10 +121,10 @@ def build_run(directory, cases=CASES, width=1, sidecar_mutator=None):
         },
         "engine": {
             "name": session["engine"],
-            "sha256": ENGINE_SHA256 if width == 1 else WIDE_ENGINE_SHA256,
+            "sha256": ENGINE_SHA256 if schema == 3 else WIDE_ENGINE_SHA256,
             "instrumentation": "instrumentation.patch",
             "instrumentation_sha256": INSTRUMENTATION_SHA256
-            if width == 1
+            if schema == 3
             else WIDE_INSTRUMENTATION_SHA256,
             "control": {"path": "control", "sha256": CONTROL_SHA256},
         },
@@ -132,12 +149,45 @@ def build_run(directory, cases=CASES, width=1, sidecar_mutator=None):
         },
         "sidecars": {"rows": len(mapping), "sha256": content_sha256(mapping)},
     }
+    if config.recipe is not None:
+        identity["recipe"] = config.recipe.identity()
     collection_path = run / "collection.json"
     write_manifest(
         collection_path,
         {"kind": "trace-v2-collection", "format_version": 1, **identity},
     )
     return config, roots, collection_path, run
+
+
+def read_release_rows(directory):
+    directory = Path(directory)
+    release = load_manifest(directory / "release.json")
+    output = {}
+    for shard in release["shards"]:
+        _, rows, arrays = verify_shard_files(directory, shard)
+        for index, row in enumerate(rows):
+            length = int(arrays["trace_len"][index])
+            count = int(arrays["state_count"][index])
+            output[(row["root_id"], row["presentation"])] = {
+                "row": row,
+                "trace_tokens": tuple(
+                    int(value) for value in arrays["trace_tokens"][index, :length]
+                ),
+                "trace_roles": tuple(
+                    int(value) for value in arrays["trace_roles"][index, :length]
+                ),
+                "state": {
+                    name: tuple(int(value) for value in arrays[name][index, :count])
+                    for name in (
+                        "state_best",
+                        "state_value",
+                        "state_basis",
+                        "state_no_tool",
+                        "state_tool",
+                    )
+                },
+            }
+    return output
 
 
 class ReleaseTests(unittest.TestCase):
@@ -361,6 +411,97 @@ class WideReleaseTests(unittest.TestCase):
             validation = validate_release(base / "release", roots, workers=1)
             self.assertTrue(validation["ok"])
             self.assertEqual(validation["rows"], len(W3_CASES) * len(PRESENTATIONS))
+
+    def test_mixed_width_recipe_release_and_validation(self):
+        cases = ("start_d4", "middlegame_black_w3", "two_moves_w3")
+        expected_presentations = {
+            "bc6ae1d761cf700dfb66ef956ac17bef4a90e0f4846624e57d22ba65f92426c7": "random",
+            "23fd2fbf6d032131267d358c35ba053a17fecb87facfabf0b3331e01e0bb8c55": "random",
+            "6c9691cab19e3988acbe741a28cf1739fe971be60fdba32fe431f2e43c89a59a": "zero",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            config, roots, collection_path, run = build_run(
+                directory,
+                cases=cases,
+                width=1,
+                recipe_text=MIXED_RECIPE,
+            )
+            self.assertEqual(
+                {root["root_id"]: root["teacher_width"] for root in roots},
+                {
+                    "bc6ae1d761cf700dfb66ef956ac17bef4a90e0f4846624e57d22ba65f92426c7": 1,
+                    "23fd2fbf6d032131267d358c35ba053a17fecb87facfabf0b3331e01e0bb8c55": 3,
+                    "6c9691cab19e3988acbe741a28cf1739fe971be60fdba32fe431f2e43c89a59a": 3,
+                },
+            )
+            _collection, selected, identity, base = load_collection(collection_path)
+            self.assertEqual(selected, roots)
+            produce_shards(
+                roots,
+                base,
+                base / "release",
+                config,
+                identity,
+                contract_path=Path("docs/teacher.md"),
+                shard_size=2,
+                workers=1,
+            )
+            release = load_manifest(base / "release" / "release.json")
+            self.assertEqual(release["teacher"]["schema_version"], 4)
+            self.assertEqual(release["search"]["teacher_width"], 1)
+            self.assertEqual(release["recipe"], config.recipe.identity())
+            validation = validate_release(base / "release", roots, workers=1)
+            self.assertTrue(validation["ok"])
+            self.assertEqual(validation["rows"], len(cases))
+            records = read_release_rows(base / "release")
+            self.assertEqual(
+                {
+                    row["root_id"]: row["presentation"]
+                    for row in (record["row"] for record in records.values())
+                },
+                expected_presentations,
+            )
+            self.assertEqual(
+                {
+                    row["root_id"]: row["teacher_width"]
+                    for row in (record["row"] for record in records.values())
+                },
+                {root["root_id"]: root["teacher_width"] for root in roots},
+            )
+            capped = next(
+                root for root in roots if root["root_id"].startswith("6c9691")
+            )
+            self.assertEqual(chess.Board(capped["fen"]).legal_moves.count(), 2)
+
+    def test_presentation_sampling_selects_existing_rows(self):
+        cases = ("start_d4", "middlegame_black_w3", "two_moves_w3")
+        with tempfile.TemporaryDirectory() as plain_directory:
+            with tempfile.TemporaryDirectory() as recipe_directory:
+                runs = []
+                for text, directory in (
+                    (None, plain_directory),
+                    (MIXED_RECIPE, recipe_directory),
+                ):
+                    config, roots, collection_path, run = build_run(
+                        directory, cases=cases, recipe_text=text
+                    )
+                    _, _, identity, base = load_collection(collection_path)
+                    produce_shards(
+                        roots,
+                        base,
+                        base / "release",
+                        config,
+                        identity,
+                        contract_path=Path("docs/teacher.md"),
+                        shard_size=2,
+                        workers=1,
+                    )
+                    runs.append(base / "release")
+                plain = read_release_rows(runs[0])
+                sampled = read_release_rows(runs[1])
+                self.assertEqual(len(sampled), len(cases))
+                for key, record in sampled.items():
+                    self.assertEqual(record, plain[key])
 
     def test_tied_wide_round_releases_with_first_come_state(self):
         with tempfile.TemporaryDirectory() as directory:

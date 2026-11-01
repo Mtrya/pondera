@@ -1352,11 +1352,13 @@ def _percentiles(values):
     }
 
 
-def profile_roots(roots):
-    """Aggregate the pilot statistics over synthesized roots."""
+def profile_roots(roots, presentations=None):
+    """Aggregate the statistics over synthesized roots and their written rows."""
     roots = list(roots)
     if not roots:
         raise ValueError("A statistics profile needs at least one root")
+    if presentations is None:
+        presentations = {root.root["root_id"]: PRESENTATIONS for root in roots}
     transitions = sum(max(stats["rounds"] - 1, 0) for stats in (r.stats for r in roots))
     overturns = sum(stat["overturned_rounds"] for stat in (r.stats for r in roots))
     refutations = sum(stat["refutations"] for stat in (r.stats for r in roots))
@@ -1364,10 +1366,19 @@ def profile_roots(roots):
     full_lengths = [r.stats["thinking_tokens"] for r in roots]
     total_lengths = [r.stats["total_tokens"] for r in roots]
     presentation_lengths = {
-        name: [len(root.rows[name].tokens) for root in roots] for name in PRESENTATIONS
+        name: [
+            len(root.rows[name].tokens)
+            for root in roots
+            if name in presentations[root.root["root_id"]]
+        ]
+        for name in PRESENTATIONS
     }
     presentation_thinking = {
-        name: [root.rows[name].thinking_tokens for root in roots]
+        name: [
+            root.rows[name].thinking_tokens
+            for root in roots
+            if name in presentations[root.root["root_id"]]
+        ]
         for name in PRESENTATIONS
     }
     rounds_distribution = Counter(r.stats["rounds"] for r in roots)
@@ -1394,9 +1405,14 @@ def profile_roots(roots):
     splits = Counter(root.root["split"] for root in roots)
     return {
         "roots": len(roots),
-        "rows": len(roots) * len(PRESENTATIONS),
+        "rows": sum(len(presentations[root.root["root_id"]]) for root in roots),
         "split_counts": dict(sorted(splits.items())),
-        "presentation_counts": {name: len(roots) for name in PRESENTATIONS},
+        "presentation_counts": {
+            name: sum(
+                1 for root in roots if name in presentations[root.root["root_id"]]
+            )
+            for name in PRESENTATIONS
+        },
         "rounds": dict(sorted(rounds_distribution.items())),
         "rounds_summary": _percentiles([r.stats["rounds"] for r in roots]),
         "thinking_tokens": _percentiles(full_lengths),
