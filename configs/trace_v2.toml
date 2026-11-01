@@ -33,9 +33,10 @@ depth = 16
 # MultiPV width W. W = 1 establishes one exact root line per round: the
 # incumbent plus any challengers that fail high and are re-searched. W > 1
 # establishes W exact root lines each round (one per PV line, narrated in line
-# order), moves the root refutation reference from the first to the W-th exact
-# candidate, and multiplies trace volume. W > 1 requires the schema-4 record
-# (per-line attempts); the instrumented build emits it automatically.
+# order); a root refutation claims "did not beat the leading bar at write
+# time" (the pass's best-so-far alpha), and trace volume multiplies. W > 1
+# requires the schema-4 record (per-line attempts); the instrumented build
+# emits it automatically.
 # The value is recorded in the manifest and read by the validator.
 teacher_width = 1
 

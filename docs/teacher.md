@@ -100,7 +100,7 @@ The traced run adds the `TraceLog` line; the control and official runs omit it. 
 ### File and line format
 
 - UTF-8 JSON Lines. One object per line, no blank lines, compact separators, fixed key order, LF line endings.
-- Every line carries `schema` (currently 3), `seq` (the 1-based line number), and `type`.
+- Every line carries `schema` (3 at teacher width one, 4 above one), `seq` (the 1-based line number), and `type`.
 - One file holds one root: exactly one `session`, one `position`, one `search_start`, and one `search_end`. `session` is the first line and `search_end` is the last.
 - A consumer rejects a different schema version or a non-monotonic `seq`.
 - The file contains no floating-point numbers.
@@ -229,7 +229,7 @@ Every event also carries `schema`, `seq`, and `type`.
 
 With W > 1 each depth iteration runs the PV lines in order. Line k searches the root moves from rank k onward; lines already established this round are skipped. Each line is a full aspiration loop with its own window, and the lines share one transposition table, so a later line's value for its remaining set can exceed an earlier line's value; the line index is not the final rank. The `round_end` rank is sorted after the round and is the authoritative order. A round with W lines therefore produces at least W distinct exact root candidates, one per line, before any refutation can be stated.
 
-Every root move not established by an earlier line is called at least once in every pass of every later line; a tail candidate can be probed up to W times per round. A candidate's value for the round is its last exact full-window call across the round's accepted passes, and the only refutation evidence the translator uses is a null-window fail-low in the last line's accepted pass, where the window brackets the final W-th value. A candidate whose every last-line call is a full-window bound (a `first` or `promote` that failed outside the window) is omitted from the trace, exactly like an accepted-pass bound at width one.
+Every root move not established by an earlier line is called at least once in every pass of every later line; a tail candidate can be probed up to W times per round. A candidate's value for the round is its last exact full-window call across the round's accepted passes, and the only refutation evidence the translator uses is a null-window fail-low in the last line's accepted pass. That window is the pass's best-so-far alpha: it usually equals the final W-th value but need not, so a refutation claims "did not beat the leading bar at write time", not "did not beat the W-th value". A candidate whose every last-line call is a full-window bound (a `first` or `promote` that failed outside the window) is omitted from the trace, exactly like an accepted-pass bound at width one.
 
 ### Invariants
 
