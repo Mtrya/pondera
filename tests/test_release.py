@@ -267,6 +267,17 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(recovered["statistics"], self.result["statistics"])
         self.assertTrue(validate_release(self.release, self.roots, workers=1)["ok"])
 
+    def test_resume_rejects_a_different_shard_layout(self):
+        with self.assertRaisesRegex(ValueError, "different shard layout"):
+            produce_shards(
+                self.roots,
+                self.release,
+                self.config,
+                sidecar_for_root=self.provider,
+                shard_size=3,
+                workers=1,
+            )
+
     def test_disjoint_jobs_merge_their_shards(self):
         with tempfile.TemporaryDirectory() as directory:
             config, roots, run, provider = build_run(

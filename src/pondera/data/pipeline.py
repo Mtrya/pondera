@@ -714,6 +714,14 @@ def _write_jsonl(path, rows):
     temporary.replace(path)
 
 
+def _read_jsonl(path):
+    return [
+        json.loads(line)
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def _array(directory, name, rows, width, dtype, padding):
     array = np.lib.format.open_memmap(
         directory / f"{name}.npy", mode="w+", dtype=dtype, shape=(len(rows), width)
@@ -882,6 +890,16 @@ def _recover_shard(output, index, roots, metadata, presentations):
                     f"Unregistered shard root {name} differs: {final}"
                 )
     return published
+
+
+def _check_shard_layout(output, shard, roots):
+    """Reject a registered shard that no longer matches the current layout."""
+    stored = _read_jsonl(Path(output) / shard["path"] / "roots.jsonl")
+    if {row["root_id"] for row in stored} != {root["root_id"] for root in roots}:
+        raise ValueError(
+            f"Registered shard {shard['path']} covers different roots; "
+            "the release was produced with a different shard layout"
+        )
 
 
 def _profile_shard(output, shard, metadata, profile):
@@ -1094,11 +1112,7 @@ def verify_shard_files(release_dir, shard, expected_metadata=None):
                 raise ValueError(f"Shard metadata {key} differs from its release")
     if manifest["rows"] != shard["rows"]:
         raise ValueError(f"Shard row count differs from its release: {directory}")
-    roots = [
-        json.loads(line)
-        for line in (directory / "roots.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    roots = _read_jsonl(directory / "roots.jsonl")
     if len(roots) != manifest["rows"]:
         raise ValueError(f"Shard roots do not match its manifest: {directory}")
     arrays = load_trace_arrays(directory, DATA_ARRAYS)
@@ -1107,14 +1121,7 @@ def verify_shard_files(release_dir, shard, expected_metadata=None):
 
 
 def _read_champions(directory):
-    directory = Path(directory)
-    return [
-        json.loads(line)
-        for line in (directory / "champions.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-        if line.strip()
-    ]
+    return _read_jsonl(Path(directory) / "champions.jsonl")
 
 
 def _move_token(uci, mirrored):
@@ -1937,6 +1944,7 @@ def produce_shards(
         if index < start_shard or (end_shard is not None and index >= end_shard):
             continue
         if index in shards_by_index:
+            _check_shard_layout(output_dir, shards_by_index[index], group)
             continue
         final = output_dir / f"shard-{index:06d}"
         if final.exists():
