@@ -1,0 +1,12 @@
+{
+  "root_id": "da09bb1cf36a0d488e1954245ec43bab0827b903779c315e1246ee79d5ef9bbc",
+  "split": "train",
+  "fen": "r2q1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 b - - 0 7",
+  "repetition": 1,
+  "turn": "black",
+  "position_key": "r2q1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 b - -",
+  "source": {
+    "case": "middlegame_black_d4",
+    "depth": 4
+  }
+}

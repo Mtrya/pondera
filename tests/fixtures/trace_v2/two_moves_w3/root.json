@@ -1,0 +1,13 @@
+{
+  "root_id": "6c9691cab19e3988acbe741a28cf1739fe971be60fdba32fe431f2e43c89a59a",
+  "split": "train",
+  "fen": "k6r/8/8/8/8/8/8/7K w - - 0 1",
+  "repetition": 1,
+  "turn": "white",
+  "position_key": "k6r/8/8/8/8/8/8/7K w - -",
+  "source": {
+    "case": "two_moves_w3",
+    "depth": 4,
+    "teacher_width": 3
+  }
+}

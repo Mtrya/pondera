@@ -1,29 +1,92 @@
+import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import chess
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
+from dataset_fixtures import encoded_row as dataset_row
+from dataset_fixtures import play, write_trace_dataset
+from torch.nn import functional as F
 
-from pondera.chess.tokenize import TOKENIZER_VERSION
-from pondera.data.prepare import prepare_dataset
-from pondera.data.storage import load_manifest, write_manifest
+from pondera.data.dataset import TracePositions
+from pondera.data.trace import (
+    ROLE_BOARD,
+    ROLE_PAD,
+    TraceWriter,
+)
 from pondera.models.checkpoint import read_checkpoint
-from pondera.training.supervised import TrainConfig, train
+from pondera.models.policy import create_model
+from pondera.training.trace import (
+    TraceCollator,
+    TrainConfig,
+    role_loss_totals,
+    trace_loss_parts,
+    train,
+)
+
+RUY_LOPEZ = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"]
+EXCHANGE_START = "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3"
+EXCHANGE_MOVES = ["b1c3", "g8f6"]
 
 
-class TrainingTests(unittest.TestCase):
+def trace_row(fen, repetition=1):
+    board = chess.Board(fen)
+    legal = sorted(move.uci() for move in board.legal_moves)
+    writer = TraceWriter(fen, repetition)
+    writer.depth()
+    writer.move(legal[0])
+    writer.board()
+    writer.evaluate(value=0.25)
+    writer.back()
+    writer.move(legal[1])
+    writer.refuted()
+    writer.back()
+    writer.evaluate(value=0.25)
+    writer.final(legal[2])
+    writer.final_evaluate(value=0.25)
+    after = chess.Board(fen)
+    after.push_uci(legal[2])
+    writer.final_pv(sorted(move.uci() for move in after.legal_moves)[0])
+    writer.end()
+    return dataset_row(fen, writer.tokens, writer.roles, repetition)
+
+
+def direct_row(fen, repetition=1):
+    board = chess.Board(fen)
+    move = sorted(move.uci() for move in board.legal_moves)[0]
+    writer = TraceWriter(fen, repetition)
+    writer.final(move)
+    writer.final_evaluate(value=0.0)
+    writer.end()
+    return dataset_row(fen, writer.tokens, writer.roles, repetition)
+
+
+def trace_rows(records, build=trace_row):
+    return [build(fen, repetition) for fen, _, repetition in records]
+
+
+class TraceTrainingTests(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.data = self.root / "data-trace"
+        write_trace_dataset(
+            self.data,
+            {
+                "train": trace_rows(play(RUY_LOPEZ)),
+                "val": trace_rows(play(EXCHANGE_MOVES, start=EXCHANGE_START)),
+            },
+        )
         self.config = TrainConfig(
             model={
                 "num_blocks": 1,
                 "hidden_size": 16,
                 "intermediate_size": 32,
                 "num_heads": 2,
-                "dropout": 0.1,
             },
             batch_size=2,
             accumulation_steps=2,
@@ -34,99 +97,111 @@ class TrainingTests(unittest.TestCase):
             val_every=2,
             save_every=1,
         )
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
-        self.data = self.root / "data"
-        board = chess.Board()
-        fens = []
-        moves = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"]
-        for move in moves:
-            fens.append(board.fen())
-            board.push_uci(move)
-        source = self.root / "positions.parquet"
-        pq.write_table(pa.table({"fen": fens, "next_move": moves}), source)
-        prepare_dataset([source], [source], self.data)
+
+    def final_metrics(self, output):
+        rows = [
+            json.loads(line)
+            for line in (output / "metrics.jsonl").read_text().splitlines()
+        ]
+        return rows[-1]
+
+    def test_training_records_trace_loss_and_final_move_top1(self):
+        output = self.root / "run"
+        train(self.config, self.data, output)
+        final = self.final_metrics(output)
+        self.assertTrue(final["training_complete"])
+        self.assertGreater(final["val/loss"], 0.0)
+        self.assertTrue(0.0 <= final["val/final_move_top1"] <= 1.0)
+        logged = [
+            json.loads(line)
+            for line in (output / "metrics.jsonl").read_text().splitlines()
+        ]
+        losses = [row["train/loss"] for row in logged if "train/loss" in row]
+        self.assertEqual(len(losses), 4)
+        self.assertLess(losses[-1], losses[0])
+        checkpoint = read_checkpoint(output / "final.pth")
+        self.assertEqual(checkpoint["step"], 4)
+        self.assertEqual(checkpoint["examples_seen"], 16)
+
+    def test_microbatch_regrouping_keeps_the_token_mean_objective(self):
+        full = replace(
+            self.config,
+            batch_size=2,
+            accumulation_steps=1,
+            epochs=1,
+            val_every=100,
+            save_every=100,
+        )
+        split = replace(full, batch_size=1, accumulation_steps=2)
+        first = read_checkpoint(train(full, self.data, self.root / "regroup-full"))
+        second = read_checkpoint(train(split, self.data, self.root / "regroup-split"))
+        difference = max(
+            float((first["model_state_dict"][name] - value).abs().max())
+            for name, value in second["model_state_dict"].items()
+        )
+        self.assertLess(difference, 1e-5)
+
+    def test_direct_answer_dataset_trains(self):
+        data = self.root / "data-direct"
+        write_trace_dataset(
+            data,
+            {
+                "train": trace_rows(play(RUY_LOPEZ), build=direct_row),
+                "val": trace_rows(
+                    play(EXCHANGE_MOVES, start=EXCHANGE_START), build=direct_row
+                ),
+            },
+        )
+        output = self.root / "run-direct"
+        train(self.config, data, output)
+        final = self.final_metrics(output)
+        self.assertTrue(final["training_complete"])
+        self.assertEqual(final["val/rows"], 2)
+        for role in ("move", "evaluation", "refuted", "final_line"):
+            self.assertNotIn(f"val/role/{role}_loss", final)
+        self.assertIn("val/role/final_move_loss", final)
+
+    def test_trace_loss_supervises_every_non_padding_token(self):
+        row = TracePositions(self.data, "val")[0]
+        batch = TraceCollator()([row])
+        model = create_model(self.config.model)
+        loss, ce, logits, generated = trace_loss_parts(model, batch)
+        targets = batch["trace_ids"].long()
+        expected_ce = F.cross_entropy(
+            logits.float().reshape(-1, logits.shape[-1]),
+            targets.reshape(-1),
+            reduction="none",
+        ).reshape(targets.shape)
+        expected_mask = batch["trace_roles"] != ROLE_PAD
+        torch.testing.assert_close(ce, expected_ce)
+        torch.testing.assert_close(generated, expected_mask)
+        torch.testing.assert_close(loss, expected_ce[expected_mask].mean())
+
+        # Hand count: 14 non-board tokens plus 32 piece atoms and 8 metadata atoms.
+        self.assertEqual(int(generated.sum()), 54)
+        self.assertEqual(int((batch["trace_roles"] == ROLE_BOARD).sum()), 40)
+        self.assertTrue(bool(generated[0, 3]))
+        totals = role_loss_totals(ce, batch["trace_roles"])
+        total = sum(float(role_total.detach()) for role_total, _ in totals.values())
+        tokens = sum(count for _, count in totals.values())
+        self.assertEqual(tokens, 54)
+        torch.testing.assert_close(loss, torch.tensor(total / tokens))
 
     def test_resume_matches_uninterrupted_training(self):
         expected = read_checkpoint(train(self.config, self.data, self.root / "full"))
         output = self.root / "resumed"
         interrupted = train(self.config, self.data, output, max_steps=1)
-        halfway = read_checkpoint(
-            train(self.config, self.data, output, resume=interrupted, max_steps=2)
-        )
-        self.assertEqual(halfway["step"], 2)
-        unchanged = read_checkpoint(
-            train(self.config, self.data, output, resume=interrupted, max_steps=2)
-        )
-        for key in ("step", "epoch", "next_micro", "scheduler_state_dict"):
-            self.assertEqual(unchanged[key], halfway[key])
-        for key, value in halfway["model_state_dict"].items():
-            torch.testing.assert_close(
-                unchanged["model_state_dict"][key], value, rtol=0, atol=0
-            )
         actual = read_checkpoint(
             train(self.config, self.data, output, resume=interrupted)
         )
-        self.assertEqual(actual["step"], 4)
+        self.assertEqual(actual["step"], expected["step"])
         for key, value in expected["model_state_dict"].items():
             torch.testing.assert_close(
                 actual["model_state_dict"][key], value, rtol=0, atol=0
             )
-        self.assertEqual(
-            actual["scheduler_state_dict"], expected["scheduler_state_dict"]
-        )
-
-    def test_training_rejects_unversioned_or_incompatible_data(self):
-        path = self.data / "manifest.json"
-        manifest = load_manifest(path)
-        for version in (None, TOKENIZER_VERSION + 1):
-            with self.subTest(version=version):
-                invalid = dict(manifest)
-                if version is None:
-                    del invalid["tokenizer_version"]
-                else:
-                    invalid["tokenizer_version"] = version
-                write_manifest(path, invalid)
-                with self.assertRaises(ValueError):
-                    train(self.config, self.data, self.root / "rejected")
-        path.unlink()
-        with self.assertRaises(FileNotFoundError):
-            train(self.config, self.data, self.root / "rejected")
-
-    def test_resume_rejects_incompatible_checkpoint(self):
-        output = self.root / "resumed"
-        path = train(self.config, self.data, output, max_steps=1)
-        checkpoint = read_checkpoint(path)
-        checkpoint["tokenizer_version"] = TOKENIZER_VERSION + 1
-        torch.save(checkpoint, path)
-        with self.assertRaises(ValueError):
-            train(self.config, self.data, output, resume=path)
-
-    def test_nonpositive_step_limit_is_rejected(self):
-        for max_steps in (0, -1):
-            with self.subTest(max_steps=max_steps):
-                with self.assertRaises(ValueError):
-                    train(
-                        self.config,
-                        self.data,
-                        self.root / "rejected",
-                        max_steps=max_steps,
-                    )
+        for key in ("board_tokens", "trace_tokens", "examples_seen"):
+            self.assertEqual(actual[key], expected[key])
 
 
-class TrainConfigTests(unittest.TestCase):
-    def test_invalid_optimizer_parameters_are_rejected(self):
-        invalid = {
-            "learning_rate": (0, -1, float("nan"), float("inf")),
-            "grad_clip": (0, -1, float("nan"), float("inf")),
-            "weight_decay": (-1, float("nan"), float("inf")),
-            "warmup_ratio": (-0.1, 1.1, float("nan"), float("inf")),
-        }
-        for name, values in invalid.items():
-            for value in values:
-                with self.subTest(name=name, value=value):
-                    with self.assertRaises(ValueError):
-                        TrainConfig(**{name: value})
-        for warmup_ratio in (0, 1):
-            TrainConfig(weight_decay=0, warmup_ratio=warmup_ratio)
+if __name__ == "__main__":
+    unittest.main()

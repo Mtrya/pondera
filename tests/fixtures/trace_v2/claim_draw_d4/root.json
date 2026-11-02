@@ -1,0 +1,12 @@
+{
+  "root_id": "87bb39450301e25252432b19d0ac272b249509031e537b7fd9b2a2fd1abe0da8",
+  "split": "train",
+  "fen": "8/8/8/4k3/8/8/8/4K3 w - - 0 1",
+  "repetition": 3,
+  "turn": "white",
+  "position_key": "8/8/8/4k3/8/8/8/4K3 w - -",
+  "source": {
+    "case": "claim_draw_d4",
+    "depth": 4
+  }
+}

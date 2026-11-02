@@ -1,0 +1,12 @@
+{
+  "root_id": "c164fc5ccb0bd9de6befa80b8f365cfcc2769c37afb4f941dfd3ac3835da21c2",
+  "split": "train",
+  "fen": "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1",
+  "repetition": 1,
+  "turn": "white",
+  "position_key": "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - -",
+  "source": {
+    "case": "mate_in_1_d4",
+    "depth": 4
+  }
+}

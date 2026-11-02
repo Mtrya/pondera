@@ -22,7 +22,7 @@ jobs:
         run: |
           uv venv
           uv export --frozen --all-extras --group dev --no-hashes --no-emit-project > /tmp/requirements.txt
-          uv pip install --torch-backend cpu -c /tmp/requirements.txt -e '.[data,training]' --group dev
+          uv pip install --torch-backend cpu -c /tmp/requirements.txt -e '.[training]' --group dev
       - name: Install Stockfish
         run: |
           sudo apt-get update

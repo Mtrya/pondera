@@ -22,6 +22,11 @@ htmlcov/
 *.arrow
 *.sqlite
 *.jsonl
+# Frozen test inputs are not generated artifacts.
+!tests/fixtures/**/*.jsonl
 *.log
 .env
 .env.*
+
+# Machine-specific platform asset contract (managed per machine).
+/INSPIRE.md

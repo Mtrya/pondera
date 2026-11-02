@@ -1,0 +1,12 @@
+{
+  "root_id": "cf341f0d9bb07e0dd19da8ebf7914279f3ebdf5380eca759914d4c18c4a57435",
+  "split": "train",
+  "fen": "1kr5/pq6/b1Rp4/Pp1Ppr2/1P6/6P1/4QP2/R2N2K1 w - - 2 34",
+  "repetition": 1,
+  "turn": "white",
+  "position_key": "1kr5/pq6/b1Rp4/Pp1Ppr2/1P6/6P1/4QP2/R2N2K1 w - -",
+  "source": {
+    "case": "capture_d4",
+    "depth": 4
+  }
+}

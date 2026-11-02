@@ -7,14 +7,17 @@ import unittest
 from pathlib import Path
 
 import chess
-import torch
 
 from pondera.evaluation.match import parse_result, run_match
-from pondera.evaluation.policy import evaluate_policy
 from pondera.models.checkpoint import save_checkpoint
-from pondera.models.transformer import PonderaModel
+from pondera.models.policy import create_model
 
-CONFIG = {"num_blocks": 1, "hidden_size": 16, "intermediate_size": 32, "num_heads": 2}
+CONFIG = {
+    "num_blocks": 1,
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_heads": 2,
+}
 
 
 class EvaluationTests(unittest.TestCase):
@@ -26,28 +29,15 @@ class EvaluationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_result(output, 4)
 
-    def test_policy_metrics_are_batch_size_independent(self):
-        torch.set_num_threads(1)
-        model = PonderaModel(**CONFIG).eval()
-        rows = [
-            {"fen": chess.STARTING_FEN, "next_move": move}
-            for move in ["e2e4", "d2d4", "g1f3"]
-        ]
-        first = evaluate_policy(model, rows, batch_size=1)
-        second = evaluate_policy(model, rows, batch_size=2)
-        self.assertEqual(second["positions"], 3)
-        for key in ["act_loss", "top1", "invalid_move_prob"]:
-            self.assertAlmostEqual(first[key], second[key], places=5)
-
     def test_real_uci_process(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "model.pth"
-            save_checkpoint(checkpoint, PonderaModel(**CONFIG), CONFIG)
+            save_checkpoint(checkpoint, create_model(CONFIG), CONFIG)
             process = subprocess.run(
                 [
                     sys.executable,
                     "-m",
-                    "pondera.cli.uci",
+                    "pondera.inference.uci",
                     "--checkpoint",
                     str(checkpoint),
                 ],
@@ -79,7 +69,7 @@ class EvaluationTests(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "pondera.cli.uci",
+                "pondera.inference.uci",
                 "--checkpoint",
                 "/nonexistent/model.pth",
             ],
@@ -99,7 +89,7 @@ class EvaluationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkpoint = root / "model.pth"
-            save_checkpoint(checkpoint, PonderaModel(**CONFIG), CONFIG)
+            save_checkpoint(checkpoint, create_model(CONFIG), CONFIG)
             openings = root / "openings.epd"
             openings.write_text("7k/5K2/6Q1/8/8/8/8/8 w - -\n")
             result = run_match(
