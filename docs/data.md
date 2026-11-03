@@ -16,9 +16,22 @@ The pool is stratified by split and whether the root allows a draw claim. Ranked
 
 ## Configuration
 
-`configs/trace.toml` is the single authority for production settings. `[paths]` locates the archive, cached root pool, external engine, and output. `[roots]` sets train/validation sizes and the draw-claimable share. `[search]` sets the engine hash-table size and independent width/depth distributions. `[synthesis]` sets BOARD probabilities, draw claims, presentation probabilities, and the random-cut interval. `[release]` sets shard size and worker count. The top-level `seed` determines root selection and all per-root samples.
+`configs/trace.toml` is the single authority for production settings. `[paths]` locates the archive, cached root pool, external engine, and output. `[roots]` sets train/validation sizes and the draw-claimable share. `[search]` sets the engine hash-table size and a joint width/depth distribution. `[synthesis]` sets BOARD probabilities, draw claims, presentation probabilities, and the random-cut interval. `[release]` sets shard size and worker count. The top-level `seed` determines root selection and all per-root samples.
 
-Width, depth, and presentation accept either one value or a probability table. Each root samples them independently using `random.Random(f"{seed}:{root_id}:<setting>")`. Exactly one of `zero`, `full`, or `random` is materialized for each root. Assignments are recomputed from the active recipe and stable root ids: an identical recipe reproduces them on resume, while a changed recipe replaces them.
+`[search].joint` is a nonempty array of `{width, depth, probability}` tables. Width is a positive integer or `"full"`; depth is a positive integer. Pairs must be unique, probabilities must lie in `[0, 1]`, and their sum must be one. A fixed setting is a one-entry array with probability one. For example:
+
+```toml
+[search]
+hash_mb = 256
+joint = [
+    { width = "full", depth = 8, probability = 0.5 },
+    { width = 1, depth = 24, probability = 0.5 },
+]
+```
+
+Each root draws one pair using `random.Random(f"{seed}:{root_id}:search")`. Entries are canonicalized before sampling, so reordering the tables preserves assignments and recipe identity. `"full"` resolves to the number of legal root moves before setting UCI `MultiPV`. The root's `teacher_width` records that concrete configured width; `effective_width` records its minimum with the legal move count. An explicit width can therefore exceed the effective width on a constrained root. A full-width root with one legal move configures width one.
+
+Presentation accepts one value or a probability table and uses a separate `random.Random(f"{seed}:{root_id}:presentation")` draw. Exactly one of `zero`, `full`, or `random` is materialized for each root. Assignments are recomputed from the active recipe and stable root ids, independently of input order, worker count, and shard boundaries. Cached settings are replaced by the active recipe; resuming an existing release with a different recipe is rejected.
 
 ## Teacher and trace synthesis
 
@@ -40,7 +53,7 @@ The presentations are `zero` (suffix only), `full` (complete thought), and `rand
 
 A release contains shards and `release.json`. Each shard stores `board_tokens`, `trace_tokens`, `trace_len`, `trace_roles`, the truncation-state arrays, `state_count`, `roots.jsonl`, and `champions.jsonl`. Shards are published atomically and can be recovered or resumed by root.
 
-Trace datasets use manifest `format_version = 6` and `grammar_version = 2`. `pondera.data.dataset` reads these arrays for training and lazily memory-maps shard storage. `pondera.data.pipeline.validate_release` checks release identity, manifests, array shapes, stored states, and every trace replay against python-chess. Validation reconstructs programs from stored tokens rather than trusting synthesis.
+Trace datasets use manifest `format_version = 7` and `grammar_version = 2`. The release identity includes the joint recipe and presentation probabilities; root rows store the sampled depth and configured/effective widths. `pondera.data.dataset` reads these arrays for training and lazily memory-maps shard storage. `pondera.data.pipeline.validate_release` reconstructs each root's sampled settings from the recipe and seed, checks effective width against legal moves, and verifies manifests, array shapes, stored states, and every trace replay against python-chess. Validation reconstructs programs from stored tokens rather than trusting synthesis. Older manifest formats are rejected.
 
 ## Scope and reproducibility
 

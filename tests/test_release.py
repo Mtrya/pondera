@@ -1,15 +1,15 @@
 import json
-import re
 import tempfile
 import threading
 import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import chess
 import numpy as np
-from trace_fixtures import tie_sidecar_lines
+from trace_fixtures import read_release_rows, tie_sidecar_lines, trace_config_text
 
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
@@ -17,6 +17,7 @@ from pondera.data.dataset import DATA_ARRAYS, TracePositions, load_manifest
 from pondera.data.pipeline import (
     load_config,
     load_trace_arrays,
+    parse_recipe,
     produce_shards,
     sample_root_settings,
     validate_release,
@@ -40,44 +41,14 @@ W3_CASES = (
 )
 MIXED_RECIPE = """
 [recipe]
-widths = {1 = 0.5, 3 = 0.5}
-depths = {4 = 1.0}
+joint = [{width = 1, depth = 4, probability = 0.5}, {width = 3, depth = 4, probability = 0.5}]
 presentations = {zero = 0.2, full = 0.5, random = 0.3}
 """
 
 
-def _inline(table):
-    return "{ " + ", ".join(f'"{key}" = {value}' for key, value in table.items()) + " }"
-
-
 def config_text(width=1, recipe_text=None):
-    text = Path("configs/trace.toml").read_text(encoding="utf-8")
-    text = re.sub(r"^depths =.*$", "depths = 4", text, flags=re.MULTILINE)
-    text = re.sub(r"^widths =.*$", f"widths = {width}", text, flags=re.MULTILINE)
-    if recipe_text is not None:
-        recipe = tomllib.loads(recipe_text)["recipe"]
-        if "widths" in recipe:
-            text = re.sub(
-                r"^widths =.*$",
-                f"widths = {_inline(recipe['widths'])}",
-                text,
-                flags=re.MULTILINE,
-            )
-        if "depths" in recipe:
-            text = re.sub(
-                r"^depths =.*$",
-                f"depths = {_inline(recipe['depths'])}",
-                text,
-                flags=re.MULTILINE,
-            )
-        if "presentations" in recipe:
-            text = re.sub(
-                r"^presentations =.*$",
-                f"presentations = {_inline(recipe['presentations'])}",
-                text,
-                flags=re.MULTILINE,
-            )
-    return text
+    recipe = tomllib.loads(recipe_text)["recipe"] if recipe_text is not None else {}
+    return trace_config_text(width=width, **recipe)
 
 
 def build_run(
@@ -106,37 +77,6 @@ def build_run(
     return config, roots, run, provider
 
 
-def read_release_rows(directory):
-    directory = Path(directory)
-    release = load_manifest(directory / "release.json")
-    output = {}
-    for shard in release["shards"]:
-        _, rows, arrays = verify_shard_files(directory, shard)
-        for index, row in enumerate(rows):
-            length = int(arrays["trace_len"][index])
-            count = int(arrays["state_count"][index])
-            output[(row["root_id"], row["presentation"])] = {
-                "row": row,
-                "trace_tokens": tuple(
-                    int(value) for value in arrays["trace_tokens"][index, :length]
-                ),
-                "trace_roles": tuple(
-                    int(value) for value in arrays["trace_roles"][index, :length]
-                ),
-                "state": {
-                    name: tuple(int(value) for value in arrays[name][index, :count])
-                    for name in (
-                        "state_best",
-                        "state_value",
-                        "state_basis",
-                        "state_without_board",
-                        "state_with_board",
-                    )
-                },
-            }
-    return output
-
-
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -160,11 +100,11 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(len(self.result["shards"]), 3)
         self.assertEqual([shard["rows"] for shard in self.result["shards"]], [2, 2, 1])
         release = load_manifest(self.release / "release.json")
-        self.assertEqual(release["format_version"], 6)
+        self.assertEqual(release["format_version"], 7)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
-        self.assertEqual(release["search"]["depth"], 4)
-        self.assertEqual(release["search"]["teacher_width"], 1)
+        self.assertEqual(release["search"], {"hash_mb": 256})
+        self.assertEqual(release["recipe"], self.config.sampling.identity())
         self.assertEqual(release["engine"]["name"], "stockfish")
         self.assertEqual(release["presentation"], self.config.presentation_dict())
         self.assertEqual(release["metadata"], validate_release_identity(release))
@@ -278,6 +218,33 @@ class ReleaseTests(unittest.TestCase):
                 workers=1,
             )
 
+    def test_resume_rejects_a_changed_joint_recipe(self):
+        recipe = {
+            **self.config.sampling.identity(),
+            "joint": [
+                {"width": 1, "depth": 4, "probability": 0.5},
+                {"width": 3, "depth": 4, "probability": 0.5},
+            ],
+        }
+        changed = replace(self.config, sampling=parse_recipe(recipe))
+        with self.assertRaises(ValueError):
+            produce_shards(
+                self.roots,
+                self.release,
+                changed,
+                sidecar_for_root=self.provider,
+                shard_size=2,
+                workers=1,
+            )
+
+    def test_validation_rejects_a_wrong_effective_width(self):
+        path = self.release / "shard-000000" / "roots.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["effective_width"] = 2
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        with self.assertRaises(ValueError):
+            validate_release(self.release, workers=1)
+
     def test_disjoint_jobs_merge_their_shards(self):
         with tempfile.TemporaryDirectory() as directory:
             config, roots, run, provider = build_run(
@@ -347,7 +314,7 @@ class WideReleaseTests(unittest.TestCase):
             )
             release = load_manifest(base / "release" / "release.json")
             self.assertEqual(release["teacher"]["schema_version"], 4)
-            self.assertEqual(release["search"]["teacher_width"], 3)
+            self.assertEqual(release["recipe"], config.sampling.identity())
             self.assertEqual(release["engine"]["name"], "stockfish")
             validation = validate_release(base / "release", roots, workers=1)
             self.assertTrue(validation["ok"])
@@ -355,20 +322,14 @@ class WideReleaseTests(unittest.TestCase):
 
     def test_mixed_width_recipe_release_and_validation(self):
         cases = ("start_d4", "middlegame_black_w3", "two_moves_w3")
-        # Seed 6 samples the widths these fixtures were recorded at (1, 3, 3)
-        # and the presentations frozen below.
-        expected_presentations = {
-            "bc6ae1d761cf700dfb66ef956ac17bef4a90e0f4846624e57d22ba65f92426c7": "random",
-            "23fd2fbf6d032131267d358c35ba053a17fecb87facfabf0b3331e01e0bb8c55": "full",
-            "6c9691cab19e3988acbe741a28cf1739fe971be60fdba32fe431f2e43c89a59a": "zero",
-        }
+        # Seed 10 assigns the widths (1, 3, 3) of these real sidecars.
         with tempfile.TemporaryDirectory() as directory:
             config, roots, run, provider = build_run(
                 directory,
                 cases=cases,
                 width=1,
                 recipe_text=MIXED_RECIPE,
-                seed=6,
+                seed=10,
             )
             self.assertEqual(
                 {root["root_id"]: root["teacher_width"] for root in roots},
@@ -389,7 +350,6 @@ class WideReleaseTests(unittest.TestCase):
             )
             release = load_manifest(base / "release" / "release.json")
             self.assertEqual(release["teacher"]["schema_version"], 4)
-            self.assertEqual(release["search"]["teacher_width"], 1)
             self.assertEqual(release["recipe"], config.sampling.identity())
             validation = validate_release(base / "release", roots, workers=1)
             self.assertTrue(validation["ok"])
@@ -400,7 +360,7 @@ class WideReleaseTests(unittest.TestCase):
                     row["root_id"]: row["presentation"]
                     for row in (record["row"] for record in records.values())
                 },
-                expected_presentations,
+                {root["root_id"]: root["presentation"] for root in roots},
             )
             self.assertEqual(
                 {
@@ -413,18 +373,20 @@ class WideReleaseTests(unittest.TestCase):
                 root for root in roots if root["root_id"].startswith("6c9691")
             )
             self.assertEqual(chess.Board(capped["fen"]).legal_moves.count(), 2)
+            stored = records[capped["root_id"], capped["presentation"]]["row"]
+            self.assertEqual(
+                (stored["teacher_width"], stored["effective_width"]), (3, 2)
+            )
 
     def test_single_width_distribution_uses_schema_three(self):
         recipe = """
 [recipe]
-widths = {1 = 1.0}
-depths = {4 = 1.0}
+joint = [{width = 1, depth = 4, probability = 1.0}]
 """
         with tempfile.TemporaryDirectory() as directory:
             config, roots, run, provider = build_run(
                 directory, cases=("start_d4",), width=3, recipe_text=recipe
             )
-            self.assertEqual(config.search.teacher_width, 1)
             self.assertEqual({root["teacher_width"] for root in roots}, {1})
             base = run
             produce_shards(
@@ -436,49 +398,46 @@ depths = {4 = 1.0}
                 workers=1,
             )
             release = load_manifest(base / "release" / "release.json")
-            self.assertEqual(release["search"]["teacher_width"], 1)
             self.assertEqual(release["teacher"]["schema_version"], 3)
             validation = validate_release(base / "release", roots, workers=1)
             self.assertTrue(validation["ok"])
 
-    def test_validation_rejects_recipe_keys_that_cannot_be_sampled(self):
-        # A zero probability makes the recorded setting unreachable: the
-        # recipe always draws width 3 (depth 5), never the recorded 1 (4).
-        cases = (
-            ("widths = {1 = 0.0, 3 = 1.0}", None),
-            (None, "depths = {4 = 0.0, 5 = 1.0}"),
-        )
-        for widths, depths in cases:
-            with self.subTest(widths=widths, depths=depths):
-                recipe = "[recipe]\n"
-                recipe += (
-                    f"{widths}\n" if widths is not None else "widths = {1 = 1.0}\n"
+    def test_validation_reconstructs_joint_settings(self):
+        for width, depth in ((3, 4), (1, 5)):
+            with (
+                self.subTest(width=width, depth=depth),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                config, roots, run, provider = build_run(directory, cases=("start_d4",))
+                release_dir = run / "release"
+                produce_shards(
+                    roots, release_dir, config, sidecar_for_root=provider, workers=1
                 )
-                recipe += (
-                    f"{depths}\n" if depths is not None else "depths = {4 = 1.0}\n"
-                )
-                with tempfile.TemporaryDirectory() as directory:
-                    config, roots, run, provider = build_run(
-                        directory,
-                        cases=("start_d4",),
-                        recipe_text=recipe,
-                    )
-                    base = run
-                    with self.assertRaises(ValueError):
-                        produce_shards(
-                            roots,
-                            base / "release",
-                            config,
-                            sidecar_for_root=provider,
-                            shard_size=1,
-                            workers=1,
-                        )
+                release_path = release_dir / "release.json"
+                release = load_manifest(release_path)
+                recipe = {
+                    **release["recipe"],
+                    "joint": [
+                        {"width": 1, "depth": 4, "probability": 0.0},
+                        {"width": width, "depth": depth, "probability": 1.0},
+                    ],
+                }
+                release["recipe"] = release["metadata"]["recipe"] = recipe
+                release_path.write_text(json.dumps(release))
+                for shard in release["shards"]:
+                    path = release_dir / shard["path"] / "manifest.json"
+                    manifest = load_manifest(path)
+                    manifest["recipe"] = recipe
+                    path.write_text(json.dumps(manifest))
+                validate_release_identity(release)
+                with self.assertRaises(ValueError):
+                    validate_release(release_dir, workers=1)
 
     def test_presentation_sampling_is_deterministic_on_resume(self):
         cases = ("start_d4", "middlegame_black_w3", "two_moves_w3")
         with tempfile.TemporaryDirectory() as directory:
             config, roots, run, provider = build_run(
-                directory, cases=cases, recipe_text=MIXED_RECIPE, seed=6
+                directory, cases=cases, recipe_text=MIXED_RECIPE, seed=10
             )
             produce_shards(
                 roots,
@@ -500,6 +459,22 @@ depths = {4 = 1.0}
             second = read_release_rows(run / "release")
             self.assertEqual(first, second)
             self.assertEqual(len(second), len(cases))
+            # Probabilities are part of identity even when these roots draw
+            # the same settings under both distributions.
+            recipe = config.sampling.identity()
+            recipe["joint"][0]["probability"] = 0.51
+            recipe["joint"][1]["probability"] = 0.49
+            changed = replace(config, sampling=parse_recipe(recipe))
+            self.assertEqual(roots, sample_root_settings(roots, changed, changed.seed))
+            with self.assertRaises(ValueError):
+                produce_shards(
+                    roots,
+                    run / "release",
+                    changed,
+                    sidecar_for_root=provider,
+                    shard_size=2,
+                    workers=1,
+                )
 
     def test_tied_wide_round_releases_with_first_come_state(self):
         with tempfile.TemporaryDirectory() as directory:

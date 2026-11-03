@@ -12,7 +12,6 @@ import json
 import math
 import os
 import random
-import re
 import select
 import shutil
 import statistics
@@ -67,7 +66,6 @@ from pondera.data.trace import (
 
 DEFAULT_CONFIG_PATH = Path("configs/trace.toml")
 PRESENTATION_NAMES = ("zero", "full", "random")
-_DIGITS = re.compile(r"^[1-9][0-9]*$")
 
 
 def _integer(section, name, value, minimum=None):
@@ -103,16 +101,25 @@ def _distribution(section, name, value, key_parser):
     return tuple(sorted(result.items(), key=lambda item: str(item[0])))
 
 
-def _positive_key(value):
-    if isinstance(value, bool):
-        raise ValueError("distribution keys must be positive integers")
-    if isinstance(value, int):
-        if value < 1:
-            raise ValueError("distribution keys must be positive integers")
-        return value
-    if not isinstance(value, str) or not _DIGITS.match(value):
-        raise ValueError("distribution keys must be positive integers")
-    return int(value)
+def _joint_distribution(value):
+    if not isinstance(value, list) or not value:
+        raise ValueError("[search] joint must be a nonempty array of tables")
+    result = {}
+    for entry in value:
+        entry = _table(entry, "search.joint", {"width", "depth", "probability"})
+        width = entry["width"]
+        if width != "full":
+            width = _integer("search.joint", "width", width, 1)
+        depth = _integer("search.joint", "depth", entry["depth"], 1)
+        outcome = (width, depth)
+        if outcome in result:
+            raise ValueError("[search] joint repeats a width/depth pair")
+        result[outcome] = _probability(
+            "search.joint", "probability", entry["probability"]
+        )
+    if not math.isclose(sum(result.values()), 1.0, rel_tol=0, abs_tol=1e-9):
+        raise ValueError("[search] joint probabilities must sum to 1")
+    return tuple(sorted(result.items(), key=lambda item: (str(item[0][0]), item[0][1])))
 
 
 def _presentation_key(value):
@@ -138,8 +145,6 @@ class RootsConfig:
 
 @dataclass(frozen=True)
 class SearchConfig:
-    depth: int
-    teacher_width: int
     hash_mb: int
 
 
@@ -148,21 +153,8 @@ class SynthesisConfig:
     claim_draw: bool
     board_descent_hazard: float
     board_frontier_p: float
-    presentations: tuple
     random_min_fraction: float
     random_max_fraction: float
-
-    @property
-    def zero(self):
-        return dict(self.presentations).get("zero", 0.0)
-
-    @property
-    def full(self):
-        return dict(self.presentations).get("full", 0.0)
-
-    @property
-    def random(self):
-        return dict(self.presentations).get("random", 0.0)
 
 
 @dataclass(frozen=True)
@@ -173,22 +165,17 @@ class ReleaseConfig:
 
 @dataclass(frozen=True)
 class SamplingConfig:
-    widths: tuple = None
-    depths: tuple = None
-    presentations: tuple = None
+    joint: tuple
+    presentations: tuple
 
     def identity(self):
-        payload = {}
-        for name, distribution in (
-            ("widths", self.widths),
-            ("depths", self.depths),
-            ("presentations", self.presentations),
-        ):
-            if distribution is not None:
-                payload[name] = {
-                    str(key): probability for key, probability in distribution
-                }
-        return payload
+        return {
+            "joint": [
+                {"width": width, "depth": depth, "probability": probability}
+                for (width, depth), probability in self.joint
+            ],
+            "presentations": dict(self.presentations),
+        }
 
 
 @dataclass(frozen=True)
@@ -202,11 +189,7 @@ class TraceConfig:
     sampling: SamplingConfig
 
     def search_dict(self):
-        return {
-            "depth": self.search.depth,
-            "teacher_width": self.search.teacher_width,
-            "hash_mb": self.search.hash_mb,
-        }
+        return {"hash_mb": self.search.hash_mb}
 
     def board_dict(self):
         return {
@@ -215,10 +198,11 @@ class TraceConfig:
         }
 
     def presentation_dict(self):
+        probabilities = dict(self.sampling.presentations)
         return {
-            "zero": self.synthesis.zero,
-            "full": self.synthesis.full,
-            "random": self.synthesis.random,
+            "zero": probabilities.get("zero", 0.0),
+            "full": probabilities.get("full", 0.0),
+            "random": probabilities.get("random", 0.0),
             "last_root": 0.0,
             "random_min_fraction": self.synthesis.random_min_fraction,
             "random_max_fraction": self.synthesis.random_max_fraction,
@@ -244,48 +228,25 @@ def sample_distribution(rng, distribution):
     return fallback
 
 
-def sample_width(sampling, seed, root_id, default_width):
-    if sampling is None or sampling.widths is None:
-        return default_width
+def sample_search(sampling, seed, root_id):
     return sample_distribution(
-        random.Random(f"{seed}:{root_id}:width"), sampling.widths
-    )
-
-
-def sample_depth(sampling, seed, root_id, default_depth):
-    if sampling is None or sampling.depths is None:
-        return default_depth
-    return sample_distribution(
-        random.Random(f"{seed}:{root_id}:depth"), sampling.depths
+        random.Random(f"{seed}:{root_id}:search"), sampling.joint
     )
 
 
 def sample_presentation(sampling, seed, root_id):
-    if sampling is None or sampling.presentations is None:
-        return None
     return sample_distribution(
         random.Random(f"{seed}:{root_id}:presentation"), sampling.presentations
     )
 
 
 def parse_recipe(values):
-    if not isinstance(values, dict):
-        raise ValueError("recipe must be a table")
-    unknown = set(values) - {"widths", "depths", "presentations"}
-    if unknown or not values:
-        raise ValueError("recipe has an unknown or empty distribution")
+    values = _table(values, "recipe", {"joint", "presentations"})
     return SamplingConfig(
-        widths=_distribution("recipe", "widths", values["widths"], _positive_key)
-        if "widths" in values
-        else None,
-        depths=_distribution("recipe", "depths", values["depths"], _positive_key)
-        if "depths" in values
-        else None,
+        joint=_joint_distribution(values["joint"]),
         presentations=_distribution(
             "recipe", "presentations", values["presentations"], _presentation_key
-        )
-        if "presentations" in values
-        else None,
+        ),
     )
 
 
@@ -330,10 +291,9 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         train, val, _probability("roots", "claimable_share", roots["claimable_share"])
     )
 
-    search = _table(values["search"], "search", {"hash_mb", "widths", "depths"})
+    search = _table(values["search"], "search", {"hash_mb", "joint"})
     hash_mb = _integer("search", "hash_mb", search["hash_mb"], 1)
-    widths = _distribution("search", "widths", search["widths"], _positive_key)
-    depths = _distribution("search", "depths", search["depths"], _positive_key)
+    joint = _joint_distribution(search["joint"])
 
     synthesis = _table(
         values["synthesis"],
@@ -366,7 +326,6 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "synthesis", "board_descent_hazard", synthesis["board_descent_hazard"]
         ),
         _probability("synthesis", "board_frontier_p", synthesis["board_frontier_p"]),
-        presentations,
         minimum,
         maximum,
     )
@@ -375,8 +334,8 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     shard_size = _integer("release", "shard_size", release["shard_size"], 1)
     workers = _integer("release", "workers", release["workers"], 1)
     release = ReleaseConfig(shard_size, workers)
-    search = SearchConfig(depths[0][0], widths[0][0], hash_mb)
-    sampling = SamplingConfig(widths, depths, presentations)
+    search = SearchConfig(hash_mb)
+    sampling = SamplingConfig(joint, presentations)
     return TraceConfig(seed, paths, roots, search, synthesis, release, sampling)
 
 
@@ -576,9 +535,9 @@ class CollectionError(RuntimeError):
     """A pipeline input or result that violates the production contract."""
 
 
-def _root_teacher(root, config):
-    width = root.get("teacher_width", config.search.teacher_width)
-    depth = root.get("depth", config.search.depth)
+def _root_teacher(root):
+    width = root["teacher_width"]
+    depth = root["depth"]
     if not isinstance(width, int) or isinstance(width, bool) or width < 1:
         raise CollectionError(f"Root {root['root_id']} has an invalid teacher width")
     if not isinstance(depth, int) or isinstance(depth, bool) or depth < 1:
@@ -597,7 +556,7 @@ def _engine_path(config):
 
 
 def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
-    width, depth = _root_teacher(root, config)
+    width, depth = _root_teacher(root)
     repetition = validate_root(root, sidecar)
     if sidecar.engine != engine_name:
         raise CollectionError(f"Engine name differs for root {root['root_id']}")
@@ -687,18 +646,12 @@ def _run_engine(engine_path, fen, config, trace_path, width, depth, timeout=900)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+        process.stdin.close()
+        process.stdout.close()
     parts = bestmove.split()
     if len(parts) < 2:
         raise CollectionError(f"engine returned no bestmove: {bestmove!r}")
     return parts[1]
-
-
-def _selection_record(root):
-    return {
-        key: value
-        for key, value in root.items()
-        if key not in {"teacher_width", "depth", "presentation"}
-    }
 
 
 RELEASE_ONLY_METADATA = frozenset({"root_selection"})
@@ -748,6 +701,7 @@ def _root_row(root, synthesized, presentation):
         "root_id": root["root_id"],
         "presentation": presentation,
         "teacher_width": synthesized.stats["teacher_width"],
+        "effective_width": root["effective_width"],
         "depth": synthesized.stats["depth"],
         "rounds": row.rounds,
         "thinking_tokens": row.thinking_tokens,
@@ -884,7 +838,7 @@ def _recover_shard(output, index, roots, metadata, presentations):
     expected = {root["root_id"]: root for root in roots}
     for row in rows:
         root = expected[row["root_id"]]
-        for name in (*ROOT_ROW_FIELDS, "teacher_width", "depth"):
+        for name in (*ROOT_ROW_FIELDS, "teacher_width", "effective_width", "depth"):
             if name in root and row.get(name) != root[name]:
                 raise FileExistsError(
                     f"Unregistered shard root {name} differs: {final}"
@@ -940,7 +894,7 @@ def _release_metadata(identity):
 
 
 FINAL_SUFFIX_OPS = frozenset({"final", "final_evaluate", "final_pv", "end"})
-SEARCH_FIELDS = frozenset({"depth", "teacher_width", "hash_mb"})
+SEARCH_FIELDS = frozenset({"hash_mb"})
 BOARD_FIELDS = frozenset({"board_descent_hazard", "board_frontier_p"})
 PRESENTATION_FIELDS = frozenset(
     {
@@ -994,12 +948,12 @@ def _release_identity_contract(release, root_count):
         "presentation",
         "synthesis",
         "root_selection",
+        "recipe",
     }
     missing = required - set(metadata)
     if missing:
         raise ValueError(f"Release identity is missing {sorted(missing)[0]}")
-    if "recipe" in metadata:
-        parse_recipe(metadata["recipe"])
+    recipe = parse_recipe(metadata["recipe"])
 
     teacher = metadata["teacher"]
     if not isinstance(teacher, dict) or set(teacher) != TEACHER_FIELDS:
@@ -1021,17 +975,8 @@ def _release_identity_contract(release, root_count):
     search = metadata["search"]
     if not isinstance(search, dict) or set(search) != SEARCH_FIELDS:
         raise ValueError("Release identity has incomplete search settings")
-    if not _is_int(search["depth"], 1) or not _is_int(search["hash_mb"], 1):
+    if not _is_int(search["hash_mb"], 1):
         raise ValueError("Release search limits are invalid")
-    if not _is_int(search["teacher_width"], 1):
-        raise ValueError("Release teacher width is invalid")
-    # A recipe samples the width per root, so the fallback search width does
-    # not name the sidecar schema; the rows' recorded widths do, and
-    # validate_release checks the schema against them after reading a shard.
-    if "recipe" not in metadata and (teacher["schema_version"] == SIDECAR_SCHEMA) != (
-        search["teacher_width"] == 1
-    ):
-        raise ValueError("Release teacher schema differs from the teacher width")
 
     board = metadata["board"]
     if not isinstance(board, dict) or set(board) != BOARD_FIELDS:
@@ -1047,6 +992,11 @@ def _release_identity_contract(release, root_count):
         raise ValueError("Release presentation fractions are invalid")
     if abs(sum(fractions) - 1.0) > 1e-9:
         raise ValueError("Release presentation fractions do not sum to one")
+    if any(
+        presentation[name] != dict(recipe.presentations).get(name, 0.0)
+        for name in PRESENTATION_NAMES
+    ):
+        raise ValueError("Release presentation fractions differ from the recipe")
     if not (
         _is_probability(presentation["random_min_fraction"])
         and _is_probability(presentation["random_max_fraction"])
@@ -1337,8 +1287,6 @@ def _validate_shard_rows(
     release_dir,
     shard,
     presentations,
-    default_width,
-    default_depth,
     recipe,
     seed,
     value_mate,
@@ -1372,14 +1320,18 @@ def _validate_shard_rows(
         depth = row.get("depth")
         if not _is_int(teacher_width, 1) or not _is_int(depth, 1):
             raise ValueError(f"Release teacher settings are invalid: {root_id}")
-        if teacher_width != sample_width(recipe, seed, root_id, default_width):
+        board = chess.Board(row["fen"])
+        legal_width = board.legal_moves.count()
+        width, expected_depth = sample_search(recipe, seed, root_id)
+        expected_width = legal_width if width == "full" else width
+        if teacher_width != expected_width:
             raise ValueError(f"Release teacher width differs: {root_id}")
-        if depth != sample_depth(recipe, seed, root_id, default_depth):
+        if depth != expected_depth:
             raise ValueError(f"Release depth differs: {root_id}")
         if root_id not in expected_presentations:
             expected_presentations[root_id] = sample_presentation(recipe, seed, root_id)
         expected_presentation = expected_presentations[root_id]
-        if expected_presentation is not None and presentation != expected_presentation:
+        if presentation != expected_presentation:
             raise ValueError(f"Release presentation differs from the recipe: {root_id}")
         champion = champions.get(root_id)
         if champion is None:
@@ -1388,15 +1340,19 @@ def _validate_shard_rows(
             expected = expected_roots.get(root_id)
             if expected is None:
                 raise ValueError(f"Release contains an unselected root: {root_id}")
-            for name in (*ROOT_ROW_FIELDS, "teacher_width", "depth"):
+            for name in (*ROOT_ROW_FIELDS, "teacher_width", "effective_width", "depth"):
                 if name in expected and row.get(name) != expected.get(name):
                     raise ValueError(
                         f"Release root {name} differs from its selection: {root_id}"
                     )
-        board = chess.Board(row["fen"])
         if board.turn != (row["turn"] == "white"):
             raise ValueError(f"Root turn disagrees with FEN: {root_id}")
-        effective_width = min(teacher_width, board.legal_moves.count())
+        effective_width = min(teacher_width, legal_width)
+        if (
+            not _is_int(row.get("effective_width"), 1)
+            or row["effective_width"] != effective_width
+        ):
+            raise ValueError(f"Release effective width differs: {root_id}")
         max_teacher_width = max(max_teacher_width, teacher_width)
         repetition = row["repetition"]
         if not _is_int(repetition, 1) or repetition > 4:
@@ -1565,10 +1521,7 @@ def _validate_shard_rows(
     if roots_seen != set(champions):
         raise ValueError(f"Shard rows do not cover its champion records: {directory}")
     for root_id, count in presentations_seen.items():
-        wanted = (
-            1 if expected_presentations[root_id] is not None else len(PRESENTATIONS)
-        )
-        if count != wanted:
+        if count != 1:
             raise ValueError(f"A shard root has the wrong row count: {directory}")
     for champion in champions.values():
         rounds = champion["rounds"]
@@ -1617,14 +1570,9 @@ def validate_release(directory, roots=None, workers=8):
     complete = release["complete_root_ids"]
     metadata = validate_release_identity(release)
     teacher = metadata["teacher"]
-    search = metadata["search"]
-    recipe = parse_recipe(metadata["recipe"]) if "recipe" in metadata else None
+    recipe = parse_recipe(metadata["recipe"])
     seed = metadata["root_selection"]["seed"]
-    presentations = (
-        tuple(name for name, _ in recipe.presentations)
-        if recipe is not None and recipe.presentations is not None
-        else PRESENTATIONS
-    )
+    presentations = tuple(name for name, _ in recipe.presentations)
     expected_shard_metadata = {**expected_metadata, **shard_configuration(metadata)}
     expected = None
     if roots is not None:
@@ -1642,8 +1590,6 @@ def validate_release(directory, roots=None, workers=8):
 
     context = (
         presentations,
-        search["teacher_width"],
-        search["depth"],
         recipe,
         seed,
         teacher["value_mate"],
@@ -1709,14 +1655,12 @@ def sample_root_settings(roots, config, seed):
     sampled = []
     for root in roots:
         result = dict(root)
-        result["teacher_width"] = sample_width(
-            config.sampling, seed, root["root_id"], config.search.teacher_width
-        )
-        result["depth"] = sample_depth(
-            config.sampling, seed, root["root_id"], config.search.depth
-        )
-        result["presentation"] = (
-            sample_presentation(config.sampling, seed, root["root_id"]) or "full"
+        width, result["depth"] = sample_search(config.sampling, seed, root["root_id"])
+        legal_width = chess.Board(root["fen"]).legal_moves.count()
+        result["teacher_width"] = legal_width if width == "full" else width
+        result["effective_width"] = min(result["teacher_width"], legal_width)
+        result["presentation"] = sample_presentation(
+            config.sampling, seed, root["root_id"]
         )
         sampled.append(result)
     return sampled
@@ -1725,7 +1669,7 @@ def sample_root_settings(roots, config, seed):
 def _engine_lines(engine_path, root, config):
     from tempfile import TemporaryDirectory
 
-    width, depth = _root_teacher(root, config)
+    width, depth = _root_teacher(root)
     with TemporaryDirectory(prefix="pondera-sidecar-") as directory:
         trace_path = Path(directory) / "trace.jsonl"
         bestmove = _run_engine(
@@ -1739,7 +1683,7 @@ def _engine_lines(engine_path, root, config):
 
 def _process_root(root, config, lines, bestmove=None, engine_name=None, teacher=None):
     """Run the complete single-root contract without any intermediate files."""
-    width, _ = _root_teacher(root, config)
+    width, _ = _root_teacher(root)
     sidecar = parse_sidecar(
         lines,
         teacher_width=width,
@@ -1751,7 +1695,7 @@ def _process_root(root, config, lines, bestmove=None, engine_name=None, teacher=
             f"bestmove differs from the sidecar for {root['root_id']}"
         )
     synthesized = synthesize_root(sidecar, root, config)
-    presentation = root.get("presentation") or "full"
+    presentation = root["presentation"]
     row = synthesized.rows[presentation]
     program = replay(
         row.tokens,
@@ -1799,10 +1743,7 @@ def _identity_for(config, roots, engine_name="stockfish"):
         "teacher": {
             "schema_version": (
                 SIDECAR_SCHEMA_WIDE
-                if any(
-                    root.get("teacher_width", config.search.teacher_width) > 1
-                    for root in roots
-                )
+                if any(root["teacher_width"] > 1 for root in roots)
                 else SIDECAR_SCHEMA
             ),
             "value_mate": 32000,
@@ -1926,9 +1867,7 @@ def produce_shards(
         for key, value in release_metadata.items()
         if key not in RELEASE_ONLY_METADATA
     }
-    presentations = {
-        root["root_id"]: (root.get("presentation") or "full",) for root in roots
-    }
+    presentations = {root["root_id"]: (root["presentation"],) for root in roots}
     release_path = output_dir / "release.json"
     previous = load_manifest(release_path)
     if previous and previous.get("metadata") != identity:

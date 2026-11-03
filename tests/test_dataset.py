@@ -76,16 +76,18 @@ class DatasetContractTests(unittest.TestCase):
         self.assertEqual(manifest["grammar_version"], TRACE_GRAMMAR_VERSION)
         self.assertEqual(manifest["grammar_version"], 2)
         self.assertEqual(manifest["format_version"], DATA_FORMAT_VERSION)
-        self.assertEqual(manifest["format_version"], 6)
+        self.assertEqual(manifest["format_version"], 7)
         self.assertEqual(manifest["tokenizer_version"], CHESS_TOKENIZER_VERSION)
 
-    def test_reads_format_five_trace_arrays(self):
+    def test_rejects_old_trace_formats(self):
         manifest_path = self.data / "manifest.json"
         manifest = json.loads(manifest_path.read_text())
-        manifest["format_version"] = 5
-        manifest_path.write_text(json.dumps(manifest))
-        positions = TracePositions(self.data, "train")
-        self.assertEqual(len(positions), 3)
+        for version in (5, 6):
+            with self.subTest(version=version):
+                manifest["format_version"] = version
+                manifest_path.write_text(json.dumps(manifest))
+                with self.assertRaises(ValueError):
+                    TracePositions(self.data, "train")
 
     def test_dataset_rejects_a_missing_grammar_version(self):
         manifest_path = self.data / "manifest.json"

@@ -1,4 +1,3 @@
-import dataclasses
 import json
 import unittest
 from pathlib import Path
@@ -58,13 +57,6 @@ def load_case(name, teacher_width=1):
 def synthesize_case(name, seed=640, teacher_width=1):
     sidecar, root = load_case(name, teacher_width)
     config = load_config()
-    depth = CASES.get(name, W3_CASES.get(name))
-    config = dataclasses.replace(
-        config,
-        search=dataclasses.replace(
-            config.search, depth=depth, teacher_width=teacher_width
-        ),
-    )
     return sidecar, root, synthesize_root(sidecar, root, config, seed=seed)
 
 
@@ -282,10 +274,6 @@ class SynthesisTests(unittest.TestCase):
     def test_even_ply_checkmate_evaluates_as_a_root_loss(self):
         sidecar, root = load_case("mate_in_2_loss_d2")
         config = load_config()
-        config = dataclasses.replace(
-            config,
-            search=dataclasses.replace(config.search, depth=2, teacher_width=1),
-        )
         synthesized = synthesize_root(sidecar, root, config, seed=640)
         full = synthesized.rows["full"]
         program = replay(
@@ -356,10 +344,6 @@ class SynthesisTests(unittest.TestCase):
         self.assertFalse(unmodified.rows["full"].claim_draw)
         root["repetition"] = 3
         config = load_config()
-        config = dataclasses.replace(
-            config,
-            search=dataclasses.replace(config.search, depth=CASES["rule_draw_d4"]),
-        )
         claimed = synthesize_root(sidecar, root, config, seed=640)
         full = claimed.rows["full"]
         self.assertTrue(full.claim_draw)
@@ -419,14 +403,6 @@ class SynthesisTests(unittest.TestCase):
         sidecar = parse_sidecar(lines, teacher_width=3)
         root = json.loads((directory / "root.json").read_text(encoding="utf-8"))
         config = load_config()
-        config = dataclasses.replace(
-            config,
-            search=dataclasses.replace(
-                config.search,
-                depth=W3_CASES["middlegame_black_w3"],
-                teacher_width=3,
-            ),
-        )
         synthesized = synthesize_root(sidecar, root, config, seed=640)
         first = synthesized.round_audits[0]
         self.assertEqual(first.move, "c5f2")
@@ -582,10 +558,6 @@ class MalformedSidecarTests(unittest.TestCase):
         sidecar = parse_sidecar(self.renumber([json.dumps(event) for event in kept]))
         root = json.loads((FIXTURES / "start_d4" / "root.json").read_text())
         config = load_config()
-        config = dataclasses.replace(
-            config,
-            search=dataclasses.replace(config.search, depth=4),
-        )
         with self.assertRaises(SynthesisError):
             synthesize_root(sidecar, root, config, seed=640)
 

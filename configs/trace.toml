@@ -7,14 +7,18 @@ output = ".local/runs/trace"
 engine = "stockfish"
 
 [roots]
-train = 1000
-val = 0
+train = 500000
+val = 2000
 claimable_share = 0.03
 
 [search]
 hash_mb = 256
-widths = { 1 = 0.50, 2 = 0.25, 3 = 0.25 }
-depths = { 12 = 0.25, 16 = 0.50, 20 = 0.25 }
+joint = [
+    { width = "full", depth = 8, probability = 0.30 },
+    { width = 8, depth = 10, probability = 0.25 },
+    { width = 3, depth = 16, probability = 0.25 },
+    { width = 1, depth = 24, probability = 0.20 },
+]
 
 [synthesis]
 claim_draw = true

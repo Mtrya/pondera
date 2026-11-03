@@ -1,6 +1,42 @@
 """Constructed edge-case records derived from the real trace fixtures."""
 
 import json
+import re
+from pathlib import Path
+
+
+def trace_config_text(width=1, depth=4, joint=None, presentations=None, engine=None):
+    text = Path("configs/trace.toml").read_text(encoding="utf-8")
+    if joint is None:
+        joint = [{"width": width, "depth": depth, "probability": 1.0}]
+    entries = [
+        "{ "
+        + ", ".join(f"{key} = {json.dumps(value)}" for key, value in entry.items())
+        + " }"
+        for entry in joint
+    ]
+    search = "[search]\nhash_mb = 256\njoint = [" + ", ".join(entries) + "]\n\n"
+    text = re.sub(r"(?ms)^\[search\]\n.*?(?=^\[)", lambda _: search, text)
+    if presentations is not None:
+        table = (
+            "{ "
+            + ", ".join(f"{key} = {value}" for key, value in presentations.items())
+            + " }"
+        )
+        text = re.sub(
+            r"^presentations =.*$",
+            lambda _: f"presentations = {table}",
+            text,
+            flags=re.MULTILINE,
+        )
+    if engine is not None:
+        text = re.sub(
+            r"^engine =.*$",
+            lambda _: f"engine = {json.dumps(str(engine))}",
+            text,
+            flags=re.MULTILINE,
+        )
+    return text
 
 
 def tie_sidecar_lines(case, lines):
@@ -35,3 +71,36 @@ def tie_sidecar_lines(case, lines):
     rank["c5f2"].update(raw=-2360, cp=-624)
     end["rank"] = [rank["c5f2"], rank["f6e4"], rank["c6d4"]]
     return [json.dumps(item, separators=(",", ":")) for item in events]
+
+
+def read_release_rows(directory):
+    from pondera.data.pipeline import load_manifest, verify_shard_files
+
+    directory = Path(directory)
+    release = load_manifest(directory / "release.json")
+    output = {}
+    for shard in release["shards"]:
+        _, rows, arrays = verify_shard_files(directory, shard)
+        for index, row in enumerate(rows):
+            length = int(arrays["trace_len"][index])
+            count = int(arrays["state_count"][index])
+            output[(row["root_id"], row["presentation"])] = {
+                "row": row,
+                "trace_tokens": tuple(
+                    int(value) for value in arrays["trace_tokens"][index, :length]
+                ),
+                "trace_roles": tuple(
+                    int(value) for value in arrays["trace_roles"][index, :length]
+                ),
+                "state": {
+                    name: tuple(int(value) for value in arrays[name][index, :count])
+                    for name in (
+                        "state_best",
+                        "state_value",
+                        "state_basis",
+                        "state_without_board",
+                        "state_with_board",
+                    )
+                },
+            }
+    return output

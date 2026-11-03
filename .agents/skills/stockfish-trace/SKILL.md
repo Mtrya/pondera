@@ -147,7 +147,7 @@ If any gate fails, stop and fix the C++ instrumentation.
 ## 5. Connecting to Pondera's pipeline
 
 1. **Configure paths**: edit a working copy of `configs/trace.toml`. Set `[paths].engine` to the treatment binary, `output` to the release directory, and `archive`/`roots` for automatic root-pool construction. If `roots` already exists, its JSONL records need a unique `root_id`, `split` (`train` or `val`), a legal non-terminal six-field `fen`, and `repetition` in `1..4`; `turn` and `position_key` are checked when present.
-2. **Configure production**: set the top-level `seed`, `[roots]` sizes and claimable share, `[search]` engine options and `widths`/`depths`, `[synthesis]` BOARD/draw/presentation settings, and `[release]` shard size and workers. Width, depth, and presentation each accept one value or a probability table. There is no separate recipe, smoke, collection, or release configuration.
+2. **Configure production**: set the top-level `seed`, `[roots]` sizes and claimable share, `[search].hash_mb` and `joint`, `[synthesis]` BOARD/draw/presentation settings, and `[release]` shard size and workers. `joint` is an array of `{width, depth, probability}` tables: widths are positive integers or `"full"`, depths are positive integers, pairs are unique, and probabilities sum to one. Each root draws a single pair; `"full"` resolves to its legal root-move count before UCI setup. Root rows record concrete `teacher_width` and capped `effective_width`. Presentation is drawn independently and accepts one value or a probability table. There is no separate recipe, smoke, collection, or release configuration.
 3. **Run the single entry point**:
    ```bash
    uv run python -m pondera.data.pipeline --config /abs/path/to/trace.toml

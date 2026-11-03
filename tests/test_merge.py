@@ -35,26 +35,17 @@ def release_rows(cases=CASES):
     The fixtures are the sidecars of an actual depth-4 search, so these are
     the same rows a release shard would carry, only without the release shell.
     """
-    with tempfile.TemporaryDirectory() as directory:
-        config_path = Path(directory) / "trace.toml"
-        config_path.write_text(
-            Path("configs/trace.toml")
-            .read_text(encoding="utf-8")
-            .replace("depths = 16", "depths = 4"),
-            encoding="utf-8",
+    config = load_config()
+    rows = []
+    for case in cases:
+        fixture = FIXTURES / case
+        root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
+        sidecar = load_sidecar(fixture / "sidecar.jsonl")
+        synthesized = synthesize_root(sidecar, root, config)
+        rows.extend(
+            np.asarray(row.tokens, dtype=np.int64) for row in synthesized.rows.values()
         )
-        config = load_config(config_path)
-        rows = []
-        for case in cases:
-            fixture = FIXTURES / case
-            root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
-            sidecar = load_sidecar(fixture / "sidecar.jsonl")
-            synthesized = synthesize_root(sidecar, root, config)
-            rows.extend(
-                np.asarray(row.tokens, dtype=np.int64)
-                for row in synthesized.rows.values()
-            )
-        return rows
+    return rows
 
 
 def exhaustive_minimum(tokens, dictionary):

@@ -13,8 +13,7 @@ from pondera.chess.codec import BOARD_TOKENS_MAX
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
 from pondera.data.trace import ROLE_COUNT, TRACE_GRAMMAR_VERSION
 
-DATA_FORMAT_VERSION = 6
-READ_FORMAT_VERSIONS = (5, DATA_FORMAT_VERSION)
+DATA_FORMAT_VERSION = 7
 TRACE_ARRAYS = ("board_tokens", "trace_tokens", "trace_len", "trace_roles")
 STATE_ARRAYS = (
     "state_without_board",
@@ -190,7 +189,7 @@ class TracePositions(Dataset):
         )
         with manifest_path.open(encoding="utf-8") as handle:
             manifest = json.load(handle)
-        if manifest.get("format_version") not in READ_FORMAT_VERSIONS:
+        if manifest.get("format_version") != DATA_FORMAT_VERSION:
             raise ValueError(
                 f"Unsupported dataset format version: {manifest.get('format_version')}"
             )
