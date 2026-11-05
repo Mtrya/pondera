@@ -35,7 +35,7 @@ from pondera.chess.vocabulary import (
     CHESS_VOCAB_SIZE,
     LINES,
 )
-from pondera.data.dataset import load_manifest
+from pondera.data.dataset import load_manifest, load_trace_arrays, read_root_rows
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 FULL_PRESENTATION = "full"
@@ -64,19 +64,12 @@ def load_full_rows(release):
     rows = []
     for shard in manifest["shards"]:
         directory = release / shard["path"]
-        tokens = np.load(directory / "trace_tokens.npy", mmap_mode="r")
-        lengths = np.load(directory / "trace_len.npy")
-        records = [
-            json.loads(line)
-            for line in (directory / "roots.jsonl")
-            .read_text(encoding="utf-8")
-            .splitlines()
-            if line.strip()
-        ]
+        tokens = load_trace_arrays(directory, ("trace_tokens",))["trace_tokens"]
+        records = read_root_rows(directory)
         for index, record in enumerate(records):
             if record["presentation"] != FULL_PRESENTATION:
                 continue
-            atoms = np.asarray(tokens[index, : int(lengths[index])], dtype=np.int64)
+            atoms = np.asarray(tokens[index], dtype=np.int64)
             rows.append((record["root_id"], atoms))
     return rows
 

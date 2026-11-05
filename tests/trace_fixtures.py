@@ -87,13 +87,13 @@ def read_release_rows(directory):
             output[(row["root_id"], row["presentation"])] = {
                 "row": row,
                 "trace_tokens": tuple(
-                    int(value) for value in arrays["trace_tokens"][index, :length]
+                    int(value) for value in arrays["trace_tokens"][index][:length]
                 ),
                 "trace_roles": tuple(
-                    int(value) for value in arrays["trace_roles"][index, :length]
+                    int(value) for value in arrays["trace_roles"][index][:length]
                 ),
                 "state": {
-                    name: tuple(int(value) for value in arrays[name][index, :count])
+                    name: tuple(int(value) for value in arrays[name][index][:count])
                     for name in (
                         "state_best",
                         "state_value",

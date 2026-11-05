@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import tempfile
@@ -13,6 +14,8 @@ from trace_fixtures import trace_config_text as config_text
 from pondera.data.pipeline import (
     CollectionError,
     _check_sidecar,
+    _collect_root,
+    _Engine,
     load_config,
     parse_recipe,
     produce_shards,
@@ -32,6 +35,33 @@ class RecipeTests(unittest.TestCase):
             path = Path(directory) / "trace.toml"
             path.write_text(text, encoding="utf-8")
             return load_config(path)
+
+    def test_root_collection_restores_gc_on_success_and_producer_failure(self):
+        config = self.load(config_text())
+        root = json.loads((FIXTURES / "start_d4" / "root.json").read_text())
+        root = sample_root_settings([root], config, config.seed)[0]
+        lines = (FIXTURES / "start_d4" / "sidecar.jsonl").read_text().splitlines()
+        original = gc.isenabled()
+        try:
+            for enabled in (True, False):
+                with self.subTest(enabled=enabled):
+                    (gc.enable if enabled else gc.disable)()
+                    _collect_root(
+                        root, config, None, None, None, {root["root_id"]: lines}
+                    )
+                    self.assertEqual(gc.isenabled(), enabled)
+                    with self.assertRaises(SynthesisError):
+                        _collect_root(
+                            root,
+                            config,
+                            None,
+                            None,
+                            None,
+                            {root["root_id"]: lines[:-1]},
+                        )
+                    self.assertEqual(gc.isenabled(), enabled)
+        finally:
+            (gc.enable if original else gc.disable)()
 
     def test_root_settings_are_recomputed_from_the_active_recipe(self):
         roots = [
@@ -190,6 +220,30 @@ class DirectPipelineIntegrationTests(unittest.TestCase):
         if not engine or not Path(engine).is_file():
             self.skipTest("set PONDERA_TRACE_ENGINE to the instrumented engine")
         return Path(engine).resolve()
+
+    def test_new_game_resets_match_fresh_recorded_searches(self):
+        engine = self.engine()
+        cases = (
+            ("start_d4", 1),
+            ("middlegame_black_w3", 3),
+            ("mate_in_1_w3", 3),
+            ("start_d4", 1),
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            _Engine(engine, 256) as session,
+        ):
+            for index, (case, width) in enumerate(cases):
+                fixture = FIXTURES / case
+                root = json.loads((fixture / "root.json").read_text())
+                path = Path(directory) / f"{index}.jsonl"
+                session.search(root["fen"], path, width, 4)
+                actual = [json.loads(line) for line in path.read_text().splitlines()]
+                expected = [
+                    json.loads(line)
+                    for line in (fixture / "sidecar.jsonl").read_text().splitlines()
+                ]
+                self.assertEqual(actual, expected, case)
 
     def test_engine_produces_a_release_without_a_sidecar_directory(self):
         engine = self.engine()

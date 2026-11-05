@@ -15,7 +15,7 @@ Create a working directory outside the Pondera checkout (or under gitignored `.l
 
 1. Fetch official Stockfish `sf_17.1` source and ensure the default NNUE networks required by that tag are present in `src/`.
 2. Copy the source tree into two sibling directories: an unmodified control tree and a treatment tree.
-3. Build the control binary from the unmodified tree (`make -C src build ARCH=...` or `profile-build` with the same target flags you will use for the treatment). Keep the control binary for the consistency gates below.
+3. Build the control binary from the unmodified tree (`make -C src build ARCH=...` or `profile-build` with the same target flags you will use for the treatment). Prefer profile-guided builds. On the execution host, use the upstream architecture selector (`ARCH=native`) to identify a native candidate, compare it with an AVX2 build on the same bounded curation workload, and keep the faster qualified build. Record the resolved architecture and rerun the consistency gates for each build. Keep the control binary for the consistency gates below.
 
 ## 2. Treatment instrumentation architecture
 
@@ -33,6 +33,7 @@ Register a string UCI option `TraceLog` (default `""`) in the engine option tabl
   - Snapshot the configured `MultiPV` (`traceMultiPV = int(options["MultiPV"])`), reset `seq = 0`, and immediately write the `session` event.
 - Also guard the start of search: if `Trace::active()` is true at search start but `Threads != 1`, close the sidecar immediately.
 - Note for callers: because `session` snapshots `Threads`, `Hash`, and `MultiPV` when `TraceLog` is set, the collector always sends `Threads`, `Hash`, and `MultiPV` before `TraceLog`.
+- Buffer sidecar writes in a 1 MiB stream buffer configured before opening the file. Do not flush after each event. Flush after `session`, after `search_end` before returning `bestmove`, and on close. Completed sidecars must remain byte-identical to the same instrumentation with per-event flushing; buffering must not change event order or search state.
 
 ### 2.2 Configured width vs. effective width
 
@@ -142,6 +143,8 @@ Before producing a dataset, verify on test roots covering ordinary midgames, mat
 3. **Determinism**: two fresh treatment processes with the same commands produce byte-identical sidecar files.
 4. **Consumer validation**: every test sidecar passes `parse_sidecar(lines, teacher_width=W)` in `src/pondera/data/trace.py`; `synthesize_root` and `replay` accept the resulting traces.
 
+Also qualify the collector's per-root resets: search different roots and widths in one engine process, closing `TraceLog` and sending `ucinewgame` between roots. Include a return to an earlier root and require the sidecar events to match fresh-process searches. `ucinewgame` must clear the TT, search histories, and NNUE refresh cache; `position fen` must replace the previous position history.
+
 If any gate fails, stop and fix the C++ instrumentation.
 
 ## 5. Connecting to Pondera's pipeline
@@ -152,12 +155,12 @@ If any gate fails, stop and fix the C++ instrumentation.
    ```bash
    uv run python -m pondera.data.pipeline --config /abs/path/to/trace.toml
    ```
-   The pipeline builds or loads the root pool, runs each root in a fresh engine process (`Threads` -> `Hash` -> `MultiPV` -> `TraceLog` -> `position fen` -> `go depth`), validates and synthesizes each sidecar in memory, replays the selected trace, and atomically publishes shards. Sidecars exist only in temporary directories. `--start-shard` and `--end-shard` optionally select a shard range for job scheduling; `--workers` overrides worker count without changing trace semantics.
-4. **Independently validate the completed release**:
+   The pipeline builds or loads the root pool and keeps one engine process per worker. It configures `Threads` and `Hash` once, then sends `TraceLog` empty -> `ucinewgame` -> `MultiPV` -> `TraceLog` -> `isready` -> `position fen` -> `go depth` for each root. It decodes the completed sidecar directly from its temporary file, synthesizes the assigned presentation, and atomically publishes Parquet shards with the HF fields and machine arrays. `--start-shard` and `--end-shard` optionally select a shard range for job scheduling; `--workers` overrides worker count without changing trace semantics.
+4. **Run independent release diagnostics**:
    ```bash
    uv run python - <<'PY'
    from pondera.data.pipeline import validate_release
-   validate_release("/abs/path/to/release")
+   validate_release("/abs/path/to/release", workers=1)
    PY
    ```
-   Validation checks manifests, array layout, stored states, and every trace replay against python-chess.
+   Use bounded qualification releases during implementation and when investigating a concrete failure. Validation checks manifests, ragged array layout, stored states, and every trace replay against python-chess. Normal curation relies on the qualified producer and synthesizer. Parallel diagnostics use spawned workers and require an importable script with an `if __name__ == "__main__"` guard.

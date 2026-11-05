@@ -5,8 +5,8 @@ This page describes the current offline data pipeline. The grammar and array lay
 Training never runs the engine. Offline production has one entry point, `pondera.data.pipeline`, and one configuration file:
 
     game archive -> stratified root pool -> instrumented Stockfish
-                 -> in-memory sidecar checks, synthesis, and replay
-                 -> sharded release -> independent release validation
+                 -> streamed sidecar decoding and synthesis
+                 -> Parquet release -> training and merge profiling
 
 ## Roots
 
@@ -35,11 +35,11 @@ Presentation accepts one value or a probability table and uses a separate `rando
 
 ## Teacher and trace synthesis
 
-The teacher is an external instrumented Stockfish 17.1 build. Neither its source nor its binary is part of this repository. One fresh engine process runs per root: `Threads`, `Hash`, and `MultiPV` are set, `TraceLog` is enabled, then `position fen` and `go depth D` are sent. No game history, time limit, or searchmoves are supplied.
+The teacher is an external instrumented Stockfish 17.1 build. Neither its source nor its binary is part of this repository. Each worker owns one engine process with fixed `Threads = 1` and `Hash`. For every root it closes the previous `TraceLog`, sends `ucinewgame` to clear search state, sets `MultiPV`, opens a new `TraceLog`, waits for `readyok`, and sends `position fen` and `go depth D`. Reset qualification compares recorded events with fresh-process searches across different roots and widths. No game history, time limit, or searchmoves are supplied.
 
 The engine writes a JSONL sidecar in a temporary directory. Schema 3 is used at configured width one; schema 4 records per-PV-line attempts at greater widths. Events are `session`, `position`, `search_start`, `round_start`, `attempt`, `candidate`, `frontier`, `round_end`, and `search_end`. Scores use internal integer units, with `cp` and WDL for ordinary scores and mate constants in the session event.
 
-For each root, `pondera.data.trace` validates the sidecar, translates the completed search into grammar-v2 tokens, and independently replays the selected row before publication. The sidecar and unsharded trace are not retained as pipeline artifacts.
+For each root, the pipeline decodes the qualified producer's completed sidecar directly from the temporary file and checks search completion and requested settings. `pondera.data.trace` translates known search operations into grammar-v2 tokens, roles, truncation states, and SAN text together. It materializes the assigned presentation while retaining statistics about the complete search. Exhaustive sidecar parsing and token replay are separate development and incident diagnostics.
 
 A trace is a causal program over the root. `<depth>` opens a round. A move enters its child; `BACK` returns to the parent; `RESET` returns to the root. Values and mate tokens evaluate the current node from the root player's perspective. `<refuted>` says that a just-entered candidate did not beat the parent's current leading exact score. `BOARD` represents the current node; the root board is already the input prefix.
 
@@ -51,9 +51,13 @@ The presentations are `zero` (suffix only), `full` (complete thought), and `rand
 
 ## Release and validation
 
-A release contains shards and `release.json`. Each shard stores `board_tokens`, `trace_tokens`, `trace_len`, `trace_roles`, the truncation-state arrays, `state_count`, `roots.jsonl`, and `champions.jsonl`. Shards are published atomically and can be recovered or resumed by root.
+A release contains shards and `release.json`. Each shard stores `data.parquet`, `champions.jsonl`, and its manifest. Parquet rows contain root metadata, human-readable fields, and authoritative machine arrays. Tokens, roles, and the five truncation-state lists are ragged; padding is added only when forming a training batch. `trace_len` supports scalar length queries; state counts come from list offsets. Shards are published atomically, registered by index and row count, and can be recovered or resumed against the selected roots. A persistent worker pool processes at most two shards at a time while completed shards are written.
 
-Trace datasets use manifest `format_version = 7` and `grammar_version = 2`. The release identity includes the joint recipe and presentation probabilities; root rows store the sampled depth and configured/effective widths. `pondera.data.dataset` reads these arrays for training and lazily memory-maps shard storage. `pondera.data.pipeline.validate_release` reconstructs each root's sampled settings from the recipe and seed, checks effective width against legal moves, and verifies manifests, array shapes, stored states, and every trace replay against python-chess. Validation reconstructs programs from stored tokens rather than trusting synthesis. Older manifest formats are rejected.
+Trace datasets use manifest `format_version = 8` and `grammar_version = 2`. The release identity includes the joint recipe and presentation probabilities; rows store `teacher_depth` and configured/effective widths. The shared HF columns are `fen`, `presentation`, `repetition`, `turn`, `teacher_depth`, `teacher_width`, `trace_text`, `final_move`, `final_value`, and `mate_distance`. `trace_text` transcribes the selected trace in absolute SAN, including board observations, evaluations, control operations, and the final suffix. `final_value` is nullable float32 `(W-L)/1000` from the deepest teacher WDL; mates use a null value and a signed mate distance. This scalar is distinct from the quantized value represented by trace tokens. Depth, width, repetition, and mate distance use int16; the remaining HF fields are strings.
+
+HF and local consumers read the same Parquet files; HF readers select training or validation rows using the `split` column. `pondera.data.dataset.TracePositions` projects machine columns and caches up to eight row groups; it leaves text and state columns unread during training. `merge_profile.py` reads full-presentation token lists directly. Source provenance is stored as a JSON string and decoded by the root-metadata reader.
+
+For bounded qualification or failure diagnosis, `pondera.data.pipeline.validate_release` reconstructs sampled settings from the recipe and seed, checks effective width against legal moves, and verifies metadata, ragged array types and lengths, stored states, and every trace replay against python-chess. Normal curation uses completion and publication checks. Older manifest formats are rejected. Parallel diagnostics use spawned workers and require an importable script with a main guard; use `workers=1` from stdin.
 
 ## Scope and reproducibility
 

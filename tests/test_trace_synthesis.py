@@ -23,6 +23,7 @@ from pondera.data.trace import (
     DRAW_CLAIM_BOUND,
     PRESENTATIONS,
     SynthesisError,
+    decode_sidecar,
     load_sidecar,
     mate_distance_moves,
     parse_sidecar,
@@ -99,6 +100,46 @@ class MateConversionTests(unittest.TestCase):
 
 
 class SynthesisTests(unittest.TestCase):
+    def test_assigned_presentation_preserves_the_row_and_full_search_statistics(self):
+        sidecar, root, reference = synthesize_case(
+            "middlegame_black_w3", teacher_width=3
+        )
+        for presentation in PRESENTATIONS:
+            assigned = synthesize_root(
+                sidecar, {**root, "presentation": presentation}, load_config()
+            )
+            self.assertEqual(set(assigned.rows), {presentation})
+            self.assertEqual(assigned.rows[presentation], reference.rows[presentation])
+            self.assertEqual(assigned.stats, reference.stats)
+
+    def test_human_suffix_preserves_san_mate_and_draw_claim(self):
+        # Frozen HF transcription examples: absolute SAN, binned values and mate moves.
+        for case, width, expected in (
+            ("mate_in_1_w3", 3, "FINAL Re8# value:+1.000 win:1 END"),
+            ("claim_draw_d4", 1, "FINAL CLAIM_DRAW value:-0.003 END"),
+            ("middlegame_black_d4", 1, "FINAL Nxe4 value:-1.000 dxe4 a6 a3 END"),
+        ):
+            with self.subTest(case=case):
+                _, _, synthesized = synthesize_case(case, teacher_width=width)
+                self.assertEqual(
+                    synthesized.rows["zero"].trace_text.splitlines()[1:], [expected]
+                )
+
+    def test_decoded_producer_records_match_checked_records(self):
+        for name in (*CASES, *W3_CASES):
+            with self.subTest(case=name):
+                path = FIXTURES / name / "sidecar.jsonl"
+                width = 3 if name in W3_CASES else 1
+                lines = path.read_text().splitlines()
+                self.assertEqual(
+                    decode_sidecar(lines), parse_sidecar(lines, teacher_width=width)
+                )
+
+    def test_incomplete_producer_output_surfaces(self):
+        lines = (FIXTURES / "start_d4" / "sidecar.jsonl").read_text().splitlines()
+        with self.assertRaises(SynthesisError):
+            decode_sidecar(lines[:-1])
+
     def test_presentations_replay_and_share_the_suffix(self):
         for name in CASES:
             with self.subTest(case=name):

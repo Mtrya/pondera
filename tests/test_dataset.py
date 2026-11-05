@@ -17,7 +17,7 @@ from pondera.chess.vocabulary import (
     PAD,
     UCI_MOVE_TO_IDX,
 )
-from pondera.data.dataset import DATA_FORMAT_VERSION, TracePositions
+from pondera.data.dataset import DATA_FORMAT_VERSION, TracePositions, write_trace_rows
 from pondera.data.trace import (
     ROLE_CONTROL,
     ROLE_FINAL_EVAL,
@@ -72,17 +72,17 @@ class DatasetContractTests(unittest.TestCase):
         )
 
     def test_manifest_carries_the_current_grammar(self):
-        manifest = json.loads((self.data / "manifest.json").read_text())
+        manifest = json.loads((self.data / "release.json").read_text())
         self.assertEqual(manifest["grammar_version"], TRACE_GRAMMAR_VERSION)
         self.assertEqual(manifest["grammar_version"], 2)
         self.assertEqual(manifest["format_version"], DATA_FORMAT_VERSION)
-        self.assertEqual(manifest["format_version"], 7)
+        self.assertEqual(manifest["format_version"], 8)
         self.assertEqual(manifest["tokenizer_version"], CHESS_TOKENIZER_VERSION)
 
     def test_rejects_old_trace_formats(self):
-        manifest_path = self.data / "manifest.json"
+        manifest_path = self.data / "release.json"
         manifest = json.loads(manifest_path.read_text())
-        for version in (5, 6):
+        for version in (5, 6, 7):
             with self.subTest(version=version):
                 manifest["format_version"] = version
                 manifest_path.write_text(json.dumps(manifest))
@@ -90,7 +90,7 @@ class DatasetContractTests(unittest.TestCase):
                     TracePositions(self.data, "train")
 
     def test_dataset_rejects_a_missing_grammar_version(self):
-        manifest_path = self.data / "manifest.json"
+        manifest_path = self.data / "release.json"
         manifest = json.loads(manifest_path.read_text())
         del manifest["grammar_version"]
         manifest_path.write_text(json.dumps(manifest))
@@ -101,7 +101,7 @@ class DatasetContractTests(unittest.TestCase):
         positions = TracePositions(self.data, "train")
         self.assertEqual(len(positions), 3)
         boards, trace, length, roles = positions[0]
-        self.assertEqual(len(trace), positions.trace.shape[1])
+        self.assertEqual(len(trace), length)
         self.assertEqual(int(length), len(self.rows[0]["trace"]))
         self.assertEqual(trace[:length].tolist(), self.rows[0]["trace"].tolist())
         self.assertEqual(roles[:length].tolist(), self.rows[0]["roles"].tolist())
@@ -112,6 +112,18 @@ class DatasetContractTests(unittest.TestCase):
         self.assertEqual(int(trace[decision - 1]), FINAL)
         self.assertNotEqual(decision, length - 1)
         self.assertEqual(int(roles[length - 1]), ROLE_CONTROL)
+
+    def test_ragged_rows_cross_parquet_row_groups(self):
+        rows = [self.rows[index % len(self.rows)] for index in range(130)]
+        directory = write_trace_dataset(self.root / "groups", {"train": rows})
+        positions = TracePositions(directory, "train")
+        for index in (129, 0, 63, 64, 127, 128, 1):
+            board, tokens, length, roles = positions[index]
+            expected = rows[index]
+            self.assertEqual(tokens.tolist(), expected["trace"].tolist())
+            self.assertEqual(roles.tolist(), expected["roles"].tolist())
+            self.assertEqual(length, len(tokens))
+            self.assertEqual(board.tolist(), encode_board(expected["fen"]).tolist())
 
     def test_collator_pads_tokens_and_locates_the_final_decision(self):
         positions = TracePositions(self.data, "train")
@@ -179,20 +191,28 @@ def write_shard(directory, index, fen):
     writer.end()
     shard = directory / f"shard-{index:06d}"
     shard.mkdir()
-    np.save(shard / "board_tokens.npy", encode_board(fen)[None, :])
-    np.save(shard / "trace_tokens.npy", writer.tokens[None, :])
-    np.save(shard / "trace_len.npy", np.asarray([len(writer.tokens)], dtype=np.int32))
-    np.save(shard / "trace_roles.npy", writer.roles[None, :])
-    for name in (
-        "state_without_board",
-        "state_with_board",
-        "state_best",
-        "state_basis",
-        "state_value",
-    ):
-        np.save(shard / f"{name}.npy", np.zeros((1, 0), dtype=np.int32))
-    np.save(shard / "state_count.npy", np.zeros(1, dtype=np.int32))
-    (shard / "roots.jsonl").write_text(json.dumps({"split": "train"}) + "\n")
+    write_trace_rows(
+        shard,
+        [
+            {
+                "split": "train",
+                "board_tokens": encode_board(fen),
+                "trace_tokens": writer.tokens,
+                "trace_len": len(writer.tokens),
+                "trace_roles": writer.roles,
+                **{
+                    name: []
+                    for name in (
+                        "state_without_board",
+                        "state_with_board",
+                        "state_best",
+                        "state_basis",
+                        "state_value",
+                    )
+                },
+            }
+        ],
+    )
     return shard.name
 
 

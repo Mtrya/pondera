@@ -9,6 +9,28 @@ CASTLING_FEN = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"
 
 
 class PathTrackerTests(unittest.TestCase):
+    def test_qualified_push_preserves_san_history_and_undo(self):
+        for fen, moves in (
+            (chess.STARTING_FEN, ("g1f3", "g8f6", "f3g1", "f6g8")),
+            (CASTLING_FEN, ("e1g1", "e8c8")),
+            ("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", ("e5d6",)),
+            ("7k/P7/8/8/8/8/8/4K3 w - - 0 1", ("a7a8q",)),
+        ):
+            with self.subTest(fen=fen):
+                tracker = PathTracker(fen)
+                reference = chess.Board(fen)
+                for move in moves:
+                    san = reference.san(chess.Move.from_uci(move))
+                    reference.push_uci(move)
+                    self.assertEqual(tracker.push_legal(move), san)
+                    self.assertEqual(tracker.fen(), reference.fen(en_passant="fen"))
+                self.assertEqual(tracker.path, moves)
+                self.assertEqual(tracker.repetition(), 2 if len(moves) == 4 else 1)
+                for _ in moves:
+                    tracker.back()
+                self.assertEqual(tracker.fen(), chess.Board(fen).fen(en_passant="fen"))
+                self.assertEqual(tracker.repetition(), 1)
+
     def test_push_and_back_match_python_chess(self):
         tracker = PathTracker(chess.STARTING_FEN)
         self.assertEqual(tracker.path, ())
@@ -73,6 +95,37 @@ class PathTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.repetition(), 5)
         tracker.push("e2e4")
         self.assertEqual(tracker.repetition(), 1)
+
+    def test_repetition_distinguishes_only_legal_en_passant(self):
+        # The rook pins e5 to the king, making d6 an unusable ep square.
+        for fen, expected in (
+            ("k3r1n1/8/8/3pP3/8/8/8/4K1N1 w - d6 0 1", 2),
+            ("k5n1/8/8/3pP3/8/8/8/4K1N1 w - d6 0 1", 1),
+        ):
+            with self.subTest(fen=fen):
+                tracker = PathTracker(fen)
+                reference = chess.Board(fen)
+                for move in ("g1f3", "g8f6", "f3g1", "f6g8"):
+                    tracker.push(move)
+                    reference.push_uci(move)
+                self.assertEqual(tracker.repetition(), expected)
+                self.assertEqual(reference.is_repetition(2), expected == 2)
+
+    def test_repetition_history_is_restored_on_back_and_reset(self):
+        tracker = PathTracker(chess.STARTING_FEN, repetition=4)
+        cycle = ("g1f3", "g8f6", "f3g1", "f6g8")
+        for _ in range(3):
+            for move in cycle:
+                tracker.push(move)
+            self.assertEqual(tracker.repetition(), 5)
+            for _ in cycle:
+                tracker.back()
+            self.assertEqual(tracker.repetition(), 4)
+        for move in cycle:
+            tracker.push(move)
+        tracker.reset()
+        self.assertEqual(tracker.repetition(), 4)
+        self.assertIsNone(tracker.search_terminal())
 
     def test_board_tokens_are_lossless_against_python_chess(self):
         fens = [chess.STARTING_FEN, CASTLING_FEN]

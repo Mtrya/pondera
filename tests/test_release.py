@@ -9,11 +9,18 @@ from pathlib import Path
 
 import chess
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 from trace_fixtures import read_release_rows, tie_sidecar_lines, trace_config_text
 
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
-from pondera.data.dataset import DATA_ARRAYS, TracePositions, load_manifest
+from pondera.data.dataset import (
+    DATA_ARRAYS,
+    TracePositions,
+    load_manifest,
+    read_root_rows,
+)
 from pondera.data.pipeline import (
     load_config,
     load_trace_arrays,
@@ -100,7 +107,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(len(self.result["shards"]), 3)
         self.assertEqual([shard["rows"] for shard in self.result["shards"]], [2, 2, 1])
         release = load_manifest(self.release / "release.json")
-        self.assertEqual(release["format_version"], 7)
+        self.assertEqual(release["format_version"], 8)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
         self.assertEqual(release["search"], {"hash_mb": 256})
@@ -114,6 +121,28 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(validation["rows"], len(CASES))
         self.assertEqual(validation["counts"]["train"], len(CASES))
         self.assertTrue((self.release / "validation.json").exists())
+
+    def test_hf_columns_preserve_the_shared_scalar_contract(self):
+        expected = {
+            "fen": pa.string(),
+            "presentation": pa.string(),
+            "repetition": pa.int16(),
+            "turn": pa.string(),
+            "teacher_depth": pa.int16(),
+            "teacher_width": pa.int16(),
+            "trace_text": pa.string(),
+            "final_move": pa.string(),
+            "final_value": pa.float32(),
+            "mate_distance": pa.int16(),
+        }
+        for shard in self.result["shards"]:
+            table = pq.read_table(self.release / shard["path"] / "data.parquet")
+            for name, dtype in expected.items():
+                self.assertEqual(table.schema.field(name).type, dtype)
+            for row in table.to_pylist():
+                self.assertEqual(len(row["trace_tokens"]), row["trace_len"])
+                self.assertEqual(len(row["trace_roles"]), row["trace_len"])
+                self.assertTrue(row["trace_text"].endswith(" END"))
 
     def test_parallel_validation_matches_sequential(self):
         sequential = validate_release(self.release, self.roots, workers=1)
@@ -152,7 +181,7 @@ class ReleaseTests(unittest.TestCase):
             }
             for index, row in enumerate(rows):
                 length = int(arrays["trace_len"][index])
-                tokens = arrays["trace_tokens"][index, :length]
+                tokens = arrays["trace_tokens"][index][:length]
                 program = replay(
                     tokens,
                     row["fen"],
@@ -166,7 +195,7 @@ class ReleaseTests(unittest.TestCase):
                 key = row["root_id"]
                 self.assertEqual(suffixes.setdefault(key, suffix), suffix)
                 self.assertEqual(row["thinking_tokens"], final.start)
-                self.assertEqual(len(champions[key]["rounds"]), row["depth"])
+                self.assertEqual(len(champions[key]["rounds"]), row["teacher_depth"])
                 thought = [
                     step
                     for step in program.steps
@@ -238,10 +267,11 @@ class ReleaseTests(unittest.TestCase):
             )
 
     def test_validation_rejects_a_wrong_effective_width(self):
-        path = self.release / "shard-000000" / "roots.jsonl"
-        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        path = self.release / "shard-000000" / "data.parquet"
+        table = pq.read_table(path)
+        rows = table.to_pylist()
         rows[0]["effective_width"] = 2
-        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), path)
         with self.assertRaises(ValueError):
             validate_release(self.release, workers=1)
 
@@ -278,9 +308,6 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(
                 [shard["path"] for shard in manifest["shards"]],
                 ["shard-000000", "shard-000001"],
-            )
-            self.assertEqual(
-                set(manifest["complete_root_ids"]), {r["root_id"] for r in roots}
             )
             self.assertTrue(validate_release(release, roots, workers=1)["ok"])
 
@@ -511,18 +538,13 @@ joint = [{width = 1, depth = 4, probability = 1.0}]
                 "state_value",
             ):
                 self.assertEqual(arrays[name].dtype, np.int32)
-            rows = [
-                json.loads(line)
-                for line in (shard / "roots.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-            ]
+            rows = read_root_rows(shard)
             full = next(
                 index for index, row in enumerate(rows) if row["presentation"] == "full"
             )
             count = int(arrays["state_count"][full])
-            basis = arrays["state_basis"][full, :count]
-            best = arrays["state_best"][full, :count]
+            basis = arrays["state_basis"][full][:count]
+            best = arrays["state_best"][full][:count]
             last_round_one = max(
                 index for index in range(count) if int(basis[index]) == 1
             )

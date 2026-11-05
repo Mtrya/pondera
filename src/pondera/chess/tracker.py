@@ -43,9 +43,10 @@ class PathTracker:
         self.root_repetition = repetition
         self._root = chess.Board(root_fen)
         self._root_key = self._position_key(self._root)
-        self.board = self._root.copy()
+        self.board = self._root.copy(stack=False)
         self._path = []
-        self._stack = [self._root.copy()]
+        self._keys = [self._root_key]
+        self._counts = {self._root_key: 1}
 
     @staticmethod
     def _position_key(board):
@@ -55,7 +56,7 @@ class PathTracker:
         capture is actually legal, which is exactly when it distinguishes
         positions for repetition.
         """
-        return " ".join(board.fen().split()[:4])
+        return board._transposition_key()
 
     @property
     def path(self) -> tuple[str, ...]:
@@ -83,29 +84,45 @@ class PathTracker:
         if parsed not in self.board.legal_moves:
             raise ValueError(f"Illegal move at this node: {move}")
         self.board.push(parsed)
+        self._record_push(move)
+
+    def push_legal(self, move: str) -> str:
+        """Push a producer-qualified absolute UCI move and return its SAN."""
+        san = self.board.san_and_push(chess.Move.from_uci(move))
+        self._record_push(move)
+        return san
+
+    def _record_push(self, move):
         self._path.append(move)
-        self._stack.append(self.board.copy())
+        key = self._position_key(self.board)
+        self._keys.append(key)
+        self._counts[key] = self._counts.get(key, 0) + 1
 
     def back(self) -> None:
         """Return to the parent node; illegal at the root."""
         if not self._path:
             raise ValueError("BACK is illegal at the root")
         self._path.pop()
-        self._stack.pop()
-        self.board = self._stack[-1].copy()
+        key = self._keys.pop()
+        count = self._counts[key] - 1
+        if count:
+            self._counts[key] = count
+        else:
+            del self._counts[key]
+        self.board.pop()
 
     def reset(self) -> None:
         """Return to the root node from any depth."""
         self._path.clear()
-        self._stack = [self._root.copy()]
-        self.board = self._root.copy()
+        self._keys = [self._root_key]
+        self._counts = {self._root_key: 1}
+        self.board = self._root.copy(stack=False)
 
     def repetition(self) -> int:
         """Occurrences of the current position, including the root history."""
-        count = 1
-        while count < len(self._stack) and self.board.is_repetition(count + 1):
-            count += 1
-        if self._position_key(self.board) == self._root_key:
+        key = self._keys[-1]
+        count = self._counts[key]
+        if key == self._root_key:
             count += self.root_repetition - 1
         return count
 
@@ -128,10 +145,8 @@ class PathTracker:
             return "mate"
         if self.board.is_stalemate():
             return "draw"
-        current = self._position_key(self.board)
-        prior = sum(
-            1 for board in self._stack[:-1] if self._position_key(board) == current
-        )
+        current = self._keys[-1]
+        prior = self._counts[current] - 1
         if prior >= 2 or (prior == 1 and current != self._root_key):
             return "draw"
         if self._path and self.board.halfmove_clock >= 100:
