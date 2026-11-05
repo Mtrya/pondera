@@ -584,7 +584,7 @@ def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
 class _Engine:
     """One worker's UCI process, reset to fresh search state for each root."""
 
-    def __init__(self, path, hash_mb, timeout=900):
+    def __init__(self, path, hash_mb, timeout=3600):
         self.process = subprocess.Popen(
             [str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
         )
@@ -1608,7 +1608,10 @@ def _engine_sidecar(engine, root):
     width, depth = _root_teacher(root)
     with TemporaryDirectory(prefix="pondera-sidecar-") as directory:
         trace_path = Path(directory) / "trace.jsonl"
-        bestmove = engine.search(root["fen"], trace_path, width, depth)
+        try:
+            bestmove = engine.search(root["fen"], trace_path, width, depth)
+        except CollectionError as error:
+            raise CollectionError(f"{error} for root {root['root_id']}") from error
         if not trace_path.is_file():
             raise CollectionError(f"Engine wrote no sidecar for root {root['root_id']}")
         with trace_path.open("rb") as handle:
