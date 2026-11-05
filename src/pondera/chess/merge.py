@@ -3,8 +3,8 @@
 The frozen vocabulary is the atom layer. A merge dictionary adds composite
 tokens whose ids continue past it (``CHESS_VOCAB_SIZE``, ``CHESS_VOCAB_SIZE +
 1``, ...), while PAD retains its existing atom id. Every composite expands to a flat
-run of 2..8 atoms; the on-disk form is the merge-dictionary v1 TSV, one
-``<id>\\t<atom> <atom> ...`` line per entry in ascending id order.
+run of 2..8 atoms. Dataset metadata and model checkpoints store these flat
+expansions in composite-ID order.
 
 Counting follows the counting-and-filtering idea of CNF-MCE
 (arXiv:2610.01127) rather than any particular implementation: every atom
@@ -36,7 +36,6 @@ from collections import Counter
 from dataclasses import dataclass
 from functools import cached_property
 from operator import index as _index
-from pathlib import Path
 
 import numpy as np
 
@@ -61,7 +60,7 @@ _VOID_DTYPE = np.dtype((np.void, _PAIR_DTYPE.itemsize))
 
 
 class MergeDictionaryError(ValueError):
-    """A dictionary that violates the merge-dictionary v1 contract."""
+    """A dictionary that violates the flat composite-token contract."""
 
 
 @dataclass(frozen=True)
@@ -131,40 +130,6 @@ class MergeDictionary:
         return np.asarray(
             [1] * MERGE_ID_BASE + [len(atoms) for atoms in self.entries], dtype=np.int8
         )
-
-    def write(self, path):
-        """Write the merge-dictionary v1 TSV."""
-        lines = [
-            f"{self.token_id(index)}\t{' '.join(map(str, atoms))}"
-            for index, atoms in enumerate(self.entries)
-        ]
-        payload = "\n".join(lines)
-        Path(path).write_text(payload + ("\n" if payload else ""), encoding="utf-8")
-
-    @classmethod
-    def read(cls, path) -> "MergeDictionary":
-        """Read the merge-dictionary v1 TSV; ids must be contiguous from the base."""
-        entries = []
-        for number, line in enumerate(
-            Path(path).read_text(encoding="utf-8").splitlines(), 1
-        ):
-            if not line.strip():
-                continue
-            fields = line.split("\t")
-            if len(fields) != 2:
-                raise MergeDictionaryError(f"Line {number} is not <id>\\t<atoms>")
-            try:
-                token = int(fields[0])
-                atoms = tuple(int(atom) for atom in fields[1].split())
-            except ValueError as error:
-                raise MergeDictionaryError(f"Line {number}: {error}") from error
-            expected = MERGE_ID_BASE + len(entries)
-            if token != expected:
-                raise MergeDictionaryError(
-                    f"Line {number} has id {token}, expected {expected}"
-                )
-            entries.append(atoms)
-        return cls(tuple(entries))
 
 
 def _streams(sequences) -> list:

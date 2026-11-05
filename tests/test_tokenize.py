@@ -18,11 +18,13 @@ from pondera.chess.merge import MergeDictionary, decode
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL
 from pondera.data.config import load_config
 from pondera.data.dataset import (
+    DATA_FORMAT_VERSION,
     HF_COLUMNS,
     TracePositions,
     load_manifest,
     parquet_sources,
     trace_data_identity,
+    write_manifest,
 )
 from pondera.data.merge_profile import build_profile, load_full_rows, write_artifacts
 from pondera.data.pipeline import produce_shards
@@ -142,7 +144,9 @@ class TokenizeTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 )
-                self.dictionary = MergeDictionary.read(output / "merged_vocabulary.txt")
+                self.dictionary = MergeDictionary(
+                    load_manifest(output / "release.json")["merge_entries"]
+                )
                 self.assertLessEqual(len(self.dictionary), budget)
                 if budget:
                     self.assertGreater(len(self.dictionary), 0)
@@ -178,6 +182,33 @@ class TokenizeTests(unittest.TestCase):
         tokenize_dataset(output, again, self.dictionary, batch_size=3)
         self.assertEqual(self.rows(again), self.rows(output))
 
+    def test_format_nine_base_cache_converts_to_inline_training_metadata(self):
+        # The accepted producer input uses list<int16> base IDs in format 9.
+        for path, _, _ in parquet_sources(self.source):
+            table = pq.read_table(path)
+            column = table.schema.get_field_index("trace_token_ids")
+            table = table.set_column(
+                column,
+                "trace_token_ids",
+                table["trace_token_ids"].cast(pa.list_(pa.int16())),
+            )
+            pq.write_table(table, path)
+        manifest = load_manifest(self.source / "release.json")
+        manifest["format_version"] = 9
+        write_manifest(self.source / "release.json", manifest)
+        original = load_full_rows(self.source)
+        output = self.root / "converted"
+        tokenize_dataset(self.source, output, self.dictionary, batch_size=2)
+        self.assertEqual(
+            load_manifest(output / "release.json")["format_version"],
+            DATA_FORMAT_VERSION,
+        )
+        self.assert_preserved(self.rows(output))
+        self.assertEqual(TracePositions(output, "train").dictionary, self.dictionary)
+        converted = load_full_rows(output)
+        for before, after in zip(original, converted):
+            np.testing.assert_array_equal(before.atoms, after.atoms)
+
     def test_hf_input_creates_ids_and_preserves_all_shared_fields(self):
         exported = self.root / "hf"
         export_hf(self.source, exported, batch_size=2)
@@ -201,6 +232,11 @@ class TokenizeTests(unittest.TestCase):
         output = self.root / "encoded"
         tokenize_dataset(self.source, output, self.dictionary)
         data = TracePositions(output, "train")
+        self.assertEqual(data.dictionary, self.dictionary)
+        self.assertEqual(
+            load_manifest(output / "release.json")["merge_entries"],
+            [list(entry) for entry in self.dictionary.entries],
+        )
         model = create_model({**MODEL, "merge_entries": data.dictionary.entries})
         batch = TraceCollator(data.dictionary)(
             [data[index] for index in range(len(data))]
@@ -240,9 +276,9 @@ class TokenizeTests(unittest.TestCase):
             actual = loaded.trace_logits(batch["ids"], batch["trace_ids"])
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         identity = trace_data_identity(output)
-        MergeDictionary(tuple(reversed(self.dictionary.entries))).write(
-            output / "merged_vocabulary.txt"
-        )
+        manifest = load_manifest(output / "release.json")
+        manifest["merge_entries"] = tuple(reversed(self.dictionary.entries))
+        write_manifest(output / "release.json", manifest)
         self.assertNotEqual(trace_data_identity(output), identity)
 
     def test_training_resume_uses_the_dataset_dictionary(self):
@@ -266,9 +302,9 @@ class TokenizeTests(unittest.TestCase):
         )
         final = train(config, data, output, resume=first, max_steps=2)
         self.assertEqual(read_checkpoint(final)["step"], 2)
-        MergeDictionary(tuple(reversed(self.dictionary.entries))).write(
-            data / "merged_vocabulary.txt"
-        )
+        manifest = load_manifest(data / "release.json")
+        manifest["merge_entries"] = tuple(reversed(self.dictionary.entries))
+        write_manifest(data / "release.json", manifest)
         with self.assertRaises(ValueError):
             train(config, data, output, resume=final, max_steps=2)
 
@@ -297,7 +333,12 @@ class TokenizeTests(unittest.TestCase):
         output = self.root / "profile"
         write_artifacts(output, document, dictionaries)
         self.assertEqual(
-            MergeDictionary.read(output / "dictionary-8.tsv"), dictionaries[8]
+            MergeDictionary(
+                json.loads((output / "curve.json").read_text())["tiers"][1][
+                    "merge_entries"
+                ]
+            ),
+            dictionaries[8],
         )
         self.assertEqual(
             json.loads((output / "curve.json").read_text())["corpus"]["loaded"]["rows"],
@@ -339,13 +380,18 @@ class TokenizeTests(unittest.TestCase):
 
     def test_input_rejects_mismatched_trace_versions(self):
         path = self.source / "release.json"
-        manifest = load_manifest(path)
-        manifest["grammar_version"] = 1
-        path.write_text(json.dumps(manifest))
-        with self.assertRaises(ValueError):
-            load_full_rows(self.source)
-        with self.assertRaises(ValueError):
-            tokenize_dataset(self.source, self.root / "invalid", self.dictionary)
+        original = load_manifest(path)
+        for field, value in (("grammar_version", 1), ("format_version", 10)):
+            with self.subTest(field=field):
+                write_manifest(path, {**original, field: value})
+                with self.assertRaises(ValueError):
+                    load_full_rows(self.source)
+                with self.assertRaises(ValueError):
+                    tokenize_dataset(
+                        self.source, self.root / "invalid", self.dictionary
+                    )
+                with self.assertRaises(ValueError):
+                    TracePositions(self.source, "train")
 
 
 if __name__ == "__main__":

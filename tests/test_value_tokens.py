@@ -19,6 +19,8 @@ from pondera.chess.vocabulary import (
     END,
     FINAL,
     HALFMOVE,
+    IDX_TO_UCI_MOVE,
+    LINES,
     MATE_LOSS,
     MATE_WIN,
     META_END,
@@ -28,6 +30,7 @@ from pondera.chess.vocabulary import (
     REPETITION,
     RESET,
     SIDE,
+    UCI_MOVE_TO_IDX,
     VALUE,
 )
 
@@ -100,6 +103,35 @@ class UnifiedVocabularyTests(unittest.TestCase):
             (2998, 2999, 3000, 3001, 3002, 3003, 3004, 3005),
         )
         self.assertEqual(CHESS_VOCAB_SIZE, 3006)
+
+    def test_generated_token_names_and_move_ids_keep_the_serialized_contract(self):
+        # Canonical tokenizer-v3 names/IDs, independent of the generator.
+        expected = {
+            0: "board:a1:P",
+            767: "board:h8:k",
+            768: "meta:side:w",
+            770: "meta:castling:K-",
+            842: "meta:ep:-",
+            943: "meta:halfmove:100+",
+            948: "meta:repetition:5+",
+            949: "<claim_draw>",
+            2918: "value:bin:00",
+            2966: "mate:win:28",
+            2997: "mate:loss:30",
+            3005: "<end>",
+        }
+        self.assertEqual(len(LINES), 3006)
+        self.assertEqual(len(set(LINES)), 3006)
+        for token, name in expected.items():
+            self.assertEqual(LINES[token], name)
+        for move, token in {
+            "a1a2": 950,
+            "e2e4": 1981,
+            "e7e8q": 2161,
+            "e1g1": 1954,
+        }.items():
+            self.assertEqual(MOVE + UCI_MOVE_TO_IDX[move], token)
+            self.assertEqual(IDX_TO_UCI_MOVE[token - MOVE], move)
 
     def test_value_decoder_rejects_non_value_tokens(self):
         # The metadata atoms end at 948; the move block starts the unified

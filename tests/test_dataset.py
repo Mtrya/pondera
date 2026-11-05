@@ -81,7 +81,7 @@ class DatasetContractTests(unittest.TestCase):
         self.assertEqual(manifest["grammar_version"], TRACE_GRAMMAR_VERSION)
         self.assertEqual(manifest["grammar_version"], 2)
         self.assertEqual(manifest["format_version"], DATA_FORMAT_VERSION)
-        self.assertEqual(manifest["format_version"], 10)
+        self.assertEqual(manifest["format_version"], 11)
         self.assertEqual(manifest["tokenizer_version"], CHESS_TOKENIZER_VERSION)
 
     def test_rejects_old_trace_formats(self):

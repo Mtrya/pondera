@@ -1,19 +1,9 @@
-"""The frozen unified vocabulary: layout constants, loader, and regenerator.
+"""Generate the canonical base token IDs from the arithmetic chess layout.
 
-`vocabulary.txt` next to this module holds one canonical name per token
-id; the line number is the id. The layout is arithmetic: 768 occupied-square
-atoms (square * 12 + piece over a1..h8 and PNBRQKpnbrqk), then self-contained
-metadata atoms (side, castling, en passant, halfmove clock, repetition count),
-then the move block, 20 value bins, mate-distance tokens (win 0-27 and 28+,
-loss 0-29 and 30+), and the eight trace delimiters PAD, BACK, RESET, BOARD,
-FINAL, REFUTED, DEPTH, END.
-
-The file is the contract. This module validates the arithmetic layout against
-the file at import; regenerate the file only when the vocabulary deliberately
-changes (`uv run python -m pondera.chess.vocabulary`) and review the diff.
+The order is occupied-square atoms, board metadata, sorted geometric moves,
+value bins, mate distances, then trace delimiters. Changing this order changes
+serialized IDs and requires a deliberate tokenizer-version change.
 """
-
-from importlib.resources import files
 
 # The version pins the serialized board-token format recorded in data
 # manifests and checkpoints; trace grammars version themselves separately in
@@ -60,74 +50,6 @@ PAD, BACK, RESET, BOARD, FINAL, REFUTED, DEPTH, END = (
     DELIM + 7,
 )
 CHESS_VOCAB_SIZE = DELIM + DELIMITERS
-
-_PATH = files("pondera.chess") / "vocabulary.txt"
-if _PATH.is_file():
-    LINES = tuple(_PATH.read_text(encoding="utf-8").split())
-else:  # first-generation bootstrap; run this module as __main__ to create it
-    LINES = ()
-
-
-def _segments(lines):
-    """Segment views of the vocabulary, bounded by their name prefixes."""
-    board = [line for line in lines if line.startswith("board:")]
-    meta = [line for line in lines if line.startswith("meta:")]
-    value = [line for line in lines if line.startswith("value:")]
-    mate = [line for line in lines if line.startswith("mate:")]
-    delim = list(lines[-DELIMITERS:])
-    moves = list(lines[len(board) + len(meta) : -len(value) - len(mate) - DELIMITERS])
-    return {
-        "board": board,
-        "meta": meta,
-        "moves": moves,
-        "value": value,
-        "mate": mate,
-        "delim": delim,
-    }
-
-
-SEGMENTS = _segments(LINES)
-
-IDX_TO_UCI_MOVE = dict(enumerate(SEGMENTS["moves"]))
-UCI_MOVE_TO_IDX = {move: index for index, move in IDX_TO_UCI_MOVE.items()}
-
-
-def _validate():
-    """The frozen file must agree with the arithmetic layout."""
-    if not LINES:
-        return
-    if len(LINES) != CHESS_VOCAB_SIZE:
-        raise ValueError("Vocabulary file length disagrees with the layout")
-    sizes = {name: len(segment) for name, segment in SEGMENTS.items()}
-    expected = {
-        "board": BOARD_TOKENS,
-        "meta": META_END - BOARD_TOKENS + 1,
-        "moves": MOVES,
-        "value": VALUE_BINS,
-        "mate": MATE_WINS + MATE_LOSSES,
-        "delim": DELIMITERS,
-    }
-    for name, size in expected.items():
-        if sizes[name] != size:
-            raise ValueError(f"Vocabulary {name} segment disagrees with the layout")
-    for token, name in [
-        (0, "board:a1:P"),
-        (SIDE, "meta:side:w"),
-        (MOVE, "<claim_draw>"),
-        (PAD, "<pad>"),
-        (BACK, "<back>"),
-        (RESET, "<reset>"),
-        (BOARD, "<board>"),
-        (FINAL, "<final>"),
-        (REFUTED, "<refuted>"),
-        (DEPTH, "<depth>"),
-        (END, "<end>"),
-    ]:
-        if LINES[token] != name:
-            raise ValueError(f"Vocabulary id {token} is not {name}")
-
-
-_validate()
 
 
 def _square(index):
@@ -205,17 +127,14 @@ def chess_vocabulary():
     return lines
 
 
+LINES = tuple(chess_vocabulary())
+IDX_TO_UCI_MOVE = dict(enumerate(LINES[MOVE:VALUE]))
+UCI_MOVE_TO_IDX = {move: index for index, move in IDX_TO_UCI_MOVE.items()}
+
+
 def main():
-    lines = chess_vocabulary()
-    old = list(LINES)
-    if old == lines:
-        print(f"unchanged: {len(lines)} tokens")
-        return
-    payload = "\n".join(lines) + "\n"
-    with _PATH.open("w", encoding="utf-8") as handle:
-        handle.write(payload)
-    changed = "initialized" if not old else "rewritten"
-    print(f"{changed}: {len(lines)} tokens")
+    """Print canonical token names in ID order."""
+    print("\n".join(LINES))
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
-DATA_FORMAT_VERSION = 10
+DATA_FORMAT_VERSION = 11
 TRACE_ARRAYS = ("trace_token_ids", "trace_len")
 STATE_ARRAYS = ("state_best", "state_value")
 DATA_ARRAYS = (*TRACE_ARRAYS, *STATE_ARRAYS, "state_count")
@@ -99,14 +99,6 @@ def parquet_sources(directory):
         )
         for path in paths
     ]
-
-
-def load_dictionary(directory):
-    """Load the dataset's selected dictionary; producer caches use base IDs."""
-    directory = Path(directory)
-    manifest = load_manifest(directory / "release.json")
-    name = manifest.get("merge_dictionary")
-    return MergeDictionary.read(directory / name) if name else MergeDictionary()
 
 
 def write_trace_rows(directory, rows):
@@ -231,7 +223,9 @@ def trace_data_identity(directory):
             "shards",
         )
     }
-    identity["merge_entries"] = load_dictionary(directory).entries
+    identity["merge_entries"] = MergeDictionary(
+        manifest.get("merge_entries", ())
+    ).entries
     return identity
 
 
@@ -245,7 +239,7 @@ class TracePositions:
             raise ValueError(f"Unknown trace split: {split}")
         directory = Path(directory)
         self.manifest = load_manifest(directory / "release.json")
-        self.dictionary = load_dictionary(directory)
+        self.dictionary = MergeDictionary(self.manifest.get("merge_entries", ()))
         for field, expected in (
             ("format_version", DATA_FORMAT_VERSION),
             ("tokenizer_version", CHESS_TOKENIZER_VERSION),

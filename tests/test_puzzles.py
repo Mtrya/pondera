@@ -212,7 +212,9 @@ class PuzzleTests(unittest.TestCase):
             replace(config.merge, budget=8, min_count=1, batch_size=1),
         )
         self.assertEqual(result["rows"], 2)
-        dictionary = MergeDictionary.read(training / "merged_vocabulary.txt")
+        dictionary = MergeDictionary(
+            load_manifest(training / "release.json")["merge_entries"]
+        )
         self.assertEqual(len(TracePositions(training, "train")), 2)
         for path, _, _ in parquet_sources(training):
             for row in pq.read_table(path).to_pylist():

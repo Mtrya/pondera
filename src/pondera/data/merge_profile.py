@@ -25,7 +25,7 @@ from pondera.chess.merge import (
     usage_counts,
 )
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION, CHESS_VOCAB_SIZE, LINES
-from pondera.data.dataset import load_dictionary, load_manifest, parquet_sources
+from pondera.data.dataset import DATA_FORMAT_VERSION, load_manifest, parquet_sources
 from pondera.data.text import trace_atoms
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
@@ -55,6 +55,8 @@ def load_rows(release, *, max_roots=None):
     release = Path(release)
     manifest = load_manifest(release / "release.json") if release.is_dir() else {}
     if manifest:
+        if manifest.get("format_version") not in {9, DATA_FORMAT_VERSION}:
+            raise ValueError(f"Unsupported dataset format in {release}")
         for field, expected in (
             ("grammar_version", TRACE_GRAMMAR_VERSION),
             ("tokenizer_version", CHESS_TOKENIZER_VERSION),
@@ -79,7 +81,7 @@ def load_rows(release, *, max_roots=None):
                 positions, key=lambda key: (random.Random(f"640:{key}").random(), key)
             )[:max_roots]
         )
-    dictionary = load_dictionary(release) if release.is_dir() else MergeDictionary()
+    dictionary = MergeDictionary(manifest.get("merge_entries", ()))
     rows = []
     for path, expected, split in sources:
         file = pq.ParquetFile(path)
@@ -426,7 +428,12 @@ def render_report(document, title="Merge dictionary profile"):
 def write_artifacts(output, document, dictionaries):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    for budget, dictionary in dictionaries.items():
-        dictionary.write(output / f"dictionary-{budget}.tsv")
+    document = {
+        **document,
+        "tiers": [
+            {**tier, "merge_entries": dictionaries[tier["budget"]].entries}
+            for tier in document["tiers"]
+        ],
+    }
     (output / "curve.json").write_text(json.dumps(document, indent=2) + "\n")
     (output / "profile.md").write_text(render_report(document))

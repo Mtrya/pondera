@@ -9,7 +9,7 @@ This layer prepares teacher traces and reads them for training. It does not impo
 | `roots/` | Source acquisition and root preparation: PGN replay with game history, Lichess puzzle setup moves, shared deduplication/splits/sampling, and self-contained provenance. See [roots/README.md](roots/README.md). |
 | `trace.py` | Trace grammar and visit state machine; sidecar parsing and validation; translation of one completed search into trace rows; independent token replay. |
 | `pipeline.py` | Joint width/depth sampling with independent presentation draws; worker engines with per-root search resets; curation from a prepared root pool; atomic shard publication and recovery; release statistics and independent validation. |
-| `dataset.py` | Central local/HF schemas, dictionary-aware dataset identity, and projected row-group loading of stored IDs with derived initial boards. |
+| `dataset.py` | Central local/HF schemas, dataset identity including inline merge entries, and projected row-group loading of stored IDs with derived initial boards. |
 | `text.py` | Convert the authoritative SAN/control/BOARD transcription into base atoms and project diagnostic roles through dictionary expansions. |
 | `tokenize.py` | Fit one configured dictionary and stream local or HF Parquet into a separate training dataset, replacing trace IDs and lengths while preserving other fields; also apply an existing dictionary through the library API. |
 | `merge_profile.py` | Fit min-cost merge dictionaries on declared full-row corpora and measure stored presentations, optional held-out groups, compression slices, and resource costs. |

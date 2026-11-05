@@ -92,6 +92,8 @@ def tokenize_dataset(source, output, dictionary=MergeDictionary(), *, batch_size
     output.parent.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(source / "release.json") if source.is_dir() else {}
     if manifest:
+        if manifest.get("format_version") not in {9, DATA_FORMAT_VERSION}:
+            raise ValueError(f"Unsupported dataset format in {source}")
         for field, expected in (
             ("grammar_version", TRACE_GRAMMAR_VERSION),
             ("tokenizer_version", CHESS_TOKENIZER_VERSION),
@@ -106,7 +108,6 @@ def tokenize_dataset(source, output, dictionary=MergeDictionary(), *, batch_size
         prefix=f".{output.name}-", dir=output.parent
     ) as work:
         work = Path(work)
-        dictionary.write(work / "merged_vocabulary.txt")
         for index, (path, expected_rows, split) in enumerate(parquet_sources(source)):
             file = pq.ParquetFile(path)
             unknown = set(file.schema_arrow.names) - set(TRACE_SCHEMA.names)
@@ -165,7 +166,7 @@ def tokenize_dataset(source, output, dictionary=MergeDictionary(), *, batch_size
                 "format_version": DATA_FORMAT_VERSION,
                 "grammar_version": TRACE_GRAMMAR_VERSION,
                 "tokenizer_version": CHESS_TOKENIZER_VERSION,
-                "merge_dictionary": "merged_vocabulary.txt",
+                "merge_entries": dictionary.entries,
                 "source": str(source),
                 "shards": shards,
             },
