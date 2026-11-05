@@ -107,7 +107,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(len(self.result["shards"]), 3)
         self.assertEqual([shard["rows"] for shard in self.result["shards"]], [2, 2, 1])
         release = load_manifest(self.release / "release.json")
-        self.assertEqual(release["format_version"], 9)
+        self.assertEqual(release["format_version"], 10)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
         self.assertEqual(release["search"], {"hash_mb": 256})
@@ -208,7 +208,6 @@ class ReleaseTests(unittest.TestCase):
         positions = TracePositions(self.release, "train")
         self.assertEqual(len(positions), len(CASES))
         row = positions[0]
-        self.assertEqual(len(row), 4)
         self.assertGreater(int(row[2]), 0)
 
     def test_resume_and_shard_recovery(self):
@@ -524,7 +523,7 @@ joint = [{width = 1, depth = 4, probability = 1.0}]
             self.assertTrue(validation["ok"])
             shard = base / "release" / "shard-000000"
             arrays = load_trace_arrays(shard, DATA_ARRAYS)
-            self.assertEqual(arrays["trace_token_ids"].dtype, np.int16)
+            self.assertEqual(arrays["trace_token_ids"].dtype, np.int32)
             self.assertEqual(arrays["trace_len"].dtype, np.int32)
             self.assertEqual(arrays["state_count"].dtype, np.int32)
             for name in ("state_best", "state_value"):

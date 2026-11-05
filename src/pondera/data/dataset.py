@@ -11,10 +11,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from pondera.chess.codec import encode_board
+from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
-from pondera.data.trace import TRACE_GRAMMAR_VERSION, derive_trace_roles
+from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
-DATA_FORMAT_VERSION = 9
+DATA_FORMAT_VERSION = 10
 TRACE_ARRAYS = ("trace_token_ids", "trace_len")
 STATE_ARRAYS = ("state_best", "state_value")
 DATA_ARRAYS = (*TRACE_ARRAYS, *STATE_ARRAYS, "state_count")
@@ -37,7 +38,7 @@ LOCAL_ONLY_SCHEMA = pa.schema(
     [
         ("root_id", pa.string()),
         ("split", pa.string()),
-        ("trace_token_ids", pa.list_(pa.int16())),
+        ("trace_token_ids", pa.list_(pa.int32())),
         ("trace_len", pa.int32()),
         ("state_best", pa.list_(pa.int32())),
         ("state_value", pa.list_(pa.int32())),
@@ -71,6 +72,41 @@ def load_manifest(path):
         return {}
     with path.open(encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def parquet_sources(directory):
+    """List release shards or HF split files as (path, row count, split)."""
+    directory = Path(directory)
+    manifest = load_manifest(directory / "release.json") if directory.is_dir() else {}
+    if manifest:
+        result = []
+        for shard in manifest["shards"]:
+            path = directory / shard["path"]
+            if path.suffix != ".parquet":
+                path /= "data.parquet"
+            result.append((path, shard["rows"], shard.get("split")))
+        return result
+    root = directory / "data" if (directory / "data").is_dir() else directory
+    paths = [root] if root.is_file() else sorted(root.glob("*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"No Parquet data in {directory}")
+    splits = {"train": "train", "validation": "val", "val": "val"}
+    return [
+        (
+            path,
+            pq.ParquetFile(path).metadata.num_rows,
+            splits.get(path.stem.split("-")[0]),
+        )
+        for path in paths
+    ]
+
+
+def load_dictionary(directory):
+    """Load the dataset's selected dictionary; producer caches use base IDs."""
+    directory = Path(directory)
+    manifest = load_manifest(directory / "release.json")
+    name = manifest.get("merge_dictionary")
+    return MergeDictionary.read(directory / name) if name else MergeDictionary()
 
 
 def write_trace_rows(directory, rows):
@@ -161,8 +197,7 @@ def validate_trace_arrays(arrays, rows=None):
     for name, array in arrays.items():
         if len(array) != row_count:
             raise ValueError(f"Trace array {name} has a different row count")
-        expected = np.int16 if name == "trace_token_ids" else np.int32
-        if array.dtype != expected:
+        if array.dtype != np.int32:
             raise ValueError(f"Trace array {name} has an unexpected dtype")
     trace = arrays.get("trace_token_ids")
     if trace is not None and np.any(trace.lengths < 1):
@@ -188,7 +223,7 @@ def validate_trace_arrays(arrays, rows=None):
 def trace_data_identity(directory):
     """The declared generation identity and shards of training input."""
     manifest = load_manifest(Path(directory) / "release.json")
-    return {
+    identity = {
         name: manifest.get(name)
         for name in (
             "format_version",
@@ -198,10 +233,12 @@ def trace_data_identity(directory):
             "shards",
         )
     }
+    identity["merge_entries"] = load_dictionary(directory).entries
+    return identity
 
 
 class TracePositions:
-    """Read base trace IDs and derive board inputs and token roles."""
+    """Read the selected trace encoding and derive only its initial board."""
 
     CACHE_GROUPS = 8
 
@@ -210,6 +247,7 @@ class TracePositions:
             raise ValueError(f"Unknown trace split: {split}")
         directory = Path(directory)
         self.manifest = load_manifest(directory / "release.json")
+        self.dictionary = load_dictionary(directory)
         for field, expected in (
             ("format_version", DATA_FORMAT_VERSION),
             ("tokenizer_version", CHESS_TOKENIZER_VERSION),
@@ -222,22 +260,24 @@ class TracePositions:
         self.index = []
         self.shards = []
         self.cache = OrderedDict()
-        for shard in self.manifest["shards"]:
-            path = directory / shard["path"] / "data.parquet"
+        for path, rows, split_label in parquet_sources(directory):
             file = pq.ParquetFile(path)
-            if file.schema_arrow != TRACE_SCHEMA:
-                raise ValueError(
-                    f"Shard schema differs from the release contract: {path}"
-                )
-            if file.metadata.num_rows != shard["rows"]:
+            for name in ("fen", "repetition", *TRACE_ARRAYS):
+                if file.schema_arrow.field(name) != TRACE_SCHEMA.field(name):
+                    raise ValueError(
+                        f"Training column {name} has an invalid type: {path}"
+                    )
+            if file.metadata.num_rows != rows:
                 raise ValueError(f"Shard row count differs from its release: {path}")
             starts, count = [], 0
             for group in range(file.num_row_groups):
                 starts.append(count)
                 count += file.metadata.row_group(group).num_rows
-            splits = file.read(columns=["split"], use_threads=False)[
-                "split"
-            ].to_pylist()
+            splits = (
+                file.read(columns=["split"], use_threads=False)["split"].to_pylist()
+                if "split" in file.schema_arrow.names
+                else [split_label] * rows
+            )
             shard_index = len(self.shards)
             self.shards.append((path, starts))
             for row, label in enumerate(splits):
@@ -273,5 +313,4 @@ class TracePositions:
             encode_board(arrays["fen"][row], arrays["repetition"][row]),
             tokens,
             int(arrays["trace_len"][row]),
-            derive_trace_roles(tokens),
         )

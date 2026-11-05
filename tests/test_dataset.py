@@ -81,7 +81,7 @@ class DatasetContractTests(unittest.TestCase):
         self.assertEqual(manifest["grammar_version"], TRACE_GRAMMAR_VERSION)
         self.assertEqual(manifest["grammar_version"], 2)
         self.assertEqual(manifest["format_version"], DATA_FORMAT_VERSION)
-        self.assertEqual(manifest["format_version"], 9)
+        self.assertEqual(manifest["format_version"], 10)
         self.assertEqual(manifest["tokenizer_version"], CHESS_TOKENIZER_VERSION)
 
     def test_rejects_old_trace_formats(self):
@@ -105,12 +105,12 @@ class DatasetContractTests(unittest.TestCase):
     def test_dataset_arrays_and_roles(self):
         positions = TracePositions(self.data, "train")
         self.assertEqual(len(positions), 3)
-        boards, trace, length, roles = positions[0]
+        boards, trace, length = positions[0]
         self.assertEqual(len(trace), length)
         self.assertEqual(int(length), len(self.rows[0]["trace"]))
         self.assertEqual(trace[:length].tolist(), self.rows[0]["trace"].tolist())
-        self.assertEqual(roles[:length].tolist(), self.rows[0]["roles"].tolist())
-        self.assertTrue(np.all(roles[length:] == ROLE_PAD))
+        roles = TraceCollator()([positions[0]])["trace_roles"][0].numpy()
+        self.assertEqual(roles.tolist(), self.rows[0]["roles"].tolist())
         # The decision follows FINAL, and the trace closes with <end>.
         self.assertEqual(int(trace[length - 1]), END)
         decision = int(np.flatnonzero(roles[:length] == ROLE_FINAL_MOVE)[0])
@@ -123,10 +123,9 @@ class DatasetContractTests(unittest.TestCase):
         directory = write_trace_dataset(self.root / "groups", {"train": rows})
         positions = TracePositions(directory, "train")
         for index in (129, 0, 63, 64, 127, 128, 1):
-            board, tokens, length, roles = positions[index]
+            board, tokens, length = positions[index]
             expected = rows[index]
             self.assertEqual(tokens.tolist(), expected["trace"].tolist())
-            self.assertEqual(roles.tolist(), expected["roles"].tolist())
             self.assertEqual(length, len(tokens))
             self.assertEqual(board.tolist(), encode_board(expected["fen"]).tolist())
 
@@ -137,9 +136,10 @@ class DatasetContractTests(unittest.TestCase):
         width = max(int(row[2]) for row in rows)
         self.assertEqual(batch["trace_ids"].shape, (len(rows), width))
         self.assertEqual(batch["trace_roles"].shape, (len(rows), width))
-        self.assertEqual(batch["trace_ids"].dtype, torch.int16)
+        self.assertEqual(batch["trace_ids"].dtype, torch.int32)
         self.assertEqual(batch["trace_roles"].dtype, torch.int8)
-        for index, (_, trace, length, roles) in enumerate(rows):
+        for index, (_, trace, length) in enumerate(rows):
+            roles = self.rows[index]["roles"]
             self.assertEqual(
                 batch["trace_ids"][index, :length].tolist(), trace[:length].tolist()
             )
@@ -177,7 +177,6 @@ class CollatorContractTests(unittest.TestCase):
                     encode_board(chess.STARTING_FEN),
                     self.trace,
                     len(self.trace),
-                    self.roles,
                 )
             ]
         )
@@ -237,7 +236,7 @@ class MixedShardCollationTests(unittest.TestCase):
 
             batch = TraceCollator()(rows)
             self.assertEqual(batch["ids"].shape, (len(rows), max(widths)))
-            for index, (board, trace, length, roles) in enumerate(rows):
+            for index, (board, trace, length) in enumerate(rows):
                 self.assertEqual(
                     batch["ids"][index, : widths[index]].tolist(), board.tolist()
                 )

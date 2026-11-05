@@ -37,7 +37,10 @@ def save_checkpoint(path, model, model_config, **training_state) -> None:
         **training_state,
         "format_version": CHECKPOINT_VERSION,
         "tokenizer_version": CHESS_TOKENIZER_VERSION,
-        "model_config": model_config,
+        "model_config": {
+            **model_config,
+            "merge_entries": model.merge_dictionary.entries,
+        },
         "model_state_dict": model.state_dict(),
     }
     torch.save(payload, temporary)

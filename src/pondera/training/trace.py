@@ -15,18 +15,13 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
-from pondera.chess.vocabulary import (
-    BOARD_VOCAB_SIZE,
-    CHESS_VOCAB_SIZE,
-    END,
-    FINAL,
-    PAD,
-)
+from pondera.chess.merge import MergeDictionary
+from pondera.chess.vocabulary import PAD
 from pondera.data.dataset import TracePositions, trace_data_identity
+from pondera.data.text import ROLE_MIXED, encoded_roles
 from pondera.data.trace import (
     ROLE_BOARD,
     ROLE_CONTROL,
-    ROLE_COUNT,
     ROLE_EVAL,
     ROLE_FINAL_EVAL,
     ROLE_FINAL_MOVE,
@@ -94,57 +89,47 @@ class TrainConfig:
 
 @dataclass
 class TraceCollator:
-    """Pad traces and derived roles, and locate each row's final decision.
+    """Pad stored tokens and locate the token containing the final decision.
 
-    The trace already carries its presentation order. The dataset derives each
-    initial board from its FEN and repetition count; boards are padded to the
-    batch maximum. Every row ends with ``<end>``, and exactly one FINAL
-    delimiter is followed by the decision that carries ROLE_FINAL_MOVE. The
-    label suffix continues after that decision, so the final move is not the
-    last token.
+    Evaluation interprets dictionary expansions for roles and final-token
+    diagnostics. Training skips that work and needs only IDs and padding.
+    FINAL or END may lie inside a composite; model inputs stay compressed.
     """
+
+    dictionary: MergeDictionary = field(default_factory=MergeDictionary)
+    diagnostics: bool = True
 
     def __call__(self, rows):
         boards = [row[0] for row in rows]
         board_width = max((len(board) for board in boards), default=0)
         board_ids = np.full((len(boards), board_width), PAD, dtype=np.int16)
         for index, board in enumerate(boards):
-            invalid = (board != PAD) & ((board < 0) | (board >= BOARD_VOCAB_SIZE))
-            if np.any(invalid):
-                raise ValueError("A board row contains a non-board token")
             board_ids[index, : len(board)] = board
         inputs = {"ids": torch.from_numpy(board_ids)}
         traces, roles, final_moves = [], [], []
-        for _, trace, trace_len, trace_roles in rows:
+        for _, trace, trace_len in rows:
             trace_len = int(trace_len)
-            if len(trace) != len(trace_roles) or not 4 <= trace_len <= len(trace):
+            if not 1 <= trace_len <= len(trace):
                 raise ValueError("A trace row has inconsistent token boundaries")
             stored = trace[:trace_len]
-            if np.any((stored < 0) | (stored >= CHESS_VOCAB_SIZE)):
-                raise ValueError("A trace row contains an out-of-vocabulary token")
-            if stored[-1] != END or np.count_nonzero(stored == END) != 1:
-                raise ValueError("A trace row must end with <end>")
-            stored_roles = trace_roles[:trace_len]
-            if np.any((stored_roles < 0) | (stored_roles >= ROLE_COUNT)):
-                raise ValueError("A trace row contains an invalid token role")
-            final = np.flatnonzero(stored_roles == ROLE_FINAL_MOVE)
-            if len(final) != 1:
-                raise ValueError("A trace row needs exactly one final move role")
-            decision = int(final[0])
-            if decision == 0 or stored[decision - 1] != FINAL:
-                raise ValueError("The final move must follow FINAL")
             traces.append(stored)
-            roles.append(stored_roles)
-            final_moves.append(decision)
+            if self.diagnostics:
+                stored_roles = encoded_roles(stored, self.dictionary)
+                roles.append(stored_roles)
+                final_moves.append(
+                    int(np.flatnonzero(stored_roles == ROLE_FINAL_MOVE)[0])
+                )
         width = max((len(trace) for trace in traces), default=0)
-        trace_ids = np.full((len(traces), width), PAD, dtype=np.int16)
-        role_ids = np.full((len(roles), width), ROLE_PAD, dtype=np.int8)
-        for index, (trace, trace_roles) in enumerate(zip(traces, roles)):
+        trace_ids = np.full((len(traces), width), PAD, dtype=np.int32)
+        for index, trace in enumerate(traces):
             trace_ids[index, : len(trace)] = trace
-            role_ids[index, : len(trace_roles)] = trace_roles
         inputs["trace_ids"] = torch.from_numpy(trace_ids)
-        inputs["trace_roles"] = torch.from_numpy(role_ids)
-        inputs["final_move_index"] = torch.tensor(final_moves, dtype=torch.long)
+        if self.diagnostics:
+            role_ids = np.full((len(roles), width), ROLE_PAD, dtype=np.int8)
+            for index, trace_roles in enumerate(roles):
+                role_ids[index, : len(trace_roles)] = trace_roles
+            inputs["trace_roles"] = torch.from_numpy(role_ids)
+            inputs["final_move_index"] = torch.tensor(final_moves, dtype=torch.long)
         return inputs
 
 
@@ -162,13 +147,13 @@ ROLE_LOSS_NAMES = {
     "final_move": ROLE_FINAL_MOVE,
     "final_line": ROLE_FINAL_PV,
     "final_evaluation": ROLE_FINAL_EVAL,
+    "mixed": ROLE_MIXED,
 }
 
 
 def trace_loss_parts(model, inputs):
     """Return equal-weight next-token CE over all non-padding trace tokens."""
     trace_ids = inputs["trace_ids"]
-    roles = inputs["trace_roles"]
     targets = trace_ids.long()
     logits = model.trace_logits(inputs["ids"], trace_ids)
     ce = F.cross_entropy(
@@ -176,7 +161,7 @@ def trace_loss_parts(model, inputs):
         targets.reshape(-1),
         reduction="none",
     ).reshape(trace_ids.shape)
-    generated = roles != ROLE_PAD
+    generated = trace_ids != PAD
     loss = (ce * generated).sum() / generated.sum().clamp_min(1)
     return loss, ce, logits, generated
 
@@ -211,7 +196,7 @@ def train(
         torch.backends.cuda.matmul.allow_tf32 = True
     train_data = TracePositions(data_dir, "train")
     val_data = TracePositions(data_dir, "val")
-    eval_collate = TraceCollator()
+    eval_collate = TraceCollator(train_data.dictionary)
     data_identity = trace_data_identity(data_dir)
     micro_batches = len(train_data) // config.batch_size
     steps_per_epoch = micro_batches // config.accumulation_steps
@@ -220,7 +205,8 @@ def train(
             "Training needs one full optimizer batch and nonempty validation data"
         )
     total_steps = steps_per_epoch * config.epochs
-    model = create_model(config.model).to(device)
+    model_config = {**config.model, "merge_entries": train_data.dictionary.entries}
+    model = create_model(model_config).to(device)
     trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -357,7 +343,7 @@ def train(
         model.train()
         values = {
             f"{prefix}/loss": loss_sum / max(token_count, 1),
-            f"{prefix}/final_move_top1": correct / count,
+            f"{prefix}/final_token_top1": correct / count,
             f"{prefix}/rows": count,
         }
         values.update(
@@ -390,8 +376,8 @@ def train(
             values["generalization/loss_gap"] = (
                 values["val/loss"] - values["train_probe/loss"]
             )
-            values["generalization/final_move_top1_gap"] = (
-                values["val/final_move_top1"] - values["train_probe/final_move_top1"]
+            values["generalization/final_token_top1_gap"] = (
+                values["val/final_token_top1"] - values["train_probe/final_token_top1"]
             )
         return values
 
@@ -399,7 +385,7 @@ def train(
         save_checkpoint(
             output_dir / name,
             model,
-            config.model,
+            model_config,
             train_config=asdict(config),
             step=step,
             epoch=epoch,
@@ -431,7 +417,7 @@ def train(
         for epoch in range(start_epoch, config.epochs):
             if step >= limit:
                 break
-            train_collate = TraceCollator()
+            train_collate = TraceCollator(train_data.dictionary, diagnostics=False)
             loader = DataLoader(
                 train_data,
                 batch_size=config.batch_size,

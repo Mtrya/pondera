@@ -6,7 +6,7 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 |---|---|
 | `chess/` | Action vocabulary, rule-only path tracking, lossless board token encoding, exact symmetry transforms, and min-cost merge dictionaries |
 | `models/` | Neural model and checkpoint serialization |
-| `data/` | Single-entry offline trace production, direct root-pool construction from game archives, release validation, encoded training arrays, and merge-vocabulary profiling |
+| `data/` | Single-entry offline trace production, root-pool construction, release validation, authoritative text conversion, replaceable training encodings, and merge-vocabulary profiling |
 | `tools/export_hf.py` | Bounded projection of an accepted local release into the shared eleven-column Hugging Face dataset; schema definitions remain in `data/` |
 | `training/` | Supervised optimization and resumable training state |
 | `inference/` | Legal move selection, masked trace generation and budget assessment, and the UCI protocol |
@@ -18,7 +18,7 @@ Representation code does not import application layers. Models depend on represe
 
 The board tokenizer has one format shared by offline data preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving piece placement and the first four FEN fields exactly. The fullmove counter is not encoded; halfmove clocks of 100 and above and repetition counts above four share their respective top atoms. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
 
-The policy is a fixed-depth causal Transformer over a bidirectional board-token prefix and a causal trace suffix, with prefix caching for generation. Model configuration contains only dimensions, dropout, and the tokenizer format version; there is no architecture selector.
+The policy is a fixed-depth causal Transformer over a bidirectional board-token prefix and a causal trace suffix, with prefix caching for generation. Model configuration contains dimensions, dropout, the tokenizer format version, and the selected dictionary's flat atom expansions. Embedding and output dimensions follow that vocabulary; checkpoints retain the expansions so token IDs remain interpretable. There is no architecture selector.
 
 ## Repository hygiene
 
