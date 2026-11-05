@@ -11,4 +11,6 @@
 
 Every puzzle contributes one candidate at the position after `Moves[0]`; the solution begins with `Moves[1]`. Complete original game history is unavailable, so puzzle roots use repetition one and declare that assumption in provenance. Their FEN clock is preserved, and no claimable-position quota is imposed. The full original puzzle row and HF revision are retained in the shared JSON `source` field.
 
+Local puzzle inputs retain the complete original row but use a null revision: an arbitrary supplied Parquet file cannot attest to the configured Hub commit. Hub downloads retain the configured immutable revision.
+
 Splits depend only on the position key. Duplicate positions within a puzzle source keep the first row. Sources are considered in configuration order; a later source excludes positions already selected by earlier sources before filling its quota. Selected records are globally ordered with the existing seeded pool-order draw. Source readers create provenance; the Parquet writer preserves it without adding a particular source's identity.

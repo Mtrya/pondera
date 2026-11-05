@@ -1,11 +1,11 @@
 """Create or replace a trace dataset's training IDs from authoritative text."""
 
 import json
-import resource
 import tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path
+from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -30,7 +30,7 @@ def merge_and_encode(source, output, config):
     Corpus sampling and optional holdout affect vocabulary fitting only.
     The output keeps all source rows and their training split membership.
     """
-    from pondera.data.merge_profile import build_profile, render_report
+    from pondera.data.merge_profile import build_profile, peak_rss_bytes, render_report
 
     output = Path(output)
     if output.exists():
@@ -57,9 +57,7 @@ def merge_and_encode(source, output, config):
         document["settings"] = settings
         document["timing"]["encoding_seconds"] = summary["seconds"]
         document["timing"]["workflow_seconds"] = time.monotonic() - started
-        document["timing"]["workflow_peak_rss_bytes"] = (
-            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-        )
+        document["timing"]["workflow_peak_rss_bytes"] = peak_rss_bytes()
         (profile / "curve.json").write_text(json.dumps(document, indent=2) + "\n")
         (profile / "profile.md").write_text(render_report(document))
         dataset.rename(output)
@@ -126,9 +124,23 @@ def tokenize_dataset(source, output, dictionary=MergeDictionary(), *, batch_size
                 for batch in file.iter_batches(
                     batch_size=batch_size, use_threads=False
                 ):
+                    if "split" in batch.schema.names:
+                        labels = set(batch.column("split").to_pylist())
+                        if labels - {"train", "val"}:
+                            raise ValueError(
+                                f"Unknown dataset split in {path}: {labels}"
+                            )
                     encoded = []
-                    for text in batch.column("trace_text").to_pylist():
-                        atoms = trace_atoms(text)
+                    for row in batch.select(
+                        ["fen", "repetition", "trace_text"]
+                    ).to_pylist():
+                        atoms = trace_atoms(
+                            row["trace_text"],
+                            expected_fen=row["fen"] if not manifest else None,
+                            expected_repetition=row["repetition"]
+                            if not manifest
+                            else None,
+                        )
                         encoded.append(encoder.encode(atoms).tolist())
                         base_atoms += len(atoms)
                     lengths = [len(ids) for ids in encoded]
@@ -167,6 +179,7 @@ def tokenize_dataset(source, output, dictionary=MergeDictionary(), *, batch_size
                 "grammar_version": TRACE_GRAMMAR_VERSION,
                 "tokenizer_version": CHESS_TOKENIZER_VERSION,
                 "merge_entries": dictionary.entries,
+                "dataset_id": manifest.get("dataset_id") or uuid4().hex,
                 "source": str(source),
                 "shards": shards,
             },

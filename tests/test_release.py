@@ -235,6 +235,20 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(recovered["statistics"], self.result["statistics"])
         self.assertTrue(validate_release(self.release, self.roots, workers=1)["ok"])
 
+    def test_resume_rejects_changed_root_provenance(self):
+        roots = [
+            {**root, "source": {"file": "another-input.pgn"}} for root in self.roots
+        ]
+        with self.assertRaises(ValueError):
+            produce_shards(
+                roots,
+                self.release,
+                self.config,
+                sidecar_for_root=self.provider,
+                shard_size=2,
+                workers=1,
+            )
+
     def test_resume_rejects_a_different_shard_layout(self):
         with self.assertRaisesRegex(ValueError, "different shard layout"):
             produce_shards(

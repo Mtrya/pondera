@@ -211,7 +211,7 @@ def validate_trace_arrays(arrays, rows=None):
 
 
 def trace_data_identity(directory):
-    """The declared generation identity and shards of training input."""
+    """The published dataset identity, generation settings, and encoding."""
     manifest = load_manifest(Path(directory) / "release.json")
     identity = {
         name: manifest.get(name)
@@ -219,6 +219,7 @@ def trace_data_identity(directory):
             "format_version",
             "grammar_version",
             "tokenizer_version",
+            "dataset_id",
             "metadata",
             "shards",
         )

@@ -277,8 +277,6 @@ def _sources(values):
                 _integer(section, "batch_size", raw["batch_size"], 1),
             )
         sources.append(source)
-    if not sum(source.train + source.val for source in sources):
-        raise ValueError("At least one source must request roots")
     return tuple(sources)
 
 

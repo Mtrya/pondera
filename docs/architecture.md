@@ -20,6 +20,8 @@ The board tokenizer has one format shared by offline data preparation and runtim
 
 The policy is a fixed-depth causal Transformer over a bidirectional board-token prefix and a causal trace suffix, with prefix caching for generation. Model configuration contains dimensions, dropout, the tokenizer format version, and the selected dictionary's flat atom expansions. Embedding and output dimensions follow that vocabulary; checkpoints retain the expansions so token IDs remain interpretable. There is no architecture selector.
 
+Generation feeds compressed token IDs to the model and expands them through the trace grammar. A composite is eligible only when its entire expansion is legal and respects the thinking budget, measured in expanded base atoms; returned traces remain expanded for replay. Move selection returns the emitted root decision. Diagnostic move probabilities condition on legal decision-bearing tokens at that generation step and sum alternatives that encode the same move.
+
 ## Repository hygiene
 
 Maintain reusable code inside the package. Do not add root Python scripts or generic utility packages. Temporary scripts, downloaded data, checkpoints, logs, external tools, and research working notes use `.local/scratch`, `.local/data`, `.local/runs`, `.local/research`, and `.local/tools`, or explicitly selected external storage. Run directories contain their configuration and outputs; evaluation does not automatically modify reviewed result summaries. Experiment configurations live with their run directories; the repository tracks configurations only for published reference runs.

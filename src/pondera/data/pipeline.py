@@ -558,6 +558,12 @@ def _check_shard_layout(output, shard, roots):
             f"Registered shard {shard['path']} covers different roots; "
             "the release was produced with a different shard layout"
         )
+    expected = {root["root_id"]: root for root in roots}
+    for row in stored:
+        root = expected[row["root_id"]]
+        for name in ROOT_ROW_FIELDS:
+            if name in root and row.get(name) != root[name]:
+                raise ValueError(f"Registered root {name} differs: {row['root_id']}")
 
 
 def _profile_shard(output, shard, profile):

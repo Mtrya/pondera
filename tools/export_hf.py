@@ -4,18 +4,22 @@ import argparse
 import json
 import os
 import shutil
+import tempfile
 from collections import Counter
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
 from pondera.data.dataset import (
+    DATA_FORMAT_VERSION,
     HF_COLUMNS,
     HF_SCHEMA,
     TRACE_SCHEMA,
     load_manifest,
 )
+from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 SPLIT_NAMES = {"train": "train", "val": "validation"}
 
@@ -31,9 +35,15 @@ def export_hf(release, output, batch_size=1024):
     manifest = load_manifest(release / "release.json")
     if not manifest or not manifest.get("shards"):
         raise ValueError(f"Release has no completed shards: {release}")
-    temporary = output.with_name(f".{output.name}.tmp")
-    if temporary.exists():
-        shutil.rmtree(temporary)
+    for field, expected in (
+        ("format_version", DATA_FORMAT_VERSION),
+        ("grammar_version", TRACE_GRAMMAR_VERSION),
+        ("tokenizer_version", CHESS_TOKENIZER_VERSION),
+    ):
+        if manifest.get(field) != expected:
+            raise ValueError(f"Unsupported release {field}: {manifest.get(field)}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
     (temporary / "data").mkdir(parents=True)
     writers = {}
     counts = Counter()

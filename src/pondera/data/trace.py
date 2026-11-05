@@ -908,6 +908,21 @@ class TraceWriter:
     def __init__(self, root_fen: str, repetition: int = 1, teacher_width: int = 1):
         self._state = _TraceState(root_fen, repetition, teacher_width)
 
+    def copy(self):
+        """Fork the grammar for a prospective composite-token expansion."""
+        from copy import deepcopy
+
+        result = object.__new__(TraceWriter)
+        # Recorded steps are immutable; only the live grammar needs deep copying.
+        result._state = deepcopy(
+            self._state,
+            {
+                id(values): values.copy()
+                for values in (self._state.tokens, self._state.roles, self._state.steps)
+            },
+        )
+        return result
+
     @property
     def finished(self):
         return self._state.phase == _DONE

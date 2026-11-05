@@ -40,7 +40,12 @@ def validate_record(record, index=0):
     position_key = _position_key(fen)
     if record.get("position_key", position_key) != position_key:
         raise CorpusError(f"Root {root_id} has an inconsistent position key")
-    board = chess.Board(fen)
+    try:
+        board = chess.Board(fen)
+    except ValueError as error:
+        raise CorpusError(f"Root {root_id} has an invalid FEN") from error
+    if not board.is_valid():
+        raise CorpusError(f"Root {root_id} has an invalid position")
     if board.is_checkmate() or board.is_stalemate() or not board.legal_moves:
         raise CorpusError(f"Root {root_id} has no legal move")
     turn = "white" if board.turn == chess.WHITE else "black"

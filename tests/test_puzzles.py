@@ -77,6 +77,11 @@ class PuzzleTests(unittest.TestCase):
             self.assertEqual(root["source"]["root_after_moves"], 1)
             self.assertTrue(root["source"]["repetition_is_assumed"])
 
+    def test_preparation_requires_an_enabled_source(self):
+        config = load_config(self.config(0))
+        with self.assertRaises(ValueError):
+            prepare_pool(config, self.root / "disabled")
+
     def test_sampling_is_stable_across_batches_and_excludes_duplicate_positions(self):
         path = self.parquet(self.rows + self.rows[:1])
         source = replace(self.source, train=4, val=0, batch_size=1)
@@ -129,7 +134,7 @@ class PuzzleTests(unittest.TestCase):
         for root in roots:
             source = root["source"]
             self.assertEqual(source["puzzle"], originals[source["puzzle"]["PuzzleId"]])
-            self.assertEqual(source["revision"], self.source.revision)
+            self.assertIsNone(source["revision"])
             self.assertNotIn("archive_url", source)
         manifest = load_manifest(output / "pool.manifest.json")
         self.assertEqual(manifest["counts"], {"train": 4, "val": 0})

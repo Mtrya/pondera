@@ -20,6 +20,7 @@ from pondera.data.config import load_config
 from pondera.data.dataset import (
     DATA_FORMAT_VERSION,
     HF_COLUMNS,
+    HF_SCHEMA,
     TracePositions,
     load_manifest,
     parquet_sources,
@@ -29,7 +30,7 @@ from pondera.data.dataset import (
 from pondera.data.merge_profile import build_profile, load_full_rows, write_artifacts
 from pondera.data.pipeline import produce_shards
 from pondera.data.text import ROLE_MIXED, trace_atoms
-from pondera.data.tokenize import tokenize_dataset
+from pondera.data.tokenize import merge_and_encode, tokenize_dataset
 from pondera.data.trace import ROLE_FINAL_MOVE, load_sidecar, synthesize_root
 from pondera.models.checkpoint import load_model, read_checkpoint, save_checkpoint
 from pondera.models.policy import create_model
@@ -40,6 +41,12 @@ MODEL = {"num_blocks": 1, "hidden_size": 16, "intermediate_size": 32, "num_heads
 
 
 class TextTests(unittest.TestCase):
+    def test_text_requires_a_final_decision_and_value(self):
+        prefix = "8/8/8/4k3/8/8/8/4K3 w - - 0 1 (repetition 3) "
+        for suffix in ("FINAL END", "FINAL CLAIM_DRAW END"):
+            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                trace_atoms(prefix + suffix)
+
     def test_text_recovers_producer_atoms_for_every_recorded_case(self):
         config = load_config()
         for fixture in sorted(FIXTURES.iterdir()):
@@ -125,6 +132,8 @@ class TokenizeTests(unittest.TestCase):
                     .replace("min_count = 8", "min_count = 1")
                     .replace("# max_roots = 128", "max_roots = 3")
                     .replace("batch_size = 128", "batch_size = 2")
+                    .replace("train = 500000", "train = 0")
+                    .replace("val = 2000", "val = 0")
                 )
                 output = self.root / f"training-{budget}"
                 subprocess.run(
@@ -168,6 +177,8 @@ class TokenizeTests(unittest.TestCase):
             pa.array(corrupt, type=pa.list_(pa.int32())),
         )
         pq.write_table(table, path)
+        for expected, profiled in zip(self.original, load_full_rows(self.source)):
+            np.testing.assert_array_equal(profiled.atoms, expected["trace_token_ids"])
         output = self.root / "encoded"
         result = tokenize_dataset(self.source, output, self.dictionary, batch_size=1)
         self.assertEqual(result["rows"], len(self.original))
@@ -181,6 +192,80 @@ class TokenizeTests(unittest.TestCase):
         again = self.root / "encoded-again"
         tokenize_dataset(output, again, self.dictionary, batch_size=3)
         self.assertEqual(self.rows(again), self.rows(output))
+
+    def test_zero_budget_needs_no_full_presentation_fitting_rows(self):
+        from dataclasses import replace
+
+        for presentation in ("zero", "random"):
+            (self.root / presentation).mkdir()
+            config, roots, run, provider = build_run(
+                self.root / presentation,
+                cases=CASES,
+                recipe_text=f"[recipe]\npresentations = {{{presentation} = 1.0}}",
+            )
+            source = run / "release"
+            produce_shards(
+                roots,
+                source,
+                config,
+                sidecar_for_root=provider,
+                shard_size=2,
+                workers=1,
+            )
+            output = self.root / f"base-{presentation}"
+            result = merge_and_encode(
+                source, output, replace(load_config().merge, budget=0)
+            )
+            self.assertEqual(result["entries"], 0)
+            self.assertEqual(result["ratio"], 1.0)
+            self.assertEqual(result["rows"], len(roots))
+            profile = json.loads((output / "profile/curve.json").read_text())
+            self.assertEqual(profile["corpus"]["fitting"]["rows"], 0)
+            self.assertEqual(profile["candidates"]["counted"], 0)
+
+    def test_hf_training_artifacts_have_distinct_persistent_identities(self):
+        identities = []
+        for index, row in enumerate(self.original[:2]):
+            source = self.root / f"hf-{index}" / "data"
+            source.mkdir(parents=True)
+            pq.write_table(
+                pa.Table.from_pylist([row], schema=HF_SCHEMA),
+                source / "train-00000.parquet",
+            )
+            output = self.root / f"hf-encoded-{index}"
+            tokenize_dataset(source.parent, output)
+            identities.append(trace_data_identity(output))
+            copied = self.root / f"reencoded-{index}"
+            tokenize_dataset(output, copied)
+            self.assertEqual(trace_data_identity(copied), identities[-1])
+        self.assertNotEqual(identities[0], identities[1])
+
+    def test_hf_import_rejects_a_different_root_header(self):
+        original = self.original[0]
+        for field, value in (("fen", self.original[1]["fen"]), ("repetition", 4)):
+            with self.subTest(field=field):
+                source = self.root / field / "data"
+                source.mkdir(parents=True)
+                pq.write_table(
+                    pa.Table.from_pylist(
+                        [{**original, field: value}], schema=HF_SCHEMA
+                    ),
+                    source / "train-00000.parquet",
+                )
+                with self.assertRaises(ValueError):
+                    tokenize_dataset(source.parent, self.root / f"invalid-{field}")
+
+    def test_library_conversion_rejects_unknown_split_labels(self):
+        path = self.source / "shard-000000/data.parquet"
+        table = pq.read_table(path)
+        table = table.set_column(
+            table.schema.get_field_index("split"),
+            "split",
+            pa.array(["validation"] * len(table)),
+        )
+        pq.write_table(table, path)
+        with self.assertRaises(ValueError):
+            tokenize_dataset(self.source, self.root / "invalid-split")
 
     def test_format_nine_base_cache_converts_to_inline_training_metadata(self):
         # The accepted producer input uses list<int16> base IDs in format 9.

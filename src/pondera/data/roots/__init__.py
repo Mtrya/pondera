@@ -17,6 +17,8 @@ def prepare_pool(config, output, *, inputs=None, cache=None):
         raise ValueError(f"Unknown input sources: {sorted(unknown)}")
     records, reports, excluded = [], {}, set()
     active = [source for source in config.sources if source.train + source.val]
+    if not active:
+        raise ValueError("At least one source must request roots for preparation")
     for index, source in enumerate(active):
         local = inputs.get(source.name)
         if source.kind == "pgn":
@@ -38,7 +40,11 @@ def prepare_pool(config, output, *, inputs=None, cache=None):
         else:
             files = puzzles.parquet_files(source, cache / source.name, local=local)
             selected, report = puzzles.build_pool(
-                files, source, config.seed, exclude=excluded
+                files,
+                source,
+                config.seed,
+                exclude=excluded,
+                local=local is not None,
             )
         records.extend(selected)
         if index + 1 < len(active):

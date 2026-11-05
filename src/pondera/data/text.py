@@ -40,7 +40,7 @@ def _position(words, index):
     return fen, repetition, index + 8
 
 
-def trace_atoms(text):
+def trace_atoms(text, *, expected_fen=None, expected_repetition=None):
     """Invert the producer's transcription without teacher or grammar replay.
 
     SAN uses the absolute current board; stored moves and BOARD observations
@@ -48,10 +48,18 @@ def trace_atoms(text):
     when a random presentation ends partway down a thought path.
     """
     words = text.split()
-    root_fen, _, index = _position(words, 0)
+    root_fen, repetition, index = _position(words, 0)
+    # Text headers normalize the fullmove counter and saturate observation clocks.
+    if expected_fen is not None and not np.array_equal(
+        encode_board(root_fen, repetition), encode_board(expected_fen, repetition)
+    ):
+        raise ValueError("Trace header board differs from the imported row")
+    if expected_repetition is not None and repetition != expected_repetition:
+        raise ValueError("Trace header repetition differs from the imported row")
     board = chess.Board(root_fen)
     mirrored = board.turn == chess.BLACK
     atoms = []
+    final_index = None
     while index < len(words):
         word = words[index]
         index += 1
@@ -73,6 +81,9 @@ def trace_atoms(text):
             atoms.append(BOARD)
             atoms.extend(observation)
         elif word == "FINAL":
+            if final_index is not None:
+                raise ValueError("A trace needs one FINAL suffix")
+            final_index = len(atoms)
             atoms.append(FINAL)
             board = chess.Board(root_fen)
         elif word == "root":
@@ -89,8 +100,15 @@ def trace_atoms(text):
             uci = reflect_uci(move.uci()) if mirrored else move.uci()
             atoms.append(MOVE + UCI_MOVE_TO_IDX[uci])
             board.push(move)
-    if not atoms or atoms[-1] != END or atoms.count(FINAL) != 1:
-        raise ValueError("A complete trace needs one FINAL suffix and END")
+    if (
+        final_index is None
+        or not atoms
+        or atoms[-1] != END
+        or final_index + 3 >= len(atoms)
+        or not MOVE <= atoms[final_index + 1] < VALUE
+        or not VALUE <= atoms[final_index + 2] < VALUE + VALUE_BINS
+    ):
+        raise ValueError("A complete trace needs a FINAL move, value, and END")
     return np.asarray(atoms, dtype=np.int32)
 
 

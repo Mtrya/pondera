@@ -126,6 +126,21 @@ def validate(rows):
 
 
 class RootPoolTests(unittest.TestCase):
+    def test_external_roots_reject_malformed_and_invalid_positions(self):
+        for fen in (
+            "broken/8/8/8/8/8/8/8 w - - 0 1",
+            "rnbq1bnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        ):
+            with self.subTest(fen=fen), self.assertRaises(CorpusError):
+                validate_record(
+                    {
+                        "root_id": "external",
+                        "split": "train",
+                        "fen": fen,
+                        "repetition": 1,
+                    }
+                )
+
     def test_repetition_counts_match_the_hand_counted_game(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest, rows = build("repetition.pgn", directory)

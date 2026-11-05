@@ -3,14 +3,19 @@ import unittest
 import chess
 import torch
 
+from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import (
     BOARD,
     CHESS_VOCAB_SIZE,
+    DEPTH,
+    END,
     FINAL,
     MOVE,
     UCI_MOVE_TO_IDX,
+    VALUE,
 )
 from pondera.data.trace import TraceWriter, replay
+from pondera.inference.policy import pick_move
 from pondera.inference.trace import (
     STOP_BUDGET,
     STOP_CAP,
@@ -102,6 +107,59 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(
             [trace.tokens for trace in together], [trace.tokens for trace in alone]
         )
+
+    def test_merged_generation_validates_expansions_and_selects_legal_moves(self):
+        # The higher-scoring expansion contains an illegal e2e5 decision.
+        entries = (
+            (FINAL, move_token("e2e5"), VALUE, END),
+            (FINAL, move_token("e2e4"), VALUE, END),
+        )
+        model = create_model({**CONFIG, "merge_entries": entries}).eval()
+        with torch.no_grad():
+            model.head.weight.zero_()
+            model.head.bias.zero_()
+            model.head.bias[CHESS_VOCAB_SIZE] = 20
+            model.head.bias[CHESS_VOCAB_SIZE + 1] = 10
+        roots = [RootPosition(chess.STARTING_FEN), RootPosition(BLACK_TO_MOVE)]
+        for protocol in (fixed_budget(0), autonomous(0), autonomous(5)):
+            traces = generate(model, roots, protocol)
+            self.assertEqual([trace.final_move for trace in traces], ["e2e4", "e7e5"])
+            for trace in traces:
+                self.assertTrue(assess(trace).structural)
+                self.assertEqual(trace.tokens, entries[1])
+                self.assertAlmostEqual(
+                    sum(torch.tensor(trace.root_move_log_probs).exp().tolist()), 1.0
+                )
+        self.assertEqual(pick_move(model, chess.Board()), "e2e4")
+
+    def test_composites_cannot_cross_the_thinking_budget_or_trail_end(self):
+        dictionary = MergeDictionary(
+            (
+                (DEPTH, move_token("e2e4")),
+                (DEPTH, FINAL, move_token("e2e4"), VALUE, END),
+                (FINAL, move_token("e2e4"), VALUE, END, END),
+            )
+        )
+        row = _GenerationRow(RootPosition(chess.STARTING_FEN), fixed_budget(1))
+        logits = torch.zeros((1, CHESS_VOCAB_SIZE + len(dictionary)))
+        logits[0, CHESS_VOCAB_SIZE] = 30
+        logits[0, CHESS_VOCAB_SIZE + 1] = 20
+        logits[0, CHESS_VOCAB_SIZE + 2] = 40
+        choices, _ = _choose([row], logits, fixed_budget(1), dictionary)
+        self.assertEqual(int(choices[0]), CHESS_VOCAB_SIZE + 1)
+        self.assertEqual(len(row.writer.tokens), 0)
+
+    def test_generated_composites_feed_the_next_model_step(self):
+        entry = (DEPTH, move_token("e2e4"))
+        model = create_model({**CONFIG, "merge_entries": (entry,)}).eval()
+        with torch.no_grad():
+            model.head.weight.zero_()
+            model.head.bias.zero_()
+            model.head.bias[CHESS_VOCAB_SIZE] = 10
+        trace = generate(model, [RootPosition(chess.STARTING_FEN)], fixed_budget(2))[0]
+        self.assertEqual(trace.tokens[:2], entry)
+        self.assertEqual(trace.thinking_tokens, 2)
+        self.assertTrue(assess(trace).structural)
 
     def test_assess_replays_with_the_declared_teacher_width(self):
         legal = sorted(move.uci() for move in chess.Board().legal_moves)

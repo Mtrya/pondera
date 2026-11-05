@@ -8,6 +8,7 @@ includes every selected presentation; vocabulary holdout is optional.
 import json
 import random
 import resource
+import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -17,10 +18,8 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from pondera.chess.merge import (
-    MergeDictionary,
     MergeEncoder,
     count_candidates,
-    decode,
     select_dictionary,
     usage_counts,
 )
@@ -48,6 +47,12 @@ def token_name(token):
 
 def is_held_out(root_id, fraction):
     return random.Random(root_id).random() < fraction
+
+
+def peak_rss_bytes():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (
+        1 if sys.platform == "darwin" else 1024
+    )
 
 
 def load_rows(release, *, max_roots=None):
@@ -81,7 +86,6 @@ def load_rows(release, *, max_roots=None):
                 positions, key=lambda key: (random.Random(f"640:{key}").random(), key)
             )[:max_roots]
         )
-    dictionary = MergeDictionary(manifest.get("merge_entries", ()))
     rows = []
     for path, expected, split in sources:
         file = pq.ParquetFile(path)
@@ -97,8 +101,7 @@ def load_rows(release, *, max_roots=None):
         columns.extend(
             name for name in ("root_id", "split") if name in file.schema_arrow.names
         )
-        cache = "trace_token_ids" in file.schema_arrow.names
-        columns.append("trace_token_ids" if cache else "trace_text")
+        columns.append("trace_text")
         for batch in file.iter_batches(
             columns=columns, batch_size=64, use_threads=False
         ):
@@ -109,11 +112,7 @@ def load_rows(release, *, max_roots=None):
                 label = row.get("split", split)
                 if label not in {"train", "val"}:
                     raise ValueError(f"Unknown dataset split: {label}")
-                atoms = (
-                    decode(row["trace_token_ids"], dictionary).astype(np.int32)
-                    if cache
-                    else trace_atoms(row["trace_text"])
-                )
+                atoms = trace_atoms(row["trace_text"])
                 rows.append(
                     ProfileRow(
                         str(release),
@@ -130,7 +129,7 @@ def load_rows(release, *, max_roots=None):
 
 
 def load_full_rows(release):
-    """Full rows, retaining split, identity, and the declared cache encoding."""
+    """Full rows from authoritative text, retaining split and identity."""
     return [row for row in load_rows(release) if row.presentation == "full"]
 
 
@@ -289,7 +288,7 @@ def build_profile(
         for row in loaded
         if row.presentation == "full" and row.position not in heldout_positions
     ]
-    if not fitting:
+    if not fitting and any(budgets):
         raise ValueError("The fitting corpus has no full-presentation rows")
     measurement = [row for row in loaded if row.position not in heldout_positions]
     heldout = [row for row in loaded if row.position in heldout_positions]
@@ -298,10 +297,14 @@ def build_profile(
     selection = [row.atoms for row in fitting if row.position in selection_positions]
     load_seconds = time.monotonic() - started
     count_start = time.monotonic()
-    candidates = count_candidates(
-        (row.atoms for row in fitting),
-        min_count=min_count,
-        per_length_limit=per_length_limit,
+    candidates = (
+        count_candidates(
+            (row.atoms for row in fitting),
+            min_count=min_count,
+            per_length_limit=per_length_limit,
+        )
+        if any(budgets)
+        else []
     )
     document = {
         "corpus": {
@@ -365,9 +368,7 @@ def build_profile(
         if on_tier is not None:
             on_tier(document["tiers"][-1])
     document["timing"]["total_seconds"] = time.monotonic() - started
-    document["timing"]["peak_rss_bytes"] = (
-        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-    )
+    document["timing"]["peak_rss_bytes"] = peak_rss_bytes()
     return document, dictionaries
 
 

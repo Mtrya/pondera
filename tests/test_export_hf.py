@@ -12,6 +12,7 @@ from pondera.data.dataset import (
     LOCAL_ONLY_COLUMNS,
     TRACE_SCHEMA,
     load_manifest,
+    write_manifest,
 )
 from pondera.data.pipeline import produce_shards, validate_release
 
@@ -110,6 +111,14 @@ class ExportTests(unittest.TestCase):
                     (run / "export" / "data" / name).read_bytes(),
                     (run / "export-again" / "data" / name).read_bytes(),
                 )
+
+            manifest_path = release / "release.json"
+            original = load_manifest(manifest_path)
+            for field in ("format_version", "grammar_version", "tokenizer_version"):
+                with self.subTest(field=field):
+                    write_manifest(manifest_path, {**original, field: -1})
+                    with self.assertRaises(ValueError):
+                        export_hf(release, run / f"invalid-{field}")
 
 
 if __name__ == "__main__":

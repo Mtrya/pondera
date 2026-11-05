@@ -39,7 +39,7 @@ def parquet_files(source, cache, *, local=None):
     return files
 
 
-def puzzle_root(row, source):
+def puzzle_root(row, source, *, local=False):
     """One fresh root after Moves[0]; retain the complete source row."""
     board = chess.Board(row["FEN"])
     board.push_uci(row["Moves"].split()[0])
@@ -57,7 +57,7 @@ def puzzle_root(row, source):
         "source": {
             "kind": "lichess_puzzles",
             "repo_id": source.repo_id,
-            "revision": source.revision,
+            "revision": None if local else source.revision,
             "root_after_moves": 1,
             "repetition_is_assumed": True,
             "puzzle": row,
@@ -65,7 +65,7 @@ def puzzle_root(row, source):
     }
 
 
-def build_pool(files, source, seed, *, exclude=()):
+def build_pool(files, source, seed, *, exclude=(), local=False):
     started = time.monotonic()
     seen = set(exclude)
     counts = Counter()
@@ -77,7 +77,7 @@ def build_pool(files, source, seed, *, exclude=()):
             ):
                 for row in batch.to_pylist():
                     counts["rows"] += 1
-                    root = puzzle_root(row, source)
+                    root = puzzle_root(row, source, local=local)
                     if root is None:
                         counts["terminal"] += 1
                         continue
@@ -93,7 +93,7 @@ def build_pool(files, source, seed, *, exclude=()):
     return selected, {
         "kind": source.kind,
         "repo_id": source.repo_id,
-        "revision": source.revision,
+        "revision": None if local else source.revision,
         "parameters": {"train": source.train, "val": source.val},
         "build": {**counts, "elapsed_seconds": time.monotonic() - started},
         "strata": strata,
