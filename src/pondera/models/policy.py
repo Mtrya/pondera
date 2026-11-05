@@ -4,6 +4,7 @@ import torch
 from huggingface_hub import PyTorchModelHubMixin
 from torch import nn
 
+from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import (
     CHESS_TOKENIZER_VERSION,
     CHESS_VOCAB_SIZE,
@@ -34,15 +35,18 @@ class PolicyModel(nn.Module, PyTorchModelHubMixin):
         intermediate_size,
         num_heads,
         dropout=0.0,
+        merge_entries=(),
     ):
         super().__init__()
+        self.merge_dictionary = MergeDictionary(merge_entries)
+        self.vocab_size = CHESS_VOCAB_SIZE + len(self.merge_dictionary)
         self.token_embedding = nn.Embedding(
-            CHESS_VOCAB_SIZE, hidden_size, padding_idx=PAD
+            self.vocab_size, hidden_size, padding_idx=PAD
         )
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         with torch.no_grad():
             self.token_embedding.weight[PAD].zero_()
-        self.head = nn.Linear(hidden_size, CHESS_VOCAB_SIZE)
+        self.head = nn.Linear(hidden_size, self.vocab_size)
         block = BlockConfig(hidden_size, intermediate_size, num_heads, dropout)
         self.backbone = Backbone(block, num_blocks)
 

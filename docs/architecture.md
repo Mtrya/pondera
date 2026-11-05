@@ -6,7 +6,8 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 |---|---|
 | `chess/` | Action vocabulary, rule-only path tracking, lossless board token encoding, exact symmetry transforms, and min-cost merge dictionaries |
 | `models/` | Neural model and checkpoint serialization |
-| `data/` | Single-entry offline trace production, direct root-pool construction from game archives, release validation, encoded training arrays, and merge-vocabulary profiling |
+| `data/` | Root preparation, trace curation, and vocabulary fitting plus encoding under one TOML recipe; release validation, authoritative text conversion, and training dataset readers |
+| `tools/export_hf.py` | Bounded projection of an accepted local release into the shared eleven-column Hugging Face dataset; schema definitions remain in `data/` |
 | `training/` | Supervised optimization and resumable training state |
 | `inference/` | Legal move selection, masked trace generation and budget assessment, and the UCI protocol |
 | `evaluation/` | External match orchestration and opening assets |
@@ -15,9 +16,11 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 
 Representation code does not import application layers. Models depend on representation, while training and inference depend on models. Training reads encoded datasets and dataset identity checks from `data`; it does not call collection, synthesis, search, or evaluation code. Evaluation orchestrates inference and external engines. Data and evaluation do not import training. Import contracts enforce these boundaries.
 
-The board tokenizer has one format shared by offline data preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving piece placement and the first four FEN fields exactly. The fullmove counter is not encoded; halfmove clocks of 100 and above and repetition counts above four share their respective top atoms. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
+The board tokenizer has one format shared by offline data preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving piece placement and the first four FEN fields exactly. Base token IDs and names are generated directly from the arithmetic layout in `chess/vocabulary.py`. The fullmove counter is not encoded; halfmove clocks of 100 and above and repetition counts above four share their respective top atoms. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
 
-The policy is a fixed-depth causal Transformer over a bidirectional board-token prefix and a causal trace suffix, with prefix caching for generation. Model configuration contains only dimensions, dropout, and the tokenizer format version; there is no architecture selector.
+The policy is a fixed-depth causal Transformer over a bidirectional board-token prefix and a causal trace suffix, with prefix caching for generation. Model configuration contains dimensions, dropout, the tokenizer format version, and the selected dictionary's flat atom expansions. Embedding and output dimensions follow that vocabulary; checkpoints retain the expansions so token IDs remain interpretable. There is no architecture selector.
+
+Generation feeds compressed token IDs to the model and expands them through the trace grammar. A composite is eligible only when its entire expansion is legal and respects the thinking budget, measured in expanded base atoms; returned traces remain expanded for replay. Move selection returns the emitted root decision. Diagnostic move probabilities condition on legal decision-bearing tokens at that generation step and sum alternatives that encode the same move.
 
 ## Repository hygiene
 

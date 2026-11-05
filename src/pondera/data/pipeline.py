@@ -1,38 +1,36 @@
 """Offline trace production: configuration, engine execution, shards, and checks.
 
-The public entry point is ``run_pipeline``. It prepares roots when necessary,
-then runs engine -> sidecar validation -> synthesis -> replay in memory for each
-root and publishes complete shards atomically. No sidecar directory or separate
-collection stage is required.
+The public entry point is ``run_pipeline``. It reads a prepared root pool,
+then runs engine -> sidecar decoding -> synthesis in memory for each root and
+publishes complete shards atomically. Exhaustive replay is an explicit
+diagnostic, outside normal production.
 """
 
-import argparse
 import fcntl
+import gc
 import json
-import math
 import os
 import random
-import re
 import select
 import shutil
 import statistics
 import subprocess
 import time
-import tomllib
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from multiprocessing import get_context
+from multiprocessing.util import Finalize
 from pathlib import Path
 
 import chess
 import numpy as np
 
-from pondera.chess.codec import cap_mate_distance, encode_board, value_bin
+from pondera.chess.codec import cap_mate_distance, value_bin
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import (
     CHESS_TOKENIZER_VERSION,
-    DEPTH,
+    FINAL,
     IDX_TO_UCI_MOVE,
     MATE_LOSS,
     MATE_WIN,
@@ -40,14 +38,16 @@ from pondera.chess.vocabulary import (
     PAD,
     VALUE,
 )
+from pondera.data.config import PRESENTATION_NAMES, parse_recipe
 from pondera.data.dataset import (
     DATA_ARRAYS,
     DATA_FORMAT_VERSION,
-    STATE_ARRAYS,
     load_manifest,
     load_trace_arrays,
+    read_root_rows,
     validate_trace_arrays,
     write_manifest,
+    write_trace_rows,
 )
 from pondera.data.trace import (
     CLAIM_DRAW_UCI,
@@ -57,178 +57,12 @@ from pondera.data.trace import (
     SIDECAR_SCHEMA,
     SIDECAR_SCHEMA_WIDE,
     TRACE_GRAMMAR_VERSION,
-    SynthesisError,
+    decode_sidecar,
     mate_distance_moves,
-    parse_sidecar,
     replay,
     synthesize_root,
     validate_root,
 )
-
-DEFAULT_CONFIG_PATH = Path("configs/trace.toml")
-PRESENTATION_NAMES = ("zero", "full", "random")
-_DIGITS = re.compile(r"^[1-9][0-9]*$")
-
-
-def _integer(section, name, value, minimum=None):
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError(f"[{section}] {name} must be an integer")
-    if minimum is not None and value < minimum:
-        raise ValueError(f"[{section}] {name} must be at least {minimum}")
-    return value
-
-
-def _probability(section, name, value):
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError(f"[{section}] {name} must be a number")
-    value = float(value)
-    if not 0.0 <= value <= 1.0:
-        raise ValueError(f"[{section}] {name} must lie in [0, 1]")
-    return value
-
-
-def _distribution(section, name, value, key_parser):
-    if isinstance(value, (int, str)) and not isinstance(value, bool):
-        value = {value: 1.0}
-    if not isinstance(value, dict) or not value:
-        raise ValueError(f"[{section}] {name} must be a value or a nonempty table")
-    result = {}
-    for raw_key, probability in value.items():
-        key = key_parser(raw_key)
-        if key in result:
-            raise ValueError(f"[{section}] {name} repeats a key")
-        result[key] = _probability(section, f"{name}.{raw_key}", probability)
-    if not math.isclose(sum(result.values()), 1.0, abs_tol=1e-9):
-        raise ValueError(f"[{section}] {name} probabilities must sum to 1")
-    return tuple(sorted(result.items(), key=lambda item: str(item[0])))
-
-
-def _positive_key(value):
-    if isinstance(value, bool):
-        raise ValueError("distribution keys must be positive integers")
-    if isinstance(value, int):
-        if value < 1:
-            raise ValueError("distribution keys must be positive integers")
-        return value
-    if not isinstance(value, str) or not _DIGITS.match(value):
-        raise ValueError("distribution keys must be positive integers")
-    return int(value)
-
-
-def _presentation_key(value):
-    if value not in PRESENTATION_NAMES:
-        raise ValueError(f"presentation must be one of {PRESENTATION_NAMES}")
-    return value
-
-
-@dataclass(frozen=True)
-class PathsConfig:
-    archive: str
-    roots: str
-    output: str
-    engine: str
-
-
-@dataclass(frozen=True)
-class RootsConfig:
-    train: int
-    val: int
-    claimable_share: float
-
-
-@dataclass(frozen=True)
-class SearchConfig:
-    depth: int
-    teacher_width: int
-    hash_mb: int
-
-
-@dataclass(frozen=True)
-class SynthesisConfig:
-    claim_draw: bool
-    board_descent_hazard: float
-    board_frontier_p: float
-    presentations: tuple
-    random_min_fraction: float
-    random_max_fraction: float
-
-    @property
-    def zero(self):
-        return dict(self.presentations).get("zero", 0.0)
-
-    @property
-    def full(self):
-        return dict(self.presentations).get("full", 0.0)
-
-    @property
-    def random(self):
-        return dict(self.presentations).get("random", 0.0)
-
-
-@dataclass(frozen=True)
-class ReleaseConfig:
-    shard_size: int
-    workers: int
-
-
-@dataclass(frozen=True)
-class SamplingConfig:
-    widths: tuple = None
-    depths: tuple = None
-    presentations: tuple = None
-
-    def identity(self):
-        payload = {}
-        for name, distribution in (
-            ("widths", self.widths),
-            ("depths", self.depths),
-            ("presentations", self.presentations),
-        ):
-            if distribution is not None:
-                payload[name] = {
-                    str(key): probability for key, probability in distribution
-                }
-        return payload
-
-
-@dataclass(frozen=True)
-class TraceConfig:
-    seed: int
-    paths: PathsConfig
-    roots: RootsConfig
-    search: SearchConfig
-    synthesis: SynthesisConfig
-    release: ReleaseConfig
-    sampling: SamplingConfig
-
-    def search_dict(self):
-        return {
-            "depth": self.search.depth,
-            "teacher_width": self.search.teacher_width,
-            "hash_mb": self.search.hash_mb,
-        }
-
-    def board_dict(self):
-        return {
-            "board_descent_hazard": self.synthesis.board_descent_hazard,
-            "board_frontier_p": self.synthesis.board_frontier_p,
-        }
-
-    def presentation_dict(self):
-        return {
-            "zero": self.synthesis.zero,
-            "full": self.synthesis.full,
-            "random": self.synthesis.random,
-            "last_root": 0.0,
-            "random_min_fraction": self.synthesis.random_min_fraction,
-            "random_max_fraction": self.synthesis.random_max_fraction,
-        }
-
-    def synthesis_dict(self):
-        return {
-            "confirmatory_repetition": "faithful",
-            "claim_draw": self.synthesis.claim_draw,
-        }
 
 
 def sample_distribution(rng, distribution):
@@ -244,140 +78,16 @@ def sample_distribution(rng, distribution):
     return fallback
 
 
-def sample_width(sampling, seed, root_id, default_width):
-    if sampling is None or sampling.widths is None:
-        return default_width
+def sample_search(sampling, seed, root_id):
     return sample_distribution(
-        random.Random(f"{seed}:{root_id}:width"), sampling.widths
-    )
-
-
-def sample_depth(sampling, seed, root_id, default_depth):
-    if sampling is None or sampling.depths is None:
-        return default_depth
-    return sample_distribution(
-        random.Random(f"{seed}:{root_id}:depth"), sampling.depths
+        random.Random(f"{seed}:{root_id}:search"), sampling.joint
     )
 
 
 def sample_presentation(sampling, seed, root_id):
-    if sampling is None or sampling.presentations is None:
-        return None
     return sample_distribution(
         random.Random(f"{seed}:{root_id}:presentation"), sampling.presentations
     )
-
-
-def parse_recipe(values):
-    if not isinstance(values, dict):
-        raise ValueError("recipe must be a table")
-    unknown = set(values) - {"widths", "depths", "presentations"}
-    if unknown or not values:
-        raise ValueError("recipe has an unknown or empty distribution")
-    return SamplingConfig(
-        widths=_distribution("recipe", "widths", values["widths"], _positive_key)
-        if "widths" in values
-        else None,
-        depths=_distribution("recipe", "depths", values["depths"], _positive_key)
-        if "depths" in values
-        else None,
-        presentations=_distribution(
-            "recipe", "presentations", values["presentations"], _presentation_key
-        )
-        if "presentations" in values
-        else None,
-    )
-
-
-def _table(values, name, required):
-    if not isinstance(values, dict):
-        raise ValueError(f"[{name}] must be a table")
-    unknown = set(values) - set(required)
-    if unknown:
-        raise ValueError(f"Unknown config key in [{name}]: {sorted(unknown)[0]}")
-    missing = set(required) - set(values)
-    if missing:
-        raise ValueError(f"Missing config key in [{name}]: {sorted(missing)[0]}")
-    return values
-
-
-def load_config(path=DEFAULT_CONFIG_PATH):
-    path = Path(path)
-    with path.open("rb") as handle:
-        values = tomllib.load(handle)
-    allowed = {"seed", "paths", "roots", "search", "synthesis", "release"}
-    if set(values) - allowed:
-        raise ValueError(f"Unknown config section: {sorted(set(values) - allowed)[0]}")
-    for section in allowed - {"seed"}:
-        if section not in values:
-            raise ValueError(f"Missing config section: [{section}]")
-    seed = _integer("seed", "seed", values.get("seed", 640))
-
-    paths = _table(values["paths"], "paths", {"archive", "roots", "output", "engine"})
-    for name in ("archive", "roots", "output", "engine"):
-        if not isinstance(paths[name], str) or (
-            name in {"roots", "output", "engine"} and not paths[name]
-        ):
-            raise ValueError(f"[paths] {name} must be a string")
-    paths = PathsConfig(**paths)
-
-    roots = _table(values["roots"], "roots", {"train", "val", "claimable_share"})
-    train = _integer("roots", "train", roots["train"], 0)
-    val = _integer("roots", "val", roots["val"], 0)
-    if train + val < 1:
-        raise ValueError("[roots] train + val must be positive")
-    roots = RootsConfig(
-        train, val, _probability("roots", "claimable_share", roots["claimable_share"])
-    )
-
-    search = _table(values["search"], "search", {"hash_mb", "widths", "depths"})
-    hash_mb = _integer("search", "hash_mb", search["hash_mb"], 1)
-    widths = _distribution("search", "widths", search["widths"], _positive_key)
-    depths = _distribution("search", "depths", search["depths"], _positive_key)
-
-    synthesis = _table(
-        values["synthesis"],
-        "synthesis",
-        {
-            "claim_draw",
-            "board_descent_hazard",
-            "board_frontier_p",
-            "presentations",
-            "random_min_fraction",
-            "random_max_fraction",
-        },
-    )
-    if not isinstance(synthesis["claim_draw"], bool):
-        raise ValueError("[synthesis] claim_draw must be a boolean")
-    presentations = _distribution(
-        "synthesis", "presentations", synthesis["presentations"], _presentation_key
-    )
-    minimum = _probability(
-        "synthesis", "random_min_fraction", synthesis["random_min_fraction"]
-    )
-    maximum = _probability(
-        "synthesis", "random_max_fraction", synthesis["random_max_fraction"]
-    )
-    if minimum >= maximum:
-        raise ValueError("[synthesis] random cut interval must be nonempty")
-    synthesis = SynthesisConfig(
-        synthesis["claim_draw"],
-        _probability(
-            "synthesis", "board_descent_hazard", synthesis["board_descent_hazard"]
-        ),
-        _probability("synthesis", "board_frontier_p", synthesis["board_frontier_p"]),
-        presentations,
-        minimum,
-        maximum,
-    )
-
-    release = _table(values["release"], "release", {"shard_size", "workers"})
-    shard_size = _integer("release", "shard_size", release["shard_size"], 1)
-    workers = _integer("release", "workers", release["workers"], 1)
-    release = ReleaseConfig(shard_size, workers)
-    search = SearchConfig(depths[0][0], widths[0][0], hash_mb)
-    sampling = SamplingConfig(widths, depths, presentations)
-    return TraceConfig(seed, paths, roots, search, synthesis, release, sampling)
 
 
 def _percentiles(values):
@@ -444,12 +154,12 @@ class RootProfile:
         ]
         self._add(root_id, root.root["split"], root.stats, rows)
 
-    def add_stored(self, row, stats, token_count):
+    def add_stored(self, row, stats, token_count, thinking_tokens):
         self._add(
             row["root_id"],
             row["split"],
             stats,
-            [(row["presentation"], token_count, row["thinking_tokens"])],
+            [(row["presentation"], token_count, thinking_tokens)],
         )
 
     def _add(self, root_id, split, stats, rows):
@@ -576,9 +286,9 @@ class CollectionError(RuntimeError):
     """A pipeline input or result that violates the production contract."""
 
 
-def _root_teacher(root, config):
-    width = root.get("teacher_width", config.search.teacher_width)
-    depth = root.get("depth", config.search.depth)
+def _root_teacher(root):
+    width = root["teacher_width"]
+    depth = root["depth"]
     if not isinstance(width, int) or isinstance(width, bool) or width < 1:
         raise CollectionError(f"Root {root['root_id']} has an invalid teacher width")
     if not isinstance(depth, int) or isinstance(depth, bool) or depth < 1:
@@ -586,18 +296,18 @@ def _root_teacher(root, config):
     return width, depth
 
 
-def _engine_path(config):
-    path = Path(config.paths.engine)
+def _engine_path(engine):
+    path = Path(engine)
     if path.is_file():
         return path.resolve()
-    resolved = shutil.which(config.paths.engine)
+    resolved = shutil.which(engine)
     if resolved is None:
-        raise FileNotFoundError(config.paths.engine)
+        raise FileNotFoundError(engine)
     return Path(resolved).resolve()
 
 
 def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
-    width, depth = _root_teacher(root, config)
+    width, depth = _root_teacher(root)
     repetition = validate_root(root, sidecar)
     if sidecar.engine != engine_name:
         raise CollectionError(f"Engine name differs for root {root['root_id']}")
@@ -618,91 +328,93 @@ def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
     return repetition
 
 
-def _run_engine(engine_path, fen, config, trace_path, width, depth, timeout=900):
-    """Drive one engine over raw UCI in the contract's exact command order.
+class _Engine:
+    """One worker's UCI process, reset to fresh search state for each root."""
 
-    python-chess manages MultiPV itself and refuses to configure it, so the
-    collector speaks plain UCI: options first, TraceLog last, a readiness
-    barrier, then position and a depth-limited go.
-    """
-    process = subprocess.Popen(
-        [str(engine_path)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        bufsize=0,
-    )
+    def __init__(self, path, hash_mb, timeout=3600):
+        self.process = subprocess.Popen(
+            [str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
+        )
+        self.buffer = b""
+        self.timeout = timeout
+        try:
+            deadline = time.monotonic() + timeout
+            self._send("uci")
+            _, banner = self._read_until("uciok", deadline)
+            if not any(line.startswith("option name TraceLog ") for line in banner):
+                raise CollectionError(f"Engine does not expose TraceLog: {path}")
+            self._send("setoption name Threads value 1")
+            self._send(f"setoption name Hash value {hash_mb}")
+        except BaseException:
+            self.close()
+            raise
 
-    def send(line):
-        process.stdin.write((line + "\n").encode())
-        process.stdin.flush()
+    def __enter__(self):
+        return self
 
-    buffer = b""
+    def __exit__(self, *exc):
+        self.close()
 
-    def read_line(deadline):
-        nonlocal buffer
-        while b"\n" not in buffer:
+    def _send(self, line):
+        self.process.stdin.write((line + "\n").encode())
+        self.process.stdin.flush()
+
+    def _read_line(self, deadline):
+        while b"\n" not in self.buffer:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise CollectionError("engine timed out")
-            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            ready, _, _ = select.select([self.process.stdout], [], [], remaining)
             if not ready:
                 continue
-            chunk = process.stdout.read(65536)
+            chunk = self.process.stdout.read(65536)
             if not chunk:
                 raise CollectionError("engine closed its output")
-            buffer += chunk
-        line, buffer = buffer.split(b"\n", 1)
+            self.buffer += chunk
+        line, self.buffer = self.buffer.split(b"\n", 1)
         return line.decode(errors="replace").strip()
 
-    def read_until(prefix, deadline):
+    def _read_until(self, prefix, deadline):
         seen = []
         while True:
-            line = read_line(deadline)
+            line = self._read_line(deadline)
             seen.append(line)
             if line.startswith(prefix):
                 return line, seen
 
-    deadline = time.monotonic() + timeout
-    try:
-        send("uci")
-        _, banner = read_until("uciok", deadline)
-        if not any(line.startswith("option name TraceLog ") for line in banner):
-            raise CollectionError(f"Engine does not expose TraceLog: {engine_path}")
-        send(f"setoption name Threads value {1}")
-        send(f"setoption name Hash value {config.search.hash_mb}")
-        send(f"setoption name MultiPV value {width}")
-        send(f"setoption name TraceLog value {trace_path}")
-        send("isready")
-        read_until("readyok", deadline)
-        send(f"position fen {fen}")
-        send(f"go depth {depth}")
-        bestmove, _ = read_until("bestmove", deadline)
-    finally:
+    def search(self, fen, trace_path, width, depth):
+        deadline = time.monotonic() + self.timeout
+        self._send("setoption name TraceLog value ")
+        # Stockfish 17.1 clears the TT, search histories and NNUE refresh cache.
+        self._send("ucinewgame")
+        self._send(f"setoption name MultiPV value {width}")
+        self._send(f"setoption name TraceLog value {trace_path}")
+        self._send("isready")
+        self._read_until("readyok", deadline)
+        self._send(f"position fen {fen}")
+        self._send(f"go depth {depth}")
+        bestmove, _ = self._read_until("bestmove", deadline)
+        parts = bestmove.split()
+        if len(parts) < 2:
+            raise CollectionError(f"engine returned no bestmove: {bestmove!r}")
+        return parts[1]
+
+    def close(self):
         try:
-            send("quit")
+            self._send("quit")
         except (BrokenPipeError, ValueError):
             pass
         try:
-            process.wait(timeout=10)
+            self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-    parts = bestmove.split()
-    if len(parts) < 2:
-        raise CollectionError(f"engine returned no bestmove: {bestmove!r}")
-    return parts[1]
-
-
-def _selection_record(root):
-    return {
-        key: value
-        for key, value in root.items()
-        if key not in {"teacher_width", "depth", "presentation"}
-    }
+            self.process.kill()
+            self.process.wait()
+        self.process.stdin.close()
+        self.process.stdout.close()
 
 
 RELEASE_ONLY_METADATA = frozenset({"root_selection"})
-ROOT_ROW_FIELDS = ("split", "fen", "repetition", "turn", "position_key", "source")
+ROOT_ROW_FIELDS = ("split", "fen", "repetition", "turn", "source")
 CHAMPION_FIELDS = ("round", "depth", "move", "raw", "wdl", "mate", "value_token", "pv")
 
 
@@ -722,39 +434,23 @@ def _read_jsonl(path):
     ]
 
 
-def _array(directory, name, rows, width, dtype, padding):
-    array = np.lib.format.open_memmap(
-        directory / f"{name}.npy", mode="w+", dtype=dtype, shape=(len(rows), width)
-    )
-    array[:] = padding
-    for index, values in enumerate(rows):
-        array[index, : len(values)] = values
-    array.flush()
-    return array
-
-
-def _one_dimensional(directory, name, values, dtype):
-    array = np.lib.format.open_memmap(
-        directory / f"{name}.npy", mode="w+", dtype=dtype, shape=(len(values),)
-    )
-    array[:] = values
-    array.flush()
-    return array
-
-
 def _root_row(root, synthesized, presentation):
     row = synthesized.rows[presentation]
     payload = {
         "root_id": root["root_id"],
         "presentation": presentation,
         "teacher_width": synthesized.stats["teacher_width"],
-        "depth": synthesized.stats["depth"],
-        "rounds": row.rounds,
-        "thinking_tokens": row.thinking_tokens,
+        "teacher_depth": synthesized.stats["depth"],
+        "trace_text": row.trace_text,
+        "final_value": (
+            synthesized.round_audits[-1].wdl[0] - synthesized.round_audits[-1].wdl[2]
+        )
+        / 1000
+        if synthesized.round_audits[-1].wdl is not None
+        else None,
+        "trace_len": len(row.tokens),
         "final_move": row.final_move,
-        "final_value_bin": row.final_value_bin,
         "mate_distance": row.mate_distance,
-        "claim_draw": row.claim_draw,
     }
     for name in ROOT_ROW_FIELDS:
         if name in root:
@@ -797,67 +493,24 @@ def _champion_row(root, synthesized):
 
 
 def _write_shard(directory, records, metadata, presentations):
-    boards, traces, roles, lengths = [], [], [], []
-    no_tool, tool, best, basis, values, counts = [], [], [], [], [], []
-    root_rows = []
-    champion_rows = []
+    rows, champion_rows = [], []
     for synthesized in records:
         root = synthesized.root
-        board = encode_board(root["fen"], int(root["repetition"]))
         for presentation in presentations[root["root_id"]]:
             row = synthesized.rows[presentation]
-            boards.append(board)
-            traces.append(row.tokens)
-            roles.append(row.roles)
-            lengths.append(len(row.tokens))
-            no_tool.append([boundary.no_tool_end for boundary in row.boundaries])
-            tool.append([boundary.tool_end for boundary in row.boundaries])
-            best.append([boundary.best for boundary in row.boundaries])
-            basis.append([boundary.basis for boundary in row.boundaries])
-            values.append([boundary.value for boundary in row.boundaries])
-            counts.append(len(row.boundaries))
-            root_rows.append(_root_row(root, synthesized, presentation))
+            payload = _root_row(root, synthesized, presentation)
+            payload["trace_token_ids"] = row.tokens
+            for name, field in (("state_best", "best"), ("state_value", "value")):
+                payload[name] = [
+                    getattr(boundary, field) for boundary in row.boundaries
+                ]
+            rows.append(payload)
         champion_rows.append(_champion_row(root, synthesized))
-    if not boards:
+    if not rows:
         raise ValueError("A trace shard cannot be empty")
-    directory.mkdir(parents=True)
-    _array(
-        directory,
-        "board_tokens",
-        boards,
-        max(map(len, boards)),
-        np.int16,
-        PAD,
-    )
-    _array(
-        directory,
-        "trace_tokens",
-        traces,
-        max(map(len, traces)),
-        np.int16,
-        PAD,
-    )
-    _one_dimensional(directory, "trace_len", lengths, np.int32)
-    _array(
-        directory,
-        "trace_roles",
-        roles,
-        max(map(len, roles)),
-        np.int8,
-        0,
-    )
-    for name, rows in [
-        ("state_without_board", no_tool),
-        ("state_with_board", tool),
-        ("state_best", best),
-        ("state_basis", basis),
-        ("state_value", values),
-    ]:
-        _array(directory, name, rows, max(map(len, rows)), np.int32, -1)
-    _one_dimensional(directory, "state_count", counts, np.int32)
-    _write_jsonl(directory / "roots.jsonl", root_rows)
+    write_trace_rows(directory, rows)
     _write_jsonl(directory / "champions.jsonl", champion_rows)
-    payload = {**metadata, "rows": len(boards)}
+    payload = {**metadata, "rows": len(rows)}
     write_manifest(directory / "manifest.json", payload)
     return payload
 
@@ -876,7 +529,7 @@ def _recover_shard(output, index, roots, metadata, presentations):
     if not isinstance(manifest.get("rows"), int):
         raise FileExistsError(f"Unregistered shard has no valid row count: {final}")
     published = {"path": final.name, "rows": manifest["rows"]}
-    _, rows, _ = verify_shard_files(output, published, metadata)
+    _, rows = _read_shard_metadata(output, published, metadata)
     if {(row["root_id"], row["presentation"]) for row in rows} != _expected_root_rows(
         roots, presentations
     ):
@@ -885,7 +538,12 @@ def _recover_shard(output, index, roots, metadata, presentations):
     for row in rows:
         root = expected[row["root_id"]]
         for name in (*ROOT_ROW_FIELDS, "teacher_width", "depth"):
-            if name in root and row.get(name) != root[name]:
+            expected_value = root.get(name)
+            if (
+                name in root
+                and row.get("teacher_depth" if name == "depth" else name)
+                != expected_value
+            ):
                 raise FileExistsError(
                     f"Unregistered shard root {name} differs: {final}"
                 )
@@ -894,24 +552,34 @@ def _recover_shard(output, index, roots, metadata, presentations):
 
 def _check_shard_layout(output, shard, roots):
     """Reject a registered shard that no longer matches the current layout."""
-    stored = _read_jsonl(Path(output) / shard["path"] / "roots.jsonl")
+    stored = read_root_rows(Path(output) / shard["path"])
     if {row["root_id"] for row in stored} != {root["root_id"] for root in roots}:
         raise ValueError(
             f"Registered shard {shard['path']} covers different roots; "
             "the release was produced with a different shard layout"
         )
+    expected = {root["root_id"]: root for root in roots}
+    for row in stored:
+        root = expected[row["root_id"]]
+        for name in ROOT_ROW_FIELDS:
+            if name in root and row.get(name) != root[name]:
+                raise ValueError(f"Registered root {name} differs: {row['root_id']}")
 
 
-def _profile_shard(output, shard, metadata, profile):
-    _, rows, arrays = verify_shard_files(output, shard, metadata)
-    champions = {
-        row["root_id"]: row for row in _read_champions(Path(output) / shard["path"])
-    }
+def _profile_shard(output, shard, profile):
+    directory = Path(output) / shard["path"]
+    rows = read_root_rows(directory)
+    tokens = load_trace_arrays(directory, ("trace_token_ids",))["trace_token_ids"]
+    champions = {row["root_id"]: row for row in _read_champions(directory)}
     for index, row in enumerate(rows):
+        final = np.flatnonzero(tokens[index] == FINAL)
+        if len(final) != 1:
+            raise ValueError(f"Stored trace has no unique FINAL: {row['root_id']}")
         profile.add_stored(
             row,
             champions[row["root_id"]]["stats"],
-            int(arrays["trace_len"][index]),
+            row["trace_len"],
+            int(final[0]),
         )
 
 
@@ -940,7 +608,7 @@ def _release_metadata(identity):
 
 
 FINAL_SUFFIX_OPS = frozenset({"final", "final_evaluate", "final_pv", "end"})
-SEARCH_FIELDS = frozenset({"depth", "teacher_width", "hash_mb"})
+SEARCH_FIELDS = frozenset({"hash_mb"})
 BOARD_FIELDS = frozenset({"board_descent_hazard", "board_frontier_p"})
 PRESENTATION_FIELDS = frozenset(
     {
@@ -994,12 +662,12 @@ def _release_identity_contract(release, root_count):
         "presentation",
         "synthesis",
         "root_selection",
+        "recipe",
     }
     missing = required - set(metadata)
     if missing:
         raise ValueError(f"Release identity is missing {sorted(missing)[0]}")
-    if "recipe" in metadata:
-        parse_recipe(metadata["recipe"])
+    recipe = parse_recipe(metadata["recipe"])
 
     teacher = metadata["teacher"]
     if not isinstance(teacher, dict) or set(teacher) != TEACHER_FIELDS:
@@ -1021,17 +689,8 @@ def _release_identity_contract(release, root_count):
     search = metadata["search"]
     if not isinstance(search, dict) or set(search) != SEARCH_FIELDS:
         raise ValueError("Release identity has incomplete search settings")
-    if not _is_int(search["depth"], 1) or not _is_int(search["hash_mb"], 1):
+    if not _is_int(search["hash_mb"], 1):
         raise ValueError("Release search limits are invalid")
-    if not _is_int(search["teacher_width"], 1):
-        raise ValueError("Release teacher width is invalid")
-    # A recipe samples the width per root, so the fallback search width does
-    # not name the sidecar schema; the rows' recorded widths do, and
-    # validate_release checks the schema against them after reading a shard.
-    if "recipe" not in metadata and (teacher["schema_version"] == SIDECAR_SCHEMA) != (
-        search["teacher_width"] == 1
-    ):
-        raise ValueError("Release teacher schema differs from the teacher width")
 
     board = metadata["board"]
     if not isinstance(board, dict) or set(board) != BOARD_FIELDS:
@@ -1047,6 +706,11 @@ def _release_identity_contract(release, root_count):
         raise ValueError("Release presentation fractions are invalid")
     if abs(sum(fractions) - 1.0) > 1e-9:
         raise ValueError("Release presentation fractions do not sum to one")
+    if any(
+        presentation[name] != dict(recipe.presentations).get(name, 0.0)
+        for name in PRESENTATION_NAMES
+    ):
+        raise ValueError("Release presentation fractions differ from the recipe")
     if not (
         _is_probability(presentation["random_min_fraction"])
         and _is_probability(presentation["random_max_fraction"])
@@ -1092,18 +756,13 @@ def _release_identity_contract(release, root_count):
 
 
 def validate_release_identity(release):
-    complete = release.get("complete_root_ids")
-    if (
-        not isinstance(complete, list)
-        or not complete
-        or len(set(complete)) != len(complete)
-    ):
-        raise ValueError("Release root ids must be nonempty and unique")
-    return _release_identity_contract(release, len(complete))
+    rows = sum(shard["rows"] for shard in release["shards"])
+    if rows < 1:
+        raise ValueError("A release needs completed rows")
+    return _release_identity_contract(release, rows)
 
 
-def verify_shard_files(release_dir, shard, expected_metadata=None):
-    """Verify a published shard and return its manifest, roots, and arrays."""
+def _read_shard_metadata(release_dir, shard, expected_metadata=None):
     directory = Path(release_dir) / shard["path"]
     manifest = load_manifest(directory / "manifest.json")
     if expected_metadata is not None:
@@ -1112,9 +771,16 @@ def verify_shard_files(release_dir, shard, expected_metadata=None):
                 raise ValueError(f"Shard metadata {key} differs from its release")
     if manifest["rows"] != shard["rows"]:
         raise ValueError(f"Shard row count differs from its release: {directory}")
-    roots = _read_jsonl(directory / "roots.jsonl")
+    roots = read_root_rows(directory)
     if len(roots) != manifest["rows"]:
         raise ValueError(f"Shard roots do not match its manifest: {directory}")
+    return manifest, roots
+
+
+def verify_shard_files(release_dir, shard, expected_metadata=None):
+    """Diagnose a published shard's metadata and ragged array contract."""
+    manifest, roots = _read_shard_metadata(release_dir, shard, expected_metadata)
+    directory = Path(release_dir) / shard["path"]
     arrays = load_trace_arrays(directory, DATA_ARRAYS)
     validate_trace_arrays(arrays, rows=len(roots))
     return manifest, roots, arrays
@@ -1337,8 +1003,6 @@ def _validate_shard_rows(
     release_dir,
     shard,
     presentations,
-    default_width,
-    default_depth,
     recipe,
     seed,
     value_mate,
@@ -1369,17 +1033,21 @@ def _validate_shard_rows(
         if not isinstance(root_id, str) or presentation not in presentations:
             raise ValueError(f"Release row identity is invalid: {directory}")
         teacher_width = row.get("teacher_width")
-        depth = row.get("depth")
+        depth = row.get("teacher_depth")
         if not _is_int(teacher_width, 1) or not _is_int(depth, 1):
             raise ValueError(f"Release teacher settings are invalid: {root_id}")
-        if teacher_width != sample_width(recipe, seed, root_id, default_width):
+        board = chess.Board(row["fen"])
+        legal_width = board.legal_moves.count()
+        width, expected_depth = sample_search(recipe, seed, root_id)
+        expected_width = legal_width if width == "full" else width
+        if teacher_width != expected_width:
             raise ValueError(f"Release teacher width differs: {root_id}")
-        if depth != sample_depth(recipe, seed, root_id, default_depth):
+        if depth != expected_depth:
             raise ValueError(f"Release depth differs: {root_id}")
         if root_id not in expected_presentations:
             expected_presentations[root_id] = sample_presentation(recipe, seed, root_id)
         expected_presentation = expected_presentations[root_id]
-        if expected_presentation is not None and presentation != expected_presentation:
+        if presentation != expected_presentation:
             raise ValueError(f"Release presentation differs from the recipe: {root_id}")
         champion = champions.get(root_id)
         if champion is None:
@@ -1389,45 +1057,45 @@ def _validate_shard_rows(
             if expected is None:
                 raise ValueError(f"Release contains an unselected root: {root_id}")
             for name in (*ROOT_ROW_FIELDS, "teacher_width", "depth"):
-                if name in expected and row.get(name) != expected.get(name):
+                expected_value = expected.get(name)
+                if (
+                    name in expected
+                    and row.get("teacher_depth" if name == "depth" else name)
+                    != expected_value
+                ):
                     raise ValueError(
                         f"Release root {name} differs from its selection: {root_id}"
                     )
-        board = chess.Board(row["fen"])
         if board.turn != (row["turn"] == "white"):
             raise ValueError(f"Root turn disagrees with FEN: {root_id}")
-        effective_width = min(teacher_width, board.legal_moves.count())
+        effective_width = min(teacher_width, legal_width)
         max_teacher_width = max(max_teacher_width, teacher_width)
         repetition = row["repetition"]
         if not _is_int(repetition, 1) or repetition > 4:
             raise ValueError(f"Root repetition is out of range: {root_id}")
+        deepest_wdl = champion["rounds"][-1]["wdl"]
+        expected_value = (
+            None
+            if deepest_wdl is None
+            else float(np.float32((deepest_wdl[0] - deepest_wdl[2]) / 1000))
+        )
+        if row["final_value"] != expected_value:
+            raise ValueError(f"Final value differs from its teacher: {root_id}")
         if root_id not in checked_champions:
             if len(champion.get("rounds", [])) != depth:
                 raise ValueError(f"Champion record has the wrong depth: {root_id}")
             for entry in champion["rounds"]:
                 _check_champion_round(root_id, entry, board, value_mate, max_ply)
             checked_champions.add(root_id)
-        encoded = encode_board(row["fen"], repetition)
-        board_tokens = arrays["board_tokens"][index]
-        if not np.array_equal(board_tokens[: len(encoded)], encoded) or not np.all(
-            board_tokens[len(encoded) :] == PAD
-        ):
-            raise ValueError(f"Board tokens disagree with FEN: {root_id}")
 
         length = int(arrays["trace_len"][index])
-        tokens = arrays["trace_tokens"][index, :length]
-        if not np.all(arrays["trace_tokens"][index, length:] == PAD) or not np.all(
-            arrays["trace_roles"][index, length:] == 0
-        ):
-            raise ValueError(f"Trace padding is invalid: {root_id}")
+        tokens = arrays["trace_token_ids"][index]
         program = replay(
             tokens,
             row["fen"],
             repetition,
             teacher_width=effective_width,
         )
-        if not np.array_equal(program.roles, arrays["trace_roles"][index, :length]):
-            raise ValueError(f"Trace roles disagree with replay: {root_id}")
         max_trace = max(max_trace, length)
 
         board_spans = [
@@ -1471,17 +1139,6 @@ def _validate_shard_rows(
         count = int(arrays["state_count"][index])
         if count != len(expected_boundaries):
             raise ValueError(f"Truncation-state count is invalid: {root_id}")
-        actual_boundaries = list(
-            zip(
-                map(int, arrays["state_with_board"][index, :count]),
-                map(int, arrays["state_without_board"][index, :count]),
-            )
-        )
-        if actual_boundaries != expected_boundaries:
-            raise ValueError(f"Truncation boundaries are invalid: {root_id}")
-        for name in STATE_ARRAYS:
-            if not np.all(arrays[name][index, count:] == -1):
-                raise ValueError(f"Truncation-state padding is invalid: {root_id}")
         expected_states = _expected_states(
             program, tokens, champion, board.turn == chess.BLACK
         )
@@ -1489,11 +1146,10 @@ def _validate_shard_rows(
             raise ValueError(f"Truncation-state count is invalid: {root_id}")
         for position, expected_state in enumerate(expected_states):
             actual = (
-                int(arrays["state_best"][index, position]),
-                int(arrays["state_value"][index, position]),
-                int(arrays["state_basis"][index, position]),
+                int(arrays["state_best"][index][position]),
+                int(arrays["state_value"][index][position]),
             )
-            if actual != expected_state:
+            if actual != expected_state[:2]:
                 raise ValueError(f"Truncation state is invalid: {root_id}")
 
         final_step = next(step for step in program.steps if step.operation == "final")
@@ -1502,19 +1158,9 @@ def _validate_shard_rows(
         if root_id in suffixes and suffixes[root_id] != suffix:
             raise ValueError(f"Presentations disagree on the FINAL suffix: {root_id}")
         suffixes[root_id] = suffix
-        if row.get("thinking_tokens") != final_index:
-            raise ValueError(f"Thinking-token count is invalid: {root_id}")
-        rounds = sum(1 for token in tokens[:final_index] if token == DEPTH)
-        if row.get("rounds") != rounds:
-            raise ValueError(f"Row round count is invalid: {root_id}")
         final_move = program.final_move
         if row.get("final_move") != final_move:
             raise ValueError(f"FINAL move differs from the trace: {root_id}")
-        if row.get("claim_draw") != (final_move == CLAIM_DRAW_UCI):
-            raise ValueError(f"Draw-claim flag differs from the trace: {root_id}")
-        value_token = int(tokens[final_index + 2])
-        if row.get("final_value_bin") != value_token - VALUE:
-            raise ValueError(f"FINAL value bin differs from the trace: {root_id}")
         mate_distance = None
         mate_index = final_index + 3
         if mate_index < len(tokens) and MATE_WIN <= int(tokens[mate_index]) < PAD:
@@ -1537,12 +1183,6 @@ def _validate_shard_rows(
             raise ValueError(
                 f"FINAL mate distance differs from the champion: {root_id}"
             )
-        if deepest["wdl"] is None:
-            expected_bin = 19 if deepest["mate"] > 0 else 0
-        else:
-            expected_bin = value_bin((deepest["wdl"][0] - deepest["wdl"][2]) / 1000)
-        if row.get("final_value_bin") != expected_bin:
-            raise ValueError(f"FINAL value bin differs from the champion: {root_id}")
         pv_start = final_index + (4 if mate_distance is not None else 3)
         pv_tokens = [int(token) for token in tokens[pv_start:-1]]
         mirrored = board.turn == chess.BLACK
@@ -1565,10 +1205,7 @@ def _validate_shard_rows(
     if roots_seen != set(champions):
         raise ValueError(f"Shard rows do not cover its champion records: {directory}")
     for root_id, count in presentations_seen.items():
-        wanted = (
-            1 if expected_presentations[root_id] is not None else len(PRESENTATIONS)
-        )
-        if count != wanted:
+        if count != 1:
             raise ValueError(f"A shard root has the wrong row count: {directory}")
     for champion in champions.values():
         rounds = champion["rounds"]
@@ -1614,17 +1251,12 @@ def validate_release(directory, roots=None, workers=8):
     for key, value in expected_metadata.items():
         if release.get(key) != value:
             raise ValueError(f"Release metadata {key} is unsupported")
-    complete = release["complete_root_ids"]
+    complete = sum(shard["rows"] for shard in release["shards"])
     metadata = validate_release_identity(release)
     teacher = metadata["teacher"]
-    search = metadata["search"]
-    recipe = parse_recipe(metadata["recipe"]) if "recipe" in metadata else None
+    recipe = parse_recipe(metadata["recipe"])
     seed = metadata["root_selection"]["seed"]
-    presentations = (
-        tuple(name for name, _ in recipe.presentations)
-        if recipe is not None and recipe.presentations is not None
-        else PRESENTATIONS
-    )
+    presentations = tuple(name for name, _ in recipe.presentations)
     expected_shard_metadata = {**expected_metadata, **shard_configuration(metadata)}
     expected = None
     if roots is not None:
@@ -1642,8 +1274,6 @@ def validate_release(directory, roots=None, workers=8):
 
     context = (
         presentations,
-        search["teacher_width"],
-        search["depth"],
         recipe,
         seed,
         teacher["value_mate"],
@@ -1661,6 +1291,7 @@ def validate_release(directory, roots=None, workers=8):
             pool = stack.enter_context(
                 ProcessPoolExecutor(
                     max_workers=workers,
+                    mp_context=get_context("spawn"),
                     initializer=_init_validation_worker,
                     initargs=(directory, *context),
                 )
@@ -1681,18 +1312,18 @@ def validate_release(directory, roots=None, workers=8):
     expected_schema = SIDECAR_SCHEMA_WIDE if max_teacher_width > 1 else SIDECAR_SCHEMA
     if teacher["schema_version"] != expected_schema:
         raise ValueError("Release teacher schema differs from its rows")
-    if seen_roots != set(complete) or len(seen) != len(complete):
+    if len(seen_roots) != complete or len(seen) != complete:
         raise ValueError("Release rows do not match its roots")
     if expected is not None:
         wanted = {
             (root_id, sample_presentation(recipe, seed, root_id))
             for root_id in expected
         }
-        if seen != wanted or set(complete) != set(expected):
+        if seen != wanted:
             raise ValueError("Release does not contain exactly the selected roots")
     result = {
         "ok": True,
-        "roots": len(complete),
+        "roots": complete,
         "rows": len(seen),
         "states": states,
         "board_responses": board_responses,
@@ -1709,59 +1340,42 @@ def sample_root_settings(roots, config, seed):
     sampled = []
     for root in roots:
         result = dict(root)
-        result["teacher_width"] = sample_width(
-            config.sampling, seed, root["root_id"], config.search.teacher_width
-        )
-        result["depth"] = sample_depth(
-            config.sampling, seed, root["root_id"], config.search.depth
-        )
-        result["presentation"] = (
-            sample_presentation(config.sampling, seed, root["root_id"]) or "full"
+        width, result["depth"] = sample_search(config.sampling, seed, root["root_id"])
+        legal_width = chess.Board(root["fen"]).legal_moves.count()
+        result["teacher_width"] = legal_width if width == "full" else width
+        result["effective_width"] = min(result["teacher_width"], legal_width)
+        result["presentation"] = sample_presentation(
+            config.sampling, seed, root["root_id"]
         )
         sampled.append(result)
     return sampled
 
 
-def _engine_lines(engine_path, root, config):
+def _engine_sidecar(engine, root):
     from tempfile import TemporaryDirectory
 
-    width, depth = _root_teacher(root, config)
+    width, depth = _root_teacher(root)
     with TemporaryDirectory(prefix="pondera-sidecar-") as directory:
         trace_path = Path(directory) / "trace.jsonl"
-        bestmove = _run_engine(
-            engine_path, root["fen"], config, trace_path, width, depth
-        )
+        try:
+            bestmove = engine.search(root["fen"], trace_path, width, depth)
+        except CollectionError as error:
+            raise CollectionError(f"{error} for root {root['root_id']}") from error
         if not trace_path.is_file():
             raise CollectionError(f"Engine wrote no sidecar for root {root['root_id']}")
-        lines = trace_path.read_text(encoding="utf-8").splitlines()
-    return lines, bestmove
+        with trace_path.open("rb") as handle:
+            sidecar = decode_sidecar(handle)
+    return sidecar, bestmove
 
 
-def _process_root(root, config, lines, bestmove=None, engine_name=None, teacher=None):
-    """Run the complete single-root contract without any intermediate files."""
-    width, _ = _root_teacher(root, config)
-    sidecar = parse_sidecar(
-        lines,
-        teacher_width=width,
-        source=f"root {root['root_id']}",
-    )
+def _process_root(root, config, sidecar, bestmove=None, engine_name=None, teacher=None):
+    """Synthesize one decoded producer record after checking search completion."""
     _check_sidecar(root, sidecar, config, engine_name or sidecar.engine, teacher)
     if bestmove is not None and sidecar.search_end["bestmove"] != bestmove:
         raise CollectionError(
             f"bestmove differs from the sidecar for {root['root_id']}"
         )
-    synthesized = synthesize_root(sidecar, root, config)
-    presentation = root.get("presentation") or "full"
-    row = synthesized.rows[presentation]
-    program = replay(
-        row.tokens,
-        root["fen"],
-        int(root["repetition"]),
-        teacher_width=sidecar.width,
-    )
-    if tuple(program.roles) != tuple(row.roles):
-        raise SynthesisError(f"replayed roles differ for {root['root_id']}")
-    return synthesized
+    return synthesize_root(sidecar, root, config)
 
 
 def _provider_lines(provider, root):
@@ -1773,36 +1387,127 @@ def _provider_lines(provider, root):
     return list(value), None
 
 
+def _collect_root(root, config, engine, engine_name, teacher, provider=None):
+    """Build one row without cyclic-GC scans of temporary acyclic events."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        if provider is not None:
+            lines, bestmove = _provider_lines(provider, root)
+            sidecar = decode_sidecar(lines)
+        else:
+            sidecar, bestmove = _engine_sidecar(engine, root)
+        result = _process_root(
+            root,
+            config,
+            sidecar,
+            bestmove=bestmove,
+            engine_name=None if provider is not None else engine_name,
+            teacher=teacher,
+        )
+        # Release the event graph before automatic collection resumes.
+        del sidecar
+        return result
+    finally:
+        if enabled:
+            gc.enable()
+
+
 def _direct_worker(root):
-    lines, bestmove = _engine_lines(_DIRECT_ENGINE, root, _DIRECT_CONFIG)
-    return _process_root(
-        root,
-        _DIRECT_CONFIG,
-        lines,
-        bestmove=bestmove,
-        engine_name=_DIRECT_NAME,
-        teacher=_DIRECT_TEACHER,
+    return _collect_root(
+        root, _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_NAME, _DIRECT_TEACHER
     )
 
 
 def _init_direct_worker(config, engine_path, engine_name, teacher):
     global _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_NAME, _DIRECT_TEACHER
     _DIRECT_CONFIG = config
-    _DIRECT_ENGINE = engine_path
+    _DIRECT_ENGINE = _Engine(
+        engine_path, config.search.hash_mb, config.search.timeout_seconds
+    )
+    Finalize(None, _DIRECT_ENGINE.close, exitpriority=10)
     _DIRECT_NAME = engine_name
     _DIRECT_TEACHER = teacher
 
 
-def _identity_for(config, roots, engine_name="stockfish"):
-    root_path = Path(config.paths.roots)
+def _synthesize_groups(
+    groups, config, engine_path, engine_name, teacher, provider, workers
+):
+    """Keep one pool busy across two shards, bounding retained results."""
+    if not groups:
+        return
+    if provider is not None or workers == 1:
+        with ExitStack() as stack:
+            engine = (
+                None
+                if provider is not None
+                else stack.enter_context(
+                    _Engine(
+                        engine_path,
+                        config.search.hash_mb,
+                        config.search.timeout_seconds,
+                    )
+                )
+            )
+            for index, group in groups:
+                records = []
+                for root in group:
+                    records.append(
+                        _collect_root(
+                            root,
+                            config,
+                            engine,
+                            engine_name,
+                            teacher,
+                            provider,
+                        )
+                    )
+                yield index, group, records
+        return
+    workers = min(workers, sum(len(group) for _, group in groups))
+    groups = iter(groups)
+    pending = {}
+    active = {}
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=get_context("spawn"),
+        initializer=_init_direct_worker,
+        initargs=(config, engine_path, engine_name, teacher),
+    ) as pool:
+
+        def submit_group():
+            item = next(groups, None)
+            if item is None:
+                return
+            index, group = item
+            records = [None] * len(group)
+            active[index] = (group, records, len(group))
+            for position, root in enumerate(group):
+                pending[pool.submit(_direct_worker, root)] = (index, position)
+
+        submit_group()
+        submit_group()
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                index, position = pending.pop(future)
+                group, records, remaining = active[index]
+                records[position] = future.result()
+                remaining -= 1
+                if remaining:
+                    active[index] = (group, records, remaining)
+                else:
+                    del active[index]
+                    yield index, group, records
+                    submit_group()
+
+
+def _identity_for(config, roots, engine_name="stockfish", root_source=None):
     return {
         "teacher": {
             "schema_version": (
                 SIDECAR_SCHEMA_WIDE
-                if any(
-                    root.get("teacher_width", config.search.teacher_width) > 1
-                    for root in roots
-                )
+                if any(root["teacher_width"] > 1 for root in roots)
                 else SIDECAR_SCHEMA
             ),
             "value_mate": 32000,
@@ -1814,8 +1519,8 @@ def _identity_for(config, roots, engine_name="stockfish"):
         "presentation": config.presentation_dict(),
         "synthesis": config.synthesis_dict(),
         "root_selection": {
-            "source": str(root_path),
-            "algorithm": "trace.toml",
+            "source": str(root_source) if root_source is not None else "in-memory",
+            "algorithm": "stratified",
             "seed": config.seed,
             "requested": len(roots),
             "counts": {
@@ -1829,49 +1534,6 @@ def _identity_for(config, roots, engine_name="stockfish"):
         },
         "recipe": config.sampling.identity(),
     }
-
-
-def _ensure_root_pool(config):
-    """Load or directly build the cached root pool required by the config."""
-    from pondera.data.roots import build_pool, ensure_archive, read_roots
-
-    path = Path(config.paths.roots)
-    parameters = {
-        "train": config.roots.train,
-        "val": config.roots.val,
-        "claimable_share": config.roots.claimable_share,
-    }
-    manifest = (
-        load_manifest(path.parent / "pool.manifest.json") if path.is_file() else {}
-    )
-    expected_source = Path(config.paths.archive)
-    cache_matches = (
-        path.is_file()
-        and manifest.get("kind") == "elite-root-pool"
-        and manifest.get("seed") == config.seed
-        and manifest.get("parameters") == parameters
-        and manifest.get("source", {}).get("file") == expected_source.name
-    )
-    if not path.is_file() or (manifest and not cache_matches):
-        archive = expected_source
-        if not archive.is_file():
-            archive = ensure_archive(archive.parent)
-        build_pool(
-            archive,
-            path.parent,
-            config.roots.train,
-            config.roots.val,
-            config.roots.claimable_share,
-            config.seed,
-        )
-        generated = path.parent / "roots.jsonl"
-        if generated != path:
-            generated.replace(path)
-    raw_roots = read_roots(path)
-    roots = sample_root_settings(raw_roots, config, config.seed)
-    if roots != raw_roots:
-        _write_jsonl(path, roots)
-    return roots
 
 
 @contextmanager
@@ -1894,12 +1556,14 @@ def produce_shards(
     workers=None,
     start_shard=0,
     end_shard=None,
+    engine="stockfish",
+    root_source=None,
 ):
     """Produce shards directly from roots, with optional fixture sidecars.
 
     ``sidecar_for_root`` is a callable/mapping used by tests and offline
-    converters. When it is omitted, each worker runs a fresh instrumented
-    engine and the sidecar exists only in a temporary directory.
+    converters. When it is omitted, each worker resets its instrumented
+    engine for each root; sidecars exist only in temporary directories.
     """
     roots = sample_root_settings(list(roots), config, config.seed)
     if not roots:
@@ -1916,19 +1580,19 @@ def produce_shards(
     engine_name = "stockfish"
     teacher = None
     if sidecar_for_root is None:
-        engine_path = _engine_path(config)
+        engine_path = _engine_path(engine)
         engine_name = "Stockfish 17.1"
         teacher = (32000, 246)
-    identity = identity or _identity_for(config, roots, engine_name=engine_name)
+    identity = identity or _identity_for(
+        config, roots, engine_name=engine_name, root_source=root_source
+    )
     release_metadata = _release_metadata(identity)
     shard_metadata = {
         key: value
         for key, value in release_metadata.items()
         if key not in RELEASE_ONLY_METADATA
     }
-    presentations = {
-        root["root_id"]: (root.get("presentation") or "full",) for root in roots
-    }
+    presentations = {root["root_id"]: (root["presentation"],) for root in roots}
     release_path = output_dir / "release.json"
     previous = load_manifest(release_path)
     if previous and previous.get("metadata") != identity:
@@ -1940,6 +1604,7 @@ def produce_shards(
         (index, roots[start : start + shard_size])
         for index, start in enumerate(range(0, len(roots), shard_size))
     ]
+    ready, pending = [], []
     for index, group in groups:
         if index < start_shard or (end_shard is not None and index >= end_shard):
             continue
@@ -1951,38 +1616,27 @@ def produce_shards(
             shard = _recover_shard(
                 output_dir, index, group, shard_metadata, presentations
             )
+            ready.append((index, group, shard))
         else:
-            if sidecar_for_root is not None:
-                records = []
-                for root in group:
-                    lines, bestmove = _provider_lines(sidecar_for_root, root)
-                    records.append(
-                        _process_root(root, config, lines, bestmove=bestmove)
-                    )
-            elif workers == 1:
-                records = []
-                for root in group:
-                    lines, bestmove = _engine_lines(engine_path, root, config)
-                    records.append(
-                        _process_root(
-                            root,
-                            config,
-                            lines,
-                            bestmove=bestmove,
-                            engine_name=engine_name,
-                            teacher=teacher,
-                        )
-                    )
-            else:
-                with ProcessPoolExecutor(
-                    max_workers=min(workers, len(group)),
-                    initializer=_init_direct_worker,
-                    initargs=(config, engine_path, engine_name, teacher),
-                ) as pool:
-                    records = list(pool.map(_direct_worker, group))
+            pending.append((index, group))
+
+    def completed_shards():
+        yield from ready
+        for index, group, records in _synthesize_groups(
+            pending,
+            config,
+            engine_path,
+            engine_name,
+            teacher,
+            sidecar_for_root,
+            workers,
+        ):
             shard = _publish_shard(
                 output_dir, index, records, shard_metadata, presentations
             )
+            yield index, group, shard
+
+    for index, group, shard in completed_shards():
         with _release_lock(output_dir):
             current = load_manifest(release_path)
             if current and current.get("metadata") != identity:
@@ -1994,68 +1648,46 @@ def produce_shards(
                 for item in current.get("shards", [])
             }
             shards_by_index[index] = shard
-            complete = set(current.get("complete_root_ids", []))
-            complete.update(root["root_id"] for root in group)
             write_manifest(
                 release_path,
                 {
                     **release_metadata,
                     "metadata": identity,
                     "shards": [shards_by_index[key] for key in sorted(shards_by_index)],
-                    "complete_root_ids": sorted(complete),
                 },
             )
     with _release_lock(output_dir):
         current = load_manifest(release_path)
-        complete = set(current.get("complete_root_ids", []))
+        complete = sum(shard["rows"] for shard in current.get("shards", []))
         profile = RootProfile(presentations)
         for shard in current.get("shards", []):
-            _profile_shard(output_dir, shard, shard_metadata, profile)
+            _profile_shard(output_dir, shard, profile)
         statistics = profile.result() if profile.roots else None
         if statistics is not None:
-            statistics["complete"] = len(complete) == len(roots)
+            statistics["complete"] = complete == len(roots)
             write_manifest(output_dir / "statistics.json", statistics)
     return {
         "shards": current.get("shards", []),
-        "roots": len(complete),
-        "pending": len(roots) - len(complete),
+        "roots": complete,
+        "pending": len(roots) - complete,
         "release": str(release_path),
         "statistics": statistics,
     }
 
 
-def run_pipeline(config, start_shard=0, end_shard=None, workers=None):
-    roots = _ensure_root_pool(config)
+def run_pipeline(config, roots, output, engine="stockfish"):
+    """Curate traces from a prepared pool without modifying its records."""
+    from pondera.data.roots.pool import read_roots
+
+    roots = Path(roots)
+    if roots.is_dir():
+        roots /= "roots.jsonl"
     return produce_shards(
-        roots,
-        config.paths.output,
+        read_roots(roots),
+        output,
         config,
-        workers=workers,
-        start_shard=start_shard,
-        end_shard=end_shard,
+        start_shard=config.release.start_shard,
+        end_shard=config.release.end_shard,
+        engine=engine,
+        root_source=roots,
     )
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), type=Path)
-    parser.add_argument("--start-shard", type=int, default=0)
-    parser.add_argument("--end-shard", type=int)
-    parser.add_argument("--workers", type=int)
-    args = parser.parse_args()
-    result = run_pipeline(
-        load_config(args.config),
-        start_shard=args.start_shard,
-        end_shard=args.end_shard,
-        workers=args.workers,
-    )
-    print(
-        json.dumps(
-            {key: value for key, value in result.items() if key != "statistics"},
-            indent=2,
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()

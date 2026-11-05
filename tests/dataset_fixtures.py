@@ -5,9 +5,13 @@ from pathlib import Path
 import chess
 import numpy as np
 
-from pondera.chess.codec import encode_board
-from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION, PAD
-from pondera.data.dataset import DATA_FORMAT_VERSION, write_manifest
+from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
+from pondera.data.dataset import (
+    DATA_FORMAT_VERSION,
+    STATE_ARRAYS,
+    write_manifest,
+    write_trace_rows,
+)
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 
@@ -41,29 +45,22 @@ def write_trace_dataset(root, splits):
         "grammar_version": TRACE_GRAMMAR_VERSION,
         "tokenizer_version": CHESS_TOKENIZER_VERSION,
     }
-    for split, rows in splits.items():
-        boards = [encode_board(row["fen"], row.get("repetition", 1)) for row in rows]
-        width = max(len(board) for board in boards)
-        board_array = np.full((len(rows), width), PAD, dtype=np.int16)
-        for index, board in enumerate(boards):
-            board_array[index, : len(board)] = board
-        trace_width = max(len(row["trace"]) for row in rows)
-        trace_array = np.full((len(rows), trace_width), PAD, dtype=np.int16)
-        length_array = np.zeros(len(rows), dtype=np.int32)
-        role_array = np.full((len(rows), trace_width), 0, dtype=np.int8)
-        for index, row in enumerate(rows):
-            tokens, roles = row["trace"], row["roles"]
-            trace_array[index, : len(tokens)] = tokens
-            role_array[index, : len(roles)] = roles
-            length_array[index] = len(tokens)
-        for name, array in (
-            ("board_tokens", board_array),
-            ("trace_tokens", trace_array),
-            ("trace_len", length_array),
-            ("trace_roles", role_array),
-        ):
-            np.save(root / f"{name}_{split}.npy", array)
-        manifest[f"rows_{split}"] = len(rows)
-        manifest[f"t_max_{split}"] = trace_width
-    write_manifest(root / "manifest.json", manifest)
+    manifest["shards"] = []
+    for index, (split, rows) in enumerate(splits.items()):
+        records = []
+        for row in rows:
+            records.append(
+                {
+                    "split": split,
+                    "fen": row["fen"],
+                    "repetition": row.get("repetition", 1),
+                    "trace_token_ids": row["trace"],
+                    "trace_len": len(row["trace"]),
+                    **{name: [] for name in STATE_ARRAYS},
+                }
+            )
+        name = f"shard-{index:06d}"
+        write_trace_rows(root / name, records)
+        manifest["shards"].append({"path": name, "rows": len(records)})
+    write_manifest(root / "release.json", manifest)
     return root

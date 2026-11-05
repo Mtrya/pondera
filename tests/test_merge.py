@@ -1,7 +1,6 @@
 """Min-cost merge encoding: dictionary contract, optimality, and round trips."""
 
 import json
-import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -22,7 +21,7 @@ from pondera.chess.merge import (
     usage_counts,
 )
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
-from pondera.data.pipeline import load_config
+from pondera.data.config import load_config
 from pondera.data.trace import load_sidecar, synthesize_root
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
@@ -35,26 +34,17 @@ def release_rows(cases=CASES):
     The fixtures are the sidecars of an actual depth-4 search, so these are
     the same rows a release shard would carry, only without the release shell.
     """
-    with tempfile.TemporaryDirectory() as directory:
-        config_path = Path(directory) / "trace.toml"
-        config_path.write_text(
-            Path("configs/trace.toml")
-            .read_text(encoding="utf-8")
-            .replace("depths = 16", "depths = 4"),
-            encoding="utf-8",
+    config = load_config()
+    rows = []
+    for case in cases:
+        fixture = FIXTURES / case
+        root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
+        sidecar = load_sidecar(fixture / "sidecar.jsonl")
+        synthesized = synthesize_root(sidecar, root, config)
+        rows.extend(
+            np.asarray(row.tokens, dtype=np.int64) for row in synthesized.rows.values()
         )
-        config = load_config(config_path)
-        rows = []
-        for case in cases:
-            fixture = FIXTURES / case
-            root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
-            sidecar = load_sidecar(fixture / "sidecar.jsonl")
-            synthesized = synthesize_root(sidecar, root, config)
-            rows.extend(
-                np.asarray(row.tokens, dtype=np.int64)
-                for row in synthesized.rows.values()
-            )
-        return rows
+    return rows
 
 
 def exhaustive_minimum(tokens, dictionary):
@@ -194,39 +184,15 @@ class SelectionTests(unittest.TestCase):
         self.assertLessEqual(len(dictionary), 2)
 
 
-class DictionaryFormatTests(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.path = Path(self.directory.name) / "dictionary.tsv"
-
-    def test_write_and_read_round_trip_the_v1_layout(self):
-        dictionary = MergeDictionary(((1, 2), (5, 6, 7), tuple(range(8))))
-        dictionary.write(self.path)
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[0], f"{CHESS_VOCAB_SIZE}\t1 2")
-        self.assertEqual(lines[1], f"{CHESS_VOCAB_SIZE + 1}\t5 6 7")
-        self.assertEqual(MergeDictionary.read(self.path), dictionary)
-
-    def test_malformed_files_raise(self):
-        base = CHESS_VOCAB_SIZE
-        malformed = [
-            f"{base + 1}\t1 2\n",
-            f"{base}\t1 2\n{base}\t3 4\n",
-            f"{base}\t1\n",
-            f"{base}\t" + " ".join(["1"] * 9) + "\n",
-            f"{base}\t1 {base}\n",
-            f"{base} 1 2\n",
-            f"{base}\t1 2\n{base + 1}\t1 2\n",
-        ]
-        for text in malformed:
-            with self.subTest(text=text):
-                self.path.write_text(text, encoding="utf-8")
-                with self.assertRaises(MergeDictionaryError):
-                    MergeDictionary.read(self.path)
-
+class DictionaryTests(unittest.TestCase):
     def test_constructor_rejects_out_of_contract_entries(self):
-        for entries in [((1,),), (tuple(range(9)),), ((CHESS_VOCAB_SIZE, 1),)]:
+        for entries in [
+            ((1,),),
+            (tuple(range(9)),),
+            ((CHESS_VOCAB_SIZE, 1),),
+            ((1, -1),),
+            ((1, 2), (1, 2)),
+        ]:
             with self.subTest(entries=entries):
                 with self.assertRaises(MergeDictionaryError):
                     MergeDictionary(entries)

@@ -17,7 +17,12 @@ from pondera.chess.vocabulary import (
     PAD,
     UCI_MOVE_TO_IDX,
 )
-from pondera.data.dataset import DATA_FORMAT_VERSION, TracePositions
+from pondera.data.dataset import (
+    DATA_FORMAT_VERSION,
+    STATE_ARRAYS,
+    TracePositions,
+    write_trace_rows,
+)
 from pondera.data.trace import (
     ROLE_CONTROL,
     ROLE_FINAL_EVAL,
@@ -72,23 +77,25 @@ class DatasetContractTests(unittest.TestCase):
         )
 
     def test_manifest_carries_the_current_grammar(self):
-        manifest = json.loads((self.data / "manifest.json").read_text())
+        manifest = json.loads((self.data / "release.json").read_text())
         self.assertEqual(manifest["grammar_version"], TRACE_GRAMMAR_VERSION)
         self.assertEqual(manifest["grammar_version"], 2)
         self.assertEqual(manifest["format_version"], DATA_FORMAT_VERSION)
-        self.assertEqual(manifest["format_version"], 6)
+        self.assertEqual(manifest["format_version"], 11)
         self.assertEqual(manifest["tokenizer_version"], CHESS_TOKENIZER_VERSION)
 
-    def test_reads_format_five_trace_arrays(self):
-        manifest_path = self.data / "manifest.json"
+    def test_rejects_old_trace_formats(self):
+        manifest_path = self.data / "release.json"
         manifest = json.loads(manifest_path.read_text())
-        manifest["format_version"] = 5
-        manifest_path.write_text(json.dumps(manifest))
-        positions = TracePositions(self.data, "train")
-        self.assertEqual(len(positions), 3)
+        for version in (5, 6, 7):
+            with self.subTest(version=version):
+                manifest["format_version"] = version
+                manifest_path.write_text(json.dumps(manifest))
+                with self.assertRaises(ValueError):
+                    TracePositions(self.data, "train")
 
     def test_dataset_rejects_a_missing_grammar_version(self):
-        manifest_path = self.data / "manifest.json"
+        manifest_path = self.data / "release.json"
         manifest = json.loads(manifest_path.read_text())
         del manifest["grammar_version"]
         manifest_path.write_text(json.dumps(manifest))
@@ -98,18 +105,29 @@ class DatasetContractTests(unittest.TestCase):
     def test_dataset_arrays_and_roles(self):
         positions = TracePositions(self.data, "train")
         self.assertEqual(len(positions), 3)
-        boards, trace, length, roles = positions[0]
-        self.assertEqual(len(trace), positions.trace.shape[1])
+        boards, trace, length = positions[0]
+        self.assertEqual(len(trace), length)
         self.assertEqual(int(length), len(self.rows[0]["trace"]))
         self.assertEqual(trace[:length].tolist(), self.rows[0]["trace"].tolist())
-        self.assertEqual(roles[:length].tolist(), self.rows[0]["roles"].tolist())
-        self.assertTrue(np.all(roles[length:] == ROLE_PAD))
+        roles = TraceCollator()([positions[0]])["trace_roles"][0].numpy()
+        self.assertEqual(roles.tolist(), self.rows[0]["roles"].tolist())
         # The decision follows FINAL, and the trace closes with <end>.
         self.assertEqual(int(trace[length - 1]), END)
         decision = int(np.flatnonzero(roles[:length] == ROLE_FINAL_MOVE)[0])
         self.assertEqual(int(trace[decision - 1]), FINAL)
         self.assertNotEqual(decision, length - 1)
         self.assertEqual(int(roles[length - 1]), ROLE_CONTROL)
+
+    def test_ragged_rows_cross_parquet_row_groups(self):
+        rows = [self.rows[index % len(self.rows)] for index in range(130)]
+        directory = write_trace_dataset(self.root / "groups", {"train": rows})
+        positions = TracePositions(directory, "train")
+        for index in (129, 0, 63, 64, 127, 128, 1):
+            board, tokens, length = positions[index]
+            expected = rows[index]
+            self.assertEqual(tokens.tolist(), expected["trace"].tolist())
+            self.assertEqual(length, len(tokens))
+            self.assertEqual(board.tolist(), encode_board(expected["fen"]).tolist())
 
     def test_collator_pads_tokens_and_locates_the_final_decision(self):
         positions = TracePositions(self.data, "train")
@@ -118,9 +136,10 @@ class DatasetContractTests(unittest.TestCase):
         width = max(int(row[2]) for row in rows)
         self.assertEqual(batch["trace_ids"].shape, (len(rows), width))
         self.assertEqual(batch["trace_roles"].shape, (len(rows), width))
-        self.assertEqual(batch["trace_ids"].dtype, torch.int16)
+        self.assertEqual(batch["trace_ids"].dtype, torch.int32)
         self.assertEqual(batch["trace_roles"].dtype, torch.int8)
-        for index, (_, trace, length, roles) in enumerate(rows):
+        for index, (_, trace, length) in enumerate(rows):
+            roles = self.rows[index]["roles"]
             self.assertEqual(
                 batch["trace_ids"][index, :length].tolist(), trace[:length].tolist()
             )
@@ -158,7 +177,6 @@ class CollatorContractTests(unittest.TestCase):
                     encode_board(chess.STARTING_FEN),
                     self.trace,
                     len(self.trace),
-                    self.roles,
                 )
             ]
         )
@@ -169,7 +187,7 @@ class CollatorContractTests(unittest.TestCase):
 
 
 def write_shard(directory, index, fen):
-    """Publish one one-row shard whose board array is exactly its own width."""
+    """Publish one one-row shard with the current local schema."""
     board = chess.Board(fen)
     writer = TraceWriter(fen)
     writer.final(sorted(move.uci() for move in board.legal_moves)[0])
@@ -177,20 +195,19 @@ def write_shard(directory, index, fen):
     writer.end()
     shard = directory / f"shard-{index:06d}"
     shard.mkdir()
-    np.save(shard / "board_tokens.npy", encode_board(fen)[None, :])
-    np.save(shard / "trace_tokens.npy", writer.tokens[None, :])
-    np.save(shard / "trace_len.npy", np.asarray([len(writer.tokens)], dtype=np.int32))
-    np.save(shard / "trace_roles.npy", writer.roles[None, :])
-    for name in (
-        "state_without_board",
-        "state_with_board",
-        "state_best",
-        "state_basis",
-        "state_value",
-    ):
-        np.save(shard / f"{name}.npy", np.zeros((1, 0), dtype=np.int32))
-    np.save(shard / "state_count.npy", np.zeros(1, dtype=np.int32))
-    (shard / "roots.jsonl").write_text(json.dumps({"split": "train"}) + "\n")
+    write_trace_rows(
+        shard,
+        [
+            {
+                "split": "train",
+                "fen": fen,
+                "repetition": 1,
+                "trace_token_ids": writer.tokens,
+                "trace_len": len(writer.tokens),
+                **{name: [] for name in STATE_ARRAYS},
+            }
+        ],
+    )
     return shard.name
 
 
@@ -219,7 +236,7 @@ class MixedShardCollationTests(unittest.TestCase):
 
             batch = TraceCollator()(rows)
             self.assertEqual(batch["ids"].shape, (len(rows), max(widths)))
-            for index, (board, trace, length, roles) in enumerate(rows):
+            for index, (board, trace, length) in enumerate(rows):
                 self.assertEqual(
                     batch["ids"][index, : widths[index]].tolist(), board.tolist()
                 )

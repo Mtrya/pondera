@@ -2,19 +2,22 @@
 
 The module is deliberately free of pipeline, filesystem-layout, and training
 concerns. ``TraceWriter`` and ``replay`` implement the grammar; ``parse_sidecar``
-validates one instrumented Stockfish record; ``synthesize_root`` translates a
-validated record into presentation rows. The pipeline composes these functions
-in memory for each root.
+provides exhaustive producer diagnostics. Normal curation decodes qualified
+producer output and synthesizes presentation rows without replaying the search.
 """
 
 import json
 import math
 import random
+from bisect import bisect_right
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
+from typing import NamedTuple
 
 import chess
 import numpy as np
+import orjson
 
 from pondera.chess.codec import (
     decode_board,
@@ -113,6 +116,59 @@ def is_eval_token(token):
 
 def is_metadata_token(token):
     return SIDE <= token <= META_END
+
+
+def derive_trace_roles(tokens):
+    """Recover token roles from grammar delimiters without chess replay."""
+    tokens = [int(token) for token in tokens]
+    roles = []
+    index = 0
+    suffix = False
+    while index < len(tokens):
+        token = tokens[index]
+        if not suffix and token == BOARD:
+            roles.append(ROLE_CONTROL)
+            index += 1
+            start = index
+            while index < len(tokens) and tokens[index] < MOVE:
+                roles.append(ROLE_BOARD)
+                index += 1
+            observation = tokens[start:index]
+            if (
+                len(observation) < 9
+                or any(token >= SIDE for token in observation[:-8])
+                or any(token < SIDE for token in observation[-8:])
+            ):
+                raise ValueError("A BOARD operation has an invalid observation")
+            continue
+        if not suffix:
+            if token == FINAL:
+                suffix = True
+                roles.append(ROLE_CONTROL)
+            elif token == REFUTED:
+                roles.append(ROLE_REFUTED)
+            elif is_move_token(token):
+                roles.append(ROLE_MOVE)
+            elif is_eval_token(token):
+                roles.append(ROLE_EVAL)
+            elif token in {BACK, RESET, DEPTH}:
+                roles.append(ROLE_CONTROL)
+            else:
+                raise ValueError(f"Unexpected thought token {token} at index {index}")
+        elif index > 0 and tokens[index - 1] == FINAL:
+            if not is_move_token(token):
+                raise ValueError("FINAL must be followed by a decision")
+            roles.append(ROLE_FINAL_MOVE)
+        elif token == END:
+            roles.append(ROLE_CONTROL)
+        elif is_move_token(token):
+            roles.append(ROLE_FINAL_PV)
+        elif is_eval_token(token):
+            roles.append(ROLE_FINAL_EVAL)
+        else:
+            raise ValueError(f"Unexpected final token {token} at index {index}")
+        index += 1
+    return np.asarray(roles, dtype=np.int8)
 
 
 @dataclass(frozen=True)
@@ -852,6 +908,21 @@ class TraceWriter:
     def __init__(self, root_fen: str, repetition: int = 1, teacher_width: int = 1):
         self._state = _TraceState(root_fen, repetition, teacher_width)
 
+    def copy(self):
+        """Fork the grammar for a prospective composite-token expansion."""
+        from copy import deepcopy
+
+        result = object.__new__(TraceWriter)
+        # Recorded steps are immutable; only the live grammar needs deep copying.
+        result._state = deepcopy(
+            self._state,
+            {
+                id(values): values.copy()
+                for values in (self._state.tokens, self._state.roles, self._state.steps)
+            },
+        )
+        return result
+
     @property
     def finished(self):
         return self._state.phase == _DONE
@@ -1159,7 +1230,7 @@ def _legal_line(root_fen, repetition, moves, stop_at_terminal=True):
 
 @dataclass(frozen=True)
 class Sidecar:
-    """A validated schema-3 or schema-4 record, indexed by event type."""
+    """A schema-3 or schema-4 record, indexed by event type."""
 
     events: tuple
     session: dict
@@ -1171,6 +1242,24 @@ class Sidecar:
     frontiers: tuple
     round_ends: tuple
     search_end: dict
+
+    @cached_property
+    def _candidates_by_attempt(self):
+        result = {}
+        for event in self.candidates:
+            result.setdefault((event["round"], event["attempt"]), []).append(event)
+        return result
+
+    @cached_property
+    def _candidate_groups_cache(self):
+        return {}
+
+    @cached_property
+    def _frontiers_by_path(self):
+        return {
+            (event["round"], event["attempt"], tuple(event["path"])): event
+            for event in self.frontiers
+        }
 
     @property
     def fen(self):
@@ -1201,6 +1290,32 @@ class Sidecar:
     @property
     def engine(self):
         return self.session["engine"]
+
+
+def decode_sidecar(lines):
+    """Decode output from the qualified producer without replaying its search.
+
+    ``parse_sidecar`` supplies the exhaustive diagnostic checks used when
+    qualifying the producer or investigating an invalid record.
+    """
+    events = tuple(orjson.loads(line) for line in lines)
+    if not events or events[-1]["type"] != "search_end":
+        raise SynthesisError("the engine sidecar did not finish")
+    by_type = {kind: [] for kind in EVENT_TYPES}
+    for event in events:
+        by_type[event["type"]].append(event)
+    return Sidecar(
+        events,
+        by_type["session"][0],
+        by_type["position"][0],
+        by_type["search_start"][0],
+        tuple(by_type["round_start"]),
+        tuple(by_type["attempt"]),
+        tuple(by_type["candidate"]),
+        tuple(by_type["frontier"]),
+        tuple(by_type["round_end"]),
+        events[-1],
+    )
 
 
 def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
@@ -1672,8 +1787,7 @@ def _final_parameters(raw, wdl, value_mate, max_ply):
     return {"mate": abs(moves), "win": moves > 0}
 
 
-@dataclass(frozen=True)
-class Boundary:
+class Boundary(NamedTuple):
     tool_end: int
     no_tool_end: int
     best: int
@@ -1719,6 +1833,7 @@ class PresentationRow:
     final_value_bin: int
     mate_distance: int | None
     claim_draw: bool
+    trace_text: str
 
 
 @dataclass(frozen=True)
@@ -1735,13 +1850,12 @@ def _move_token(uci, mirrored):
 
 
 class _Candidate:
-    __slots__ = ("move", "parent", "order", "calls", "exact", "refuted", "first_seq")
+    __slots__ = ("move", "parent", "order", "exact", "refuted", "first_seq")
 
     def __init__(self, move, parent, order, calls):
         self.move = move
         self.parent = parent
         self.order = order
-        self.calls = calls
         self.first_seq = calls[0]["seq"]
         exact = [
             call
@@ -1757,40 +1871,43 @@ class _Candidate:
         self.refuted = refuted[-1] if refuted and self.exact is None else None
 
 
+class _CandidateGroups:
+    """Group raw calls once; build candidates only at narrated parents."""
+
+    def __init__(self, events):
+        self.calls = {}
+        self.cache = {}
+        for event in events:
+            parent = tuple(event["path"][:-1])
+            moves = self.calls.setdefault(parent, {})
+            moves.setdefault(event["move"], []).append(event)
+
+    def get(self, parent, default=()):
+        if parent in self.cache:
+            return self.cache[parent]
+        calls_by_move = self.calls.get(parent)
+        if calls_by_move is None:
+            return default
+        candidates = [
+            _Candidate(move, parent, calls[0]["order"], calls)
+            for move, calls in calls_by_move.items()
+        ]
+        candidates.sort(key=lambda candidate: (candidate.order, candidate.first_seq))
+        self.cache[parent] = candidates
+        return candidates
+
+
 def _candidate_groups(sidecar, round_number, attempt):
-    groups = {}
-    for event in sidecar.candidates:
-        if event["round"] != round_number or event["attempt"] != attempt:
-            continue
-        parent = tuple(event["path"][:-1])
-        key = (parent, event["move"])
-        groups.setdefault(key, []).append(event)
-    result = {}
-    for (parent, move), calls in groups.items():
-        orders = {call["order"] for call in calls}
-        if len(orders) != 1:
-            raise SynthesisError("calls for one candidate disagree on order")
-        result.setdefault(parent, []).append(
-            _Candidate(move, parent, orders.pop(), calls)
+    key = (round_number, attempt)
+    if key not in sidecar._candidate_groups_cache:
+        sidecar._candidate_groups_cache[key] = _CandidateGroups(
+            sidecar._candidates_by_attempt.get(key, ())
         )
-    for values in result.values():
-        values.sort(key=lambda candidate: (candidate.order, candidate.first_seq))
-    return result
+    return sidecar._candidate_groups_cache[key]
 
 
 def _frontier_for(sidecar, round_number, attempt, path):
-    matches = [
-        event
-        for event in sidecar.frontiers
-        if event["round"] == round_number
-        and event["attempt"] == attempt
-        and tuple(event["path"]) == path
-    ]
-    if not matches:
-        return None
-    if len(matches) != 1:
-        raise SynthesisError("a frontier path has more than one frontier event")
-    return matches[0]
+    return sidecar._frontiers_by_path.get((round_number, attempt, path))
 
 
 class _RootState:
@@ -1846,18 +1963,127 @@ class _RootState:
         return best, value, self.round
 
 
+class _TraceBuffer:
+    """Encode known synthesis operations without running the grammar checker."""
+
+    def __init__(self, tracker):
+        self.tracker = tracker
+        self.mirrored = tracker.board.turn == chess.BLACK
+        self.tokens = []
+        self.roles = []
+        self.last_was_board = False
+        self.final_start = None
+        self.final_move = None
+        self.text_parts = []
+        self.text_ends = []
+        self.text_line = None
+        self.round = 0
+        fen, repetition = decode_board(tracker.board_tokens())
+        self.initial_text = f"{fen} (repetition {repetition})"
+
+    def _text(self, text):
+        self.text_parts.append(text)
+        self.text_ends.append(len(self.tokens))
+
+    @staticmethod
+    def _evaluation_text(token):
+        if token >= MATE_WIN:
+            distance, win = _mate_fields(token)
+            return f"{'win' if win else 'loss'}:{distance}"
+        return f"value:{decode_value_token(token):+.3f}"
+
+    def _emit(self, token, role):
+        self.tokens.append(token)
+        self.roles.append(role)
+        self.last_was_board = False
+
+    def depth(self):
+        self._emit(DEPTH, ROLE_CONTROL)
+        self.round += 1
+        self._text(f"\nDEPTH {self.round}")
+        self.text_line = "depth"
+
+    def move(self, uci, san):
+        self._emit(_move_token(uci, self.mirrored), ROLE_MOVE)
+        self._text((" " if self.text_line == "candidate" else "\n") + san)
+        self.text_line = "candidate"
+
+    def back(self):
+        self._emit(BACK, ROLE_CONTROL)
+        self._text(" BACK")
+
+    def reset(self):
+        self._emit(RESET, ROLE_CONTROL)
+        self._text("\nRESET")
+        self.text_line = "reset"
+
+    def refuted(self):
+        self._emit(REFUTED, ROLE_REFUTED)
+        self._text(" REFUTED")
+
+    def apply(self, token):
+        self._emit(token, ROLE_EVAL)
+        evaluation = self._evaluation_text(token)
+        if self.tracker.depth:
+            self._text(" " + evaluation)
+        else:
+            self._text("\nroot " + evaluation)
+            self.text_line = "root"
+
+    def board(self):
+        observation = self.tracker.board_tokens()
+        fen, _ = decode_board(observation)
+        if self.mirrored:
+            observation = TOKEN_MIRROR[observation]
+        self._emit(BOARD, ROLE_CONTROL)
+        self.tokens.extend(observation)
+        self.roles.extend([ROLE_BOARD] * len(observation))
+        self.last_was_board = True
+        self._text(f" BOARD {fen} (repetition {self.tracker.repetition()})")
+
+    def final(self, uci):
+        self.final_start = len(self.tokens)
+        self.final_move = uci
+        self._emit(FINAL, ROLE_CONTROL)
+        self._emit(
+            CLAIM_DRAW if uci == CLAIM_DRAW_UCI else _move_token(uci, self.mirrored),
+            ROLE_FINAL_MOVE,
+        )
+        self.pv_board = chess.Board(self.tracker.root_fen)
+        san = (
+            "CLAIM_DRAW"
+            if uci == CLAIM_DRAW_UCI
+            else self.pv_board.san_and_push(chess.Move.from_uci(uci))
+        )
+        self._text("\nFINAL " + san)
+
+    def final_evaluate(self, value=None, mate=None, win=None):
+        if mate is None:
+            self._emit(VALUE + value_bin(value), ROLE_FINAL_EVAL)
+            self._text(" " + self._evaluation_text(self.tokens[-1]))
+        else:
+            self._emit(VALUE + (VALUE_BINS - 1 if win else 0), ROLE_FINAL_EVAL)
+            self._text(" " + self._evaluation_text(self.tokens[-1]))
+            self._emit(mate_token(mate, win), ROLE_FINAL_EVAL)
+            self._text(" " + self._evaluation_text(self.tokens[-1]))
+
+    def final_pv(self, uci):
+        self._emit(_move_token(uci, self.mirrored), ROLE_FINAL_PV)
+        self._text(" " + self.pv_board.san_and_push(chess.Move.from_uci(uci)))
+
+    def end(self):
+        self._emit(END, ROLE_CONTROL)
+        self._text(" END")
+
+
 class _Synthesis:
     def __init__(self, sidecar, root, config, seed):
         self.sidecar = sidecar
         self.root = root
         self.config = config
         self.seed = config.seed if seed is None else seed
-        self.writer = TraceWriter(
-            sidecar.fen,
-            int(root["repetition"]),
-            teacher_width=sidecar.width,
-        )
         self.tracker = PathTracker(sidecar.fen, int(root["repetition"]))
+        self.writer = _TraceBuffer(self.tracker)
         self.state = _RootState(self.writer.mirrored, sidecar.width)
         self.board_rng = random.Random(f"{self.seed}:{root['root_id']}:board")
         self.boundaries = []
@@ -1877,16 +2103,15 @@ class _Synthesis:
     def _record(self):
         length = len(self.writer.tokens)
         delta = length - self.previous_len
-        operation = self.writer.steps[-1].operation
-        if operation != "board":
+        if not self.writer.last_was_board:
             self.no_tool_len += delta
         best, value, basis = self.state.snapshot()
         self.boundaries.append(Boundary(length, self.no_tool_len, best, value, basis))
         self.previous_len = length
 
     def _write_move(self, move, spine=True):
-        self.writer.move(move)
-        self.tracker.push(move)
+        san = self.tracker.push_legal(move)
+        self.writer.move(move, san)
         self._record()
         if not spine:
             return
@@ -2183,10 +2408,7 @@ class _Synthesis:
     def _present(self):
         tokens = tuple(int(token) for token in self.writer.tokens)
         roles = tuple(int(role) for role in self.writer.roles)
-        final_step = next(
-            step for step in self.writer.steps if step.operation == "final"
-        )
-        suffix_start = final_step.start
+        suffix_start = self.writer.final_start
         suffix_tokens = tokens[suffix_start:]
         suffix_roles = roles[suffix_start:]
         if suffix_tokens[0] != FINAL:
@@ -2202,7 +2424,14 @@ class _Synthesis:
                 else mate_token_id - MATE_WIN
             )
         rows = {}
-        for presentation in PRESENTATIONS:
+        suffix_text_start = bisect_right(self.writer.text_ends, suffix_start)
+        suffix_text = "".join(self.writer.text_parts[suffix_text_start:])
+        presentations = (
+            (self.root["presentation"],)
+            if "presentation" in self.root
+            else PRESENTATIONS
+        )
+        for presentation in presentations:
             if presentation == "zero":
                 cut = 0
                 boundaries = ()
@@ -2244,11 +2473,16 @@ class _Synthesis:
                 value_token - VALUE,
                 mate_distance,
                 final_move == CLAIM_DRAW_UCI,
+                self.writer.initial_text
+                + "".join(
+                    self.writer.text_parts[: bisect_right(self.writer.text_ends, cut)]
+                )
+                + suffix_text,
             )
-        stats = self._stats(rows)
+        stats = self._stats()
         return SynthesizedRoot(self.root, rows, tuple(self.round_audits), stats)
 
-    def _stats(self, rows):
+    def _stats(self):
         audits = self.round_audits
         champions = [audit.move for audit in audits]
         changes = [
@@ -2281,11 +2515,11 @@ class _Synthesis:
             "root_values": root_values,
             "root_mates": [audit.mate for audit in audits],
             "all_draw": all_draw,
-            "claim_draw": rows["full"].claim_draw,
+            "claim_draw": self._claim,
             "claimable": self.tracker.root_repetition >= 3
             or chess.Board(self.sidecar.fen).halfmove_clock >= 100,
-            "thinking_tokens": rows["full"].thinking_tokens,
-            "total_tokens": len(rows["full"].tokens),
+            "thinking_tokens": self.writer.final_start,
+            "total_tokens": len(self.writer.tokens),
             "board_descent": self.board_counts["descent"],
             "board_frontier": self.board_counts["frontier"],
             "exact_evals": self.exact_evals,
@@ -2328,7 +2562,7 @@ def validate_root(root, sidecar):
 
 
 def synthesize_root(sidecar, root, config, seed=None):
-    """Synthesize one root, its presentation rows, and its audit trail."""
+    """Synthesize the assigned presentation, or all for an unassigned diagnostic root."""
     validate_root(root, sidecar)
     if sidecar.search_start["depth"] != sidecar.round_ends[-1]["depth"]:
         raise SynthesisError("the recorded search did not complete its requested depth")

@@ -105,13 +105,13 @@ class TraceTrainingTests(unittest.TestCase):
         ]
         return rows[-1]
 
-    def test_training_records_trace_loss_and_final_move_top1(self):
+    def test_training_records_trace_loss_and_final_token_top1(self):
         output = self.root / "run"
         train(self.config, self.data, output)
         final = self.final_metrics(output)
         self.assertTrue(final["training_complete"])
         self.assertGreater(final["val/loss"], 0.0)
-        self.assertTrue(0.0 <= final["val/final_move_top1"] <= 1.0)
+        self.assertTrue(0.0 <= final["val/final_token_top1"] <= 1.0)
         logged = [
             json.loads(line)
             for line in (output / "metrics.jsonl").read_text().splitlines()

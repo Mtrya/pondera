@@ -1,5 +1,6 @@
 """Greedy trace generation under the trace grammar's next-token mask."""
 
+from copy import copy
 from dataclasses import dataclass
 
 import chess
@@ -7,6 +8,7 @@ import numpy as np
 import torch
 
 from pondera.chess.codec import BOARD_TOKENS_MAX, encode_boards
+from pondera.chess.merge import MergeDictionary
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import (
     CHESS_VOCAB_SIZE,
@@ -27,7 +29,7 @@ _SUFFIX_STEPS = 256
 
 @dataclass(frozen=True)
 class GenerationProtocol:
-    """A fixed thinking budget or an autonomous safety cap, in tokens."""
+    """A fixed thinking budget or safety cap, in expanded base atoms."""
 
     kind: str
     budget: int | None = None
@@ -53,7 +55,7 @@ class GenerationProtocol:
 
 
 def fixed_budget(budget: int) -> GenerationProtocol:
-    """Force FINAL after exactly ``budget`` thinking tokens."""
+    """Force FINAL after ``budget`` thinking atoms, completing any BOARD."""
     return GenerationProtocol(FIXED, budget=budget)
 
 
@@ -137,13 +139,53 @@ class _GenerationRow:
         self.stop = None
         self.final_move = None
 
-    def set_move_distribution(self, logits):
+    def set_move_distribution(self, logits, decisions):
+        """Condition on legal tokens that emit a root decision at this step."""
         if not self.root_move_tokens:
             self.root_move_log_probs = ()
             return
-        ids = torch.tensor(self.root_move_tokens, device=logits.device)
-        values = logits.float()[ids]
-        self.root_move_log_probs = tuple(torch.log_softmax(values, -1).tolist())
+        values = []
+        for move in self.root_move_tokens:
+            ids = [token for token, decision in decisions.items() if decision == move]
+            values.append(torch.logsumexp(logits[ids].float(), 0))
+        values = torch.stack(values)
+        self.root_move_log_probs = tuple(
+            torch.log_softmax(values, -1).tolist()
+            if torch.isfinite(values).any()
+            else [-float("inf")] * len(values)
+        )
+
+    def next_tokens(self, protocol):
+        if self.writer.finished:
+            return (PAD,), False
+        if self.writer.final_written:
+            return legal_tokens(self.writer, False, self.legal_cache), False
+        at_limit = self.thinking >= protocol.limit and not self.writer.completing_board
+        if at_limit:
+            return (FINAL,), True
+        ids = legal_tokens(self.writer, protocol.kind == AUTONOMOUS, self.legal_cache)
+        return ids or legal_tokens(self.writer, True, self.legal_cache), False
+
+    def accepts(self, atoms, protocol):
+        trial = copy(self)
+        trial.writer = self.writer.copy()
+        for atom in atoms:
+            if trial.writer.finished:
+                return False
+            allowed, forced = trial.next_tokens(protocol)
+            if atom not in allowed:
+                return False
+            trial.apply(atom, forced)
+        return True
+
+    def decision_in(self, atoms):
+        if self.writer.awaiting_final_move:
+            return atoms[0]
+        if not self.writer.final_written and FINAL in atoms:
+            index = atoms.index(FINAL) + 1
+            if index < len(atoms):
+                return atoms[index]
+        return None
 
     def _check_emitted(self, token):
         if int(self.writer.tokens[-1]) != token:
@@ -185,34 +227,45 @@ class _GenerationRow:
         )
 
 
-def _choose(rows, logits, protocol):
-    masks = np.zeros((len(rows), CHESS_VOCAB_SIZE), dtype=bool)
+def _choose(rows, logits, protocol, dictionary=MergeDictionary()):
+    masks = np.zeros(tuple(logits.shape), dtype=bool)
     forced = np.zeros(len(rows), dtype=bool)
+    choices = np.full(len(rows), PAD, dtype=np.int32)
+    starts = np.asarray([entry[0] for entry in dictionary.entries])
+    scores = logits.float().cpu().numpy()
     for index, row in enumerate(rows):
-        if row.writer.finished:
-            masks[index, PAD] = True
-            continue
-        if row.writer.awaiting_final_move:
-            masks[index, list(row.decision_tokens)] = True
-            row.set_move_distribution(logits[index])
-            continue
-        if row.writer.final_written:
-            ids = legal_tokens(row.writer, False, row.legal_cache)
-            masks[index, list(ids)] = True
-            continue
-        at_limit = row.thinking >= protocol.limit and not row.writer.completing_board
-        forced[index] = at_limit
-        final_allowed = at_limit or protocol.kind == AUTONOMOUS
-        ids = legal_tokens(row.writer, final_allowed, row.legal_cache)
-        if not ids:
-            ids = legal_tokens(row.writer, True, row.legal_cache)
+        ids, forced[index] = row.next_tokens(protocol)
         masks[index, list(ids)] = True
-    allowed = torch.from_numpy(masks).to(logits.device)
-    choices = logits.masked_fill(~allowed, -torch.inf).argmax(-1)
-    if forced.any():
-        forced_mask = torch.from_numpy(forced).to(logits.device)
-        choices = torch.where(forced_mask, torch.full_like(choices, FINAL), choices)
-    return choices.cpu().numpy(), forced
+        if not row.writer.finished:
+            masks[index, CHESS_VOCAB_SIZE:] = np.isin(starts, ids)
+        candidates = np.flatnonzero(masks[index])
+        accepted = {}
+
+        def atoms(token):
+            return (
+                dictionary.expansion(token) if token >= CHESS_VOCAB_SIZE else (token,)
+            )
+
+        def legal(token):
+            if token not in accepted:
+                accepted[token] = token < CHESS_VOCAB_SIZE or row.accepts(
+                    atoms(token), protocol
+                )
+            return accepted[token]
+
+        # Check complete expansions lazily, in greedy score order.
+        for token in candidates[np.argsort(-scores[index, candidates], kind="stable")]:
+            if legal(int(token)):
+                choices[index] = token
+                break
+        if row.decision_in(atoms(int(choices[index]))) is not None:
+            decisions = {}
+            for token in candidates:
+                decision = row.decision_in(atoms(int(token)))
+                if decision is not None and legal(int(token)):
+                    decisions[int(token)] = decision
+            row.set_move_distribution(logits[index], decisions)
+    return choices, forced
 
 
 def _generate_batch(model, roots, protocol):
@@ -221,20 +274,27 @@ def _generate_batch(model, roots, protocol):
         encode_boards([root.fen for root in roots], [root.repetition for root in roots])
     ).to(device)
     rows = [_GenerationRow(root, protocol) for root in roots]
+    dictionary = model.merge_dictionary
     logits, cache = model.prefill(ids)
     bound = protocol.limit + BOARD_TOKENS_MAX + 1 + _SUFFIX_STEPS
     for _ in range(bound):
         if all(row.writer.finished for row in rows):
             break
-        choices, forced = _choose(rows, logits, protocol)
+        choices, forced = _choose(rows, logits, protocol, dictionary)
         for index, row in enumerate(rows):
-            row.apply(int(choices[index]), bool(forced[index]))
+            token = int(choices[index])
+            atoms = (
+                dictionary.expansion(token) if token >= CHESS_VOCAB_SIZE else (token,)
+            )
+            for atom in atoms:
+                _, at_limit = row.next_tokens(protocol)
+                row.apply(atom, at_limit)
         step = np.array(
             [
                 PAD if row.writer.finished else int(choices[index])
                 for index, row in enumerate(rows)
             ],
-            dtype=np.int16,
+            dtype=np.int32,
         )
         if all(row.writer.finished for row in rows):
             break
