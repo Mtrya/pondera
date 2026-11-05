@@ -5,8 +5,8 @@ import re
 from pathlib import Path
 
 
-def trace_config_text(width=1, depth=4, joint=None, presentations=None, engine=None):
-    text = Path("configs/trace.toml").read_text(encoding="utf-8")
+def trace_config_text(width=1, depth=4, joint=None, presentations=None):
+    text = Path("configs/data.toml").read_text(encoding="utf-8")
     if joint is None:
         joint = [{"width": width, "depth": depth, "probability": 1.0}]
     entries = [
@@ -15,7 +15,11 @@ def trace_config_text(width=1, depth=4, joint=None, presentations=None, engine=N
         + " }"
         for entry in joint
     ]
-    search = "[search]\nhash_mb = 256\njoint = [" + ", ".join(entries) + "]\n\n"
+    search = (
+        "[search]\nhash_mb = 256\ntimeout_seconds = 3600\njoint = ["
+        + ", ".join(entries)
+        + "]\n\n"
+    )
     text = re.sub(r"(?ms)^\[search\]\n.*?(?=^\[)", lambda _: search, text)
     if presentations is not None:
         table = (
@@ -26,13 +30,6 @@ def trace_config_text(width=1, depth=4, joint=None, presentations=None, engine=N
         text = re.sub(
             r"^presentations =.*$",
             lambda _: f"presentations = {table}",
-            text,
-            flags=re.MULTILINE,
-        )
-    if engine is not None:
-        text = re.sub(
-            r"^engine =.*$",
-            lambda _: f"engine = {json.dumps(str(engine))}",
             text,
             flags=re.MULTILINE,
         )

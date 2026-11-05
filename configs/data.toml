@@ -1,0 +1,60 @@
+seed = 640
+
+[sources.elite]
+kind = "pgn"
+url = "https://database.nikonoel.fr/lichess_elite_2025-11.zip"
+sha256 = "1ffa577aa0a1352fa04c9a890a6706049a3a79edc52810b136758d1e2a1a2eab"
+train = 500000
+val = 2000
+claimable_share = 0.03
+# Omit limit_games to preprocess the complete archive.
+# limit_games = 100
+
+[sources.puzzles]
+kind = "lichess_puzzles"
+repo_id = "Lichess/chess-puzzles"
+revision = "461725966ea46898ec6481372a6326de3281bfbd"
+train = 0
+val = 0
+batch_size = 1024
+
+[search]
+hash_mb = 256
+timeout_seconds = 3600
+joint = [
+    { width = "full", depth = 8, probability = 0.30 },
+    { width = 8, depth = 10, probability = 0.25 },
+    { width = 3, depth = 16, probability = 0.25 },
+    { width = 1, depth = 24, probability = 0.20 },
+]
+
+[synthesis]
+claim_draw = true
+board_descent_hazard = 0.15
+board_frontier_p = 0.5
+presentations = { zero = 0.10, full = 0.50, random = 0.40 }
+random_min_fraction = 0.05
+random_max_fraction = 0.95
+
+[release]
+shard_size = 1024
+workers = 8
+start_shard = 0
+# end_shard is exclusive; omit it to process the remaining shards.
+# end_shard = 1
+
+[merge]
+# Maximum number of composites, in addition to the fixed base vocabulary.
+budget = 16384
+fit_split = "all"
+holdout_fraction = 0.0
+min_count = 8
+per_length_limit = 20000
+selection_stride = 1
+max_rounds = 100000
+top = 20
+# Omit max_roots to use all input roots; block defaults to max(8, budget // 32).
+# max_roots = 128
+# block = 32
+
+batch_size = 128

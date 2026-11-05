@@ -1,16 +1,14 @@
 """Offline trace production: configuration, engine execution, shards, and checks.
 
-The public entry point is ``run_pipeline``. It prepares roots when necessary,
+The public entry point is ``run_pipeline``. It reads a prepared root pool,
 then runs engine -> sidecar decoding -> synthesis in memory for each root and
 publishes complete shards atomically. Exhaustive replay is an explicit
 diagnostic, outside normal production.
 """
 
-import argparse
 import fcntl
 import gc
 import json
-import math
 import os
 import random
 import select
@@ -18,11 +16,9 @@ import shutil
 import statistics
 import subprocess
 import time
-import tomllib
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
 from multiprocessing import get_context
 from multiprocessing.util import Finalize
 from pathlib import Path
@@ -42,6 +38,7 @@ from pondera.chess.vocabulary import (
     PAD,
     VALUE,
 )
+from pondera.data.config import PRESENTATION_NAMES, parse_recipe
 from pondera.data.dataset import (
     DATA_ARRAYS,
     DATA_FORMAT_VERSION,
@@ -52,7 +49,6 @@ from pondera.data.dataset import (
     write_manifest,
     write_trace_rows,
 )
-from pondera.data.roots import complete_source
 from pondera.data.trace import (
     CLAIM_DRAW_UCI,
     DRAW_CLAIM_BOUND,
@@ -67,156 +63,6 @@ from pondera.data.trace import (
     synthesize_root,
     validate_root,
 )
-
-DEFAULT_CONFIG_PATH = Path("configs/trace.toml")
-PRESENTATION_NAMES = ("zero", "full", "random")
-
-
-def _integer(section, name, value, minimum=None):
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError(f"[{section}] {name} must be an integer")
-    if minimum is not None and value < minimum:
-        raise ValueError(f"[{section}] {name} must be at least {minimum}")
-    return value
-
-
-def _probability(section, name, value):
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError(f"[{section}] {name} must be a number")
-    value = float(value)
-    if not 0.0 <= value <= 1.0:
-        raise ValueError(f"[{section}] {name} must lie in [0, 1]")
-    return value
-
-
-def _distribution(section, name, value, key_parser):
-    if isinstance(value, (int, str)) and not isinstance(value, bool):
-        value = {value: 1.0}
-    if not isinstance(value, dict) or not value:
-        raise ValueError(f"[{section}] {name} must be a value or a nonempty table")
-    result = {}
-    for raw_key, probability in value.items():
-        key = key_parser(raw_key)
-        if key in result:
-            raise ValueError(f"[{section}] {name} repeats a key")
-        result[key] = _probability(section, f"{name}.{raw_key}", probability)
-    if not math.isclose(sum(result.values()), 1.0, abs_tol=1e-9):
-        raise ValueError(f"[{section}] {name} probabilities must sum to 1")
-    return tuple(sorted(result.items(), key=lambda item: str(item[0])))
-
-
-def _joint_distribution(value):
-    if not isinstance(value, list) or not value:
-        raise ValueError("[search] joint must be a nonempty array of tables")
-    result = {}
-    for entry in value:
-        entry = _table(entry, "search.joint", {"width", "depth", "probability"})
-        width = entry["width"]
-        if width != "full":
-            width = _integer("search.joint", "width", width, 1)
-        depth = _integer("search.joint", "depth", entry["depth"], 1)
-        outcome = (width, depth)
-        if outcome in result:
-            raise ValueError("[search] joint repeats a width/depth pair")
-        result[outcome] = _probability(
-            "search.joint", "probability", entry["probability"]
-        )
-    if not math.isclose(sum(result.values()), 1.0, rel_tol=0, abs_tol=1e-9):
-        raise ValueError("[search] joint probabilities must sum to 1")
-    return tuple(sorted(result.items(), key=lambda item: (str(item[0][0]), item[0][1])))
-
-
-def _presentation_key(value):
-    if value not in PRESENTATION_NAMES:
-        raise ValueError(f"presentation must be one of {PRESENTATION_NAMES}")
-    return value
-
-
-@dataclass(frozen=True)
-class PathsConfig:
-    archive: str
-    roots: str
-    output: str
-    engine: str
-
-
-@dataclass(frozen=True)
-class RootsConfig:
-    train: int
-    val: int
-    claimable_share: float
-
-
-@dataclass(frozen=True)
-class SearchConfig:
-    hash_mb: int
-
-
-@dataclass(frozen=True)
-class SynthesisConfig:
-    claim_draw: bool
-    board_descent_hazard: float
-    board_frontier_p: float
-    random_min_fraction: float
-    random_max_fraction: float
-
-
-@dataclass(frozen=True)
-class ReleaseConfig:
-    shard_size: int
-    workers: int
-
-
-@dataclass(frozen=True)
-class SamplingConfig:
-    joint: tuple
-    presentations: tuple
-
-    def identity(self):
-        return {
-            "joint": [
-                {"width": width, "depth": depth, "probability": probability}
-                for (width, depth), probability in self.joint
-            ],
-            "presentations": dict(self.presentations),
-        }
-
-
-@dataclass(frozen=True)
-class TraceConfig:
-    seed: int
-    paths: PathsConfig
-    roots: RootsConfig
-    search: SearchConfig
-    synthesis: SynthesisConfig
-    release: ReleaseConfig
-    sampling: SamplingConfig
-
-    def search_dict(self):
-        return {"hash_mb": self.search.hash_mb}
-
-    def board_dict(self):
-        return {
-            "board_descent_hazard": self.synthesis.board_descent_hazard,
-            "board_frontier_p": self.synthesis.board_frontier_p,
-        }
-
-    def presentation_dict(self):
-        probabilities = dict(self.sampling.presentations)
-        return {
-            "zero": probabilities.get("zero", 0.0),
-            "full": probabilities.get("full", 0.0),
-            "random": probabilities.get("random", 0.0),
-            "last_root": 0.0,
-            "random_min_fraction": self.synthesis.random_min_fraction,
-            "random_max_fraction": self.synthesis.random_max_fraction,
-        }
-
-    def synthesis_dict(self):
-        return {
-            "confirmatory_repetition": "faithful",
-            "claim_draw": self.synthesis.claim_draw,
-        }
 
 
 def sample_distribution(rng, distribution):
@@ -242,105 +88,6 @@ def sample_presentation(sampling, seed, root_id):
     return sample_distribution(
         random.Random(f"{seed}:{root_id}:presentation"), sampling.presentations
     )
-
-
-def parse_recipe(values):
-    values = _table(values, "recipe", {"joint", "presentations"})
-    return SamplingConfig(
-        joint=_joint_distribution(values["joint"]),
-        presentations=_distribution(
-            "recipe", "presentations", values["presentations"], _presentation_key
-        ),
-    )
-
-
-def _table(values, name, required):
-    if not isinstance(values, dict):
-        raise ValueError(f"[{name}] must be a table")
-    unknown = set(values) - set(required)
-    if unknown:
-        raise ValueError(f"Unknown config key in [{name}]: {sorted(unknown)[0]}")
-    missing = set(required) - set(values)
-    if missing:
-        raise ValueError(f"Missing config key in [{name}]: {sorted(missing)[0]}")
-    return values
-
-
-def load_config(path=DEFAULT_CONFIG_PATH):
-    path = Path(path)
-    with path.open("rb") as handle:
-        values = tomllib.load(handle)
-    allowed = {"seed", "paths", "roots", "search", "synthesis", "release"}
-    if set(values) - allowed:
-        raise ValueError(f"Unknown config section: {sorted(set(values) - allowed)[0]}")
-    for section in allowed - {"seed"}:
-        if section not in values:
-            raise ValueError(f"Missing config section: [{section}]")
-    seed = _integer("seed", "seed", values.get("seed", 640))
-
-    paths = _table(values["paths"], "paths", {"archive", "roots", "output", "engine"})
-    for name in ("archive", "roots", "output", "engine"):
-        if not isinstance(paths[name], str) or (
-            name in {"roots", "output", "engine"} and not paths[name]
-        ):
-            raise ValueError(f"[paths] {name} must be a string")
-    paths = PathsConfig(**paths)
-
-    roots = _table(values["roots"], "roots", {"train", "val", "claimable_share"})
-    train = _integer("roots", "train", roots["train"], 0)
-    val = _integer("roots", "val", roots["val"], 0)
-    if train + val < 1:
-        raise ValueError("[roots] train + val must be positive")
-    roots = RootsConfig(
-        train, val, _probability("roots", "claimable_share", roots["claimable_share"])
-    )
-
-    search = _table(values["search"], "search", {"hash_mb", "joint"})
-    hash_mb = _integer("search", "hash_mb", search["hash_mb"], 1)
-    joint = _joint_distribution(search["joint"])
-
-    synthesis = _table(
-        values["synthesis"],
-        "synthesis",
-        {
-            "claim_draw",
-            "board_descent_hazard",
-            "board_frontier_p",
-            "presentations",
-            "random_min_fraction",
-            "random_max_fraction",
-        },
-    )
-    if not isinstance(synthesis["claim_draw"], bool):
-        raise ValueError("[synthesis] claim_draw must be a boolean")
-    presentations = _distribution(
-        "synthesis", "presentations", synthesis["presentations"], _presentation_key
-    )
-    minimum = _probability(
-        "synthesis", "random_min_fraction", synthesis["random_min_fraction"]
-    )
-    maximum = _probability(
-        "synthesis", "random_max_fraction", synthesis["random_max_fraction"]
-    )
-    if minimum >= maximum:
-        raise ValueError("[synthesis] random cut interval must be nonempty")
-    synthesis = SynthesisConfig(
-        synthesis["claim_draw"],
-        _probability(
-            "synthesis", "board_descent_hazard", synthesis["board_descent_hazard"]
-        ),
-        _probability("synthesis", "board_frontier_p", synthesis["board_frontier_p"]),
-        minimum,
-        maximum,
-    )
-
-    release = _table(values["release"], "release", {"shard_size", "workers"})
-    shard_size = _integer("release", "shard_size", release["shard_size"], 1)
-    workers = _integer("release", "workers", release["workers"], 1)
-    release = ReleaseConfig(shard_size, workers)
-    search = SearchConfig(hash_mb)
-    sampling = SamplingConfig(joint, presentations)
-    return TraceConfig(seed, paths, roots, search, synthesis, release, sampling)
 
 
 def _percentiles(values):
@@ -549,13 +296,13 @@ def _root_teacher(root):
     return width, depth
 
 
-def _engine_path(config):
-    path = Path(config.paths.engine)
+def _engine_path(engine):
+    path = Path(engine)
     if path.is_file():
         return path.resolve()
-    resolved = shutil.which(config.paths.engine)
+    resolved = shutil.which(engine)
     if resolved is None:
-        raise FileNotFoundError(config.paths.engine)
+        raise FileNotFoundError(engine)
     return Path(resolved).resolve()
 
 
@@ -792,8 +539,6 @@ def _recover_shard(output, index, roots, metadata, presentations):
         root = expected[row["root_id"]]
         for name in (*ROOT_ROW_FIELDS, "teacher_width", "depth"):
             expected_value = root.get(name)
-            if name == "source":
-                expected_value = complete_source(expected_value)
             if (
                 name in root
                 and row.get("teacher_depth" if name == "depth" else name)
@@ -1307,8 +1052,6 @@ def _validate_shard_rows(
                 raise ValueError(f"Release contains an unselected root: {root_id}")
             for name in (*ROOT_ROW_FIELDS, "teacher_width", "depth"):
                 expected_value = expected.get(name)
-                if name == "source":
-                    expected_value = complete_source(expected_value)
                 if (
                     name in expected
                     and row.get("teacher_depth" if name == "depth" else name)
@@ -1673,7 +1416,9 @@ def _direct_worker(root):
 def _init_direct_worker(config, engine_path, engine_name, teacher):
     global _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_NAME, _DIRECT_TEACHER
     _DIRECT_CONFIG = config
-    _DIRECT_ENGINE = _Engine(engine_path, config.search.hash_mb)
+    _DIRECT_ENGINE = _Engine(
+        engine_path, config.search.hash_mb, config.search.timeout_seconds
+    )
     Finalize(None, _DIRECT_ENGINE.close, exitpriority=10)
     _DIRECT_NAME = engine_name
     _DIRECT_TEACHER = teacher
@@ -1690,7 +1435,13 @@ def _synthesize_groups(
             engine = (
                 None
                 if provider is not None
-                else stack.enter_context(_Engine(engine_path, config.search.hash_mb))
+                else stack.enter_context(
+                    _Engine(
+                        engine_path,
+                        config.search.hash_mb,
+                        config.search.timeout_seconds,
+                    )
+                )
             )
             for index, group in groups:
                 records = []
@@ -1745,8 +1496,7 @@ def _synthesize_groups(
                     submit_group()
 
 
-def _identity_for(config, roots, engine_name="stockfish"):
-    root_path = Path(config.paths.roots)
+def _identity_for(config, roots, engine_name="stockfish", root_source=None):
     return {
         "teacher": {
             "schema_version": (
@@ -1763,8 +1513,8 @@ def _identity_for(config, roots, engine_name="stockfish"):
         "presentation": config.presentation_dict(),
         "synthesis": config.synthesis_dict(),
         "root_selection": {
-            "source": str(root_path),
-            "algorithm": "trace.toml",
+            "source": str(root_source) if root_source is not None else "in-memory",
+            "algorithm": "stratified",
             "seed": config.seed,
             "requested": len(roots),
             "counts": {
@@ -1778,49 +1528,6 @@ def _identity_for(config, roots, engine_name="stockfish"):
         },
         "recipe": config.sampling.identity(),
     }
-
-
-def _ensure_root_pool(config):
-    """Load or directly build the cached root pool required by the config."""
-    from pondera.data.roots import build_pool, ensure_archive, read_roots
-
-    path = Path(config.paths.roots)
-    parameters = {
-        "train": config.roots.train,
-        "val": config.roots.val,
-        "claimable_share": config.roots.claimable_share,
-    }
-    manifest = (
-        load_manifest(path.parent / "pool.manifest.json") if path.is_file() else {}
-    )
-    expected_source = Path(config.paths.archive)
-    cache_matches = (
-        path.is_file()
-        and manifest.get("kind") == "elite-root-pool"
-        and manifest.get("seed") == config.seed
-        and manifest.get("parameters") == parameters
-        and manifest.get("source", {}).get("file") == expected_source.name
-    )
-    if not path.is_file() or (manifest and not cache_matches):
-        archive = expected_source
-        if not archive.is_file():
-            archive = ensure_archive(archive.parent)
-        build_pool(
-            archive,
-            path.parent,
-            config.roots.train,
-            config.roots.val,
-            config.roots.claimable_share,
-            config.seed,
-        )
-        generated = path.parent / "roots.jsonl"
-        if generated != path:
-            generated.replace(path)
-    raw_roots = read_roots(path)
-    roots = sample_root_settings(raw_roots, config, config.seed)
-    if roots != raw_roots:
-        _write_jsonl(path, roots)
-    return roots
 
 
 @contextmanager
@@ -1843,6 +1550,8 @@ def produce_shards(
     workers=None,
     start_shard=0,
     end_shard=None,
+    engine="stockfish",
+    root_source=None,
 ):
     """Produce shards directly from roots, with optional fixture sidecars.
 
@@ -1865,10 +1574,12 @@ def produce_shards(
     engine_name = "stockfish"
     teacher = None
     if sidecar_for_root is None:
-        engine_path = _engine_path(config)
+        engine_path = _engine_path(engine)
         engine_name = "Stockfish 17.1"
         teacher = (32000, 246)
-    identity = identity or _identity_for(config, roots, engine_name=engine_name)
+    identity = identity or _identity_for(
+        config, roots, engine_name=engine_name, root_source=root_source
+    )
     release_metadata = _release_metadata(identity)
     shard_metadata = {
         key: value
@@ -1958,38 +1669,19 @@ def produce_shards(
     }
 
 
-def run_pipeline(config, start_shard=0, end_shard=None, workers=None):
-    roots = _ensure_root_pool(config)
+def run_pipeline(config, roots, output, engine="stockfish"):
+    """Curate traces from a prepared pool without modifying its records."""
+    from pondera.data.roots.pool import read_roots
+
+    roots = Path(roots)
+    if roots.is_dir():
+        roots /= "roots.jsonl"
     return produce_shards(
-        roots,
-        config.paths.output,
+        read_roots(roots),
+        output,
         config,
-        workers=workers,
-        start_shard=start_shard,
-        end_shard=end_shard,
+        start_shard=config.release.start_shard,
+        end_shard=config.release.end_shard,
+        engine=engine,
+        root_source=roots,
     )
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), type=Path)
-    parser.add_argument("--start-shard", type=int, default=0)
-    parser.add_argument("--end-shard", type=int)
-    parser.add_argument("--workers", type=int)
-    args = parser.parse_args()
-    result = run_pipeline(
-        load_config(args.config),
-        start_shard=args.start_shard,
-        end_shard=args.end_shard,
-        workers=args.workers,
-    )
-    print(
-        json.dumps(
-            {key: value for key, value in result.items() if key != "statistics"},
-            indent=2,
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()

@@ -1,9 +1,10 @@
 """Create or replace a trace dataset's training IDs from authoritative text."""
 
-import argparse
 import json
+import resource
 import tempfile
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import pyarrow as pa
@@ -21,6 +22,52 @@ from pondera.data.dataset import (
 )
 from pondera.data.text import trace_atoms
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
+
+
+def merge_and_encode(source, output, config):
+    """Fit the configured composite budget, then encode the complete dataset.
+
+    Corpus sampling and optional holdout affect vocabulary fitting only.
+    The output keeps all source rows and their training split membership.
+    """
+    from pondera.data.merge_profile import build_profile, render_report
+
+    output = Path(output)
+    if output.exists():
+        raise FileExistsError(output)
+    started = time.monotonic()
+    settings = asdict(config)
+    options = {
+        key: value
+        for key, value in settings.items()
+        if key not in {"budget", "batch_size"}
+    }
+    document, dictionaries = build_profile([source], [config.budget], **options)
+    dictionary = dictionaries[config.budget]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}-", dir=output.parent
+    ) as work:
+        dataset = Path(work) / "dataset"
+        summary = tokenize_dataset(
+            source, dataset, dictionary, batch_size=config.batch_size
+        )
+        profile = dataset / "profile"
+        profile.mkdir()
+        document["settings"] = settings
+        document["timing"]["encoding_seconds"] = summary["seconds"]
+        document["timing"]["workflow_seconds"] = time.monotonic() - started
+        document["timing"]["workflow_peak_rss_bytes"] = (
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        )
+        (profile / "curve.json").write_text(json.dumps(document, indent=2) + "\n")
+        (profile / "profile.md").write_text(render_report(document))
+        dataset.rename(output)
+    return {
+        **summary,
+        "output": str(output),
+        "workflow_seconds": time.monotonic() - started,
+    }
 
 
 def _replace(table, name, values, type):
@@ -135,27 +182,3 @@ def tokenize_dataset(source, output, dictionary=MergeDictionary(), *, batch_size
         write_manifest(work / "tokenization.json", summary)
         work.rename(output)
     return summary
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--vocabulary", type=Path)
-    parser.add_argument("--batch-size", type=int, default=128)
-    args = parser.parse_args()
-    dictionary = (
-        MergeDictionary.read(args.vocabulary) if args.vocabulary else MergeDictionary()
-    )
-    print(
-        json.dumps(
-            tokenize_dataset(
-                args.input, args.output, dictionary, batch_size=args.batch_size
-            ),
-            indent=2,
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()

@@ -22,7 +22,7 @@ from pondera.chess.merge import (
     usage_counts,
 )
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
-from pondera.data.pipeline import load_config
+from pondera.data.config import load_config
 from pondera.data.trace import load_sidecar, synthesize_root
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"

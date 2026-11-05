@@ -1,6 +1,8 @@
 """Real teacher traces qualify authoritative text and merged training inputs."""
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +16,7 @@ from tools.export_hf import export_hf
 
 from pondera.chess.merge import MergeDictionary, decode
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL
+from pondera.data.config import load_config
 from pondera.data.dataset import (
     HF_COLUMNS,
     TracePositions,
@@ -22,7 +25,7 @@ from pondera.data.dataset import (
     trace_data_identity,
 )
 from pondera.data.merge_profile import build_profile, load_full_rows, write_artifacts
-from pondera.data.pipeline import load_config, produce_shards
+from pondera.data.pipeline import produce_shards
 from pondera.data.text import ROLE_MIXED, trace_atoms
 from pondera.data.tokenize import tokenize_dataset
 from pondera.data.trace import ROLE_FINAL_MOVE, load_sidecar, synthesize_root
@@ -108,6 +111,48 @@ class TokenizeTests(unittest.TestCase):
                 decode(result["trace_token_ids"], self.dictionary),
                 expected["trace_token_ids"],
             )
+
+    def test_configured_workflow_fits_one_budget_and_encodes_all_rows(self):
+        for budget in (0, 8):
+            with self.subTest(budget=budget):
+                config = self.root / "data.toml"
+                config.write_text(
+                    Path("configs/data.toml")
+                    .read_text()
+                    .replace("budget = 16384", f"budget = {budget}")
+                    .replace("min_count = 8", "min_count = 1")
+                    .replace("# max_roots = 128", "max_roots = 3")
+                    .replace("batch_size = 128", "batch_size = 2")
+                )
+                output = self.root / f"training-{budget}"
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pondera.data",
+                        "encode",
+                        "--config",
+                        str(config),
+                        "--input",
+                        str(self.source),
+                        "--output",
+                        str(output),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.dictionary = MergeDictionary.read(output / "merged_vocabulary.txt")
+                self.assertLessEqual(len(self.dictionary), budget)
+                if budget:
+                    self.assertGreater(len(self.dictionary), 0)
+                self.assert_preserved(self.rows(output))
+                document = json.loads((output / "profile" / "curve.json").read_text())
+                self.assertEqual(document["settings"]["budget"], budget)
+                self.assertEqual(document["corpus"]["loaded"]["rows"], 3)
+                self.assertEqual(len(document["tiers"]), 1)
+                self.assertGreater(document["timing"]["workflow_peak_rss_bytes"], 0)
+                self.assertEqual(len(TracePositions(output, "train")), 4)
 
     def test_conversion_replaces_the_cache_from_authoritative_text(self):
         path = self.source / "shard-000000" / "data.parquet"

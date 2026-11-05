@@ -1,6 +1,8 @@
 import gc
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from collections import Counter
@@ -11,19 +13,17 @@ import chess
 from trace_fixtures import read_release_rows
 from trace_fixtures import trace_config_text as config_text
 
+from pondera.data.config import load_config, parse_recipe
 from pondera.data.pipeline import (
     CollectionError,
     _check_sidecar,
     _collect_root,
     _Engine,
-    load_config,
-    parse_recipe,
     produce_shards,
-    run_pipeline,
     sample_root_settings,
     validate_release,
 )
-from pondera.data.roots import root_id_for
+from pondera.data.roots.pool import root_id_for
 from pondera.data.trace import SynthesisError, load_sidecar
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
@@ -253,21 +253,34 @@ class DirectPipelineIntegrationTests(unittest.TestCase):
             directory = Path(directory)
             config_path = directory / "trace.toml"
             config_path.write_text(
-                config_text(engine=str(engine.resolve()))
-                .replace(
-                    'roots = ".local/data/roots.jsonl"',
-                    f'roots = "{directory / "roots.jsonl"}"',
-                )
-                .replace(
-                    'output = ".local/runs/trace"',
-                    f'output = "{directory / "release"}"',
-                ),
+                config_text().replace("workers = 8", "workers = 1"),
                 encoding="utf-8",
             )
             (directory / "roots.jsonl").write_text(
                 json.dumps(root) + "\n", encoding="utf-8"
             )
-            result = run_pipeline(load_config(config_path), workers=1)
+            before = (directory / "roots.jsonl").read_bytes()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pondera.data",
+                    "curate",
+                    "--config",
+                    str(config_path),
+                    "--input",
+                    str(directory),
+                    "--output",
+                    str(directory / "release"),
+                    "--engine",
+                    str(engine),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            result = json.loads(completed.stdout)
+            self.assertEqual((directory / "roots.jsonl").read_bytes(), before)
             self.assertEqual(result["roots"], 1)
             self.assertFalse((directory / "release" / "roots").exists())
             self.assertTrue(validate_release(directory / "release", workers=1)["ok"])
@@ -302,17 +315,25 @@ class DirectPipelineIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             path = directory / "trace.toml"
-            path.write_text(config_text(joint=joint, engine=engine))
+            path.write_text(config_text(joint=joint))
             config = load_config(path)
             sampled = sample_root_settings(roots, config, config.seed)
             self.assertEqual({r["depth"] for r in sampled}, {3, 4})
             self.assertIn(1, {r["teacher_width"] for r in sampled})
             self.assertIn(2, {r["teacher_width"] for r in sampled})
-            produce_shards(roots, directory / "serial", config, workers=1, shard_size=2)
+            produce_shards(
+                roots,
+                directory / "serial",
+                config,
+                engine=engine,
+                workers=1,
+                shard_size=2,
+            )
             produce_shards(
                 list(reversed(roots)),
                 directory / "parallel",
                 config,
+                engine=engine,
                 workers=2,
                 shard_size=3,
             )
@@ -320,6 +341,7 @@ class DirectPipelineIntegrationTests(unittest.TestCase):
                 roots,
                 directory / "resumed",
                 config,
+                engine=engine,
                 workers=2,
                 shard_size=2,
                 end_shard=1,
@@ -328,7 +350,12 @@ class DirectPipelineIntegrationTests(unittest.TestCase):
             # Recover a real published shard whose registration was interrupted.
             (directory / "resumed" / "release.json").unlink()
             produce_shards(
-                roots, directory / "resumed", config, workers=2, shard_size=2
+                roots,
+                directory / "resumed",
+                config,
+                engine=engine,
+                workers=2,
+                shard_size=2,
             )
             expected = read_release_rows(directory / "serial")
             for name in ("serial", "parallel", "resumed"):
@@ -339,7 +366,9 @@ class DirectPipelineIntegrationTests(unittest.TestCase):
             full = replace(
                 config, sampling=replace(config.sampling, joint=((("full", 3), 1.0),))
             )
-            produce_shards(roots[-1:], directory / "full-one", full, workers=1)
+            produce_shards(
+                roots[-1:], directory / "full-one", full, engine=engine, workers=1
+            )
             self.assertTrue(validate_release(directory / "full-one", workers=1)["ok"])
             self.assertEqual(
                 next(iter(read_release_rows(directory / "full-one").values()))["row"][

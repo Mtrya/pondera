@@ -18,7 +18,8 @@ from pondera.chess.vocabulary import (
     UCI_MOVE_TO_IDX,
     VALUE,
 )
-from pondera.data.pipeline import load_config, profile_roots
+from pondera.data.config import load_config
+from pondera.data.pipeline import profile_roots
 from pondera.data.trace import (
     DRAW_CLAIM_BOUND,
     PRESENTATIONS,

@@ -15,6 +15,7 @@ from trace_fixtures import read_release_rows, tie_sidecar_lines, trace_config_te
 
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
+from pondera.data.config import load_config, parse_recipe
 from pondera.data.dataset import (
     DATA_ARRAYS,
     TracePositions,
@@ -22,9 +23,7 @@ from pondera.data.dataset import (
     read_root_rows,
 )
 from pondera.data.pipeline import (
-    load_config,
     load_trace_arrays,
-    parse_recipe,
     produce_shards,
     sample_root_settings,
     validate_release,

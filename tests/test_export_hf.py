@@ -14,7 +14,6 @@ from pondera.data.dataset import (
     load_manifest,
 )
 from pondera.data.pipeline import produce_shards, validate_release
-from pondera.data.roots import SOURCE_SHA256, SOURCE_URL
 
 REMOVED_COLUMNS = {
     "board_tokens",
@@ -35,9 +34,12 @@ class ExportTests(unittest.TestCase):
     def test_real_release_projection_preserves_shared_rows_and_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             config, roots, run, provider = build_run(directory, cases=CASES, seed=649)
+            source_config = config.sources[0]
             for index, root in enumerate(roots):
                 root["split"] = "val" if index == 0 else "train"
                 root["source"] = {
+                    "archive_url": source_config.url,
+                    "archive_sha256": source_config.sha256,
                     "file": "lichess_elite_2025-11.pgn",
                     "game": 12460 + index,
                     "ply": 54,
@@ -87,8 +89,8 @@ class ExportTests(unittest.TestCase):
                 self.assertEqual(table.to_pylist(), expected)
                 for row in expected:
                     source = json.loads(row["source"])
-                    self.assertEqual(source["archive_url"], SOURCE_URL)
-                    self.assertEqual(source["archive_sha256"], SOURCE_SHA256)
+                    self.assertEqual(source["archive_url"], source_config.url)
+                    self.assertEqual(source["archive_sha256"], source_config.sha256)
                     self.assertEqual(
                         set(source),
                         {"archive_url", "archive_sha256", "file", "game", "ply"},

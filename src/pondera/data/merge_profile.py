@@ -5,7 +5,6 @@ roots, rather than alternate full views of every random/zero row. Measurement
 includes every selected presentation; vocabulary holdout is optional.
 """
 
-import argparse
 import json
 import random
 import resource
@@ -29,8 +28,6 @@ from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION, CHESS_VOCAB_SIZE, 
 from pondera.data.dataset import load_dictionary, load_manifest, parquet_sources
 from pondera.data.text import trace_atoms
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
-
-DEFAULT_BUDGETS = (100, 500, 2000, 8000)
 
 
 @dataclass(frozen=True)
@@ -433,49 +430,3 @@ def write_artifacts(output, document, dictionaries):
         dictionary.write(output / f"dictionary-{budget}.tsv")
     (output / "curve.json").write_text(json.dumps(document, indent=2) + "\n")
     (output / "profile.md").write_text(render_report(document))
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--release", action="append", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--budget", action="append", type=int)
-    parser.add_argument("--fit-split", choices=("all", "train", "val"), default="all")
-    parser.add_argument("--holdout-fraction", type=float, default=0.0)
-    parser.add_argument("--max-roots", type=int)
-    parser.add_argument("--min-count", type=int, default=8)
-    parser.add_argument("--per-length-limit", type=int, default=20_000)
-    parser.add_argument("--selection-stride", type=int, default=1)
-    parser.add_argument("--block", type=int, help="default max(8, budget // 32)")
-    parser.add_argument("--max-rounds", type=int, default=100_000)
-    parser.add_argument("--top", type=int, default=20)
-    args = parser.parse_args()
-
-    def report(tier):
-        print(
-            f"budget {tier['budget']:,}: {tier['entries']:,} entries; "
-            f"corpus {_percent(tier['measurement']['ratio'])}; "
-            f"held out {_percent(tier['heldout']['ratio'])}",
-            flush=True,
-        )
-
-    document, dictionaries = build_profile(
-        args.release,
-        args.budget or DEFAULT_BUDGETS,
-        fit_split=args.fit_split,
-        holdout_fraction=args.holdout_fraction,
-        max_roots=args.max_roots,
-        min_count=args.min_count,
-        per_length_limit=args.per_length_limit,
-        selection_stride=args.selection_stride,
-        block=args.block,
-        max_rounds=args.max_rounds,
-        top=args.top,
-        on_tier=report,
-    )
-    write_artifacts(args.output, document, dictionaries)
-    print(f"artifacts: {args.output}")
-
-
-if __name__ == "__main__":
-    main()

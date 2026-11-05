@@ -16,21 +16,8 @@ from pondera.data.dataset import (
     TRACE_SCHEMA,
     load_manifest,
 )
-from pondera.data.roots import complete_source
 
 SPLIT_NAMES = {"train": "train", "val": "validation"}
-
-
-def _projection(rows):
-    projected = []
-    for row in rows:
-        if row["source"] is not None:
-            source = json.loads(row["source"])
-            completed = complete_source(source)
-            if completed != source:
-                row["source"] = json.dumps(completed, sort_keys=True)
-        projected.append({name: row[name] for name in HF_COLUMNS})
-    return pa.Table.from_pylist(projected, schema=HF_SCHEMA)
 
 
 def export_hf(release, output, batch_size=1024):
@@ -80,10 +67,12 @@ def export_hf(release, output, batch_size=1024):
                             compression_level=3,
                             use_dictionary=["presentation", "turn", "final_move"],
                         )
-                    writers[hf_split].write_table(_projection(selected))
+                    writers[hf_split].write_table(
+                        pa.Table.from_pylist(selected, schema=HF_SCHEMA)
+                    )
                     counts[hf_split] += len(selected)
-        if set(counts) != set(SPLIT_NAMES.values()):
-            raise ValueError("Export requires nonempty train and validation splits")
+        if not counts:
+            raise ValueError("Release contains no rows")
         for writer in writers.values():
             writer.close()
         files = [
@@ -93,6 +82,7 @@ def export_hf(release, output, batch_size=1024):
                 "bytes": (temporary / "data" / f"{split}-00000.parquet").stat().st_size,
             }
             for split in ("train", "validation")
+            if split in counts
         ]
         os.replace(temporary, output)
     except BaseException:

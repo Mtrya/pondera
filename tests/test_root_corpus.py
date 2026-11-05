@@ -1,28 +1,30 @@
+import hashlib
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+import urllib.parse
 import zipfile
 from collections import Counter
 from pathlib import Path
 
 import chess
 
+from pondera.data.config import load_config
 from pondera.data.dataset import load_manifest
-from pondera.data.roots import (
-    SOURCE_FILE,
+from pondera.data.roots.pgn import _Candidate, _profile, ensure_archive
+from pondera.data.roots.pgn import build_pool as collect_pgn
+from pondera.data.roots.pool import (
     CorpusError,
-    _Candidate,
     _claimable,
     _position_key,
-    _profile,
-    build_pool,
-    ensure_archive,
     root_id_for,
     select_pool,
     split_for,
     validate_record,
+    write_pool,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "root_corpus"
@@ -44,6 +46,14 @@ FIXTURE_POOLS = {
 }
 
 
+def build_pool(archive, directory, train, val, share, seed, limit_games=None):
+    records, manifest = collect_pgn(
+        archive, train, val, share, seed, limit_games=limit_games
+    )
+    write_pool(directory, records, manifest)
+    return manifest
+
+
 def build(fixture, directory, limit_games=None, train=None, val=None, share=None):
     if fixture == "corrupt.pgn" and limit_games == 2 and train is None:
         default_train, default_val, default_share = 3, 0, 0.0
@@ -61,6 +71,54 @@ def build(fixture, directory, limit_games=None, train=None, val=None, share=None
 
 def by_key(rows):
     return {row["position_key"]: row for row in rows}
+
+
+class PrepareTests(unittest.TestCase):
+    def test_preparation_produces_the_requested_pool_without_trace_curation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            config = directory / "data.toml"
+            config.write_text(
+                Path("configs/data.toml")
+                .read_text()
+                .replace("train = 500000", "train = 2")
+                .replace("val = 2000", "val = 0")
+                .replace("claimable_share = 0.03", "claimable_share = 0.0")
+                .replace(
+                    load_config().sources[0].url,
+                    (FIXTURES / "ties.pgn").resolve().as_uri(),
+                )
+                .replace(
+                    load_config().sources[0].sha256,
+                    hashlib.sha256((FIXTURES / "ties.pgn").read_bytes()).hexdigest(),
+                )
+            )
+            output = directory / "prepared"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pondera.data",
+                    "prepare",
+                    "--config",
+                    str(config),
+                    "--output",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "roots.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual({row["position_key"] for row in rows}, {E4_KEY, E5_KEY})
+            self.assertEqual({row["split"] for row in rows}, {"train"})
+            self.assertFalse((output / "release.json").exists())
+            manifest = load_manifest(output / "pool.manifest.json")
+            self.assertEqual(manifest["parameters"]["train"], 2)
 
 
 def validate(rows):
@@ -301,10 +359,11 @@ class RootPoolTests(unittest.TestCase):
 
     def test_download_rejects_an_archive_with_the_pinned_name_but_wrong_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / SOURCE_FILE
+            source = load_config().sources[0]
+            path = Path(directory) / Path(urllib.parse.urlsplit(source.url).path).name
             path.write_bytes(b"not the pinned archive")
             with self.assertRaises(CorpusError):
-                ensure_archive(directory)
+                ensure_archive(directory, source)
 
     def test_limit_games_stops_at_the_input_prefix(self):
         with tempfile.TemporaryDirectory() as directory:

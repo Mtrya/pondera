@@ -111,14 +111,12 @@ def load_dictionary(directory):
 
 def write_trace_rows(directory, rows):
     """Store unpadded rows with shared fields and local machine arrays."""
-    from pondera.data.roots import complete_source
-
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     records = [
         {
             **row,
-            "source": json.dumps(complete_source(row["source"]), sort_keys=True)
+            "source": json.dumps(row["source"], sort_keys=True)
             if row.get("source") is not None
             else None,
         }
