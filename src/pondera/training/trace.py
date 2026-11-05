@@ -94,11 +94,11 @@ class TrainConfig:
 
 @dataclass
 class TraceCollator:
-    """Pad stored traces and roles, and locate each row's final decision.
+    """Pad traces and derived roles, and locate each row's final decision.
 
-    The trace already carries its presentation order. Board rows come padded
-    to their shard's width, which can differ across shards; they are repadded
-    to the batch maximum. Every row ends with ``<end>``, and exactly one FINAL
+    The trace already carries its presentation order. The dataset derives each
+    initial board from its FEN and repetition count; boards are padded to the
+    batch maximum. Every row ends with ``<end>``, and exactly one FINAL
     delimiter is followed by the decision that carries ROLE_FINAL_MOVE. The
     label suffix continues after that decision, so the final move is not the
     last token.

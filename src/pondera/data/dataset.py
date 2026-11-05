@@ -10,19 +10,13 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from pondera.chess.codec import BOARD_TOKENS_MAX
+from pondera.chess.codec import encode_board
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
-from pondera.data.trace import ROLE_COUNT, TRACE_GRAMMAR_VERSION
+from pondera.data.trace import TRACE_GRAMMAR_VERSION, derive_trace_roles
 
-DATA_FORMAT_VERSION = 8
-TRACE_ARRAYS = ("board_tokens", "trace_tokens", "trace_len", "trace_roles")
-STATE_ARRAYS = (
-    "state_without_board",
-    "state_with_board",
-    "state_best",
-    "state_basis",
-    "state_value",
-)
+DATA_FORMAT_VERSION = 9
+TRACE_ARRAYS = ("trace_token_ids", "trace_len")
+STATE_ARRAYS = ("state_best", "state_value")
 DATA_ARRAYS = (*TRACE_ARRAYS, *STATE_ARRAYS, "state_count")
 HF_SCHEMA = pa.schema(
     [
@@ -36,27 +30,22 @@ HF_SCHEMA = pa.schema(
         ("final_move", pa.string()),
         ("final_value", pa.float32()),
         ("mate_distance", pa.int16()),
+        ("source", pa.string()),
     ]
 )
-TRACE_SCHEMA = pa.schema(
+LOCAL_ONLY_SCHEMA = pa.schema(
     [
-        *HF_SCHEMA,
         ("root_id", pa.string()),
         ("split", pa.string()),
-        ("effective_width", pa.int16()),
-        ("rounds", pa.int16()),
-        ("thinking_tokens", pa.int32()),
+        ("trace_token_ids", pa.list_(pa.int16())),
         ("trace_len", pa.int32()),
-        ("final_value_bin", pa.int16()),
-        ("claim_draw", pa.bool_()),
-        ("position_key", pa.string()),
-        ("source", pa.string()),
-        ("board_tokens", pa.list_(pa.int16())),
-        ("trace_tokens", pa.list_(pa.int16())),
-        ("trace_roles", pa.list_(pa.int8())),
-        *((name, pa.list_(pa.int32())) for name in STATE_ARRAYS),
+        ("state_best", pa.list_(pa.int32())),
+        ("state_value", pa.list_(pa.int32())),
     ]
 )
+TRACE_SCHEMA = pa.schema([*HF_SCHEMA, *LOCAL_ONLY_SCHEMA])
+HF_COLUMNS = tuple(field.name for field in HF_SCHEMA)
+LOCAL_ONLY_COLUMNS = tuple(field.name for field in LOCAL_ONLY_SCHEMA)
 ROOT_COLUMNS = [
     field.name
     for field in TRACE_SCHEMA
@@ -85,13 +74,15 @@ def load_manifest(path):
 
 
 def write_trace_rows(directory, rows):
-    """Store unpadded rows with the HF scalars and authoritative machine arrays."""
+    """Store unpadded rows with shared fields and local machine arrays."""
+    from pondera.data.roots import complete_source
+
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     records = [
         {
             **row,
-            "source": json.dumps(row["source"], sort_keys=True)
+            "source": json.dumps(complete_source(row["source"]), sort_keys=True)
             if row.get("source") is not None
             else None,
         }
@@ -161,7 +152,7 @@ def load_trace_arrays(directory, names=TRACE_ARRAYS):
 
 
 def validate_trace_arrays(arrays, rows=None):
-    """Diagnostic checks of ragged array types, lengths and role ranges."""
+    """Diagnostic checks of ragged array types and lengths."""
     if not arrays:
         raise ValueError("A Trace dataset needs token arrays")
     row_count = len(next(iter(arrays.values())))
@@ -170,19 +161,10 @@ def validate_trace_arrays(arrays, rows=None):
     for name, array in arrays.items():
         if len(array) != row_count:
             raise ValueError(f"Trace array {name} has a different row count")
-        expected = (
-            np.int16
-            if name in {"board_tokens", "trace_tokens"}
-            else np.int8
-            if name == "trace_roles"
-            else np.int32
-        )
+        expected = np.int16 if name == "trace_token_ids" else np.int32
         if array.dtype != expected:
             raise ValueError(f"Trace array {name} has an unexpected dtype")
-    boards = arrays.get("board_tokens")
-    if boards is not None and np.any(boards.lengths > BOARD_TOKENS_MAX):
-        raise ValueError("Board token array exceeds its declared width")
-    trace = arrays.get("trace_tokens")
+    trace = arrays.get("trace_token_ids")
     if trace is not None and np.any(trace.lengths < 1):
         raise ValueError("Trace rows cannot be empty")
     lengths = arrays.get("trace_len")
@@ -192,12 +174,6 @@ def validate_trace_arrays(arrays, rows=None):
         and not np.array_equal(lengths, trace.lengths)
     ):
         raise ValueError("Trace lengths do not match their examples")
-    roles = arrays.get("trace_roles")
-    if roles is not None:
-        if trace is not None and not np.array_equal(roles.lengths, trace.lengths):
-            raise ValueError("Trace roles do not match their examples")
-        if np.any((roles.values < 0) | (roles.values >= ROLE_COUNT)):
-            raise ValueError("Trace roles do not match their declared format")
     best = arrays.get("state_best")
     for name in STATE_ARRAYS:
         array = arrays.get(name)
@@ -225,7 +201,7 @@ def trace_data_identity(directory):
 
 
 class TracePositions:
-    """Read machine columns directly from the same Parquet files used by HF."""
+    """Read base trace IDs and derive board inputs and token roles."""
 
     CACHE_GROUPS = 8
 
@@ -249,6 +225,10 @@ class TracePositions:
         for shard in self.manifest["shards"]:
             path = directory / shard["path"] / "data.parquet"
             file = pq.ParquetFile(path)
+            if file.schema_arrow != TRACE_SCHEMA:
+                raise ValueError(
+                    f"Shard schema differs from the release contract: {path}"
+                )
             if file.metadata.num_rows != shard["rows"]:
                 raise ValueError(f"Shard row count differs from its release: {path}")
             starts, count = [], 0
@@ -277,17 +257,21 @@ class TracePositions:
             file = pq.ParquetFile(self.shards[shard][0])
             table = file.read_row_group(
                 group,
-                columns=["board_tokens", "trace_tokens", "trace_len", "trace_roles"],
+                columns=["fen", "repetition", *TRACE_ARRAYS],
                 use_threads=False,
             )
-            self.cache[key] = _arrays_from_table(table, TRACE_ARRAYS)
+            arrays = _arrays_from_table(table, TRACE_ARRAYS)
+            arrays["fen"] = table["fen"].to_pylist()
+            arrays["repetition"] = table["repetition"].to_pylist()
+            self.cache[key] = arrays
             if len(self.cache) > self.CACHE_GROUPS:
                 self.cache.popitem(last=False)
         self.cache.move_to_end(key)
         arrays = self.cache[key]
+        tokens = arrays["trace_token_ids"][row].copy()
         return (
-            arrays["board_tokens"][row].copy(),
-            arrays["trace_tokens"][row].copy(),
+            encode_board(arrays["fen"][row], arrays["repetition"][row]),
+            tokens,
             int(arrays["trace_len"][row]),
-            arrays["trace_roles"][row].copy(),
+            derive_trace_roles(tokens),
         )

@@ -5,7 +5,6 @@ from pathlib import Path
 import chess
 import numpy as np
 
-from pondera.chess.codec import encode_board
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
 from pondera.data.dataset import (
     DATA_FORMAT_VERSION,
@@ -55,10 +54,8 @@ def write_trace_dataset(root, splits):
                     "split": split,
                     "fen": row["fen"],
                     "repetition": row.get("repetition", 1),
-                    "board_tokens": encode_board(row["fen"], row.get("repetition", 1)),
-                    "trace_tokens": row["trace"],
+                    "trace_token_ids": row["trace"],
                     "trace_len": len(row["trace"]),
-                    "trace_roles": row["roles"],
                     **{name: [] for name in STATE_ARRAYS},
                 }
             )

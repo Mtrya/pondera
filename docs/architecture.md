@@ -7,6 +7,7 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 | `chess/` | Action vocabulary, rule-only path tracking, lossless board token encoding, exact symmetry transforms, and min-cost merge dictionaries |
 | `models/` | Neural model and checkpoint serialization |
 | `data/` | Single-entry offline trace production, direct root-pool construction from game archives, release validation, encoded training arrays, and merge-vocabulary profiling |
+| `tools/export_hf.py` | Bounded projection of an accepted local release into the shared eleven-column Hugging Face dataset; schema definitions remain in `data/` |
 | `training/` | Supervised optimization and resumable training state |
 | `inference/` | Legal move selection, masked trace generation and budget assessment, and the UCI protocol |
 | `evaluation/` | External match orchestration and opening assets |

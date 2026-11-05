@@ -64,7 +64,7 @@ def load_full_rows(release):
     rows = []
     for shard in manifest["shards"]:
         directory = release / shard["path"]
-        tokens = load_trace_arrays(directory, ("trace_tokens",))["trace_tokens"]
+        tokens = load_trace_arrays(directory, ("trace_token_ids",))["trace_token_ids"]
         records = read_root_rows(directory)
         for index, record in enumerate(records):
             if record["presentation"] != FULL_PRESENTATION:

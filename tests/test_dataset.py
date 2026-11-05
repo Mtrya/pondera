@@ -17,7 +17,12 @@ from pondera.chess.vocabulary import (
     PAD,
     UCI_MOVE_TO_IDX,
 )
-from pondera.data.dataset import DATA_FORMAT_VERSION, TracePositions, write_trace_rows
+from pondera.data.dataset import (
+    DATA_FORMAT_VERSION,
+    STATE_ARRAYS,
+    TracePositions,
+    write_trace_rows,
+)
 from pondera.data.trace import (
     ROLE_CONTROL,
     ROLE_FINAL_EVAL,
@@ -76,7 +81,7 @@ class DatasetContractTests(unittest.TestCase):
         self.assertEqual(manifest["grammar_version"], TRACE_GRAMMAR_VERSION)
         self.assertEqual(manifest["grammar_version"], 2)
         self.assertEqual(manifest["format_version"], DATA_FORMAT_VERSION)
-        self.assertEqual(manifest["format_version"], 8)
+        self.assertEqual(manifest["format_version"], 9)
         self.assertEqual(manifest["tokenizer_version"], CHESS_TOKENIZER_VERSION)
 
     def test_rejects_old_trace_formats(self):
@@ -183,7 +188,7 @@ class CollatorContractTests(unittest.TestCase):
 
 
 def write_shard(directory, index, fen):
-    """Publish one one-row shard whose board array is exactly its own width."""
+    """Publish one one-row shard with the current local schema."""
     board = chess.Board(fen)
     writer = TraceWriter(fen)
     writer.final(sorted(move.uci() for move in board.legal_moves)[0])
@@ -196,20 +201,11 @@ def write_shard(directory, index, fen):
         [
             {
                 "split": "train",
-                "board_tokens": encode_board(fen),
-                "trace_tokens": writer.tokens,
+                "fen": fen,
+                "repetition": 1,
+                "trace_token_ids": writer.tokens,
                 "trace_len": len(writer.tokens),
-                "trace_roles": writer.roles,
-                **{
-                    name: []
-                    for name in (
-                        "state_without_board",
-                        "state_with_board",
-                        "state_best",
-                        "state_basis",
-                        "state_value",
-                    )
-                },
+                **{name: [] for name in STATE_ARRAYS},
             }
         ],
     )

@@ -30,11 +30,11 @@ from pathlib import Path
 import chess
 import numpy as np
 
-from pondera.chess.codec import cap_mate_distance, encode_board, value_bin
+from pondera.chess.codec import cap_mate_distance, value_bin
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import (
     CHESS_TOKENIZER_VERSION,
-    DEPTH,
+    FINAL,
     IDX_TO_UCI_MOVE,
     MATE_LOSS,
     MATE_WIN,
@@ -52,6 +52,7 @@ from pondera.data.dataset import (
     write_manifest,
     write_trace_rows,
 )
+from pondera.data.roots import complete_source
 from pondera.data.trace import (
     CLAIM_DRAW_UCI,
     DRAW_CLAIM_BOUND,
@@ -406,12 +407,12 @@ class RootProfile:
         ]
         self._add(root_id, root.root["split"], root.stats, rows)
 
-    def add_stored(self, row, stats, token_count):
+    def add_stored(self, row, stats, token_count, thinking_tokens):
         self._add(
             row["root_id"],
             row["split"],
             stats,
-            [(row["presentation"], token_count, row["thinking_tokens"])],
+            [(row["presentation"], token_count, thinking_tokens)],
         )
 
     def _add(self, root_id, split, stats, rows):
@@ -666,7 +667,7 @@ class _Engine:
 
 
 RELEASE_ONLY_METADATA = frozenset({"root_selection"})
-ROOT_ROW_FIELDS = ("split", "fen", "repetition", "turn", "position_key", "source")
+ROOT_ROW_FIELDS = ("split", "fen", "repetition", "turn", "source")
 CHAMPION_FIELDS = ("round", "depth", "move", "raw", "wdl", "mate", "value_token", "pv")
 
 
@@ -692,7 +693,6 @@ def _root_row(root, synthesized, presentation):
         "root_id": root["root_id"],
         "presentation": presentation,
         "teacher_width": synthesized.stats["teacher_width"],
-        "effective_width": root["effective_width"],
         "teacher_depth": synthesized.stats["depth"],
         "trace_text": row.trace_text,
         "final_value": (
@@ -701,13 +701,9 @@ def _root_row(root, synthesized, presentation):
         / 1000
         if synthesized.round_audits[-1].wdl is not None
         else None,
-        "rounds": row.rounds,
-        "thinking_tokens": row.thinking_tokens,
         "trace_len": len(row.tokens),
         "final_move": row.final_move,
-        "final_value_bin": row.final_value_bin,
         "mate_distance": row.mate_distance,
-        "claim_draw": row.claim_draw,
     }
     for name in ROOT_ROW_FIELDS:
         if name in root:
@@ -753,20 +749,11 @@ def _write_shard(directory, records, metadata, presentations):
     rows, champion_rows = [], []
     for synthesized in records:
         root = synthesized.root
-        board = encode_board(root["fen"], int(root["repetition"]))
         for presentation in presentations[root["root_id"]]:
             row = synthesized.rows[presentation]
             payload = _root_row(root, synthesized, presentation)
-            payload.update(
-                board_tokens=board, trace_tokens=row.tokens, trace_roles=row.roles
-            )
-            for name, field in (
-                ("state_without_board", "no_tool_end"),
-                ("state_with_board", "tool_end"),
-                ("state_best", "best"),
-                ("state_basis", "basis"),
-                ("state_value", "value"),
-            ):
+            payload["trace_token_ids"] = row.tokens
+            for name, field in (("state_best", "best"), ("state_value", "value")):
                 payload[name] = [
                     getattr(boundary, field) for boundary in row.boundaries
                 ]
@@ -803,10 +790,14 @@ def _recover_shard(output, index, roots, metadata, presentations):
     expected = {root["root_id"]: root for root in roots}
     for row in rows:
         root = expected[row["root_id"]]
-        for name in (*ROOT_ROW_FIELDS, "teacher_width", "effective_width", "depth"):
+        for name in (*ROOT_ROW_FIELDS, "teacher_width", "depth"):
+            expected_value = root.get(name)
+            if name == "source":
+                expected_value = complete_source(expected_value)
             if (
                 name in root
-                and row.get("teacher_depth" if name == "depth" else name) != root[name]
+                and row.get("teacher_depth" if name == "depth" else name)
+                != expected_value
             ):
                 raise FileExistsError(
                     f"Unregistered shard root {name} differs: {final}"
@@ -825,15 +816,19 @@ def _check_shard_layout(output, shard, roots):
 
 
 def _profile_shard(output, shard, profile):
-    rows = read_root_rows(Path(output) / shard["path"])
-    champions = {
-        row["root_id"]: row for row in _read_champions(Path(output) / shard["path"])
-    }
-    for row in rows:
+    directory = Path(output) / shard["path"]
+    rows = read_root_rows(directory)
+    tokens = load_trace_arrays(directory, ("trace_token_ids",))["trace_token_ids"]
+    champions = {row["root_id"]: row for row in _read_champions(directory)}
+    for index, row in enumerate(rows):
+        final = np.flatnonzero(tokens[index] == FINAL)
+        if len(final) != 1:
+            raise ValueError(f"Stored trace has no unique FINAL: {row['root_id']}")
         profile.add_stored(
             row,
             champions[row["root_id"]]["stats"],
             row["trace_len"],
+            int(final[0]),
         )
 
 
@@ -1310,21 +1305,21 @@ def _validate_shard_rows(
             expected = expected_roots.get(root_id)
             if expected is None:
                 raise ValueError(f"Release contains an unselected root: {root_id}")
-            for name in (*ROOT_ROW_FIELDS, "teacher_width", "effective_width", "depth"):
-                if name in expected and row.get(
-                    "teacher_depth" if name == "depth" else name
-                ) != expected.get(name):
+            for name in (*ROOT_ROW_FIELDS, "teacher_width", "depth"):
+                expected_value = expected.get(name)
+                if name == "source":
+                    expected_value = complete_source(expected_value)
+                if (
+                    name in expected
+                    and row.get("teacher_depth" if name == "depth" else name)
+                    != expected_value
+                ):
                     raise ValueError(
                         f"Release root {name} differs from its selection: {root_id}"
                     )
         if board.turn != (row["turn"] == "white"):
             raise ValueError(f"Root turn disagrees with FEN: {root_id}")
         effective_width = min(teacher_width, legal_width)
-        if (
-            not _is_int(row.get("effective_width"), 1)
-            or row["effective_width"] != effective_width
-        ):
-            raise ValueError(f"Release effective width differs: {root_id}")
         max_teacher_width = max(max_teacher_width, teacher_width)
         repetition = row["repetition"]
         if not _is_int(repetition, 1) or repetition > 4:
@@ -1343,21 +1338,15 @@ def _validate_shard_rows(
             for entry in champion["rounds"]:
                 _check_champion_round(root_id, entry, board, value_mate, max_ply)
             checked_champions.add(root_id)
-        encoded = encode_board(row["fen"], repetition)
-        board_tokens = arrays["board_tokens"][index]
-        if not np.array_equal(board_tokens, encoded):
-            raise ValueError(f"Board tokens disagree with FEN: {root_id}")
 
         length = int(arrays["trace_len"][index])
-        tokens = arrays["trace_tokens"][index]
+        tokens = arrays["trace_token_ids"][index]
         program = replay(
             tokens,
             row["fen"],
             repetition,
             teacher_width=effective_width,
         )
-        if not np.array_equal(program.roles, arrays["trace_roles"][index][:length]):
-            raise ValueError(f"Trace roles disagree with replay: {root_id}")
         max_trace = max(max_trace, length)
 
         board_spans = [
@@ -1401,14 +1390,6 @@ def _validate_shard_rows(
         count = int(arrays["state_count"][index])
         if count != len(expected_boundaries):
             raise ValueError(f"Truncation-state count is invalid: {root_id}")
-        actual_boundaries = list(
-            zip(
-                map(int, arrays["state_with_board"][index][:count]),
-                map(int, arrays["state_without_board"][index][:count]),
-            )
-        )
-        if actual_boundaries != expected_boundaries:
-            raise ValueError(f"Truncation boundaries are invalid: {root_id}")
         expected_states = _expected_states(
             program, tokens, champion, board.turn == chess.BLACK
         )
@@ -1418,9 +1399,8 @@ def _validate_shard_rows(
             actual = (
                 int(arrays["state_best"][index][position]),
                 int(arrays["state_value"][index][position]),
-                int(arrays["state_basis"][index][position]),
             )
-            if actual != expected_state:
+            if actual != expected_state[:2]:
                 raise ValueError(f"Truncation state is invalid: {root_id}")
 
         final_step = next(step for step in program.steps if step.operation == "final")
@@ -1429,19 +1409,9 @@ def _validate_shard_rows(
         if root_id in suffixes and suffixes[root_id] != suffix:
             raise ValueError(f"Presentations disagree on the FINAL suffix: {root_id}")
         suffixes[root_id] = suffix
-        if row.get("thinking_tokens") != final_index:
-            raise ValueError(f"Thinking-token count is invalid: {root_id}")
-        rounds = sum(1 for token in tokens[:final_index] if token == DEPTH)
-        if row.get("rounds") != rounds:
-            raise ValueError(f"Row round count is invalid: {root_id}")
         final_move = program.final_move
         if row.get("final_move") != final_move:
             raise ValueError(f"FINAL move differs from the trace: {root_id}")
-        if row.get("claim_draw") != (final_move == CLAIM_DRAW_UCI):
-            raise ValueError(f"Draw-claim flag differs from the trace: {root_id}")
-        value_token = int(tokens[final_index + 2])
-        if row.get("final_value_bin") != value_token - VALUE:
-            raise ValueError(f"FINAL value bin differs from the trace: {root_id}")
         mate_distance = None
         mate_index = final_index + 3
         if mate_index < len(tokens) and MATE_WIN <= int(tokens[mate_index]) < PAD:
@@ -1464,12 +1434,6 @@ def _validate_shard_rows(
             raise ValueError(
                 f"FINAL mate distance differs from the champion: {root_id}"
             )
-        if deepest["wdl"] is None:
-            expected_bin = 19 if deepest["mate"] > 0 else 0
-        else:
-            expected_bin = value_bin((deepest["wdl"][0] - deepest["wdl"][2]) / 1000)
-        if row.get("final_value_bin") != expected_bin:
-            raise ValueError(f"FINAL value bin differs from the champion: {root_id}")
         pv_start = final_index + (4 if mate_distance is not None else 3)
         pv_tokens = [int(token) for token in tokens[pv_start:-1]]
         mirrored = board.turn == chess.BLACK

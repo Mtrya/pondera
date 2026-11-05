@@ -75,6 +75,7 @@ def tie_sidecar_lines(case, lines):
 
 def read_release_rows(directory):
     from pondera.data.pipeline import load_manifest, verify_shard_files
+    from pondera.data.trace import derive_trace_roles
 
     directory = Path(directory)
     release = load_manifest(directory / "release.json")
@@ -84,23 +85,16 @@ def read_release_rows(directory):
         for index, row in enumerate(rows):
             length = int(arrays["trace_len"][index])
             count = int(arrays["state_count"][index])
+            tokens = arrays["trace_token_ids"][index][:length]
             output[(row["root_id"], row["presentation"])] = {
                 "row": row,
-                "trace_tokens": tuple(
-                    int(value) for value in arrays["trace_tokens"][index][:length]
-                ),
+                "trace_tokens": tuple(int(value) for value in tokens),
                 "trace_roles": tuple(
-                    int(value) for value in arrays["trace_roles"][index][:length]
+                    int(value) for value in derive_trace_roles(tokens)
                 ),
                 "state": {
                     name: tuple(int(value) for value in arrays[name][index][:count])
-                    for name in (
-                        "state_best",
-                        "state_value",
-                        "state_basis",
-                        "state_without_board",
-                        "state_with_board",
-                    )
+                    for name in ("state_best", "state_value")
                 },
             }
     return output

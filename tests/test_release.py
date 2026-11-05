@@ -107,7 +107,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(len(self.result["shards"]), 3)
         self.assertEqual([shard["rows"] for shard in self.result["shards"]], [2, 2, 1])
         release = load_manifest(self.release / "release.json")
-        self.assertEqual(release["format_version"], 8)
+        self.assertEqual(release["format_version"], 9)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
         self.assertEqual(release["search"], {"hash_mb": 256})
@@ -134,14 +134,16 @@ class ReleaseTests(unittest.TestCase):
             "final_move": pa.string(),
             "final_value": pa.float32(),
             "mate_distance": pa.int16(),
+            "source": pa.string(),
         }
         for shard in self.result["shards"]:
             table = pq.read_table(self.release / shard["path"] / "data.parquet")
+            self.assertEqual(len(table.schema), 17)
             for name, dtype in expected.items():
                 self.assertEqual(table.schema.field(name).type, dtype)
             for row in table.to_pylist():
-                self.assertEqual(len(row["trace_tokens"]), row["trace_len"])
-                self.assertEqual(len(row["trace_roles"]), row["trace_len"])
+                self.assertEqual(len(row["trace_token_ids"]), row["trace_len"])
+                self.assertEqual(len(row["state_best"]), len(row["state_value"]))
                 self.assertTrue(row["trace_text"].endswith(" END"))
 
     def test_parallel_validation_matches_sequential(self):
@@ -181,7 +183,7 @@ class ReleaseTests(unittest.TestCase):
             }
             for index, row in enumerate(rows):
                 length = int(arrays["trace_len"][index])
-                tokens = arrays["trace_tokens"][index][:length]
+                tokens = arrays["trace_token_ids"][index][:length]
                 program = replay(
                     tokens,
                     row["fen"],
@@ -194,7 +196,6 @@ class ReleaseTests(unittest.TestCase):
                 suffix = tuple(int(token) for token in tokens[final.start :])
                 key = row["root_id"]
                 self.assertEqual(suffixes.setdefault(key, suffix), suffix)
-                self.assertEqual(row["thinking_tokens"], final.start)
                 self.assertEqual(len(champions[key]["rounds"]), row["teacher_depth"])
                 thought = [
                     step
@@ -266,11 +267,11 @@ class ReleaseTests(unittest.TestCase):
                 workers=1,
             )
 
-    def test_validation_rejects_a_wrong_effective_width(self):
+    def test_validation_rejects_a_wrong_trace_length(self):
         path = self.release / "shard-000000" / "data.parquet"
         table = pq.read_table(path)
         rows = table.to_pylist()
-        rows[0]["effective_width"] = 2
+        rows[0]["trace_len"] += 1
         pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), path)
         with self.assertRaises(ValueError):
             validate_release(self.release, workers=1)
@@ -318,9 +319,8 @@ class ReleaseTests(unittest.TestCase):
         for shard in release["shards"]:
             _, rows, _ = verify_shard_files(self.release, shard, expected)
             for row in rows:
-                if row["claim_draw"]:
+                if row["final_move"] == "<claim_draw>":
                     claim_roots.add(row["root_id"])
-                    self.assertEqual(row["final_move"], "<claim_draw>")
                     self.assertEqual(row["mate_distance"], None)
         claim = json.loads((FIXTURES / "claim_draw_d4" / "root.json").read_text())
         self.assertEqual(claim_roots, {claim["root_id"]})
@@ -401,9 +401,8 @@ class WideReleaseTests(unittest.TestCase):
             )
             self.assertEqual(chess.Board(capped["fen"]).legal_moves.count(), 2)
             stored = records[capped["root_id"], capped["presentation"]]["row"]
-            self.assertEqual(
-                (stored["teacher_width"], stored["effective_width"]), (3, 2)
-            )
+            self.assertEqual(stored["teacher_width"], 3)
+            self.assertNotIn("effective_width", stored)
 
     def test_single_width_distribution_uses_schema_three(self):
         recipe = """
@@ -525,31 +524,25 @@ joint = [{width = 1, depth = 4, probability = 1.0}]
             self.assertTrue(validation["ok"])
             shard = base / "release" / "shard-000000"
             arrays = load_trace_arrays(shard, DATA_ARRAYS)
-            self.assertEqual(arrays["trace_tokens"].dtype, np.int16)
-            self.assertEqual(arrays["board_tokens"].dtype, np.int16)
-            self.assertEqual(arrays["trace_roles"].dtype, np.int8)
+            self.assertEqual(arrays["trace_token_ids"].dtype, np.int16)
             self.assertEqual(arrays["trace_len"].dtype, np.int32)
             self.assertEqual(arrays["state_count"].dtype, np.int32)
-            for name in (
-                "state_without_board",
-                "state_with_board",
-                "state_best",
-                "state_basis",
-                "state_value",
-            ):
+            for name in ("state_best", "state_value"):
                 self.assertEqual(arrays[name].dtype, np.int32)
             rows = read_root_rows(shard)
             full = next(
                 index for index, row in enumerate(rows) if row["presentation"] == "full"
             )
-            count = int(arrays["state_count"][full])
-            basis = arrays["state_basis"][full][:count]
-            best = arrays["state_best"][full][:count]
-            last_round_one = max(
-                index for index in range(count) if int(basis[index]) == 1
-            )
+            tokens = arrays["trace_token_ids"][full]
+            program = replay(tokens, rows[full]["fen"], rows[full]["repetition"], 3)
+            depths = [
+                index
+                for index, step in enumerate(program.steps)
+                if step.operation == "depth"
+            ]
+            best = arrays["state_best"][full]
             kept = MOVE + UCI_MOVE_TO_IDX[reflect_uci("f6e4")]
-            self.assertEqual(int(best[last_round_one]), kept)
+            self.assertEqual(int(best[depths[1] - 1]), kept)
 
 
 if __name__ == "__main__":

@@ -147,6 +147,23 @@ def root_id_for(fen, repetition):
     return f"{fen}|{repetition}"
 
 
+def complete_source(source):
+    """Add the pinned public archive identity to a legacy game locator."""
+    if source is None or not isinstance(source, dict):
+        return source
+    if not {"file", "game", "ply"} <= set(source):
+        return source
+    completed = {
+        **source,
+        "archive_url": SOURCE_URL,
+        "archive_sha256": SOURCE_SHA256,
+    }
+    for name in ("archive_url", "archive_sha256"):
+        if source.get(name, completed[name]) != completed[name]:
+            raise CorpusError(f"Source {name} differs from the pinned archive")
+    return completed
+
+
 def split_for(position_key):
     """Return the split assigned to a position key."""
     bucket = random.Random(position_key).randrange(SPLIT_MODULUS)

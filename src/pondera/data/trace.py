@@ -118,6 +118,59 @@ def is_metadata_token(token):
     return SIDE <= token <= META_END
 
 
+def derive_trace_roles(tokens):
+    """Recover token roles from grammar delimiters without chess replay."""
+    tokens = [int(token) for token in tokens]
+    roles = []
+    index = 0
+    suffix = False
+    while index < len(tokens):
+        token = tokens[index]
+        if not suffix and token == BOARD:
+            roles.append(ROLE_CONTROL)
+            index += 1
+            start = index
+            while index < len(tokens) and tokens[index] < MOVE:
+                roles.append(ROLE_BOARD)
+                index += 1
+            observation = tokens[start:index]
+            if (
+                len(observation) < 9
+                or any(token >= SIDE for token in observation[:-8])
+                or any(token < SIDE for token in observation[-8:])
+            ):
+                raise ValueError("A BOARD operation has an invalid observation")
+            continue
+        if not suffix:
+            if token == FINAL:
+                suffix = True
+                roles.append(ROLE_CONTROL)
+            elif token == REFUTED:
+                roles.append(ROLE_REFUTED)
+            elif is_move_token(token):
+                roles.append(ROLE_MOVE)
+            elif is_eval_token(token):
+                roles.append(ROLE_EVAL)
+            elif token in {BACK, RESET, DEPTH}:
+                roles.append(ROLE_CONTROL)
+            else:
+                raise ValueError(f"Unexpected thought token {token} at index {index}")
+        elif index > 0 and tokens[index - 1] == FINAL:
+            if not is_move_token(token):
+                raise ValueError("FINAL must be followed by a decision")
+            roles.append(ROLE_FINAL_MOVE)
+        elif token == END:
+            roles.append(ROLE_CONTROL)
+        elif is_move_token(token):
+            roles.append(ROLE_FINAL_PV)
+        elif is_eval_token(token):
+            roles.append(ROLE_FINAL_EVAL)
+        else:
+            raise ValueError(f"Unexpected final token {token} at index {index}")
+        index += 1
+    return np.asarray(roles, dtype=np.int8)
+
+
 @dataclass(frozen=True)
 class Step:
     """One validated trace operation with its token span and resulting state.
