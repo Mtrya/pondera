@@ -162,6 +162,7 @@ class DataConfig:
     def search_dict(self):
         return {
             "hash_mb": self.search.hash_mb,
+            "timeout_seconds": self.search.timeout_seconds,
             "syzygy_probe_limit": (
                 self.search.syzygy_probe_limit if self.search.syzygy_path else 0
             ),
@@ -310,9 +311,10 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     hash_mb = _integer("search", "hash_mb", search["hash_mb"], 1)
     timeout = _integer("search", "timeout_seconds", search["timeout_seconds"], 1)
     joint = _joint_distribution(search["joint"])
-    syzygy_path = search.get("syzygy_path") or None
+    syzygy_path = search.get("syzygy_path")
     if syzygy_path is not None and not isinstance(syzygy_path, str):
         raise ValueError("[search] syzygy_path must be a path string")
+    syzygy_path = syzygy_path or None
     probe_limit = _integer(
         "search", "syzygy_probe_limit", search.get("syzygy_probe_limit", 7), 1
     )

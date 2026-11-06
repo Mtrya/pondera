@@ -1,6 +1,4 @@
-import contextlib
 import gc
-import io
 import json
 import os
 import subprocess
@@ -22,6 +20,7 @@ from pondera.data.pipeline import (
     _check_sidecar,
     _collect_root,
     _Engine,
+    _start_engine,
     produce_shards,
     sample_root_settings,
     validate_release,
@@ -233,6 +232,19 @@ def send(line):
     sys.stdout.flush()
 
 
+def bump(name):
+    with open(state_path.with_suffix(".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = (
+            json.loads(state_path.read_text(encoding="utf-8"))
+            if state_path.exists()
+            else {}
+        )
+        state[name] = state.get(name, 0) + 1
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        return state[name]
+
+
 fen = None
 trace = ""
 for raw in sys.stdin:
@@ -253,22 +265,17 @@ for raw in sys.stdin:
     elif line.startswith("position fen "):
         fen = line[len("position fen "):]
     elif line.startswith("go "):
-        with open(state_path.with_suffix(".lock"), "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            with open(manifest["golog"], "a") as log:
-                log.write(fen + "\\n")
-            state = (
-                json.loads(state_path.read_text(encoding="utf-8"))
-                if state_path.exists()
-                else {}
-            )
-            failed = state.get("failed", False)
-            if not failed:
-                state_path.write_text(json.dumps({"failed": True}), encoding="utf-8")
-        if not failed:
+        with open(manifest["golog"], "a") as log:
+            log.write(fen + "\\n")
+        case = cases[fen]
+        if bump("faults") == 1:
+            fault = manifest.get("fault", "die")
+            if fault == "garbage":
+                Path(trace).write_text('{"malformed": true}\\n', encoding="utf-8")
+                send("bestmove " + case["bestmove"])
+                continue
             send("bestmove")
             sys.exit(1)
-        case = cases[fen]
         Path(trace).write_text(
             Path(case["sidecar"]).read_text(encoding="utf-8"), encoding="utf-8"
         )
@@ -279,66 +286,77 @@ for raw in sys.stdin:
 
 
 class EngineFailureIntegrationTests(unittest.TestCase):
-    """A worker whose engine dies mid-search must rebuild it and carry on."""
+    """Engine-side failures isolate their root and never escape the run."""
+
+    def run_engine(self, directory, manifest_fields=None, timeout=None):
+        directory = Path(directory)
+        cases = {}
+        roots = []
+        for name in (
+            "start_d4",
+            "middlegame_black_d4",
+            "mate_in_1_d4",
+            "claim_draw_d4",
+        ):
+            fixture = FIXTURES / name
+            root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
+            lines = (fixture / "sidecar.jsonl").read_text(encoding="utf-8")
+            cases[root["fen"]] = {
+                "sidecar": str(fixture / "sidecar.jsonl"),
+                "bestmove": json.loads(lines.splitlines()[-1])["bestmove"],
+            }
+            roots.append(root)
+        script = directory / "fake_engine.py"
+        golog = directory / "fake-engine-gos.jsonl"
+        manifest = script.with_suffix(".json")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "cases": cases,
+                    "state": str(directory / "fake-engine-state.json"),
+                    "golog": str(golog),
+                    **(manifest_fields or {}),
+                }
+            ),
+            encoding="utf-8",
+        )
+        script.write_text(f"#!{sys.executable}\n" + FAKE_ENGINE, encoding="utf-8")
+        script.chmod(0o755)
+        config_path = directory / "trace.toml"
+        config_path.write_text(config_text(timeout=timeout), encoding="utf-8")
+        config = load_config(config_path)
+        result = produce_shards(
+            roots,
+            directory / "release",
+            config,
+            shard_size=2,
+            workers=2,
+            engine=script,
+        )
+        searches = Counter(golog.read_text(encoding="utf-8").splitlines())
+        return result, roots, searches
 
     def test_a_dying_engine_is_rebuilt_and_its_root_isolated(self):
         with tempfile.TemporaryDirectory() as directory:
-            directory = Path(directory)
-            cases = {}
-            roots = []
-            for name in (
-                "start_d4",
-                "middlegame_black_d4",
-                "mate_in_1_d4",
-                "claim_draw_d4",
-            ):
-                fixture = FIXTURES / name
-                root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
-                lines = (fixture / "sidecar.jsonl").read_text(encoding="utf-8")
-                cases[root["fen"]] = {
-                    "sidecar": str(fixture / "sidecar.jsonl"),
-                    "bestmove": json.loads(lines.splitlines()[-1])["bestmove"],
-                }
-                roots.append(root)
-            script = directory / "fake_engine.py"
-            golog = directory / "fake-engine-gos.jsonl"
-            manifest = script.with_suffix(".json")
-            manifest.write_text(
-                json.dumps(
-                    {
-                        "cases": cases,
-                        "state": str(directory / "fake-engine-state.json"),
-                        "golog": str(golog),
-                    }
-                ),
-                encoding="utf-8",
-            )
-            script.write_text(f"#!{sys.executable}\n" + FAKE_ENGINE, encoding="utf-8")
-            script.chmod(0o755)
-            config_path = directory / "trace.toml"
-            config_path.write_text(config_text(), encoding="utf-8")
-            config = load_config(config_path)
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                result = produce_shards(
-                    roots,
-                    directory / "release",
-                    config,
-                    shard_size=2,
-                    workers=2,
-                    engine=script,
-                )
+            result, roots, searches = self.run_engine(directory)
             self.assertEqual(result["roots"], len(roots))
             self.assertTrue(
-                validate_release(directory / "release", roots, workers=1)["ok"]
+                validate_release(Path(directory) / "release", roots, workers=1)["ok"]
             )
-            # The engine died once: exactly one root failure is reported, and
-            # exactly one root was searched twice (its retry). Without the
-            # worker rebuilding its engine, the dead process would also fail
-            # the next roots assigned to that worker within the same pass.
-            failures = output.getvalue().count("collection failed")
-            self.assertEqual(failures, 1)
-            searches = Counter(golog.read_text(encoding="utf-8").splitlines())
+            # The engine died once: exactly one root was searched twice (its
+            # retry). Without the worker rebuilding its engine, the dead
+            # process would also fail the next roots assigned to that worker
+            # within the same pass.
+            self.assertEqual(sorted(searches.values()), [1] * (len(roots) - 1) + [2])
+
+    def test_a_malformed_sidecar_is_isolated_and_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, roots, searches = self.run_engine(directory, {"fault": "garbage"})
+            self.assertEqual(result["roots"], len(roots))
+            self.assertEqual(result["dropped"], 0)
+            self.assertTrue(
+                validate_release(Path(directory) / "release", roots, workers=1)["ok"]
+            )
             self.assertEqual(sorted(searches.values()), [1] * (len(roots) - 1) + [2])
 
 
@@ -360,9 +378,15 @@ for raw in sys.stdin:
         break
 """
 
+SLOW_ENGINE = """
+import time
+
+time.sleep(3600)
+"""
+
 
 class EngineTimeoutTests(unittest.TestCase):
-    """A search that never answers must surface as a distinct timeout."""
+    """A search past the deadline raises a timeout; a slow start must not."""
 
     def test_a_search_past_the_deadline_raises_a_timeout(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -373,6 +397,19 @@ class EngineTimeoutTests(unittest.TestCase):
             with _Engine(script, 256, timeout=1) as engine:
                 with self.assertRaises(EngineTimeoutError):
                     engine.search(chess.STARTING_FEN, directory / "trace.jsonl", 1, 4)
+
+    def test_a_slow_engine_start_is_a_plain_collection_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            script = directory / "slow_engine.py"
+            script.write_text(f"#!{sys.executable}\n" + SLOW_ENGINE, encoding="utf-8")
+            script.chmod(0o755)
+            config_path = directory / "trace.toml"
+            config_path.write_text(config_text(timeout=1), encoding="utf-8")
+            config = load_config(config_path)
+            with self.assertRaises(CollectionError) as caught:
+                _start_engine(script, config)
+            self.assertNotIsInstance(caught.exception, EngineTimeoutError)
 
 
 class SyzygyOptionIntegrationTests(unittest.TestCase):
@@ -426,14 +463,25 @@ class SyzygyOptionIntegrationTests(unittest.TestCase):
 
     def test_syzygy_options_reach_the_engine_only_when_configured(self):
         with tempfile.TemporaryDirectory() as directory:
+            tables = Path(directory) / "tb"
+            tables.mkdir()
+            (tables / "KRvK.rtbw").write_bytes(b"")
             sent = self.produce(
                 Path(directory) / "enabled",
-                'syzygy_path = "/nonexistent/tb"\nsyzygy_probe_limit = 5',
+                f"syzygy_path = {json.dumps(str(tables))}\nsyzygy_probe_limit = 5",
             )
-            self.assertIn("setoption name SyzygyPath value /nonexistent/tb", sent)
+            self.assertIn(f"setoption name SyzygyPath value {tables}", sent)
             self.assertIn("setoption name SyzygyProbeLimit value 5", sent)
             disabled = self.produce(Path(directory) / "disabled", None)
             self.assertNotIn("Syzygy", disabled)
+
+    def test_an_unusable_tablebase_path_fails_before_any_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                self.produce(
+                    Path(directory) / "enabled",
+                    'syzygy_path = "/nonexistent/tb"\nsyzygy_probe_limit = 5',
+                )
 
 
 class DirectPipelineIntegrationTests(unittest.TestCase):
