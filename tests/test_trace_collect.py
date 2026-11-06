@@ -242,6 +242,11 @@ for raw in sys.stdin:
         send("uciok")
     elif line.startswith("setoption name TraceLog value"):
         trace = line.split("value", 1)[1].strip()
+    elif line.startswith("setoption"):
+        optionslog = manifest.get("optionslog")
+        if optionslog:
+            with open(optionslog, "a") as log:
+                log.write(line + "\\n")
     elif line == "isready":
         send("readyok")
     elif line.startswith("position fen "):
@@ -334,6 +339,67 @@ class EngineFailureIntegrationTests(unittest.TestCase):
             self.assertEqual(failures, 1)
             searches = Counter(golog.read_text(encoding="utf-8").splitlines())
             self.assertEqual(sorted(searches.values()), [1] * (len(roots) - 1) + [2])
+
+
+class SyzygyOptionIntegrationTests(unittest.TestCase):
+    """The engine process must receive the configured tablebase options."""
+
+    def produce(self, directory, options):
+        directory = Path(directory)
+        directory.mkdir(parents=True)
+        cases = {}
+        roots = []
+        for name in ("start_d4", "middlegame_black_d4"):
+            fixture = FIXTURES / name
+            root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
+            lines = (fixture / "sidecar.jsonl").read_text(encoding="utf-8")
+            cases[root["fen"]] = {
+                "sidecar": str(fixture / "sidecar.jsonl"),
+                "bestmove": json.loads(lines.splitlines()[-1])["bestmove"],
+            }
+            roots.append(root)
+        script = directory / "fake_engine.py"
+        optionslog = directory / "fake-engine-options.log"
+        manifest = script.with_suffix(".json")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "cases": cases,
+                    "state": str(directory / "fake-engine-state.json"),
+                    "golog": str(directory / "fake-engine-gos.jsonl"),
+                    "optionslog": str(optionslog),
+                }
+            ),
+            encoding="utf-8",
+        )
+        script.write_text(f"#!{sys.executable}\n" + FAKE_ENGINE, encoding="utf-8")
+        script.chmod(0o755)
+        config_path = directory / "trace.toml"
+        text = config_text()
+        if options is not None:
+            text = text.replace("[search]\n", f"[search]\n{options}\n", 1)
+        config_path.write_text(text, encoding="utf-8")
+        config = load_config(config_path)
+        produce_shards(
+            roots,
+            directory / "release",
+            config,
+            shard_size=2,
+            workers=1,
+            engine=script,
+        )
+        return optionslog.read_text(encoding="utf-8")
+
+    def test_syzygy_options_reach_the_engine_only_when_configured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sent = self.produce(
+                Path(directory) / "enabled",
+                'syzygy_path = "/nonexistent/tb"\nsyzygy_probe_limit = 5',
+            )
+            self.assertIn("setoption name SyzygyPath value /nonexistent/tb", sent)
+            self.assertIn("setoption name SyzygyProbeLimit value 5", sent)
+            disabled = self.produce(Path(directory) / "disabled", None)
+            self.assertNotIn("Syzygy", disabled)
 
 
 class DirectPipelineIntegrationTests(unittest.TestCase):

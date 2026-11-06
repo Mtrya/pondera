@@ -342,7 +342,9 @@ def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
 class _Engine:
     """One worker's UCI process, reset to fresh search state for each root."""
 
-    def __init__(self, path, hash_mb, timeout=3600):
+    def __init__(
+        self, path, hash_mb, timeout=3600, syzygy_path=None, syzygy_probe_limit=7
+    ):
         self.process = subprocess.Popen(
             [str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
         )
@@ -357,6 +359,11 @@ class _Engine:
                 raise CollectionError(f"Engine does not expose TraceLog: {path}")
             self._send("setoption name Threads value 1")
             self._send(f"setoption name Hash value {hash_mb}")
+            if syzygy_path is not None:
+                self._send(f"setoption name SyzygyPath value {syzygy_path}")
+                self._send(
+                    f"setoption name SyzygyProbeLimit value {syzygy_probe_limit}"
+                )
         except BaseException:
             self.close()
             raise
@@ -751,7 +758,7 @@ def _release_metadata(identity):
 
 
 FINAL_SUFFIX_OPS = frozenset({"final", "final_evaluate", "final_pv", "end"})
-SEARCH_FIELDS = frozenset({"hash_mb"})
+SEARCH_FIELDS = frozenset({"hash_mb", "syzygy_probe_limit"})
 BOARD_FIELDS = frozenset({"board_descent_hazard", "board_frontier_p"})
 PRESENTATION_FIELDS = frozenset(
     {
@@ -834,6 +841,8 @@ def _release_identity_contract(release, root_count):
         raise ValueError("Release identity has incomplete search settings")
     if not _is_int(search["hash_mb"], 1):
         raise ValueError("Release search limits are invalid")
+    if not _is_int(search["syzygy_probe_limit"], 0) or search["syzygy_probe_limit"] > 7:
+        raise ValueError("Release tablebase probe limit is invalid")
 
     board = metadata["board"]
     if not isinstance(board, dict) or set(board) != BOARD_FIELDS:
@@ -1571,6 +1580,8 @@ def _direct_worker(root):
             _DIRECT_ENGINE_PATH,
             _DIRECT_CONFIG.search.hash_mb,
             _DIRECT_CONFIG.search.timeout_seconds,
+            _DIRECT_CONFIG.search.syzygy_path,
+            _DIRECT_CONFIG.search.syzygy_probe_limit,
         )
         Finalize(None, _DIRECT_ENGINE.close, exitpriority=10)
         raise
@@ -1582,7 +1593,11 @@ def _init_direct_worker(config, engine_path, engine_name, teacher):
     _DIRECT_CONFIG = config
     _DIRECT_ENGINE_PATH = engine_path
     _DIRECT_ENGINE = _Engine(
-        engine_path, config.search.hash_mb, config.search.timeout_seconds
+        engine_path,
+        config.search.hash_mb,
+        config.search.timeout_seconds,
+        config.search.syzygy_path,
+        config.search.syzygy_probe_limit,
     )
     Finalize(None, _DIRECT_ENGINE.close, exitpriority=10)
     _DIRECT_NAME = engine_name
@@ -1605,7 +1620,11 @@ def _synthesize_groups(
         engine = None
         if provider is None:
             engine = _Engine(
-                engine_path, config.search.hash_mb, config.search.timeout_seconds
+                engine_path,
+                config.search.hash_mb,
+                config.search.timeout_seconds,
+                config.search.syzygy_path,
+                config.search.syzygy_probe_limit,
             )
         try:
             for index, group in groups:
@@ -1633,6 +1652,8 @@ def _synthesize_groups(
                                 engine_path,
                                 config.search.hash_mb,
                                 config.search.timeout_seconds,
+                                config.search.syzygy_path,
+                                config.search.syzygy_probe_limit,
                             )
                         continue
                     cache.store(index, root, record)

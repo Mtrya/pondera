@@ -111,7 +111,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release["format_version"], 11)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
-        self.assertEqual(release["search"], {"hash_mb": 256})
+        self.assertEqual(release["search"], {"hash_mb": 256, "syzygy_probe_limit": 0})
         self.assertEqual(release["recipe"], self.config.sampling.identity())
         self.assertEqual(release["engine"]["name"], "stockfish")
         self.assertEqual(release["presentation"], self.config.presentation_dict())
