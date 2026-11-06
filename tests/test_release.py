@@ -3,6 +3,7 @@ import tempfile
 import threading
 import tomllib
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -23,6 +24,7 @@ from pondera.data.dataset import (
     read_root_rows,
 )
 from pondera.data.pipeline import (
+    CollectionError,
     load_trace_arrays,
     produce_shards,
     sample_root_settings,
@@ -336,6 +338,99 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(row["mate_distance"], None)
         claim = json.loads((FIXTURES / "claim_draw_d4" / "root.json").read_text())
         self.assertEqual(claim_roots, {claim["root_id"]})
+
+
+class FailureIsolationTests(unittest.TestCase):
+    """A failed root must not kill its shard mates, its run, or its resume."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.config, self.roots, self.run, self.provider = build_run(self.root)
+        produce_shards(
+            self.roots,
+            self.run / "baseline",
+            self.config,
+            sidecar_for_root=self.provider,
+            shard_size=2,
+            workers=1,
+        )
+        self.baseline = read_release_rows(self.run / "baseline")
+
+    def produce(self, provider):
+        return produce_shards(
+            self.roots,
+            self.run / "release",
+            self.config,
+            sidecar_for_root=provider,
+            shard_size=2,
+            workers=1,
+        )
+
+    def flaky(self, fail_id, times):
+        calls = Counter()
+
+        def provider(root):
+            calls[root["root_id"]] += 1
+            if root["root_id"] == fail_id and calls[fail_id] <= times:
+                raise CollectionError("injected collection failure")
+            return self.provider[root["root_id"]]
+
+        return provider, calls
+
+    def test_a_failed_root_is_retried_within_the_run(self):
+        fail_id = self.roots[1]["root_id"]
+        provider, calls = self.flaky(fail_id, times=1)
+        result = self.produce(provider)
+        self.assertEqual(result["roots"], len(CASES))
+        self.assertEqual(calls[fail_id], 2)
+        self.assertEqual(self.baseline, read_release_rows(self.run / "release"))
+        self.assertTrue(
+            validate_release(self.run / "release", self.roots, workers=1)["ok"]
+        )
+        self.assertFalse((self.run / "release" / ".roots").exists())
+
+    def test_collected_roots_survive_a_failed_run(self):
+        fail_id = self.roots[1]["root_id"]
+        provider, _ = self.flaky(fail_id, times=2)
+        with self.assertRaises(CollectionError):
+            self.produce(provider)
+        release = load_manifest(self.run / "release" / "release.json")
+        self.assertEqual(
+            [shard["path"] for shard in release["shards"]],
+            ["shard-000001", "shard-000002"],
+        )
+        checkpoints = self.run / "release" / ".roots" / "shard-000000"
+        self.assertEqual(
+            {path.name for path in checkpoints.iterdir()},
+            {f"{self.roots[0]['root_id']}.pkl", f"{fail_id}.error.json"},
+        )
+
+        provider, calls = self.flaky(fail_id, times=0)
+        result = self.produce(provider)
+        self.assertEqual(result["roots"], len(CASES))
+        self.assertEqual(dict(calls), {fail_id: 1})
+        self.assertEqual(self.baseline, read_release_rows(self.run / "release"))
+        self.assertTrue(
+            validate_release(self.run / "release", self.roots, workers=1)["ok"]
+        )
+
+    def test_a_root_that_keeps_failing_stops_being_retried(self):
+        fail_id = self.roots[1]["root_id"]
+        provider, calls = self.flaky(fail_id, times=10)
+        for expected in (2, 3, 3):
+            with self.assertRaises(CollectionError) as caught:
+                self.produce(provider)
+            self.assertEqual(calls[fail_id], expected)
+        self.assertIn(fail_id, str(caught.exception))
+
+    def test_a_programming_error_is_not_isolated(self):
+        def provider(root):
+            raise ValueError("a real bug")
+
+        with self.assertRaises(ValueError):
+            self.produce(provider)
 
 
 class WideReleaseTests(unittest.TestCase):

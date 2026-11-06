@@ -1,4 +1,6 @@
+import contextlib
 import gc
+import io
 import json
 import os
 import subprocess
@@ -212,6 +214,126 @@ class SidecarValidationTests(unittest.TestCase):
             with self.subTest(engine=engine, teacher=teacher):
                 with self.assertRaises(CollectionError):
                     _check_sidecar(root, sidecar, config, engine, teacher)
+
+
+FAKE_ENGINE = """
+import fcntl
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(__file__).with_suffix(".json").read_text(encoding="utf-8"))
+cases = manifest["cases"]
+state_path = Path(manifest["state"])
+
+
+def send(line):
+    sys.stdout.write(line + "\\n")
+    sys.stdout.flush()
+
+
+fen = None
+trace = ""
+for raw in sys.stdin:
+    line = raw.strip()
+    if line == "uci":
+        send("id name fixture-engine")
+        send("option name TraceLog type string default ")
+        send("uciok")
+    elif line.startswith("setoption name TraceLog value"):
+        trace = line.split("value", 1)[1].strip()
+    elif line == "isready":
+        send("readyok")
+    elif line.startswith("position fen "):
+        fen = line[len("position fen "):]
+    elif line.startswith("go "):
+        with open(state_path.with_suffix(".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with open(manifest["golog"], "a") as log:
+                log.write(fen + "\\n")
+            state = (
+                json.loads(state_path.read_text(encoding="utf-8"))
+                if state_path.exists()
+                else {}
+            )
+            failed = state.get("failed", False)
+            if not failed:
+                state_path.write_text(json.dumps({"failed": True}), encoding="utf-8")
+        if not failed:
+            send("bestmove")
+            sys.exit(1)
+        case = cases[fen]
+        Path(trace).write_text(
+            Path(case["sidecar"]).read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        send("bestmove " + case["bestmove"])
+    elif line == "quit":
+        break
+"""
+
+
+class EngineFailureIntegrationTests(unittest.TestCase):
+    """A worker whose engine dies mid-search must rebuild it and carry on."""
+
+    def test_a_dying_engine_is_rebuilt_and_its_root_isolated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            cases = {}
+            roots = []
+            for name in (
+                "start_d4",
+                "middlegame_black_d4",
+                "mate_in_1_d4",
+                "claim_draw_d4",
+            ):
+                fixture = FIXTURES / name
+                root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
+                lines = (fixture / "sidecar.jsonl").read_text(encoding="utf-8")
+                cases[root["fen"]] = {
+                    "sidecar": str(fixture / "sidecar.jsonl"),
+                    "bestmove": json.loads(lines.splitlines()[-1])["bestmove"],
+                }
+                roots.append(root)
+            script = directory / "fake_engine.py"
+            golog = directory / "fake-engine-gos.jsonl"
+            manifest = script.with_suffix(".json")
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "cases": cases,
+                        "state": str(directory / "fake-engine-state.json"),
+                        "golog": str(golog),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            script.write_text(f"#!{sys.executable}\n" + FAKE_ENGINE, encoding="utf-8")
+            script.chmod(0o755)
+            config_path = directory / "trace.toml"
+            config_path.write_text(config_text(), encoding="utf-8")
+            config = load_config(config_path)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = produce_shards(
+                    roots,
+                    directory / "release",
+                    config,
+                    shard_size=2,
+                    workers=2,
+                    engine=script,
+                )
+            self.assertEqual(result["roots"], len(roots))
+            self.assertTrue(
+                validate_release(directory / "release", roots, workers=1)["ok"]
+            )
+            # The engine died once: exactly one root failure is reported, and
+            # exactly one root was searched twice (its retry). Without the
+            # worker rebuilding its engine, the dead process would also fail
+            # the next roots assigned to that worker within the same pass.
+            failures = output.getvalue().count("collection failed")
+            self.assertEqual(failures, 1)
+            searches = Counter(golog.read_text(encoding="utf-8").splitlines())
+            self.assertEqual(sorted(searches.values()), [1] * (len(roots) - 1) + [2])
 
 
 class DirectPipelineIntegrationTests(unittest.TestCase):

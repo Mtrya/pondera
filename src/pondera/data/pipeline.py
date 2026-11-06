@@ -1,15 +1,17 @@
 """Offline trace production: configuration, engine execution, shards, and checks.
 
 The public entry point is ``run_pipeline``. It reads a prepared root pool,
-then runs engine -> sidecar decoding -> synthesis in memory for each root and
-publishes complete shards atomically. Exhaustive replay is an explicit
-diagnostic, outside normal production.
+then runs engine -> sidecar decoding -> synthesis for each root, checkpointing
+every collected root beside the release so interrupted runs recollect only
+missing roots, and publishes complete shards atomically. Exhaustive replay is
+an explicit diagnostic, outside normal production.
 """
 
 import fcntl
 import gc
 import json
 import os
+import pickle
 import random
 import select
 import shutil
@@ -22,6 +24,7 @@ from contextlib import ExitStack, contextmanager
 from multiprocessing import get_context
 from multiprocessing.util import Finalize
 from pathlib import Path
+from uuid import uuid4
 
 import chess
 import numpy as np
@@ -286,6 +289,14 @@ class CollectionError(RuntimeError):
     """A pipeline input or result that violates the production contract."""
 
 
+# A root that keeps failing stops being retried but is never dropped silently:
+# its shard stays unpublished and the run fails loudly once everything else
+# is done. The run-level bound stops a systemic failure (e.g. a full disk)
+# from burning one retry budget on every remaining root.
+MAX_ROOT_ATTEMPTS = 3
+MAX_RUN_FAILURES = 64
+
+
 def _root_teacher(root):
     width = root["teacher_width"]
     depth = root["depth"]
@@ -337,6 +348,7 @@ class _Engine:
         )
         self.buffer = b""
         self.timeout = timeout
+        self.closed = False
         try:
             deadline = time.monotonic() + timeout
             self._send("uci")
@@ -356,8 +368,11 @@ class _Engine:
         self.close()
 
     def _send(self, line):
-        self.process.stdin.write((line + "\n").encode())
-        self.process.stdin.flush()
+        try:
+            self.process.stdin.write((line + "\n").encode())
+            self.process.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError) as error:
+            raise CollectionError("engine process is gone") from error
 
     def _read_line(self, deadline):
         while b"\n" not in self.buffer:
@@ -400,9 +415,12 @@ class _Engine:
         return parts[1]
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         try:
             self._send("quit")
-        except (BrokenPipeError, ValueError):
+        except CollectionError:
             pass
         try:
             self.process.wait(timeout=10)
@@ -595,6 +613,131 @@ def _publish_shard(output, index, records, metadata, presentations):
         return _recover_shard(output, index, roots, metadata, presentations)
     os.replace(temporary, final)
     return {"path": final.name, "rows": payload["rows"]}
+
+
+class _RootCache:
+    """Per-root synthesized-record checkpoints beside a release's shards.
+
+    Every successfully collected root is pickled under ``.roots`` so an
+    interrupted run recollects only roots that never completed. Entries are
+    tied to the release identity; an unreadable or root-mismatching entry
+    silently degrades to recollection, since a cache may never corrupt a
+    release. Failure records count attempts across runs so a permanently
+    failing root stops being retried without ever being dropped silently.
+    """
+
+    def __init__(self, output, identity):
+        self.directory = output / ".roots"
+        marker = self.directory / "identity.json"
+        stored = load_manifest(marker) if marker.is_file() else None
+        if stored is not None and stored != identity:
+            shutil.rmtree(self.directory)
+            stored = None
+        self.directory.mkdir(parents=True, exist_ok=True)
+        if stored is None:
+            write_manifest(marker, identity)
+
+    def _shard(self, index):
+        return self.directory / f"shard-{index:06d}"
+
+    def load(self, index, root):
+        path = self._shard(index) / f"{root['root_id']}.pkl"
+        try:
+            with path.open("rb") as handle:
+                record = pickle.load(handle)
+        except (
+            OSError,
+            EOFError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            ImportError,
+            pickle.UnpicklingError,
+        ):
+            return None
+        if getattr(record, "root", None) != root:
+            return None
+        return record
+
+    def store(self, index, root, record):
+        shard = self._shard(index)
+        try:
+            shard.mkdir(parents=True, exist_ok=True)
+            temporary = shard / f".{root['root_id']}.{uuid4().hex}.tmp"
+            with temporary.open("wb") as handle:
+                pickle.dump(record, handle, protocol=5)
+            temporary.replace(shard / f"{root['root_id']}.pkl")
+            (shard / f"{root['root_id']}.error.json").unlink(missing_ok=True)
+        except OSError:
+            # A cache may lose a write (e.g. a concurrent finisher removed the
+            # directory); the root is then recollected on the next run.
+            pass
+
+    def failure(self, index, root):
+        path = self._shard(index) / f"{root['root_id']}.error.json"
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(record, dict)
+            or record.get("root_id") != root["root_id"]
+            or not _is_int(record.get("attempts"), 1)
+            or not isinstance(record.get("error"), str)
+        ):
+            return None
+        return record
+
+    def record_failure(self, index, root, error):
+        failure = self.failure(index, root)
+        attempts = (failure["attempts"] if failure is not None else 0) + 1
+        shard = self._shard(index)
+        shard.mkdir(parents=True, exist_ok=True)
+        path = shard / f"{root['root_id']}.error.json"
+        temporary = shard / f".{path.name}.{uuid4().hex}.tmp"
+        temporary.write_text(
+            json.dumps(
+                {
+                    "root_id": root["root_id"],
+                    "attempts": attempts,
+                    "error": str(error),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+        return attempts
+
+    def clear_shard(self, index):
+        shutil.rmtree(self._shard(index), ignore_errors=True)
+
+
+def _cached_or_capped(cache, index, root):
+    """A root's checkpoint hit, its exhausted failure record, or neither."""
+    cached = cache.load(index, root)
+    if cached is not None:
+        return cached, None
+    failure = cache.failure(index, root)
+    if failure is not None and failure["attempts"] >= MAX_ROOT_ATTEMPTS:
+        return None, failure["error"]
+    return None, None
+
+
+def _note_failure(cache, run, index, root, error):
+    attempts = cache.record_failure(index, root, error)
+    run["failures"] += 1
+    print(
+        f"shard {index:06d} root {root['root_id']}: collection failed "
+        f"({attempts}/{MAX_ROOT_ATTEMPTS}): {error}",
+        flush=True,
+    )
+    if run["failures"] > MAX_RUN_FAILURES:
+        raise CollectionError(
+            f"over {MAX_RUN_FAILURES} failed root attempts in one run; "
+            "treating the failures as systemic"
+        )
+    return str(error)
 
 
 def _release_metadata(identity):
@@ -1414,14 +1557,30 @@ def _collect_root(root, config, engine, engine_name, teacher, provider=None):
 
 
 def _direct_worker(root):
-    return _collect_root(
-        root, _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_NAME, _DIRECT_TEACHER
-    )
+    global _DIRECT_ENGINE
+    try:
+        return _collect_root(
+            root, _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_NAME, _DIRECT_TEACHER
+        )
+    except CollectionError:
+        # A failed search leaves the engine's protocol state unknown (it may
+        # still be searching); the worker starts a fresh process rather than
+        # trusting the desynchronized one for the next root.
+        _DIRECT_ENGINE.close()
+        _DIRECT_ENGINE = _Engine(
+            _DIRECT_ENGINE_PATH,
+            _DIRECT_CONFIG.search.hash_mb,
+            _DIRECT_CONFIG.search.timeout_seconds,
+        )
+        Finalize(None, _DIRECT_ENGINE.close, exitpriority=10)
+        raise
 
 
 def _init_direct_worker(config, engine_path, engine_name, teacher):
-    global _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_NAME, _DIRECT_TEACHER
+    global _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_ENGINE_PATH, _DIRECT_NAME
+    global _DIRECT_TEACHER
     _DIRECT_CONFIG = config
+    _DIRECT_ENGINE_PATH = engine_path
     _DIRECT_ENGINE = _Engine(
         engine_path, config.search.hash_mb, config.search.timeout_seconds
     )
@@ -1431,43 +1590,63 @@ def _init_direct_worker(config, engine_path, engine_name, teacher):
 
 
 def _synthesize_groups(
-    groups, config, engine_path, engine_name, teacher, provider, workers
+    groups, config, engine_path, engine_name, teacher, provider, workers, cache, run
 ):
-    """Keep one pool busy across two shards, bounding retained results."""
+    """Keep one pool busy across two shards, bounding retained results.
+
+    Yields ``(index, group, records, failures)`` per group, where ``failures``
+    maps positions of uncollected roots to their last collection error. A
+    group with failures is not publishable; its collected roots are
+    checkpointed, so retrying it recollects only the missing roots.
+    """
     if not groups:
         return
     if provider is not None or workers == 1:
-        with ExitStack() as stack:
-            engine = (
-                None
-                if provider is not None
-                else stack.enter_context(
-                    _Engine(
-                        engine_path,
-                        config.search.hash_mb,
-                        config.search.timeout_seconds,
-                    )
-                )
+        engine = None
+        if provider is None:
+            engine = _Engine(
+                engine_path, config.search.hash_mb, config.search.timeout_seconds
             )
+        try:
             for index, group in groups:
-                records = []
-                for root in group:
-                    records.append(
-                        _collect_root(
-                            root,
-                            config,
-                            engine,
-                            engine_name,
-                            teacher,
-                            provider,
+                records = [None] * len(group)
+                failures = {}
+                for position, root in enumerate(group):
+                    cached, capped = _cached_or_capped(cache, index, root)
+                    if cached is not None:
+                        records[position] = cached
+                        continue
+                    if capped is not None:
+                        failures[position] = capped
+                        continue
+                    try:
+                        record = _collect_root(
+                            root, config, engine, engine_name, teacher, provider
                         )
-                    )
-                yield index, group, records
+                    except CollectionError as error:
+                        failures[position] = _note_failure(
+                            cache, run, index, root, error
+                        )
+                        if engine is not None:
+                            engine.close()
+                            engine = _Engine(
+                                engine_path,
+                                config.search.hash_mb,
+                                config.search.timeout_seconds,
+                            )
+                        continue
+                    cache.store(index, root, record)
+                    records[position] = record
+                yield index, group, records, failures
+        finally:
+            if engine is not None:
+                engine.close()
         return
     workers = min(workers, sum(len(group) for _, group in groups))
     groups = iter(groups)
     pending = {}
     active = {}
+    completed = []
     with ProcessPoolExecutor(
         max_workers=workers,
         mp_context=get_context("spawn"),
@@ -1481,25 +1660,50 @@ def _synthesize_groups(
                 return
             index, group = item
             records = [None] * len(group)
-            active[index] = (group, records, len(group))
+            failures = {}
+            remaining = 0
             for position, root in enumerate(group):
+                cached, capped = _cached_or_capped(cache, index, root)
+                if cached is not None:
+                    records[position] = cached
+                    continue
+                if capped is not None:
+                    failures[position] = capped
+                    continue
                 pending[pool.submit(_direct_worker, root)] = (index, position)
+                remaining += 1
+            if remaining:
+                active[index] = (group, records, failures, remaining)
+            else:
+                completed.append((index, group, records, failures))
 
         submit_group()
         submit_group()
-        while pending:
+        while pending or completed:
+            while completed:
+                index, group, records, failures = completed.pop(0)
+                yield index, group, records, failures
+                submit_group()
+            if not pending:
+                break
             done, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in done:
                 index, position = pending.pop(future)
-                group, records, remaining = active[index]
-                records[position] = future.result()
+                group, records, failures, remaining = active[index]
+                root = group[position]
+                try:
+                    record = future.result()
+                except CollectionError as error:
+                    failures[position] = _note_failure(cache, run, index, root, error)
+                else:
+                    cache.store(index, root, record)
+                    records[position] = record
                 remaining -= 1
                 if remaining:
-                    active[index] = (group, records, remaining)
+                    active[index] = (group, records, failures, remaining)
                 else:
                     del active[index]
-                    yield index, group, records
-                    submit_group()
+                    completed.append((index, group, records, failures))
 
 
 def _identity_for(config, roots, engine_name="stockfish", root_source=None):
@@ -1564,6 +1768,14 @@ def produce_shards(
     ``sidecar_for_root`` is a callable/mapping used by tests and offline
     converters. When it is omitted, each worker resets its instrumented
     engine for each root; sidecars exist only in temporary directories.
+
+    Every collected root is checkpointed under ``<output>/.roots`` until its
+    shard is registered, so an interrupted run recollects only missing roots.
+    A root whose collection raises ``CollectionError`` is isolated from its
+    shard mates, retried in a second pass, and retried across runs up to
+    ``MAX_ROOT_ATTEMPTS``; if any roots remain failed after everything else
+    is published, the run raises one summary error and keeps the checkpoints.
+    The cache directory is removed once the release is complete.
     """
     roots = sample_root_settings(list(roots), config, config.seed)
     if not roots:
@@ -1604,12 +1816,14 @@ def produce_shards(
         (index, roots[start : start + shard_size])
         for index, start in enumerate(range(0, len(roots), shard_size))
     ]
+    cache = _RootCache(output_dir, identity)
     ready, pending = [], []
     for index, group in groups:
         if index < start_shard or (end_shard is not None and index >= end_shard):
             continue
         if index in shards_by_index:
             _check_shard_layout(output_dir, shards_by_index[index], group)
+            cache.clear_shard(index)
             continue
         final = output_dir / f"shard-{index:06d}"
         if final.exists():
@@ -1620,9 +1834,13 @@ def produce_shards(
         else:
             pending.append((index, group))
 
-    def completed_shards():
+    run = {"failures": 0}
+    failed = []
+
+    def publishable():
         yield from ready
-        for index, group, records in _synthesize_groups(
+        deferred = []
+        for index, group, records, failures in _synthesize_groups(
             pending,
             config,
             engine_path,
@@ -1630,13 +1848,47 @@ def produce_shards(
             teacher,
             sidecar_for_root,
             workers,
+            cache,
+            run,
         ):
-            shard = _publish_shard(
-                output_dir, index, records, shard_metadata, presentations
+            if failures:
+                deferred.append((index, group))
+                continue
+            yield (
+                index,
+                group,
+                _publish_shard(
+                    output_dir, index, records, shard_metadata, presentations
+                ),
             )
-            yield index, group, shard
+        # A deferred group's collected roots are checkpoint hits here; only
+        # the failed roots are recollected in this second pass.
+        for index, group, records, failures in _synthesize_groups(
+            deferred,
+            config,
+            engine_path,
+            engine_name,
+            teacher,
+            sidecar_for_root,
+            workers,
+            cache,
+            run,
+        ):
+            if failures:
+                failed.extend(
+                    (index, group[position]["root_id"], error)
+                    for position, error in failures.items()
+                )
+                continue
+            yield (
+                index,
+                group,
+                _publish_shard(
+                    output_dir, index, records, shard_metadata, presentations
+                ),
+            )
 
-    for index, group, shard in completed_shards():
+    for index, group, shard in publishable():
         with _release_lock(output_dir):
             current = load_manifest(release_path)
             if current and current.get("metadata") != identity:
@@ -1656,6 +1908,7 @@ def produce_shards(
                     "shards": [shards_by_index[key] for key in sorted(shards_by_index)],
                 },
             )
+        cache.clear_shard(index)
     with _release_lock(output_dir):
         current = load_manifest(release_path)
         complete = sum(shard["rows"] for shard in current.get("shards", []))
@@ -1666,6 +1919,17 @@ def produce_shards(
         if statistics is not None:
             statistics["complete"] = complete == len(roots)
             write_manifest(output_dir / "statistics.json", statistics)
+    if failed:
+        summary = "; ".join(
+            f"shard {index:06d} root {root_id} ({error})"
+            for index, root_id, error in failed[:10]
+        )
+        raise CollectionError(
+            f"{len(failed)} roots failed permanently; their shards stay "
+            "unpublished and every collected root stays checkpointed for the "
+            f"next run: {summary}"
+        )
+    shutil.rmtree(cache.directory, ignore_errors=True)
     return {
         "shards": current.get("shards", []),
         "roots": complete,
