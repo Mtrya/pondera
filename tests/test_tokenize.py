@@ -28,7 +28,7 @@ from pondera.data.dataset import (
     write_manifest,
 )
 from pondera.data.merge_profile import build_profile, load_full_rows, write_artifacts
-from pondera.data.pipeline import produce_shards
+from pondera.data.pipeline import EngineTimeoutError, produce_shards, validate_release
 from pondera.data.text import ROLE_MIXED, trace_atoms
 from pondera.data.tokenize import merge_and_encode, tokenize_dataset
 from pondera.data.trace import ROLE_FINAL_MOVE, load_sidecar, synthesize_root
@@ -191,6 +191,32 @@ class TokenizeTests(unittest.TestCase):
         self.assertEqual(first.schema_arrow.names, table.schema.names)
         again = self.root / "encoded-again"
         tokenize_dataset(output, again, self.dictionary, batch_size=3)
+        self.assertEqual(self.rows(again), self.rows(output))
+
+    def test_encoding_preserves_an_entirely_dropped_shard(self):
+        directory = self.root / "drops"
+        directory.mkdir()
+        config, roots, run, sidecars = build_run(directory)
+        dropped = {root["root_id"] for root in roots[:2]}
+
+        def provider(root):
+            if root["root_id"] in dropped:
+                raise EngineTimeoutError("engine timed out")
+            return sidecars[root["root_id"]]
+
+        source = run / "release"
+        produce_shards(
+            roots, source, config, sidecar_for_root=provider, shard_size=2, workers=1
+        )
+        self.assertTrue(validate_release(source, roots, workers=1)["ok"])
+        output = directory / "encoded"
+        summary = tokenize_dataset(source, output, self.dictionary)
+        self.assertEqual(summary["rows"], len(roots) - len(dropped))
+        for path, rows, _ in parquet_sources(output):
+            self.assertEqual(pq.ParquetFile(path).metadata.num_rows, rows)
+        self.assertEqual(len(TracePositions(output, "train")), 3)
+        again = directory / "encoded-again"
+        tokenize_dataset(output, again, self.dictionary)
         self.assertEqual(self.rows(again), self.rows(output))
 
     def test_zero_budget_needs_no_full_presentation_fitting_rows(self):

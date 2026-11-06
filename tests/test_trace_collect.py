@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -16,16 +17,18 @@ from trace_fixtures import trace_config_text as config_text
 from pondera.data.config import load_config, parse_recipe
 from pondera.data.pipeline import (
     CollectionError,
+    EngineStartupError,
     EngineTimeoutError,
     _check_sidecar,
     _collect_root,
     _Engine,
     _start_engine,
     produce_shards,
+    run_pipeline,
     sample_root_settings,
     validate_release,
 )
-from pondera.data.roots.pool import root_id_for
+from pondera.data.roots.pool import read_roots, root_id_for
 from pondera.data.trace import SynthesisError, load_sidecar
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
@@ -219,7 +222,9 @@ class SidecarValidationTests(unittest.TestCase):
 FAKE_ENGINE = """
 import fcntl
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 manifest = json.loads(Path(__file__).with_suffix(".json").read_text(encoding="utf-8"))
@@ -245,6 +250,13 @@ def bump(name):
         return state[name]
 
 
+launch = bump("starts")
+if manifest.get("pids"):
+    with open(manifest["pids"], "a") as log:
+        log.write(str(os.getpid()) + "\\n")
+if launch in manifest.get("bad_starts", []):
+    sys.exit(1)
+
 fen = None
 trace = ""
 for raw in sys.stdin:
@@ -268,10 +280,32 @@ for raw in sys.stdin:
         with open(manifest["golog"], "a") as log:
             log.write(fen + "\\n")
         case = cases[fen]
-        if bump("faults") == 1:
+        if fen == manifest.get("unblock_fen"):
+            Path(manifest["gate"]).touch()
+        if fen in manifest.get("blocked_fens", []):
+            while not Path(manifest["gate"]).exists():
+                time.sleep(0.01)
+        if fen == manifest.get("hang_fen"):
+            time.sleep(3600)
+        if fen == manifest.get("fail_fen"):
+            send("bestmove")
+            continue
+        if bump("faults") == 1 and manifest.get("fault", "die") != "none":
             fault = manifest.get("fault", "die")
             if fault == "garbage":
                 Path(trace).write_text('{"malformed": true}\\n', encoding="utf-8")
+                send("bestmove " + case["bestmove"])
+                continue
+            if fault in {"missing_fen", "bad_depth", "missing_rank"}:
+                events = [json.loads(line) for line in Path(case["sidecar"]).read_text().splitlines()]
+                for event in events:
+                    if fault == "missing_fen" and event["type"] == "position":
+                        del event["fen"]
+                    if fault == "bad_depth" and event["type"] == "search_start":
+                        event["depth"] = "invalid"
+                    if fault == "missing_rank" and event["type"] == "round_end":
+                        del event["rank"]
+                Path(trace).write_text("\\n".join(json.dumps(event) for event in events) + "\\n")
                 send("bestmove " + case["bestmove"])
                 continue
             send("bestmove")
@@ -285,46 +319,53 @@ for raw in sys.stdin:
 """
 
 
+def fixture_engine(directory, manifest_fields=None, timeout=None, extra_cases=()):
+    directory = Path(directory)
+    cases = {}
+    roots = []
+    for name in (
+        "start_d4",
+        "middlegame_black_d4",
+        "mate_in_1_d4",
+        "claim_draw_d4",
+        *extra_cases,
+    ):
+        fixture = FIXTURES / name
+        root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
+        lines = (fixture / "sidecar.jsonl").read_text(encoding="utf-8")
+        cases[root["fen"]] = {
+            "sidecar": str(fixture / "sidecar.jsonl"),
+            "bestmove": json.loads(lines.splitlines()[-1])["bestmove"],
+        }
+        roots.append(root)
+    script = directory / "fake_engine.py"
+    golog = directory / "fake-engine-gos.jsonl"
+    script.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "cases": cases,
+                "state": str(directory / "fake-engine-state.json"),
+                "golog": str(golog),
+                **(manifest_fields or {}),
+            }
+        ),
+        encoding="utf-8",
+    )
+    script.write_text(f"#!{sys.executable}\n" + FAKE_ENGINE, encoding="utf-8")
+    script.chmod(0o755)
+    config_path = directory / "trace.toml"
+    config_path.write_text(config_text(timeout=timeout), encoding="utf-8")
+    return load_config(config_path), roots, script, golog
+
+
 class EngineFailureIntegrationTests(unittest.TestCase):
     """Engine-side failures isolate their root and never escape the run."""
 
     def run_engine(self, directory, manifest_fields=None, timeout=None):
         directory = Path(directory)
-        cases = {}
-        roots = []
-        for name in (
-            "start_d4",
-            "middlegame_black_d4",
-            "mate_in_1_d4",
-            "claim_draw_d4",
-        ):
-            fixture = FIXTURES / name
-            root = json.loads((fixture / "root.json").read_text(encoding="utf-8"))
-            lines = (fixture / "sidecar.jsonl").read_text(encoding="utf-8")
-            cases[root["fen"]] = {
-                "sidecar": str(fixture / "sidecar.jsonl"),
-                "bestmove": json.loads(lines.splitlines()[-1])["bestmove"],
-            }
-            roots.append(root)
-        script = directory / "fake_engine.py"
-        golog = directory / "fake-engine-gos.jsonl"
-        manifest = script.with_suffix(".json")
-        manifest.write_text(
-            json.dumps(
-                {
-                    "cases": cases,
-                    "state": str(directory / "fake-engine-state.json"),
-                    "golog": str(golog),
-                    **(manifest_fields or {}),
-                }
-            ),
-            encoding="utf-8",
+        config, roots, script, golog = fixture_engine(
+            directory, manifest_fields, timeout
         )
-        script.write_text(f"#!{sys.executable}\n" + FAKE_ENGINE, encoding="utf-8")
-        script.chmod(0o755)
-        config_path = directory / "trace.toml"
-        config_path.write_text(config_text(timeout=timeout), encoding="utf-8")
-        config = load_config(config_path)
         result = produce_shards(
             roots,
             directory / "release",
@@ -350,14 +391,163 @@ class EngineFailureIntegrationTests(unittest.TestCase):
             self.assertEqual(sorted(searches.values()), [1] * (len(roots) - 1) + [2])
 
     def test_a_malformed_sidecar_is_isolated_and_retried(self):
+        for fault in ("garbage", "missing_fen", "bad_depth", "missing_rank"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                result, roots, searches = self.run_engine(directory, {"fault": fault})
+                self.assertEqual(result["roots"], len(roots))
+                self.assertEqual(result["dropped"], 0)
+                self.assertTrue(
+                    validate_release(Path(directory) / "release", roots, workers=1)[
+                        "ok"
+                    ]
+                )
+                self.assertEqual(
+                    sorted(searches.values()), [1] * (len(roots) - 1) + [2]
+                )
+
+    def test_later_shards_unblock_slow_roots_in_both_active_shards(self):
         with tempfile.TemporaryDirectory() as directory:
-            result, roots, searches = self.run_engine(directory, {"fault": "garbage"})
+            directory = Path(directory)
+            config, roots, script, golog = fixture_engine(
+                directory, timeout=5, extra_cases=("stalemate_d4",)
+            )
+            manifest = json.loads(script.with_suffix(".json").read_text())
+            manifest.update(
+                fault="none",
+                blocked_fens=[roots[0]["fen"], roots[2]["fen"]],
+                unblock_fen=roots[4]["fen"],
+                gate=str(directory / "gate"),
+            )
+            script.with_suffix(".json").write_text(json.dumps(manifest))
+            result = produce_shards(
+                roots,
+                directory / "release",
+                config,
+                shard_size=2,
+                workers=4,
+                engine=script,
+            )
             self.assertEqual(result["roots"], len(roots))
             self.assertEqual(result["dropped"], 0)
+            self.assertEqual(len(golog.read_text().splitlines()), len(roots))
             self.assertTrue(
-                validate_release(Path(directory) / "release", roots, workers=1)["ok"]
+                validate_release(directory / "release", roots, workers=1)["ok"]
             )
-            self.assertEqual(sorted(searches.values()), [1] * (len(roots) - 1) + [2])
+
+    def test_a_failed_start_aborts_without_charging_unsearched_roots(self):
+        for workers in (1, 2):
+            with (
+                self.subTest(workers=workers),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                directory = Path(directory)
+                config, roots, script, golog = fixture_engine(
+                    directory,
+                    {"bad_starts": [2] if workers == 1 else list(range(1, 9))},
+                )
+                with self.assertRaises(EngineStartupError):
+                    produce_shards(
+                        roots,
+                        directory / "release",
+                        config,
+                        shard_size=2,
+                        workers=workers,
+                        engine=script,
+                    )
+                before = Counter(
+                    golog.read_text().splitlines() if golog.exists() else []
+                )
+                manifest = json.loads(script.with_suffix(".json").read_text())
+                manifest.update(bad_starts=[], fault="none")
+                script.with_suffix(".json").write_text(json.dumps(manifest))
+                produce_shards(
+                    roots,
+                    directory / "release",
+                    config,
+                    shard_size=2,
+                    workers=workers,
+                    engine=script,
+                )
+                searches = Counter(golog.read_text().splitlines())
+                self.assertEqual(
+                    sorted(searches.values()), [1, 1, 1, 2] if workers == 1 else [1] * 4
+                )
+                self.assertEqual(sum(before.values()), 1 if workers == 1 else 0)
+
+    def test_the_failure_limit_stops_hanging_engines_and_keeps_completed_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            pids = directory / "pids"
+            config, fixtures, script, golog = fixture_engine(
+                directory, {"fault": "none", "pids": str(pids)}, timeout=60
+            )
+            roots = fixtures[:2] + [
+                {**fixtures[2], "root_id": f"failure-{i}"} for i in range(70)
+            ]
+            manifest = json.loads(script.with_suffix(".json").read_text())
+            manifest.update(hang_fen=roots[1]["fen"], fail_fen=roots[2]["fen"])
+            script.with_suffix(".json").write_text(json.dumps(manifest))
+            config_path = directory / "trace.toml"
+            config_path.write_text(
+                config_path.read_text().replace("workers = 8", "workers = 2")
+            )
+            input_path = directory / "roots.jsonl"
+            input_path.write_text("".join(json.dumps(root) + "\n" for root in roots))
+            roots = read_roots(input_path)
+            command = [
+                sys.executable,
+                "-m",
+                "pondera.data",
+                "curate",
+                "--config",
+                str(config_path),
+                "--input",
+                str(input_path),
+                "--output",
+                str(directory / "release"),
+                "--engine",
+                str(script),
+            ]
+            with subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            ) as process:
+                try:
+                    process.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate()
+                    self.fail(
+                        "Curation waited for a hanging search after the failure limit"
+                    )
+            self.assertNotEqual(process.returncode, 0)
+            self.assertGreaterEqual(
+                Counter(golog.read_text().splitlines())[roots[2]["fen"]], 65
+            )
+            self.assertEqual(
+                Counter(golog.read_text().splitlines())[roots[0]["fen"]], 1
+            )
+            for pid in pids.read_text().splitlines():
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid), 0)
+            manifest.update(hang_fen=None, fail_fen=None)
+            script.with_suffix(".json").write_text(json.dumps(manifest))
+            result = run_pipeline(
+                load_config(config_path),
+                input_path,
+                directory / "release",
+                engine=script,
+            )
+            self.assertEqual(result["roots"], len(roots))
+            self.assertEqual(
+                Counter(golog.read_text().splitlines())[roots[0]["fen"]], 1
+            )
+            self.assertTrue(
+                validate_release(directory / "release", roots, workers=1)["ok"]
+            )
 
 
 HANG_ENGINE = """

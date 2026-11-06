@@ -16,10 +16,11 @@ import pickle
 import random
 import select
 import shutil
+import signal
 import statistics
 import subprocess
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from multiprocessing import get_context
@@ -63,6 +64,7 @@ from pondera.data.trace import (
     TRACE_GRAMMAR_VERSION,
     decode_sidecar,
     mate_distance_moves,
+    parse_sidecar,
     replay,
     synthesize_root,
     validate_root,
@@ -294,6 +296,10 @@ class EngineTimeoutError(CollectionError):
     """The engine exceeded the per-root deadline; the root is dropped."""
 
 
+class EngineStartupError(CollectionError):
+    """The worker cannot start an engine; no root attempt was made."""
+
+
 # A root that keeps failing stops being retried but is never dropped silently:
 # its shard stays unpublished and the run fails loudly once everything else
 # is done. The run-level bound stops a systemic failure (e.g. a full disk)
@@ -323,13 +329,7 @@ def _engine_path(engine):
 
 
 def _start_engine(engine_path, config):
-    """A fresh worker engine; a failed start is retryable, never a drop.
-
-    A startup timeout or a missing binary says nothing about the root being
-    collected, so every startup failure is normalized to a plain
-    ``CollectionError`` — an ``EngineTimeoutError`` here would misclassify
-    the root as a fortress.
-    """
+    """Start an engine, separating worker failures from root failures."""
     try:
         return _Engine(
             engine_path,
@@ -338,12 +338,8 @@ def _start_engine(engine_path, config):
             config.search.syzygy_path,
             config.search.syzygy_probe_limit,
         )
-    except Exception as error:
-        if isinstance(error, CollectionError) and not isinstance(
-            error, EngineTimeoutError
-        ):
-            raise
-        raise CollectionError(f"engine failed to start: {error}") from error
+    except (CollectionError, OSError) as error:
+        raise EngineStartupError(f"engine failed to start: {error}") from error
 
 
 def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
@@ -400,7 +396,7 @@ class _Engine:
                     f"setoption name SyzygyProbeLimit value {syzygy_probe_limit}"
                 )
         except BaseException:
-            self.close()
+            self.close(force=True)
             raise
 
     def __enter__(self):
@@ -456,21 +452,25 @@ class _Engine:
             raise CollectionError(f"engine returned no bestmove: {bestmove!r}")
         return parts[1]
 
-    def close(self):
+    def close(self, *, force=False):
         if self.closed:
             return
-        self.closed = True
-        try:
-            self._send("quit")
-        except CollectionError:
-            pass
-        try:
-            self.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
+        if force:
             self.process.kill()
             self.process.wait()
+        else:
+            try:
+                self._send("quit")
+            except CollectionError:
+                pass
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
         self.process.stdin.close()
         self.process.stdout.close()
+        self.closed = True
 
 
 RELEASE_ONLY_METADATA = frozenset({"root_selection"})
@@ -726,17 +726,15 @@ class _RootCache:
     def store(self, index, root, record):
         shard = self._shard(index)
         key = self._key(root)
+        shard.mkdir(parents=True, exist_ok=True)
+        temporary = shard / f".{key}.{uuid4().hex}.tmp"
         try:
-            shard.mkdir(parents=True, exist_ok=True)
-            temporary = shard / f".{key}.{uuid4().hex}.tmp"
             with temporary.open("wb") as handle:
                 pickle.dump(record, handle, protocol=5)
             temporary.replace(shard / f"{key}.pkl")
             (shard / f"{key}.error.json").unlink(missing_ok=True)
-        except OSError:
-            # A cache may lose a write (e.g. a concurrent finisher removed the
-            # directory); the root is then recollected on the next run.
-            pass
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def failure(self, index, root):
         path = self._shard(index) / f"{self._key(root)}.error.json"
@@ -1678,14 +1676,31 @@ def _collect_root(root, config, engine, engine_name, teacher, provider=None):
             sidecar = decode_sidecar(lines)
         else:
             sidecar, bestmove = _engine_sidecar(engine, root)
-        result = _process_root(
-            root,
-            config,
-            sidecar,
-            bestmove=bestmove,
-            engine_name=None if provider is not None else engine_name,
-            teacher=teacher,
-        )
+        try:
+            result = _process_root(
+                root,
+                config,
+                sidecar,
+                bestmove=bestmove,
+                engine_name=None if provider is not None else engine_name,
+                teacher=teacher,
+            )
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as error:
+            if provider is not None:
+                raise
+            # Diagnose producer data only on failure. Valid sidecars leave
+            # synthesis bugs visible, without replaying every healthy search.
+            try:
+                parse_sidecar(
+                    (json.dumps(event) for event in sidecar.events),
+                    teacher_width=root["teacher_width"],
+                )
+            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+                raise CollectionError(
+                    f"Engine wrote an invalid sidecar for root {root['root_id']}:"
+                    f" {error}"
+                ) from error
+            raise
         # Release the event graph before automatic collection resumes.
         del sidecar
         return result
@@ -1694,43 +1709,60 @@ def _collect_root(root, config, engine, engine_name, teacher, provider=None):
             gc.enable()
 
 
-def _direct_worker(root):
+def _close_direct_engine():
     global _DIRECT_ENGINE
+    if _DIRECT_ENGINE is not None:
+        _DIRECT_ENGINE.close(force=True)
+        _DIRECT_ENGINE = None
+
+
+def _direct_worker(index, root):
+    global _DIRECT_ENGINE
+    if _DIRECT_STOPPING.is_set():
+        raise InterruptedError("Curation stopped")
+    # Startup failures abort the run before a root attempt is counted.
+    if _DIRECT_ENGINE is None:
+        _DIRECT_ENGINE = _start_engine(_DIRECT_ENGINE_PATH, _DIRECT_CONFIG)
     try:
-        return _collect_root(
+        record = _collect_root(
             root, _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_NAME, _DIRECT_TEACHER
         )
-    except CollectionError:
-        # A failed search leaves the engine's protocol state unknown (it may
-        # still be searching); the worker starts a fresh process rather than
-        # trusting the desynchronized one for the next root.
-        _DIRECT_ENGINE.close()
-        try:
-            _DIRECT_ENGINE = _start_engine(_DIRECT_ENGINE_PATH, _DIRECT_CONFIG)
-        except CollectionError:
-            # The root's own failure stands; the next root on this worker
-            # retries the rebuild against the closed engine.
-            pass
-        else:
-            Finalize(None, _DIRECT_ENGINE.close, exitpriority=10)
+        _DIRECT_CACHE.store(index, root, record)
+    except BaseException:
+        _close_direct_engine()
         raise
 
 
-def _init_direct_worker(config, engine_path, engine_name, teacher):
+def _interrupt_direct_worker(signum, frame):
+    # The executor catches task exceptions; leave subsequent interruption
+    # disabled while the task unwinds and reaps its engine process.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise InterruptedError("Curation stopped")
+
+
+def _init_direct_worker(
+    config, engine_path, engine_name, teacher, cache, stopping, worker_pids
+):
     global _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_ENGINE_PATH, _DIRECT_NAME
-    global _DIRECT_TEACHER
+    global _DIRECT_TEACHER, _DIRECT_CACHE, _DIRECT_STOPPING
     _DIRECT_CONFIG = config
     _DIRECT_ENGINE_PATH = engine_path
-    _DIRECT_ENGINE = _start_engine(engine_path, config)
-    Finalize(None, _DIRECT_ENGINE.close, exitpriority=10)
+    _DIRECT_ENGINE = None
+    _DIRECT_CACHE = cache
+    _DIRECT_STOPPING = stopping
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, _interrupt_direct_worker)
+    Finalize(None, _close_direct_engine, exitpriority=10)
     _DIRECT_NAME = engine_name
     _DIRECT_TEACHER = teacher
+    with worker_pids.get_lock():
+        worker_pids[worker_pids[:].index(0)] = os.getpid()
 
 
 def _synthesize_groups(
     groups, config, engine_path, engine_name, teacher, provider, workers, cache, run
 ):
-    """Keep one pool busy across two shards, bounding retained results.
+    """Refill a bounded set of root searches across shard boundaries.
 
     Yields ``(index, group, records, failures)`` per group, where ``failures``
     maps positions of uncollected roots to their last collection error. A
@@ -1741,8 +1773,6 @@ def _synthesize_groups(
         return
     if provider is not None or workers == 1:
         engine = None
-        if provider is None:
-            engine = _start_engine(engine_path, config)
         try:
             for index, group in groups:
                 records = [None] * len(group)
@@ -1757,6 +1787,8 @@ def _synthesize_groups(
                         continue
                     if dropped:
                         continue
+                    if provider is None and engine is None:
+                        engine = _start_engine(engine_path, config)
                     try:
                         record = _collect_root(
                             root, config, engine, engine_name, teacher, provider
@@ -1764,97 +1796,120 @@ def _synthesize_groups(
                     except EngineTimeoutError:
                         _note_dropped(cache, index, root)
                         if engine is not None:
-                            engine.close()
-                            engine = _start_engine(engine_path, config)
+                            engine.close(force=True)
+                            engine = None
                         continue
                     except CollectionError as error:
                         failures[position] = _note_failure(
                             cache, run, index, root, error
                         )
                         if engine is not None:
-                            engine.close()
-                            engine = _start_engine(engine_path, config)
+                            engine.close(force=True)
+                            engine = None
                         continue
                     cache.store(index, root, record)
                     records[position] = record
                 yield index, group, records, failures
         finally:
             if engine is not None:
-                engine.close()
+                engine.close(force=True)
         return
     workers = min(workers, sum(len(group) for _, group in groups))
-    groups = iter(groups)
     pending = {}
     active = {}
-    completed = []
-    with ProcessPoolExecutor(
-        max_workers=workers,
-        mp_context=get_context("spawn"),
-        initializer=_init_direct_worker,
-        initargs=(config, engine_path, engine_name, teacher),
-    ) as pool:
+    completed = deque()
 
-        def submit_group():
-            item = next(groups, None)
-            if item is None:
-                return
-            index, group = item
-            records = [None] * len(group)
-            failures = {}
-            remaining = 0
+    def finished(index):
+        state = active[index]
+        state["remaining"] -= 1
+        if state["remaining"] == 0:
+            completed.append(index)
+
+    def missing_roots():
+        for index, group in groups:
+            active[index] = {"group": group, "remaining": len(group), "failures": {}}
             for position, root in enumerate(group):
                 cached, capped, dropped = _cached_or_capped(cache, index, root)
-                if cached is not None:
-                    records[position] = cached
-                    continue
-                if capped is not None:
-                    failures[position] = capped
-                    continue
-                if dropped:
-                    continue
-                pending[pool.submit(_direct_worker, root)] = (index, position)
-                remaining += 1
-            if remaining:
-                active[index] = (group, records, failures, remaining)
-            else:
-                completed.append((index, group, records, failures))
+                if cached is not None or capped is not None or dropped:
+                    if capped is not None:
+                        active[index]["failures"][position] = capped
+                    del cached
+                    finished(index)
+                else:
+                    yield index, position, root
 
-        submit_group()
-        submit_group()
-        try:
-            while pending or completed:
-                while completed:
-                    index, group, records, failures = completed.pop(0)
-                    yield index, group, records, failures
-                    submit_group()
-                if not pending:
+    missing = missing_roots()
+    context = get_context("spawn")
+    stopping = context.Event()
+    worker_pids = context.Array("i", workers)
+    pool = ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=context,
+        initializer=_init_direct_worker,
+        initargs=(
+            config,
+            engine_path,
+            engine_name,
+            teacher,
+            cache,
+            stopping,
+            worker_pids,
+        ),
+    )
+    try:
+        while True:
+            while len(pending) < 2 * workers:
+                item = next(missing, None)
+                if item is None:
                     break
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    index, position = pending.pop(future)
-                    group, records, failures, remaining = active[index]
-                    root = group[position]
-                    try:
-                        record = future.result()
-                    except EngineTimeoutError:
-                        _note_dropped(cache, index, root)
-                    except CollectionError as error:
-                        failures[position] = _note_failure(
-                            cache, run, index, root, error
-                        )
-                    else:
-                        cache.store(index, root, record)
-                        records[position] = record
-                    remaining -= 1
-                    if remaining:
-                        active[index] = (group, records, failures, remaining)
-                    else:
-                        del active[index]
-                        completed.append((index, group, records, failures))
-        except BaseException:
-            # The systemic-failure breaker must not wait out queued searches.
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
+                index, position, root = item
+                pending[pool.submit(_direct_worker, index, root)] = (index, position)
+            while completed:
+                index = completed.popleft()
+                state = active.pop(index)
+                group, failures = state["group"], state["failures"]
+                records = []
+                if not failures:
+                    for root in group:
+                        record = cache.load(index, root)
+                        if record is None and cache.dropped(index, root) is None:
+                            raise CollectionError(
+                                f"Missing checkpoint for root {root['root_id']}"
+                            )
+                        records.append(record)
+                yield index, group, records, failures
+            if not pending:
+                break
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                index, position = pending.pop(future)
+                state = active[index]
+                group, failures = state["group"], state["failures"]
+                root = group[position]
+                try:
+                    future.result()
+                except EngineStartupError:
+                    raise
+                except EngineTimeoutError:
+                    _note_dropped(cache, index, root)
+                except CollectionError as error:
+                    failures[position] = _note_failure(cache, run, index, root, error)
+                finished(index)
+    except BaseException:
+        stopping.set()
+        # Python 3.13 has no public executor method to interrupt workers.
+        # Interrupt searches before joining, including engine startup waits.
+        with worker_pids.get_lock():
+            pids = worker_pids[:]
+        for pid in pids:
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _syzygy_tables(path):
