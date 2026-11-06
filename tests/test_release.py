@@ -22,9 +22,11 @@ from pondera.data.dataset import (
     TracePositions,
     load_manifest,
     read_root_rows,
+    write_manifest,
 )
 from pondera.data.pipeline import (
     CollectionError,
+    EngineTimeoutError,
     load_trace_arrays,
     produce_shards,
     sample_root_settings,
@@ -424,6 +426,66 @@ class FailureIsolationTests(unittest.TestCase):
                 self.produce(provider)
             self.assertEqual(calls[fail_id], expected)
         self.assertIn(fail_id, str(caught.exception))
+
+    def test_a_timed_out_root_is_dropped_without_retry(self):
+        drop_id = self.roots[1]["root_id"]
+        calls = Counter()
+
+        def provider(root):
+            calls[root["root_id"]] += 1
+            if root["root_id"] == drop_id:
+                raise EngineTimeoutError("engine timed out")
+            return self.provider[root["root_id"]]
+
+        result = self.produce(provider)
+        self.assertEqual(calls[drop_id], 1)
+        self.assertEqual(result["roots"], len(CASES) - 1)
+        self.assertEqual(result["dropped"], 1)
+        release = load_manifest(self.run / "release" / "release.json")
+        self.assertEqual(release["dropped"], [{"root_id": drop_id, "shard": 0}])
+        self.assertTrue(
+            validate_release(self.run / "release", self.roots, workers=1)["ok"]
+        )
+        expected = {
+            key: value for key, value in self.baseline.items() if key[0] != drop_id
+        }
+        self.assertEqual(expected, read_release_rows(self.run / "release"))
+        self.assertFalse((self.run / "release" / ".roots").exists())
+
+    def test_a_dropped_root_is_not_recollected_on_resume(self):
+        drop_id = self.roots[1]["root_id"]
+        fail_id = self.roots[3]["root_id"]
+
+        def provider(root):
+            if root["root_id"] == drop_id:
+                raise EngineTimeoutError("engine timed out")
+            if root["root_id"] == fail_id:
+                raise CollectionError("injected collection failure")
+            return self.provider[root["root_id"]]
+
+        with self.assertRaises(CollectionError):
+            self.produce(provider)
+
+        calls = Counter()
+
+        def counting(root):
+            calls[root["root_id"]] += 1
+            return self.provider[root["root_id"]]
+
+        result = self.produce(counting)
+        self.assertEqual(calls.get(drop_id, 0), 0)
+        self.assertEqual(calls[fail_id], 1)
+        self.assertEqual(result["dropped"], 1)
+        self.assertTrue(
+            validate_release(self.run / "release", self.roots, workers=1)["ok"]
+        )
+
+    def test_validation_rejects_a_dropped_root_that_is_present(self):
+        release = load_manifest(self.run / "baseline" / "release.json")
+        release["dropped"] = [{"root_id": self.roots[0]["root_id"], "shard": 0}]
+        write_manifest(self.run / "baseline" / "release.json", release)
+        with self.assertRaises(ValueError):
+            validate_release(self.run / "baseline", self.roots, workers=1)
 
     def test_a_programming_error_is_not_isolated(self):
         def provider(root):

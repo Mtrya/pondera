@@ -289,6 +289,10 @@ class CollectionError(RuntimeError):
     """A pipeline input or result that violates the production contract."""
 
 
+class EngineTimeoutError(CollectionError):
+    """The engine exceeded the per-root deadline; the root is dropped."""
+
+
 # A root that keeps failing stops being retried but is never dropped silently:
 # its shard stays unpublished and the run fails loudly once everything else
 # is done. The run-level bound stops a systemic failure (e.g. a full disk)
@@ -385,7 +389,7 @@ class _Engine:
         while b"\n" not in self.buffer:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise CollectionError("engine timed out")
+                raise EngineTimeoutError("engine timed out")
             ready, _, _ = select.select([self.process.stdout], [], [], remaining)
             if not ready:
                 continue
@@ -613,6 +617,8 @@ def _publish_shard(output, index, records, metadata, presentations):
     temporary = output / f".shard-{index:06d}.tmp"
     if temporary.exists():
         shutil.rmtree(temporary)
+    # Dropped roots (engine timeouts) leave no record behind.
+    records = [record for record in records if record is not None]
     payload = _write_shard(temporary, records, metadata, presentations)
     if final.exists():
         shutil.rmtree(temporary)
@@ -631,6 +637,8 @@ class _RootCache:
     silently degrades to recollection, since a cache may never corrupt a
     release. Failure records count attempts across runs so a permanently
     failing root stops being retried without ever being dropped silently.
+    Dropped roots (engine timeouts) persist as markers so a resumed run
+    never recollects them.
     """
 
     def __init__(self, output, identity):
@@ -716,19 +724,52 @@ class _RootCache:
         temporary.replace(path)
         return attempts
 
+    def dropped(self, index, root):
+        path = self._shard(index) / f"{root['root_id']}.dropped.json"
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(record, dict)
+            or record.get("root_id") != root["root_id"]
+            or not isinstance(record.get("error"), str)
+        ):
+            return None
+        return record
+
+    def record_dropped(self, index, root, error):
+        shard = self._shard(index)
+        shard.mkdir(parents=True, exist_ok=True)
+        path = shard / f"{root['root_id']}.dropped.json"
+        temporary = shard / f".{path.name}.{uuid4().hex}.tmp"
+        temporary.write_text(
+            json.dumps({"root_id": root["root_id"], "error": str(error)}) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
     def clear_shard(self, index):
         shutil.rmtree(self._shard(index), ignore_errors=True)
 
 
 def _cached_or_capped(cache, index, root):
-    """A root's checkpoint hit, its exhausted failure record, or neither."""
+    """A root's checkpoint hit, its exhausted failure record, or its drop."""
     cached = cache.load(index, root)
     if cached is not None:
-        return cached, None
+        return cached, None, False
     failure = cache.failure(index, root)
     if failure is not None and failure["attempts"] >= MAX_ROOT_ATTEMPTS:
-        return None, failure["error"]
-    return None, None
+        return None, failure["error"], False
+    return None, None, cache.dropped(index, root) is not None
+
+
+def _note_dropped(cache, index, root):
+    cache.record_dropped(index, root, "engine timed out")
+    print(
+        f"shard {index:06d} root {root['root_id']}: dropped after engine timeout",
+        flush=True,
+    )
 
 
 def _note_failure(cache, run, index, root, error):
@@ -911,7 +952,10 @@ def validate_release_identity(release):
     rows = sum(shard["rows"] for shard in release["shards"])
     if rows < 1:
         raise ValueError("A release needs completed rows")
-    return _release_identity_contract(release, rows)
+    # The root-selection identity describes the selected roots, which are the
+    # published rows plus the dropped ones.
+    dropped = release.get("dropped", [])
+    return _release_identity_contract(release, rows + len(dropped))
 
 
 def _read_shard_metadata(release_dir, shard, expected_metadata=None):
@@ -1394,6 +1438,20 @@ def validate_release(directory, roots=None, workers=8):
     release = load_manifest(directory / "release.json")
     if not release:
         raise FileNotFoundError(directory / "release.json")
+    dropped = release.get("dropped", [])
+    if not isinstance(dropped, list):
+        raise ValueError("Release dropped list is invalid")
+    dropped_ids = set()
+    for entry in dropped:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"root_id", "shard"}
+            or not isinstance(entry["root_id"], str)
+            or not _is_int(entry["shard"], 0)
+            or entry["root_id"] in dropped_ids
+        ):
+            raise ValueError("Release dropped entries are invalid")
+        dropped_ids.add(entry["root_id"])
     expected_metadata = {
         "format_version": DATA_FORMAT_VERSION,
         "grammar_version": TRACE_GRAMMAR_VERSION,
@@ -1466,10 +1524,15 @@ def validate_release(directory, roots=None, workers=8):
         raise ValueError("Release teacher schema differs from its rows")
     if len(seen_roots) != complete or len(seen) != complete:
         raise ValueError("Release rows do not match its roots")
+    if dropped_ids & seen_roots:
+        raise ValueError("A dropped root appears in the release")
     if expected is not None:
+        if not dropped_ids <= set(expected):
+            raise ValueError("Release drops an unselected root")
         wanted = {
             (root_id, sample_presentation(recipe, seed, root_id))
             for root_id in expected
+            if root_id not in dropped_ids
         }
         if seen != wanted:
             raise ValueError("Release does not contain exactly the selected roots")
@@ -1511,6 +1574,8 @@ def _engine_sidecar(engine, root):
         trace_path = Path(directory) / "trace.jsonl"
         try:
             bestmove = engine.search(root["fen"], trace_path, width, depth)
+        except EngineTimeoutError as error:
+            raise EngineTimeoutError(f"{error} for root {root['root_id']}") from error
         except CollectionError as error:
             raise CollectionError(f"{error} for root {root['root_id']}") from error
         if not trace_path.is_file():
@@ -1631,17 +1696,31 @@ def _synthesize_groups(
                 records = [None] * len(group)
                 failures = {}
                 for position, root in enumerate(group):
-                    cached, capped = _cached_or_capped(cache, index, root)
+                    cached, capped, dropped = _cached_or_capped(cache, index, root)
                     if cached is not None:
                         records[position] = cached
                         continue
                     if capped is not None:
                         failures[position] = capped
                         continue
+                    if dropped:
+                        continue
                     try:
                         record = _collect_root(
                             root, config, engine, engine_name, teacher, provider
                         )
+                    except EngineTimeoutError:
+                        _note_dropped(cache, index, root)
+                        if engine is not None:
+                            engine.close()
+                            engine = _Engine(
+                                engine_path,
+                                config.search.hash_mb,
+                                config.search.timeout_seconds,
+                                config.search.syzygy_path,
+                                config.search.syzygy_probe_limit,
+                            )
+                        continue
                     except CollectionError as error:
                         failures[position] = _note_failure(
                             cache, run, index, root, error
@@ -1684,12 +1763,14 @@ def _synthesize_groups(
             failures = {}
             remaining = 0
             for position, root in enumerate(group):
-                cached, capped = _cached_or_capped(cache, index, root)
+                cached, capped, dropped = _cached_or_capped(cache, index, root)
                 if cached is not None:
                     records[position] = cached
                     continue
                 if capped is not None:
                     failures[position] = capped
+                    continue
+                if dropped:
                     continue
                 pending[pool.submit(_direct_worker, root)] = (index, position)
                 remaining += 1
@@ -1714,6 +1795,8 @@ def _synthesize_groups(
                 root = group[position]
                 try:
                     record = future.result()
+                except EngineTimeoutError:
+                    _note_dropped(cache, index, root)
                 except CollectionError as error:
                     failures[position] = _note_failure(cache, run, index, root, error)
                 else:
@@ -1792,11 +1875,13 @@ def produce_shards(
 
     Every collected root is checkpointed under ``<output>/.roots`` until its
     shard is registered, so an interrupted run recollects only missing roots.
-    A root whose collection raises ``CollectionError`` is isolated from its
-    shard mates, retried in a second pass, and retried across runs up to
-    ``MAX_ROOT_ATTEMPTS``; if any roots remain failed after everything else
-    is published, the run raises one summary error and keeps the checkpoints.
-    The cache directory is removed once the release is complete.
+    A root whose engine exceeds the per-root timeout is dropped without
+    retry and recorded under ``dropped`` in the release. Any other
+    ``CollectionError`` is isolated from its shard mates, retried in a
+    second pass, and retried across runs up to ``MAX_ROOT_ATTEMPTS``; if any
+    roots remain failed after everything else is published, the run raises
+    one summary error and keeps the checkpoints. The cache directory is
+    removed once the release is complete.
     """
     roots = sample_root_settings(list(roots), config, config.seed)
     if not roots:
@@ -1839,19 +1924,36 @@ def produce_shards(
     ]
     cache = _RootCache(output_dir, identity)
     ready, pending = [], []
+    dropped_by_shard = {}
+    for entry in (previous or {}).get("dropped", []):
+        dropped_by_shard.setdefault(entry["shard"], set()).add(entry["root_id"])
     for index, group in groups:
         if index < start_shard or (end_shard is not None and index >= end_shard):
             continue
         if index in shards_by_index:
-            _check_shard_layout(output_dir, shards_by_index[index], group)
+            dropped = dropped_by_shard.get(index, set())
+            _check_shard_layout(
+                output_dir,
+                shards_by_index[index],
+                [root for root in group if root["root_id"] not in dropped],
+            )
             cache.clear_shard(index)
             continue
         final = output_dir / f"shard-{index:06d}"
         if final.exists():
+            dropped = [
+                root["root_id"]
+                for root in group
+                if cache.dropped(index, root) is not None
+            ]
             shard = _recover_shard(
-                output_dir, index, group, shard_metadata, presentations
+                output_dir,
+                index,
+                [root for root in group if root["root_id"] not in set(dropped)],
+                shard_metadata,
+                presentations,
             )
-            ready.append((index, group, shard))
+            ready.append((index, group, shard, dropped))
         else:
             pending.append((index, group))
 
@@ -1859,7 +1961,8 @@ def produce_shards(
     failed = []
 
     def publishable():
-        yield from ready
+        for index, group, shard, dropped in ready:
+            yield index, group, shard, dropped
         deferred = []
         for index, group, records, failures in _synthesize_groups(
             pending,
@@ -1875,12 +1978,18 @@ def produce_shards(
             if failures:
                 deferred.append((index, group))
                 continue
+            dropped = [
+                group[position]["root_id"]
+                for position, record in enumerate(records)
+                if record is None
+            ]
             yield (
                 index,
                 group,
                 _publish_shard(
                     output_dir, index, records, shard_metadata, presentations
                 ),
+                dropped,
             )
         # A deferred group's collected roots are checkpoint hits here; only
         # the failed roots are recollected in this second pass.
@@ -1901,15 +2010,21 @@ def produce_shards(
                     for position, error in failures.items()
                 )
                 continue
+            dropped = [
+                group[position]["root_id"]
+                for position, record in enumerate(records)
+                if record is None
+            ]
             yield (
                 index,
                 group,
                 _publish_shard(
                     output_dir, index, records, shard_metadata, presentations
                 ),
+                dropped,
             )
 
-    for index, group, shard in publishable():
+    for index, group, shard, dropped_ids in publishable():
         with _release_lock(output_dir):
             current = load_manifest(release_path)
             if current and current.get("metadata") != identity:
@@ -1921,11 +2036,15 @@ def produce_shards(
                 for item in current.get("shards", [])
             }
             shards_by_index[index] = shard
+            dropped = (current or {}).get("dropped", []) + [
+                {"root_id": root_id, "shard": index} for root_id in dropped_ids
+            ]
             write_manifest(
                 release_path,
                 {
                     **release_metadata,
                     "metadata": identity,
+                    "dropped": dropped,
                     "shards": [shards_by_index[key] for key in sorted(shards_by_index)],
                 },
             )
@@ -1933,12 +2052,13 @@ def produce_shards(
     with _release_lock(output_dir):
         current = load_manifest(release_path)
         complete = sum(shard["rows"] for shard in current.get("shards", []))
+        dropped = current.get("dropped", [])
         profile = RootProfile(presentations)
         for shard in current.get("shards", []):
             _profile_shard(output_dir, shard, profile)
         statistics = profile.result() if profile.roots else None
         if statistics is not None:
-            statistics["complete"] = complete == len(roots)
+            statistics["complete"] = complete + len(dropped) == len(roots)
             write_manifest(output_dir / "statistics.json", statistics)
     if failed:
         summary = "; ".join(
@@ -1954,7 +2074,8 @@ def produce_shards(
     return {
         "shards": current.get("shards", []),
         "roots": complete,
-        "pending": len(roots) - complete,
+        "dropped": len(dropped),
+        "pending": len(roots) - complete - len(dropped),
         "release": str(release_path),
         "statistics": statistics,
     }

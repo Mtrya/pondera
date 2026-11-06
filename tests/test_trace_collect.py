@@ -18,6 +18,7 @@ from trace_fixtures import trace_config_text as config_text
 from pondera.data.config import load_config, parse_recipe
 from pondera.data.pipeline import (
     CollectionError,
+    EngineTimeoutError,
     _check_sidecar,
     _collect_root,
     _Engine,
@@ -339,6 +340,39 @@ class EngineFailureIntegrationTests(unittest.TestCase):
             self.assertEqual(failures, 1)
             searches = Counter(golog.read_text(encoding="utf-8").splitlines())
             self.assertEqual(sorted(searches.values()), [1] * (len(roots) - 1) + [2])
+
+
+HANG_ENGINE = """
+import sys
+import time
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if line == "uci":
+        sys.stdout.write("option name TraceLog type string default \\nuciok\\n")
+        sys.stdout.flush()
+    elif line == "isready":
+        sys.stdout.write("readyok\\n")
+        sys.stdout.flush()
+    elif line.startswith("go "):
+        time.sleep(3600)
+    elif line == "quit":
+        break
+"""
+
+
+class EngineTimeoutTests(unittest.TestCase):
+    """A search that never answers must surface as a distinct timeout."""
+
+    def test_a_search_past_the_deadline_raises_a_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            script = directory / "hang_engine.py"
+            script.write_text(f"#!{sys.executable}\n" + HANG_ENGINE, encoding="utf-8")
+            script.chmod(0o755)
+            with _Engine(script, 256, timeout=1) as engine:
+                with self.assertRaises(EngineTimeoutError):
+                    engine.search(chess.STARTING_FEN, directory / "trace.jsonl", 1, 4)
 
 
 class SyzygyOptionIntegrationTests(unittest.TestCase):
