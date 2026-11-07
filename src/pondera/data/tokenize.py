@@ -119,8 +119,21 @@ def tokenize_dataset(source, output, dictionary=MergeDictionary(), *, batch_size
             name = f"shard-{index:06d}"
             (work / name).mkdir()
             shard_rows = 0
-            writer = None
-            try:
+            schema = file.schema_arrow
+            for field in (
+                TRACE_SCHEMA.field("trace_token_ids"),
+                TRACE_SCHEMA.field("trace_len"),
+            ):
+                column = schema.get_field_index(field.name)
+                schema = (
+                    schema.append(field) if column < 0 else schema.set(column, field)
+                )
+            with pq.ParquetWriter(
+                work / name / "data.parquet",
+                schema,
+                compression="zstd",
+                compression_level=3,
+            ) as writer:
                 for batch in file.iter_batches(
                     batch_size=batch_size, use_threads=False
                 ):
@@ -151,19 +164,9 @@ def tokenize_dataset(source, output, dictionary=MergeDictionary(), *, batch_size
                         pa.list_(pa.int32()),
                     )
                     table = _replace(table, "trace_len", lengths, pa.int32())
-                    if writer is None:
-                        writer = pq.ParquetWriter(
-                            work / name / "data.parquet",
-                            table.schema,
-                            compression="zstd",
-                            compression_level=3,
-                        )
                     writer.write_table(table, row_group_size=64)
                     shard_rows += len(batch)
                     tokens += sum(lengths)
-            finally:
-                if writer is not None:
-                    writer.close()
             if shard_rows != expected_rows:
                 raise ValueError(f"Shard row count differs from its release: {path}")
             shard = {"path": name, "rows": shard_rows}

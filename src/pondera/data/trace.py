@@ -1296,26 +1296,33 @@ def decode_sidecar(lines):
     """Decode output from the qualified producer without replaying its search.
 
     ``parse_sidecar`` supplies the exhaustive diagnostic checks used when
-    qualifying the producer or investigating an invalid record.
+    qualifying the producer or investigating an invalid record. Any malformed
+    input surfaces as ``SynthesisError``; structural accidents never escape
+    as bare ``KeyError``/``IndexError``/``TypeError``.
     """
-    events = tuple(orjson.loads(line) for line in lines)
-    if not events or events[-1]["type"] != "search_end":
-        raise SynthesisError("the engine sidecar did not finish")
-    by_type = {kind: [] for kind in EVENT_TYPES}
-    for event in events:
-        by_type[event["type"]].append(event)
-    return Sidecar(
-        events,
-        by_type["session"][0],
-        by_type["position"][0],
-        by_type["search_start"][0],
-        tuple(by_type["round_start"]),
-        tuple(by_type["attempt"]),
-        tuple(by_type["candidate"]),
-        tuple(by_type["frontier"]),
-        tuple(by_type["round_end"]),
-        events[-1],
-    )
+    try:
+        events = tuple(orjson.loads(line) for line in lines)
+        if not events or events[-1]["type"] != "search_end":
+            raise SynthesisError("the engine sidecar did not finish")
+        by_type = {kind: [] for kind in EVENT_TYPES}
+        for event in events:
+            by_type[event["type"]].append(event)
+        return Sidecar(
+            events,
+            by_type["session"][0],
+            by_type["position"][0],
+            by_type["search_start"][0],
+            tuple(by_type["round_start"]),
+            tuple(by_type["attempt"]),
+            tuple(by_type["candidate"]),
+            tuple(by_type["frontier"]),
+            tuple(by_type["round_end"]),
+            events[-1],
+        )
+    except (ValueError, KeyError, IndexError, TypeError) as error:
+        if isinstance(error, SynthesisError):
+            raise
+        raise SynthesisError(f"malformed sidecar: {error}") from error
 
 
 def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):

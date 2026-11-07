@@ -20,7 +20,14 @@ batch_size = 1024
 
 [search]
 hash_mb = 256
-timeout_seconds = 3600
+# Roots whose search exceeds this deadline are dropped from the release
+# (recorded under "dropped" in release.json) and never retried.
+timeout_seconds = 1800
+# Syzygy tablebases: a worker-local directory of WDL/DTZ files. Empty path
+# disables probing (recorded as 0 in the release identity); the probe limit
+# caps the probed piece count.
+syzygy_path = ""
+syzygy_probe_limit = 7
 joint = [
     { width = "full", depth = 8, probability = 0.30 },
     { width = 8, depth = 10, probability = 0.25 },

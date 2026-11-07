@@ -3,6 +3,7 @@ import tempfile
 import threading
 import tomllib
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -21,8 +22,11 @@ from pondera.data.dataset import (
     TracePositions,
     load_manifest,
     read_root_rows,
+    write_manifest,
 )
 from pondera.data.pipeline import (
+    CollectionError,
+    EngineTimeoutError,
     load_trace_arrays,
     produce_shards,
     sample_root_settings,
@@ -30,6 +34,7 @@ from pondera.data.pipeline import (
     validate_release_identity,
     verify_shard_files,
 )
+from pondera.data.roots.pool import root_id_for
 from pondera.data.trace import replay
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
@@ -109,7 +114,15 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release["format_version"], 11)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
-        self.assertEqual(release["search"], {"hash_mb": 256})
+        self.assertEqual(
+            release["search"],
+            {
+                "hash_mb": 256,
+                "timeout_seconds": 3600,
+                "syzygy_probe_limit": 0,
+                "syzygy_tables": None,
+            },
+        )
         self.assertEqual(release["recipe"], self.config.sampling.identity())
         self.assertEqual(release["engine"]["name"], "stockfish")
         self.assertEqual(release["presentation"], self.config.presentation_dict())
@@ -338,7 +351,288 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(claim_roots, {claim["root_id"]})
 
 
+class FailureIsolationTests(unittest.TestCase):
+    """A failed root must not kill its shard mates, its run, or its resume."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.config, self.roots, self.run, self.provider = build_run(self.root)
+        produce_shards(
+            self.roots,
+            self.run / "baseline",
+            self.config,
+            sidecar_for_root=self.provider,
+            shard_size=2,
+            workers=1,
+        )
+        self.baseline = read_release_rows(self.run / "baseline")
+
+    def produce(self, provider):
+        return produce_shards(
+            self.roots,
+            self.run / "release",
+            self.config,
+            sidecar_for_root=provider,
+            shard_size=2,
+            workers=1,
+        )
+
+    def flaky(self, fail_id, times):
+        calls = Counter()
+
+        def provider(root):
+            calls[root["root_id"]] += 1
+            if root["root_id"] == fail_id and calls[fail_id] <= times:
+                raise CollectionError("injected collection failure")
+            return self.provider[root["root_id"]]
+
+        return provider, calls
+
+    def test_a_failed_root_is_retried_within_the_run(self):
+        fail_id = self.roots[1]["root_id"]
+        provider, calls = self.flaky(fail_id, times=1)
+        result = self.produce(provider)
+        self.assertEqual(result["roots"], len(CASES))
+        self.assertEqual(calls[fail_id], 2)
+        self.assertEqual(self.baseline, read_release_rows(self.run / "release"))
+        self.assertTrue(
+            validate_release(self.run / "release", self.roots, workers=1)["ok"]
+        )
+        self.assertFalse((self.run / "release" / ".roots").exists())
+
+    def test_collected_roots_survive_a_failed_run(self):
+        fail_id = self.roots[1]["root_id"]
+        provider, _ = self.flaky(fail_id, times=2)
+        with self.assertRaises(CollectionError):
+            self.produce(provider)
+        release = load_manifest(self.run / "release" / "release.json")
+        self.assertEqual(
+            [shard["path"] for shard in release["shards"]],
+            ["shard-000001", "shard-000002"],
+        )
+
+        provider, calls = self.flaky(fail_id, times=0)
+        result = self.produce(provider)
+        self.assertEqual(result["roots"], len(CASES))
+        self.assertEqual(dict(calls), {fail_id: 1})
+        self.assertEqual(self.baseline, read_release_rows(self.run / "release"))
+        self.assertTrue(
+            validate_release(self.run / "release", self.roots, workers=1)["ok"]
+        )
+
+    def test_a_root_that_keeps_failing_stops_being_retried(self):
+        fail_id = self.roots[1]["root_id"]
+        provider, calls = self.flaky(fail_id, times=10)
+        for expected in (2, 3, 3):
+            with self.assertRaises(CollectionError) as caught:
+                self.produce(provider)
+            self.assertEqual(calls[fail_id], expected)
+        self.assertIn(fail_id, str(caught.exception))
+
+    def test_a_timed_out_root_is_dropped_without_retry(self):
+        drop_id = self.roots[1]["root_id"]
+        calls = Counter()
+
+        def provider(root):
+            calls[root["root_id"]] += 1
+            if root["root_id"] == drop_id:
+                raise EngineTimeoutError("engine timed out")
+            return self.provider[root["root_id"]]
+
+        result = self.produce(provider)
+        self.assertEqual(calls[drop_id], 1)
+        self.assertEqual(result["roots"], len(CASES) - 1)
+        self.assertEqual(result["dropped"], 1)
+        release = load_manifest(self.run / "release" / "release.json")
+        self.assertEqual(release["dropped"], [{"root_id": drop_id, "shard": 0}])
+        self.assertTrue(
+            validate_release(self.run / "release", self.roots, workers=1)["ok"]
+        )
+        expected = {
+            key: value for key, value in self.baseline.items() if key[0] != drop_id
+        }
+        self.assertEqual(expected, read_release_rows(self.run / "release"))
+        self.assertFalse((self.run / "release" / ".roots").exists())
+
+    def test_a_dropped_root_is_not_recollected_on_resume(self):
+        drop_id = self.roots[1]["root_id"]
+        fail_id = self.roots[3]["root_id"]
+
+        def provider(root):
+            if root["root_id"] == drop_id:
+                raise EngineTimeoutError("engine timed out")
+            if root["root_id"] == fail_id:
+                raise CollectionError("injected collection failure")
+            return self.provider[root["root_id"]]
+
+        with self.assertRaises(CollectionError):
+            self.produce(provider)
+
+        calls = Counter()
+
+        def counting(root):
+            calls[root["root_id"]] += 1
+            return self.provider[root["root_id"]]
+
+        result = self.produce(counting)
+        self.assertEqual(calls.get(drop_id, 0), 0)
+        self.assertEqual(calls[fail_id], 1)
+        self.assertEqual(result["dropped"], 1)
+        self.assertTrue(
+            validate_release(self.run / "release", self.roots, workers=1)["ok"]
+        )
+
+    def test_fen_derived_root_ids_are_cached_across_runs(self):
+        # Root ids are opaque strings; FEN-derived ones contain "/" and "|".
+        roots = []
+        provider = {}
+        for root in self.roots:
+            renamed = dict(root)
+            renamed["root_id"] = root_id_for(root["fen"], root["repetition"])
+            roots.append(renamed)
+            provider[renamed["root_id"]] = self.provider[root["root_id"]]
+        fail_id = roots[1]["root_id"]
+        calls = Counter()
+
+        def flaky(root):
+            calls[root["root_id"]] += 1
+            if root["root_id"] == fail_id:
+                raise CollectionError("injected collection failure")
+            return provider[root["root_id"]]
+
+        with self.assertRaises(CollectionError):
+            produce_shards(
+                roots,
+                self.run / "release",
+                self.config,
+                sidecar_for_root=flaky,
+                shard_size=2,
+                workers=1,
+            )
+
+        calls = Counter()
+
+        def counting(root):
+            calls[root["root_id"]] += 1
+            return provider[root["root_id"]]
+
+        result = produce_shards(
+            roots,
+            self.run / "release",
+            self.config,
+            sidecar_for_root=counting,
+            shard_size=2,
+            workers=1,
+        )
+        self.assertEqual(result["roots"], len(CASES))
+        # Only the root that failed the first run was recollected.
+        self.assertEqual(dict(calls), {fail_id: 1})
+        self.assertTrue(validate_release(self.run / "release", roots, workers=1)["ok"])
+
+    def test_a_partial_range_run_keeps_the_cache_for_untouched_shards(self):
+        fail_id = self.roots[4]["root_id"]  # shard 2 of 0..2
+        provider, _ = self.flaky(fail_id, times=10)
+        with self.assertRaises(CollectionError):
+            self.produce(provider)
+
+        # A range-limited run that only republishes finished shards must not
+        # wipe the failed root's retry budget.
+        result = produce_shards(
+            self.roots,
+            self.run / "release",
+            self.config,
+            sidecar_for_root=self.provider,
+            shard_size=2,
+            workers=1,
+            start_shard=0,
+            end_shard=2,
+        )
+        self.assertEqual(result["pending"], 1)
+
+        provider, calls = self.flaky(fail_id, times=10)
+        with self.assertRaises(CollectionError):
+            self.produce(provider)
+        # Two attempts from the first run persisted; the cap is reached after
+        # one more, so the third run collects the root exactly once.
+        self.assertEqual(calls[fail_id], 1)
+
+    def test_a_shard_whose_roots_all_time_out_publishes_empty(self):
+        drop_ids = {self.roots[0]["root_id"], self.roots[1]["root_id"]}
+
+        def provider(root):
+            if root["root_id"] in drop_ids:
+                raise EngineTimeoutError("engine timed out")
+            return self.provider[root["root_id"]]
+
+        result = self.produce(provider)
+        self.assertEqual(result["roots"], len(CASES) - 2)
+        self.assertEqual(result["dropped"], 2)
+        release = load_manifest(self.run / "release" / "release.json")
+        self.assertEqual([shard["rows"] for shard in release["shards"]], [0, 2, 1])
+        self.assertEqual(
+            sorted(release["dropped"], key=lambda entry: entry["root_id"]),
+            [{"root_id": root_id, "shard": 0} for root_id in sorted(drop_ids)],
+        )
+        expected = {
+            key: value for key, value in self.baseline.items() if key[0] not in drop_ids
+        }
+        self.assertEqual(expected, read_release_rows(self.run / "release"))
+        self.assertTrue(
+            validate_release(self.run / "release", self.roots, workers=1)["ok"]
+        )
+
+    def test_validation_rejects_a_dropped_root_that_is_present(self):
+        release = load_manifest(self.run / "baseline" / "release.json")
+        release["dropped"] = [{"root_id": self.roots[0]["root_id"], "shard": 0}]
+        write_manifest(self.run / "baseline" / "release.json", release)
+        with self.assertRaises(ValueError):
+            validate_release(self.run / "baseline", self.roots, workers=1)
+
+    def test_a_programming_error_is_not_isolated(self):
+        def provider(root):
+            raise ValueError("a real bug")
+
+        with self.assertRaises(ValueError):
+            self.produce(provider)
+
+
 class WideReleaseTests(unittest.TestCase):
+    def test_a_wide_recipe_release_validates_when_its_wide_roots_are_dropped(self):
+        cases = ("start_d4", "middlegame_black_w3", "two_moves_w3")
+        # Seed 10 assigns the widths (1, 3, 3) of these real sidecars.
+        with tempfile.TemporaryDirectory() as directory:
+            config, roots, run, provider = build_run(
+                directory,
+                cases=cases,
+                width=1,
+                recipe_text=MIXED_RECIPE,
+                seed=10,
+            )
+            wide = {root["root_id"] for root in roots if root["teacher_width"] > 1}
+            self.assertEqual(len(wide), 2)
+
+            def dropping(root):
+                if root["root_id"] in wide:
+                    raise EngineTimeoutError("engine timed out")
+                return provider[root["root_id"]]
+
+            result = produce_shards(
+                roots,
+                run / "release",
+                config,
+                sidecar_for_root=dropping,
+                shard_size=2,
+                workers=1,
+            )
+            self.assertEqual(result["dropped"], 2)
+            release = load_manifest(run / "release" / "release.json")
+            # The recipe keeps its wide schema even though no wide root
+            # survived: the schema is a property of the recipe.
+            self.assertEqual(release["teacher"]["schema_version"], 4)
+            self.assertTrue(validate_release(run / "release", roots, workers=1)["ok"])
+
     def test_wide_teacher_release_and_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             config, roots, run, provider = build_run(directory, cases=W3_CASES, width=3)

@@ -98,6 +98,8 @@ class PuzzleSourceConfig:
 class SearchConfig:
     hash_mb: int
     timeout_seconds: int
+    syzygy_path: str | None
+    syzygy_probe_limit: int
 
 
 @dataclass(frozen=True)
@@ -158,7 +160,13 @@ class DataConfig:
     merge: MergeConfig
 
     def search_dict(self):
-        return {"hash_mb": self.search.hash_mb}
+        return {
+            "hash_mb": self.search.hash_mb,
+            "timeout_seconds": self.search.timeout_seconds,
+            "syzygy_probe_limit": (
+                self.search.syzygy_probe_limit if self.search.syzygy_path else 0
+            ),
+        }
 
     def board_dict(self):
         return {
@@ -294,10 +302,24 @@ def load_config(path=DEFAULT_CONFIG_PATH):
 
     sources = _sources(values["sources"])
 
-    search = _table(values["search"], "search", {"hash_mb", "timeout_seconds", "joint"})
+    search = _table(
+        values["search"],
+        "search",
+        {"hash_mb", "timeout_seconds", "joint"},
+        {"syzygy_path", "syzygy_probe_limit"},
+    )
     hash_mb = _integer("search", "hash_mb", search["hash_mb"], 1)
     timeout = _integer("search", "timeout_seconds", search["timeout_seconds"], 1)
     joint = _joint_distribution(search["joint"])
+    syzygy_path = search.get("syzygy_path")
+    if syzygy_path is not None and not isinstance(syzygy_path, str):
+        raise ValueError("[search] syzygy_path must be a path string")
+    syzygy_path = syzygy_path or None
+    probe_limit = _integer(
+        "search", "syzygy_probe_limit", search.get("syzygy_probe_limit", 7), 1
+    )
+    if probe_limit > 7:
+        raise ValueError("[search] syzygy_probe_limit must be at most 7")
 
     synthesis = _table(
         values["synthesis"],
@@ -347,7 +369,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     if end_shard is not None:
         end_shard = _integer("release", "end_shard", end_shard, start_shard + 1)
     release = ReleaseConfig(shard_size, workers, start_shard, end_shard)
-    search = SearchConfig(hash_mb, timeout)
+    search = SearchConfig(hash_mb, timeout, syzygy_path, probe_limit)
     sampling = SamplingConfig(joint, presentations)
 
     merge = _table(

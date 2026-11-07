@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 
-def trace_config_text(width=1, depth=4, joint=None, presentations=None):
+def trace_config_text(width=1, depth=4, joint=None, presentations=None, timeout=None):
     text = Path("configs/data.toml").read_text(encoding="utf-8")
     if joint is None:
         joint = [{"width": width, "depth": depth, "probability": 1.0}]
@@ -16,7 +16,7 @@ def trace_config_text(width=1, depth=4, joint=None, presentations=None):
         for entry in joint
     ]
     search = (
-        "[search]\nhash_mb = 256\ntimeout_seconds = 3600\njoint = ["
+        f"[search]\nhash_mb = 256\ntimeout_seconds = {3600 if timeout is None else timeout}\njoint = ["
         + ", ".join(entries)
         + "]\n\n"
     )
