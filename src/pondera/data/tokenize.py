@@ -25,7 +25,7 @@ from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 
 def merge_and_encode(source, output, config):
-    """Fit the configured composite budget, then encode the complete dataset.
+    """Fit the configured total vocabulary size, then encode the complete dataset.
 
     Corpus sampling and optional holdout affect vocabulary fitting only.
     The output keeps all source rows and their training split membership.
@@ -40,10 +40,10 @@ def merge_and_encode(source, output, config):
     options = {
         key: value
         for key, value in settings.items()
-        if key not in {"budget", "batch_size"}
+        if key not in {"vocab_size", "batch_size"}
     }
-    document, dictionaries = build_profile([source], [config.budget], **options)
-    dictionary = dictionaries[config.budget]
+    document, dictionaries = build_profile([source], [config.vocab_size], **options)
+    dictionary = dictionaries[config.vocab_size]
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix=f".{output.name}-", dir=output.parent

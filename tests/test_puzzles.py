@@ -16,6 +16,7 @@ from tools.export_hf import export_hf
 from trace_fixtures import trace_config_text
 
 from pondera.chess.merge import MergeDictionary, decode
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
 from pondera.data.config import load_config
 from pondera.data.dataset import TracePositions, load_manifest, parquet_sources
 from pondera.data.pipeline import validate_release
@@ -214,7 +215,9 @@ class PuzzleTests(unittest.TestCase):
         result = merge_and_encode(
             exported,
             training,
-            replace(config.merge, budget=8, min_count=1, batch_size=1),
+            replace(
+                config.merge, vocab_size=CHESS_VOCAB_SIZE + 8, min_count=1, batch_size=1
+            ),
         )
         self.assertEqual(result["rows"], 2)
         dictionary = MergeDictionary(

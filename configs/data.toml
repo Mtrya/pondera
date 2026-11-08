@@ -51,16 +51,16 @@ start_shard = 0
 # end_shard = 1
 
 [merge]
-# Maximum number of composites, in addition to the fixed base vocabulary.
-budget = 16384
-fit_split = "all"
+# Total vocabulary size, including the fixed base vocabulary.
+vocab_size = 8192
+fit_split = "train"
 holdout_fraction = 0.0
 min_count = 8
 per_length_limit = 20000
 selection_stride = 1
 max_rounds = 100000
 top = 20
-# Omit max_roots to use all input roots; block defaults to max(8, budget // 32).
+# Omit max_roots to use all input roots; block defaults to max(8, composites // 32).
 # max_roots = 128
 # block = 32
 

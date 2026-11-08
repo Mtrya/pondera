@@ -244,7 +244,7 @@ def _top(dictionary, usage, count):
 
 def build_profile(
     releases,
-    budgets,
+    vocab_sizes,
     *,
     holdout_fraction=0.0,
     fit_split="all",
@@ -260,15 +260,17 @@ def build_profile(
     """Count full rows, select dictionaries, and stream corpus measurements."""
     started = time.monotonic()
     releases = [Path(release).resolve() for release in releases]
-    budgets = list(budgets)
+    vocab_sizes = list(vocab_sizes)
     if not releases or len(set(releases)) != len(releases):
         raise ValueError("Provide distinct input releases")
     if (
-        not budgets
-        or any(budget < 0 for budget in budgets)
-        or len(set(budgets)) != len(budgets)
+        not vocab_sizes
+        or any(size < CHESS_VOCAB_SIZE for size in vocab_sizes)
+        or len(set(vocab_sizes)) != len(vocab_sizes)
     ):
-        raise ValueError("Provide distinct nonnegative budgets")
+        raise ValueError(
+            "Provide distinct vocabulary sizes no smaller than the base vocabulary"
+        )
     if not 0 <= holdout_fraction < 1:
         raise ValueError("holdout fraction must lie in [0, 1)")
     if selection_stride < 1 or fit_split not in {"all", "train", "val"}:
@@ -288,7 +290,7 @@ def build_profile(
         for row in loaded
         if row.presentation == "full" and row.position not in heldout_positions
     ]
-    if not fitting and any(budgets):
+    if not fitting and any(size > CHESS_VOCAB_SIZE for size in vocab_sizes):
         raise ValueError("The fitting corpus has no full-presentation rows")
     measurement = [row for row in loaded if row.position not in heldout_positions]
     heldout = [row for row in loaded if row.position in heldout_positions]
@@ -303,7 +305,7 @@ def build_profile(
             min_count=min_count,
             per_length_limit=per_length_limit,
         )
-        if any(budgets)
+        if any(size > CHESS_VOCAB_SIZE for size in vocab_sizes)
         else []
     )
     document = {
@@ -338,13 +340,14 @@ def build_profile(
         "tiers": [],
     }
     dictionaries = {}
-    for budget in budgets:
-        round_block = block if block is not None else max(8, budget // 32)
+    for size in vocab_sizes:
+        composites = size - CHESS_VOCAB_SIZE
+        round_block = block if block is not None else max(8, composites // 32)
         selection_start = time.monotonic()
         dictionary = select_dictionary(
             selection,
             candidates,
-            budget,
+            composites,
             block=round_block,
             max_rounds=max_rounds,
         )
@@ -352,10 +355,10 @@ def build_profile(
         measure_start = time.monotonic()
         measured, usage = _measure(measurement, dictionary)
         unseen, _ = _measure(heldout, dictionary)
-        dictionaries[budget] = dictionary
+        dictionaries[size] = dictionary
         document["tiers"].append(
             {
-                "budget": budget,
+                "vocab_size": size,
                 "block": round_block,
                 "entries": len(dictionary),
                 "measurement": measured,
@@ -390,13 +393,13 @@ def render_report(document, title="Merge dictionary profile"):
         f"Fitting split: {corpus['fit_split']}; optional root holdout: "
         f"{corpus['holdout_fraction']:.3f}. Original dataset split labels are preserved.",
         "",
-        "| budget | entries | encoded tokens | corpus ratio | active entries | held-out ratio |",
+        "| vocab size | entries | encoded tokens | corpus ratio | active entries | held-out ratio |",
         "|---:|---:|---:|---:|---:|---:|",
     ]
     for tier in document["tiers"]:
         measured = tier["measurement"]
         lines.append(
-            f"| {tier['budget']:,} | {tier['entries']:,} | {measured['tokens']:,} | "
+            f"| {tier['vocab_size']:,} | {tier['entries']:,} | {measured['tokens']:,} | "
             f"{_percent(measured['ratio'])} | {measured['used']:,} | "
             f"{_percent(tier['heldout']['ratio'])} |"
         )
@@ -414,7 +417,7 @@ def render_report(document, title="Merge dictionary profile"):
     for tier in document["tiers"]:
         lines += [
             "",
-            f"### Budget {tier['budget']}",
+            f"### Vocabulary size {tier['vocab_size']}",
             "",
             "| id | uses | atom savings | expansion |",
             "|---:|---:|---:|---|",
@@ -432,7 +435,7 @@ def write_artifacts(output, document, dictionaries):
     document = {
         **document,
         "tiers": [
-            {**tier, "merge_entries": dictionaries[tier["budget"]].entries}
+            {**tier, "merge_entries": dictionaries[tier["vocab_size"]].entries}
             for tier in document["tiers"]
         ],
     }

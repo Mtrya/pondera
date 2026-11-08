@@ -136,7 +136,7 @@ class SamplingConfig:
 
 @dataclass(frozen=True)
 class MergeConfig:
-    budget: int
+    vocab_size: int
     fit_split: str
     holdout_fraction: float
     max_roots: int | None
@@ -376,7 +376,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         values["merge"],
         "merge",
         {
-            "budget",
+            "vocab_size",
             "fit_split",
             "holdout_fraction",
             "min_count",
@@ -395,7 +395,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     if holdout == 1:
         raise ValueError("[merge] holdout_fraction must be less than one")
     merge = MergeConfig(
-        _integer("merge", "budget", merge["budget"], 0),
+        _integer("merge", "vocab_size", merge["vocab_size"], 1),
         fit_split,
         holdout,
         _integer("merge", "max_roots", merge["max_roots"], 1)

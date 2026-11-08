@@ -121,21 +121,21 @@ class TokenizeTests(unittest.TestCase):
                 expected["trace_token_ids"],
             )
 
-    def test_configured_workflow_fits_one_budget_and_encodes_all_rows(self):
-        for budget in (0, 8):
-            with self.subTest(budget=budget):
+    def test_configured_workflow_fits_one_vocabulary_size_and_encodes_all_rows(self):
+        for vocab_size in (CHESS_VOCAB_SIZE, CHESS_VOCAB_SIZE + 8):
+            with self.subTest(vocab_size=vocab_size):
                 config = self.root / "data.toml"
                 config.write_text(
                     Path("configs/data.toml")
                     .read_text()
-                    .replace("budget = 16384", f"budget = {budget}")
+                    .replace("vocab_size = 8192", f"vocab_size = {vocab_size}")
                     .replace("min_count = 8", "min_count = 1")
                     .replace("# max_roots = 128", "max_roots = 3")
                     .replace("batch_size = 128", "batch_size = 2")
                     .replace("train = 500000", "train = 0")
                     .replace("val = 2000", "val = 0")
                 )
-                output = self.root / f"training-{budget}"
+                output = self.root / f"training-{vocab_size}"
                 subprocess.run(
                     [
                         sys.executable,
@@ -156,12 +156,14 @@ class TokenizeTests(unittest.TestCase):
                 self.dictionary = MergeDictionary(
                     load_manifest(output / "release.json")["merge_entries"]
                 )
-                self.assertLessEqual(len(self.dictionary), budget)
-                if budget:
+                self.assertLessEqual(
+                    len(self.dictionary), vocab_size - CHESS_VOCAB_SIZE
+                )
+                if vocab_size > CHESS_VOCAB_SIZE:
                     self.assertGreater(len(self.dictionary), 0)
                 self.assert_preserved(self.rows(output))
                 document = json.loads((output / "profile" / "curve.json").read_text())
-                self.assertEqual(document["settings"]["budget"], budget)
+                self.assertEqual(document["settings"]["vocab_size"], vocab_size)
                 self.assertEqual(document["corpus"]["loaded"]["rows"], 3)
                 self.assertEqual(len(document["tiers"]), 1)
                 self.assertGreater(document["timing"]["workflow_peak_rss_bytes"], 0)
@@ -219,7 +221,7 @@ class TokenizeTests(unittest.TestCase):
         tokenize_dataset(output, again, self.dictionary)
         self.assertEqual(self.rows(again), self.rows(output))
 
-    def test_zero_budget_needs_no_full_presentation_fitting_rows(self):
+    def test_base_vocabulary_needs_no_full_presentation_fitting_rows(self):
         from dataclasses import replace
 
         for presentation in ("zero", "random"):
@@ -240,7 +242,9 @@ class TokenizeTests(unittest.TestCase):
             )
             output = self.root / f"base-{presentation}"
             result = merge_and_encode(
-                source, output, replace(load_config().merge, budget=0)
+                source,
+                output,
+                replace(load_config().merge, vocab_size=CHESS_VOCAB_SIZE),
             )
             self.assertEqual(result["entries"], 0)
             self.assertEqual(result["ratio"], 1.0)
@@ -422,7 +426,7 @@ class TokenizeTests(unittest.TestCase):
     def test_profile_preserves_splits_and_optional_empty_holdout(self):
         document, dictionaries = build_profile(
             [self.source],
-            [0, 8],
+            [CHESS_VOCAB_SIZE, CHESS_VOCAB_SIZE + 8],
             min_count=1,
             per_length_limit=32,
             block=4,
@@ -449,7 +453,7 @@ class TokenizeTests(unittest.TestCase):
                     "merge_entries"
                 ]
             ),
-            dictionaries[8],
+            dictionaries[CHESS_VOCAB_SIZE + 8],
         )
         self.assertEqual(
             json.loads((output / "curve.json").read_text())["corpus"]["loaded"]["rows"],
@@ -457,7 +461,7 @@ class TokenizeTests(unittest.TestCase):
         )
         heldout, _ = build_profile(
             [self.source],
-            [8],
+            [CHESS_VOCAB_SIZE + 8],
             fit_split="train",
             min_count=1,
             per_length_limit=32,
@@ -469,14 +473,16 @@ class TokenizeTests(unittest.TestCase):
         self.assertEqual(heldout["corpus"]["heldout"]["release_splits"], {"val": 1})
         again, repeats = build_profile(
             [self.source],
-            [8],
+            [CHESS_VOCAB_SIZE + 8],
             min_count=1,
             per_length_limit=32,
             selection_stride=1,
             block=4,
             max_rounds=64,
         )
-        self.assertEqual(repeats[8], dictionaries[8])
+        self.assertEqual(
+            repeats[CHESS_VOCAB_SIZE + 8], dictionaries[CHESS_VOCAB_SIZE + 8]
+        )
         self.assertEqual(again["tiers"][0]["measurement"], measured)
 
     def test_profiler_expands_the_declared_cache_before_counting(self):
