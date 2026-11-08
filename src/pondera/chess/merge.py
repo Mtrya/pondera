@@ -230,19 +230,37 @@ def _join(streams) -> np.ndarray:
     return body
 
 
+def _mix64(values: np.ndarray) -> np.ndarray:
+    """Deterministic uint64 bit mix (splitmix64 finalizer), in place."""
+    values ^= values >> np.uint64(30)
+    values *= np.uint64(0xBF58476D1CE4E5B9)
+    values ^= values >> np.uint64(27)
+    values *= np.uint64(0x94D049BB133111EB)
+    values ^= values >> np.uint64(31)
+    return values
+
+
 def _count_chunk(streams, max_length, forbidden, partition=0, partitions=1) -> dict:
     """Per-length (unique keys, counts) counted inside one chunk of streams.
 
-    With ``partitions`` above one, only windows whose first two atoms fall in
-    ``partition`` (pair code modulo the partition count) are counted; every
-    window of length >= 2 belongs to exactly one partition, so the passes
-    partition the key space exactly.
+    With ``partitions`` above one, only windows whose leading atoms route to
+    ``partition`` are counted; every window belongs to exactly one partition,
+    so the passes partition the key space exactly. Length-2 windows route by
+    their atom pair, longer windows by their atom triple, each through a
+    fixed integer mix: raw codes keep low-entropy structure (one refuted-line
+    closing pattern alone covers ~12% of windows) and an unmixed or pair-only
+    modulo runs several times hotter than average.
     """
     body = _join(streams)
     blocked = np.isin(body, list(forbidden)) if forbidden else None
-    routes = None
+    routes_pair = routes_triple = None
     if partitions > 1 and body.size >= MIN_MERGE_LENGTH:
-        routes = (body[:-1].astype(np.int64) * MERGE_ID_BASE + body[1:]) % partitions
+        base = np.uint64(MERGE_ID_BASE)
+        codes = body[:-1].astype(np.uint64) * base + body[1:].astype(np.uint64)
+        if body.size >= MIN_MERGE_LENGTH + 1:
+            triples = codes[:-1] * base + body[2:].astype(np.uint64)
+            routes_triple = _mix64(triples) % np.uint64(partitions)
+        routes_pair = _mix64(codes) % np.uint64(partitions)
     result = {}
     for length in range(MIN_MERGE_LENGTH, max_length + 1):
         if body.size < length:
@@ -253,6 +271,7 @@ def _count_chunk(streams, max_length, forbidden, partition=0, partitions=1) -> d
             inside &= ~np.lib.stride_tricks.sliding_window_view(blocked, length).any(
                 axis=1
             )
+        routes = routes_pair if length == MIN_MERGE_LENGTH else routes_triple
         if routes is not None:
             inside &= routes[: len(inside)] == partition
         if not inside.any():
