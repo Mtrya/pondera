@@ -26,7 +26,11 @@ def main():
         "encode", help="Fit a merge vocabulary and encode traces"
     )
     encode.add_argument("--input", required=True, type=Path)
-    for command in (prepare, curate, encode):
+    pack = commands.add_parser(
+        "pack", help="Pack a tokenized dataset into training streams"
+    )
+    pack.add_argument("--input", required=True, type=Path)
+    for command in (prepare, curate, encode, pack):
         command.add_argument("--config", default=DEFAULT_CONFIG_PATH, type=Path)
         command.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
@@ -50,6 +54,10 @@ def main():
 
         result = run_pipeline(config, args.input, args.output, engine=args.engine)
         result = {key: value for key, value in result.items() if key != "statistics"}
+    elif args.command == "pack":
+        from pondera.data.packing import write_packed
+
+        result = write_packed(args.input, args.output, seed=config.seed)
     else:
         from pondera.data.tokenize import merge_and_encode
 
