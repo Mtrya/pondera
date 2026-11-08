@@ -137,7 +137,12 @@ class CountingTests(unittest.TestCase):
     def test_chunked_and_parallel_counting_match_single_chunk(self):
         rows = release_rows()
         reference = count_candidates(rows, min_count=2, per_length_limit=64)
-        for kwargs in ({"chunk_atoms": 7}, {"workers": 2, "chunk_atoms": 13}):
+        for kwargs in (
+            {"chunk_atoms": 7},
+            {"workers": 2, "chunk_atoms": 13},
+            {"partitions": 3},
+            {"workers": 2, "chunk_atoms": 13, "partitions": 5},
+        ):
             with self.subTest(kwargs=kwargs):
                 self.assertEqual(
                     count_candidates(rows, min_count=2, per_length_limit=64, **kwargs),

@@ -230,10 +230,19 @@ def _join(streams) -> np.ndarray:
     return body
 
 
-def _count_chunk(streams, max_length, forbidden) -> dict:
-    """Per-length (unique keys, counts) counted inside one chunk of streams."""
+def _count_chunk(streams, max_length, forbidden, partition=0, partitions=1) -> dict:
+    """Per-length (unique keys, counts) counted inside one chunk of streams.
+
+    With ``partitions`` above one, only windows whose first two atoms fall in
+    ``partition`` (pair code modulo the partition count) are counted; every
+    window of length >= 2 belongs to exactly one partition, so the passes
+    partition the key space exactly.
+    """
     body = _join(streams)
     blocked = np.isin(body, list(forbidden)) if forbidden else None
+    routes = None
+    if partitions > 1 and body.size >= MIN_MERGE_LENGTH:
+        routes = (body[:-1].astype(np.int64) * MERGE_ID_BASE + body[1:]) % partitions
     result = {}
     for length in range(MIN_MERGE_LENGTH, max_length + 1):
         if body.size < length:
@@ -244,9 +253,11 @@ def _count_chunk(streams, max_length, forbidden) -> dict:
             inside &= ~np.lib.stride_tricks.sliding_window_view(blocked, length).any(
                 axis=1
             )
+        if routes is not None:
+            inside &= routes[: len(inside)] == partition
         if not inside.any():
             continue
-        keys = _pack(windows)[inside]
+        keys = _pack(windows[inside])
         result[length] = np.unique(keys, return_counts=True)
     return result
 
@@ -254,17 +265,24 @@ def _count_chunk(streams, max_length, forbidden) -> dict:
 _COUNT_STREAMS = None
 _COUNT_MAX_LENGTH = MAX_MERGE_LENGTH
 _COUNT_FORBIDDEN = ()
+_COUNT_PARTITION = (0, 1)
 
 
-def _count_pool_init(max_length, forbidden):
-    global _COUNT_MAX_LENGTH, _COUNT_FORBIDDEN
+def _count_pool_init(max_length, forbidden, partition=(0, 1)):
+    global _COUNT_MAX_LENGTH, _COUNT_FORBIDDEN, _COUNT_PARTITION
     _COUNT_MAX_LENGTH = max_length
     _COUNT_FORBIDDEN = forbidden
+    _COUNT_PARTITION = partition
 
 
 def _count_span(span):
     start, stop = span
-    return _count_chunk(_COUNT_STREAMS[start:stop], _COUNT_MAX_LENGTH, _COUNT_FORBIDDEN)
+    return _count_chunk(
+        _COUNT_STREAMS[start:stop],
+        _COUNT_MAX_LENGTH,
+        _COUNT_FORBIDDEN,
+        *_COUNT_PARTITION,
+    )
 
 
 def _merge_portions(portions) -> tuple:
@@ -277,33 +295,6 @@ def _merge_portions(portions) -> tuple:
     return keys[boundaries], np.add.reduceat(counts, boundaries)
 
 
-def _merge_chunk_counts(chunks, group=8) -> dict:
-    """Fold per-chunk count tables into exact per-length totals.
-
-    Counts sum associatively, so folding arrivals into the running totals in
-    small groups is exact while the parent never holds every chunk's table at
-    once; the alternative (one final concat of all chunks) peaks at the sum
-    of all chunk tables, which is what OOMed the 500k-row fit.
-    """
-    totals = {}
-    pending = {}
-
-    def flush(length):
-        portions = pending.pop(length)
-        if length in totals:
-            portions.insert(0, totals[length])
-        totals[length] = _merge_portions(portions)
-
-    for chunk in chunks:
-        for length, portion in chunk.items():
-            pending.setdefault(length, []).append(portion)
-            if len(pending[length]) >= group:
-                flush(length)
-    for length in list(pending):
-        flush(length)
-    return totals
-
-
 def count_candidates(
     sequences,
     *,
@@ -313,6 +304,7 @@ def count_candidates(
     forbidden=(),
     workers: int = 1,
     chunk_atoms: int = 1 << 24,
+    partitions=None,
 ) -> list:
     """Occurrence counts of every atom substring of length 2..max_length.
 
@@ -322,7 +314,16 @@ def count_candidates(
     workspace stays near a few hundred MiB; chunk counts merge exactly
     because no window crosses a boundary. With ``workers`` above one, forked
     worker processes count the chunks, inheriting the streams copy-on-write.
-    Only candidates occurring at least ``min_count`` times survive;
+
+    The distinct-key set grows near-linearly with corpus size (measured
+    ~2·N^0.89 on release traces, i.e. billions of keys at production scale),
+    so the merged table cannot live in one process. Counting therefore runs
+    ``partitions`` passes, each admitting only windows whose first-two-atom
+    code falls in that partition; a substring's occurrences all share one
+    partition, so per-partition ``min_count`` filtering is exact and the
+    passes' union is identical to a single monolithic count. ``None`` derives
+    the count from the corpus size (one partition per 200M atoms). Only
+    candidates occurring at least ``min_count`` times survive;
     ``per_length_limit`` further caps each length, keeping the highest-saving
     candidates. The result is sorted by potential savings, then count, then
     atoms, so the caller's pool is deterministic.
@@ -345,30 +346,51 @@ def count_candidates(
             raise ValueError(f"Not an atom id: {atom}")
     streams = _streams32(sequences)
     spans = _spans([stream.size for stream in streams], chunk_atoms)
-    if workers > 1 and len(spans) > 1:
-        global _COUNT_STREAMS
-        _COUNT_STREAMS = streams
-        try:
-            context = multiprocessing.get_context("fork")
-            with context.Pool(
-                workers, initializer=_count_pool_init, initargs=(max_length, forbidden)
-            ) as pool:
-                totals = _merge_chunk_counts(pool.imap(_count_span, spans))
-        finally:
-            _COUNT_STREAMS = None
-    else:
-        totals = _merge_chunk_counts(
-            _count_chunk(streams[start:stop], max_length, forbidden)
-            for start, stop in spans
-        )
+    if partitions is None:
+        partitions = max(1, sum(stream.size for stream in streams) // 200_000_000)
+    if partitions < 1:
+        raise ValueError("partitions must be positive")
+    retained = {}
+    for partition in range(partitions):
+        if workers > 1 and len(spans) > 1:
+            global _COUNT_STREAMS
+            _COUNT_STREAMS = streams
+            try:
+                context = multiprocessing.get_context("fork")
+                with context.Pool(
+                    workers,
+                    initializer=_count_pool_init,
+                    initargs=(max_length, forbidden, (partition, partitions)),
+                ) as pool:
+                    chunks = pool.map(_count_span, spans)
+            finally:
+                _COUNT_STREAMS = None
+        else:
+            chunks = [
+                _count_chunk(
+                    streams[start:stop],
+                    max_length,
+                    forbidden,
+                    partition,
+                    partitions,
+                )
+                for start, stop in spans
+            ]
+        for length in range(MIN_MERGE_LENGTH, max_length + 1):
+            portions = [chunk.pop(length) for chunk in chunks if length in chunk]
+            if not portions:
+                continue
+            keys, counts = _merge_portions(portions)
+            keep = counts >= min_count
+            if keep.any():
+                retained.setdefault(length, []).append((keys[keep], counts[keep]))
     found = []
     for length in range(MIN_MERGE_LENGTH, max_length + 1):
-        table = totals.get(length)
-        if table is None:
+        portions = retained.get(length)
+        if not portions:
             continue
-        keys, counts = table
+        keys, counts = _merge_portions(portions)
         order = np.argsort(-counts, kind="stable")
-        order = order[counts[order] >= min_count]
         if per_length_limit is not None:
             order = order[:per_length_limit]
         found.extend(
