@@ -60,6 +60,8 @@ per_length_limit = 20000
 selection_stride = 1
 max_rounds = 100000
 top = 20
+# Fitting/encoding worker processes; results are identical at any count.
+workers = 8
 # Omit max_roots to use all input roots; block defaults to max(8, composites // 32).
 # max_roots = 128
 # block = 32

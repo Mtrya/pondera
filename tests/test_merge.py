@@ -123,6 +123,27 @@ class CountingTests(unittest.TestCase):
         candidates = count_candidates([[1, 2, 1, 2]], min_count=2)
         self.assertEqual([candidate.atoms for candidate in candidates], [(1, 2)])
 
+    def test_forbidden_atoms_are_never_counted(self):
+        candidates = count_candidates([[1, 3, 1, 3, 2, 3]], min_count=1, forbidden=(2,))
+        self.assertEqual(
+            {candidate.atoms: candidate.count for candidate in candidates},
+            {(1, 3): 2, (3, 1): 1, (1, 3, 1): 1, (3, 1, 3): 1, (1, 3, 1, 3): 1},
+        )
+
+    def test_forbidden_atoms_are_validated(self):
+        with self.assertRaises(ValueError):
+            count_candidates([[1, 2]], forbidden=(CHESS_VOCAB_SIZE,))
+
+    def test_chunked_and_parallel_counting_match_single_chunk(self):
+        rows = release_rows()
+        reference = count_candidates(rows, min_count=2, per_length_limit=64)
+        for kwargs in ({"chunk_atoms": 7}, {"workers": 2, "chunk_atoms": 13}):
+            with self.subTest(kwargs=kwargs):
+                self.assertEqual(
+                    count_candidates(rows, min_count=2, per_length_limit=64, **kwargs),
+                    reference,
+                )
+
 
 class EncodingTests(unittest.TestCase):
     def test_tie_takes_the_composite_and_the_longest_entry(self):
@@ -208,6 +229,21 @@ class ReleaseRoundTripTests(unittest.TestCase):
             self.assertEqual(decode(tokens, dictionary).tolist(), row.tolist())
         self.assertLess(
             sum(len(tokens) for tokens in encoded), sum(len(row) for row in rows)
+        )
+
+    def test_parallel_encoding_and_selection_match_sequential(self):
+        rows = release_rows()
+        repeats = max(1, -(-1_100_000 // sum(len(row) for row in rows)))
+        corpus = rows * repeats
+        candidates = count_candidates(corpus, min_count=2, per_length_limit=64)
+        sequential = select_dictionary(corpus, candidates, 32)
+        parallel = select_dictionary(corpus, candidates, 32, workers=2)
+        self.assertEqual(parallel, sequential)
+        sequential = encode_corpus(corpus, parallel)
+        parallel_encoded = encode_corpus(corpus, parallel, workers=2)
+        self.assertEqual(
+            [tokens.tolist() for tokens in parallel_encoded],
+            [tokens.tolist() for tokens in sequential],
         )
 
 

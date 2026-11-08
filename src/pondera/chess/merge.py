@@ -32,6 +32,7 @@ longer entry, which together with a fixed candidate ordering makes the
 encoding a function of the atom stream and the dictionary alone.
 """
 
+import multiprocessing
 from collections import Counter
 from dataclasses import dataclass
 from functools import cached_property
@@ -146,6 +147,35 @@ def _streams(sequences) -> list:
     return streams
 
 
+def _streams32(sequences) -> list:
+    """Validated atom streams in the compact dtype counting joins together."""
+    streams = []
+    for sequence in sequences:
+        stream = np.asarray(sequence, dtype=np.int32)
+        if stream.ndim != 1:
+            raise ValueError("A token stream is one-dimensional")
+        if stream.size:
+            low, high = int(stream.min()), int(stream.max())
+            if low < 0 or high >= MERGE_ID_BASE:
+                raise ValueError("Streams hold atom ids in [0, MERGE_ID_BASE)")
+        streams.append(stream)
+    return streams
+
+
+def _spans(masses, span_mass) -> list:
+    """Contiguous [start, stop) spans each holding at most ``span_mass`` mass."""
+    spans = []
+    start, mass = 0, 0
+    for index, value in enumerate(masses):
+        if mass and mass + value > span_mass:
+            spans.append((start, index))
+            start, mass = index, 0
+        mass += value
+    if start < len(masses):
+        spans.append((start, len(masses)))
+    return spans
+
+
 def _pack(windows) -> np.ndarray:
     """Pack each row of a (n, length) window view into an exact key."""
     length = windows.shape[1]
@@ -189,7 +219,7 @@ def _unpack(key, length: int) -> tuple:
 
 def _join(streams) -> np.ndarray:
     total = sum(len(stream) for stream in streams) + max(len(streams) - 1, 0)
-    body = np.empty(total, dtype=np.int64)
+    body = np.empty(total, dtype=np.int32)
     position = 0
     for index, stream in enumerate(streams):
         if index:
@@ -200,20 +230,64 @@ def _join(streams) -> np.ndarray:
     return body
 
 
+def _count_chunk(streams, max_length, forbidden) -> dict:
+    """Per-length (unique keys, counts) counted inside one chunk of streams."""
+    body = _join(streams)
+    blocked = np.isin(body, list(forbidden)) if forbidden else None
+    result = {}
+    for length in range(MIN_MERGE_LENGTH, max_length + 1):
+        if body.size < length:
+            break
+        windows = np.lib.stride_tricks.sliding_window_view(body, length)
+        inside = windows.min(axis=1) >= 0
+        if blocked is not None:
+            inside &= ~np.lib.stride_tricks.sliding_window_view(blocked, length).any(
+                axis=1
+            )
+        if not inside.any():
+            continue
+        keys = _pack(windows)[inside]
+        result[length] = np.unique(keys, return_counts=True)
+    return result
+
+
+_COUNT_STREAMS = None
+_COUNT_MAX_LENGTH = MAX_MERGE_LENGTH
+_COUNT_FORBIDDEN = ()
+
+
+def _count_pool_init(max_length, forbidden):
+    global _COUNT_MAX_LENGTH, _COUNT_FORBIDDEN
+    _COUNT_MAX_LENGTH = max_length
+    _COUNT_FORBIDDEN = forbidden
+
+
+def _count_span(span):
+    start, stop = span
+    return _count_chunk(_COUNT_STREAMS[start:stop], _COUNT_MAX_LENGTH, _COUNT_FORBIDDEN)
+
+
 def count_candidates(
     sequences,
     *,
     min_count: int = 2,
     max_length: int = MAX_MERGE_LENGTH,
     per_length_limit=None,
+    forbidden=(),
+    workers: int = 1,
+    chunk_atoms: int = 1 << 26,
 ) -> list:
     """Occurrence counts of every atom substring of length 2..max_length.
 
-    A window never crosses a stream boundary. Only candidates occurring at
-    least ``min_count`` times survive; ``per_length_limit`` further caps each
-    length, keeping the highest-saving candidates. The result is sorted by
-    potential savings, then count, then atoms, so the caller's pool is
-    deterministic.
+    A window never crosses a stream boundary, and a window containing a
+    forbidden atom is never counted. Streams are counted in chunks of about
+    ``chunk_atoms`` atoms to bound memory; chunk counts merge exactly because
+    no window crosses a boundary. With ``workers`` above one, forked worker
+    processes count the chunks, inheriting the streams copy-on-write. Only
+    candidates occurring at least ``min_count`` times survive;
+    ``per_length_limit`` further caps each length, keeping the highest-saving
+    candidates. The result is sorted by potential savings, then count, then
+    atoms, so the caller's pool is deterministic.
     """
     if min_count < 1:
         raise ValueError("min_count must be positive")
@@ -223,24 +297,49 @@ def count_candidates(
         )
     if per_length_limit is not None and per_length_limit < 1:
         raise ValueError("per_length_limit must be positive")
-    streams = _streams(sequences)
-    body = _join(streams)
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    if chunk_atoms < 1:
+        raise ValueError("chunk_atoms must be positive")
+    forbidden = tuple(_index(atom) for atom in forbidden)
+    for atom in forbidden:
+        if not 0 <= atom < MERGE_ID_BASE:
+            raise ValueError(f"Not an atom id: {atom}")
+    streams = _streams32(sequences)
+    spans = _spans([stream.size for stream in streams], chunk_atoms)
+    if workers > 1 and len(spans) > 1:
+        global _COUNT_STREAMS
+        _COUNT_STREAMS = streams
+        try:
+            context = multiprocessing.get_context("fork")
+            with context.Pool(
+                workers, initializer=_count_pool_init, initargs=(max_length, forbidden)
+            ) as pool:
+                chunks = pool.map(_count_span, spans)
+        finally:
+            _COUNT_STREAMS = None
+    else:
+        chunks = [
+            _count_chunk(streams[start:stop], max_length, forbidden)
+            for start, stop in spans
+        ]
     found = []
     for length in range(MIN_MERGE_LENGTH, max_length + 1):
-        if body.size < length:
-            break
-        windows = np.lib.stride_tricks.sliding_window_view(body, length)
-        inside = windows.min(axis=1) >= 0
-        if not inside.any():
+        portions = [chunk[length] for chunk in chunks if length in chunk]
+        if not portions:
             continue
-        keys = _pack(windows)[inside]
-        unique, counts = np.unique(keys, return_counts=True)
+        keys = np.concatenate([portion[0] for portion in portions])
+        counts = np.concatenate([portion[1] for portion in portions])
+        order = np.argsort(keys, kind="stable")
+        keys, counts = keys[order], counts[order]
+        boundaries = np.flatnonzero(np.concatenate(([True], keys[1:] != keys[:-1])))
+        keys, counts = keys[boundaries], np.add.reduceat(counts, boundaries)
         order = np.argsort(-counts, kind="stable")
         order = order[counts[order] >= min_count]
         if per_length_limit is not None:
             order = order[:per_length_limit]
         found.extend(
-            Candidate(_unpack(unique[index], length), int(counts[index]))
+            Candidate(_unpack(keys[index], length), int(counts[index]))
             for index in order
         )
     found.sort(
@@ -349,10 +448,47 @@ class MergeEncoder:
         return _encode_stream(stream, *_match(stream, self.tables))
 
 
-def encode_corpus(sequences, dictionary: MergeDictionary) -> list:
-    """Encode every atom stream with the dictionary, in input order."""
-    encoder = MergeEncoder(dictionary)
-    return [encoder.encode(stream) for stream in sequences]
+_WORKER_STREAMS = None
+_WORKER_ENCODER = None
+
+
+def _encode_pool_init(dictionary):
+    global _WORKER_ENCODER
+    _WORKER_ENCODER = MergeEncoder(dictionary)
+
+
+def _encode_span(span):
+    start, stop = span
+    encoder = _WORKER_ENCODER
+    return [encoder.encode(_WORKER_STREAMS[index]) for index in range(start, stop)]
+
+
+def encode_corpus(sequences, dictionary: MergeDictionary, workers: int = 1) -> list:
+    """Encode every atom stream with the dictionary, in input order.
+
+    With ``workers`` above one, forked worker processes encode atom-balanced
+    spans of the stream list, inheriting the streams copy-on-write; the
+    result is identical to sequential encoding.
+    """
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    streams = list(sequences)
+    masses = [len(stream) for stream in streams]
+    if workers == 1 or len(streams) < 2 or sum(masses) < 1 << 20:
+        encoder = MergeEncoder(dictionary)
+        return [encoder.encode(stream) for stream in streams]
+    global _WORKER_STREAMS
+    _WORKER_STREAMS = streams
+    try:
+        spans = _spans(masses, max(1, -(-sum(masses) // (workers * 4))))
+        context = multiprocessing.get_context("fork")
+        with context.Pool(
+            workers, initializer=_encode_pool_init, initargs=(dictionary,)
+        ) as pool:
+            chunks = pool.map(_encode_span, spans)
+    finally:
+        _WORKER_STREAMS = None
+    return [encoded for chunk in chunks for encoded in chunk]
 
 
 def encode(tokens, dictionary: MergeDictionary) -> np.ndarray:
@@ -429,6 +565,7 @@ def select_dictionary(
     *,
     block: int = 64,
     max_rounds: int = 100_000,
+    workers: int = 1,
 ) -> MergeDictionary:
     """Grow at most ``budget`` composites from counted candidates.
 
@@ -439,7 +576,8 @@ def select_dictionary(
     `count_candidates` is the vocabulary's ceiling. The loop stops at the
     budget, when the encoder produces no new merge, or after ``max_rounds``; a
     final pass drops the entries the encoder did not choose. The entries keep
-    their admission order, most valuable first.
+    their admission order, most valuable first. Encoding passes use
+    ``workers`` forked worker processes when above one.
     """
     if budget < 0:
         raise ValueError("budget must be non-negative")
@@ -447,6 +585,8 @@ def select_dictionary(
         raise ValueError("block must be positive")
     if max_rounds < 1:
         raise ValueError("max_rounds must be positive")
+    if workers < 1:
+        raise ValueError("workers must be positive")
     pool = {candidate.atoms for candidate in _unique_candidates(candidates)}
     if budget == 0 or not pool:
         return MergeDictionary(())
@@ -456,7 +596,7 @@ def select_dictionary(
         if len(entries) >= budget:
             break
         dictionary = MergeDictionary(tuple(entries))
-        encodings = encode_corpus(streams, dictionary)
+        encodings = encode_corpus(streams, dictionary, workers=workers)
         usage = usage_counts(encodings, dictionary)
         expansions = {
             dictionary.token_id(index): atoms for index, atoms in enumerate(entries)
@@ -476,7 +616,7 @@ def select_dictionary(
             break
     if entries:
         dictionary = MergeDictionary(tuple(entries))
-        encodings = encode_corpus(streams, dictionary)
+        encodings = encode_corpus(streams, dictionary, workers=workers)
         usage = usage_counts(encodings, dictionary)
         entries = [atoms for atoms, count in zip(entries, usage) if count > 0]
     return MergeDictionary(tuple(entries))

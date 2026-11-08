@@ -147,6 +147,7 @@ class MergeConfig:
     max_rounds: int
     top: int
     batch_size: int
+    workers: int
 
 
 @dataclass(frozen=True)
@@ -386,7 +387,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "top",
             "batch_size",
         },
-        {"max_roots", "block"},
+        {"max_roots", "block", "workers"},
     )
     fit_split = merge["fit_split"]
     if fit_split not in {"all", "train", "val"}:
@@ -408,5 +409,6 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         _integer("merge", "max_rounds", merge["max_rounds"], 1),
         _integer("merge", "top", merge["top"], 0),
         _integer("merge", "batch_size", merge["batch_size"], 1),
+        _integer("merge", "workers", merge.get("workers", 1), 1),
     )
     return DataConfig(seed, sources, search, synthesis, release, sampling, merge)

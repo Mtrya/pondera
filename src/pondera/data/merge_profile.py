@@ -6,6 +6,7 @@ includes every selected presentation; vocabulary holdout is optional.
 """
 
 import json
+import multiprocessing
 import random
 import resource
 import sys
@@ -18,15 +19,25 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from pondera.chess.merge import (
-    MergeEncoder,
     count_candidates,
+    encode_corpus,
     select_dictionary,
     usage_counts,
 )
-from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION, CHESS_VOCAB_SIZE, LINES
+from pondera.chess.vocabulary import (
+    CHESS_TOKENIZER_VERSION,
+    CHESS_VOCAB_SIZE,
+    FINAL,
+    LINES,
+)
 from pondera.data.dataset import DATA_FORMAT_VERSION, load_manifest, parquet_sources
 from pondera.data.text import trace_atoms
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
+
+# Fitting never admits a composite containing FINAL: zero-presentation
+# generation prefills FINAL on its own, so the dictionary must keep it a
+# standalone token for training and generation tokenization to agree.
+FORBIDDEN_FITTING_ATOMS = (FINAL,)
 
 
 @dataclass(frozen=True)
@@ -55,8 +66,56 @@ def peak_rss_bytes():
     )
 
 
-def load_rows(release, *, max_roots=None):
-    """Project only profile columns, selecting root groups before token IO."""
+def _load_shard(task):
+    """Parse one shard's profile rows from authoritative text, in order."""
+    path, expected, split, release_name, selected = task
+    file = pq.ParquetFile(path)
+    if file.metadata.num_rows != expected:
+        raise ValueError(f"Shard row count differs from its release: {path}")
+    columns = [
+        "fen",
+        "repetition",
+        "presentation",
+        "teacher_width",
+        "teacher_depth",
+    ]
+    columns.extend(
+        name for name in ("root_id", "split") if name in file.schema_arrow.names
+    )
+    columns.append("trace_text")
+    rows = []
+    for batch in file.iter_batches(columns=columns, batch_size=64, use_threads=False):
+        for row in batch.to_pylist():
+            position = " ".join(row["fen"].split()[:4])
+            if selected is not None and position not in selected:
+                continue
+            label = row.get("split", split)
+            if label not in {"train", "val"}:
+                raise ValueError(f"Unknown dataset split: {label}")
+            rows.append(
+                ProfileRow(
+                    release_name,
+                    row.get("root_id") or f"{row['fen']}|{row['repetition']}",
+                    position,
+                    label,
+                    row["presentation"],
+                    row["teacher_width"],
+                    row["teacher_depth"],
+                    trace_atoms(row["trace_text"]),
+                )
+            )
+    return rows
+
+
+def load_rows(release, *, max_roots=None, workers=1):
+    """Project only profile columns, selecting root groups before token IO.
+
+    With ``workers`` above one, spawned worker processes parse shards in
+    parallel — spawned, not forked, so no Parquet IO state crosses a fork.
+    Rows keep shard order either way.
+    """
+    if workers < 1:
+        raise ValueError("workers must be positive")
     release = Path(release)
     manifest = load_manifest(release / "release.json") if release.is_dir() else {}
     if manifest:
@@ -86,46 +145,17 @@ def load_rows(release, *, max_roots=None):
                 positions, key=lambda key: (random.Random(f"640:{key}").random(), key)
             )[:max_roots]
         )
-    rows = []
-    for path, expected, split in sources:
-        file = pq.ParquetFile(path)
-        if file.metadata.num_rows != expected:
-            raise ValueError(f"Shard row count differs from its release: {path}")
-        columns = [
-            "fen",
-            "repetition",
-            "presentation",
-            "teacher_width",
-            "teacher_depth",
-        ]
-        columns.extend(
-            name for name in ("root_id", "split") if name in file.schema_arrow.names
-        )
-        columns.append("trace_text")
-        for batch in file.iter_batches(
-            columns=columns, batch_size=64, use_threads=False
-        ):
-            for row in batch.to_pylist():
-                position = " ".join(row["fen"].split()[:4])
-                if selected is not None and position not in selected:
-                    continue
-                label = row.get("split", split)
-                if label not in {"train", "val"}:
-                    raise ValueError(f"Unknown dataset split: {label}")
-                atoms = trace_atoms(row["trace_text"])
-                rows.append(
-                    ProfileRow(
-                        str(release),
-                        row.get("root_id") or f"{row['fen']}|{row['repetition']}",
-                        position,
-                        label,
-                        row["presentation"],
-                        row["teacher_width"],
-                        row["teacher_depth"],
-                        atoms,
-                    )
-                )
-    return rows
+    tasks = [
+        (path, expected, split, str(release), selected)
+        for path, expected, split in sources
+    ]
+    if workers > 1 and len(tasks) > 1:
+        context = multiprocessing.get_context("spawn")
+        with context.Pool(workers) as pool:
+            groups = pool.map(_load_shard, tasks)
+    else:
+        groups = [_load_shard(task) for task in tasks]
+    return [row for group in groups for row in group]
 
 
 def load_full_rows(release):
@@ -164,20 +194,18 @@ def _summary(rows):
     }
 
 
-def _measure(rows, dictionary):
-    encoder = MergeEncoder(dictionary)
+def _measure(rows, dictionary, workers=1):
+    encodings = encode_corpus((row.atoms for row in rows), dictionary, workers=workers)
+    usage = usage_counts(encodings, dictionary)
     total = _empty()
-    usage = np.zeros(len(dictionary), dtype=np.int64)
     slices = {
         name: {}
         for name in ("presentation", "search", "length", "release_split", "release")
     }
     lengths = []
-    for row in rows:
-        encoded = encoder.encode(row.atoms)
+    for row, encoded in zip(rows, encodings):
         atoms, tokens = len(row.atoms), len(encoded)
         _add(total, atoms, tokens)
-        usage += usage_counts((encoded,), dictionary)
         lengths.append(tokens)
         length = (
             "<1k"
@@ -255,9 +283,14 @@ def build_profile(
     block=None,
     max_rounds=100_000,
     top=20,
+    workers=1,
     on_tier=None,
 ):
-    """Count full rows, select dictionaries, and stream corpus measurements."""
+    """Count full rows, select dictionaries, and stream corpus measurements.
+
+    ``workers`` parallelizes loading, candidate counting, selection encoding,
+    and measurement across processes without changing any result.
+    """
     started = time.monotonic()
     releases = [Path(release).resolve() for release in releases]
     vocab_sizes = list(vocab_sizes)
@@ -275,8 +308,12 @@ def build_profile(
         raise ValueError("holdout fraction must lie in [0, 1)")
     if selection_stride < 1 or fit_split not in {"all", "train", "val"}:
         raise ValueError("Invalid fitting split or selection stride")
+    if workers < 1:
+        raise ValueError("workers must be positive")
     loaded = [
-        row for release in releases for row in load_rows(release, max_roots=max_roots)
+        row
+        for release in releases
+        for row in load_rows(release, max_roots=max_roots, workers=workers)
     ]
     heldout_positions = {
         row.position for row in loaded if is_held_out(row.position, holdout_fraction)
@@ -304,6 +341,8 @@ def build_profile(
             (row.atoms for row in fitting),
             min_count=min_count,
             per_length_limit=per_length_limit,
+            forbidden=FORBIDDEN_FITTING_ATOMS,
+            workers=workers,
         )
         if any(size > CHESS_VOCAB_SIZE for size in vocab_sizes)
         else []
@@ -328,6 +367,7 @@ def build_profile(
         "candidates": {
             "min_count": min_count,
             "per_length_limit": per_length_limit,
+            "forbidden": list(FORBIDDEN_FITTING_ATOMS),
             "counted": len(candidates),
             "retained_by_length": dict(
                 Counter(len(candidate.atoms) for candidate in candidates)
@@ -350,11 +390,12 @@ def build_profile(
             composites,
             block=round_block,
             max_rounds=max_rounds,
+            workers=workers,
         )
         select_seconds = time.monotonic() - selection_start
         measure_start = time.monotonic()
-        measured, usage = _measure(measurement, dictionary)
-        unseen, _ = _measure(heldout, dictionary)
+        measured, usage = _measure(measurement, dictionary, workers=workers)
+        unseen, _ = _measure(heldout, dictionary, workers=workers)
         dictionaries[size] = dictionary
         document["tiers"].append(
             {

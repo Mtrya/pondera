@@ -14,7 +14,7 @@ import torch
 from test_release import CASES, build_run
 from tools.export_hf import export_hf
 
-from pondera.chess.merge import MergeDictionary, decode
+from pondera.chess.merge import MergeDictionary, MergeEncoder, decode
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL
 from pondera.data.config import load_config
 from pondera.data.dataset import (
@@ -422,6 +422,71 @@ class TokenizeTests(unittest.TestCase):
         write_manifest(data / "release.json", manifest)
         with self.assertRaises(ValueError):
             train(config, data, output, resume=final, max_steps=2)
+
+    def test_fitting_never_admits_a_composite_containing_final(self):
+        document, dictionaries = build_profile(
+            [self.source],
+            [CHESS_VOCAB_SIZE + 64],
+            min_count=1,
+            per_length_limit=64,
+            block=4,
+            max_rounds=64,
+        )
+        dictionary = dictionaries[CHESS_VOCAB_SIZE + 64]
+        self.assertGreater(len(dictionary), 0)
+        for entry in dictionary.entries:
+            self.assertNotIn(FINAL, entry)
+        encoder = MergeEncoder(dictionary)
+        for row in self.original:
+            atoms = row["trace_token_ids"]
+            self.assertEqual(atoms.count(FINAL), 1)
+            encoded = encoder.encode(atoms)
+            self.assertEqual(int(np.count_nonzero(encoded == FINAL)), 1)
+
+    def test_parallel_profile_and_tokenization_match_sequential(self):
+        document, dictionaries = build_profile(
+            [self.source],
+            [CHESS_VOCAB_SIZE + 8],
+            min_count=1,
+            per_length_limit=32,
+            block=4,
+            max_rounds=64,
+        )
+        parallel_document, parallel_dictionaries = build_profile(
+            [self.source],
+            [CHESS_VOCAB_SIZE + 8],
+            min_count=1,
+            per_length_limit=32,
+            block=4,
+            max_rounds=64,
+            workers=2,
+        )
+        self.assertEqual(parallel_dictionaries, dictionaries)
+
+        def timeless(profile):
+            stripped = {key: value for key, value in profile.items() if key != "timing"}
+            stripped["tiers"] = [
+                {
+                    key: value
+                    for key, value in tier.items()
+                    if not key.endswith("_seconds")
+                }
+                for tier in stripped["tiers"]
+            ]
+            return stripped
+
+        self.assertEqual(timeless(parallel_document), timeless(document))
+        serial = self.root / "serial"
+        tokenize_dataset(self.source, serial, self.dictionary, batch_size=1)
+        parallel = self.root / "parallel"
+        tokenize_dataset(
+            self.source, parallel, self.dictionary, batch_size=1, workers=2
+        )
+        self.assertEqual(self.rows(parallel), self.rows(serial))
+        manifest = load_manifest(parallel / "release.json")
+        expected = load_manifest(serial / "release.json")
+        self.assertEqual(manifest["shards"], expected["shards"])
+        self.assertEqual(manifest["merge_entries"], expected["merge_entries"])
 
     def test_profile_preserves_splits_and_optional_empty_holdout(self):
         document, dictionaries = build_profile(

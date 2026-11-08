@@ -1,6 +1,7 @@
 """Create or replace a trace dataset's training IDs from authoritative text."""
 
 import json
+import multiprocessing
 import tempfile
 import time
 from dataclasses import asdict
@@ -50,7 +51,11 @@ def merge_and_encode(source, output, config):
     ) as work:
         dataset = Path(work) / "dataset"
         summary = tokenize_dataset(
-            source, dataset, dictionary, batch_size=config.batch_size
+            source,
+            dataset,
+            dictionary,
+            batch_size=config.batch_size,
+            workers=config.workers,
         )
         profile = dataset / "profile"
         profile.mkdir()
@@ -76,14 +81,97 @@ def _replace(table, name, values, type):
     return table.set_column(index, name, column)
 
 
-def tokenize_dataset(source, output, dictionary=MergeDictionary(), *, batch_size=128):
+def _tokenize_shard(encoder, task):
+    """Encode one shard into the staging area and return its shard record."""
+    path, expected_rows, split, name, work, batch_size, check_header = task
+    file = pq.ParquetFile(path)
+    unknown = set(file.schema_arrow.names) - set(TRACE_SCHEMA.names)
+    if unknown:
+        raise ValueError(f"Unknown dataset columns: {sorted(unknown)}")
+    for field in HF_SCHEMA:
+        if file.schema_arrow.field(field.name) != field:
+            raise ValueError(f"Shared field {field.name} has an invalid type")
+    if "split" not in file.schema_arrow.names and split not in {"train", "val"}:
+        raise ValueError(f"No dataset split for {path}")
+    shard_dir = Path(work) / name
+    shard_dir.mkdir()
+    shard_rows = 0
+    base_atoms = tokens = 0
+    schema = file.schema_arrow
+    for field in (
+        TRACE_SCHEMA.field("trace_token_ids"),
+        TRACE_SCHEMA.field("trace_len"),
+    ):
+        column = schema.get_field_index(field.name)
+        schema = schema.append(field) if column < 0 else schema.set(column, field)
+    with pq.ParquetWriter(
+        shard_dir / "data.parquet",
+        schema,
+        compression="zstd",
+        compression_level=3,
+    ) as writer:
+        for batch in file.iter_batches(batch_size=batch_size, use_threads=False):
+            if "split" in batch.schema.names:
+                labels = set(batch.column("split").to_pylist())
+                if labels - {"train", "val"}:
+                    raise ValueError(f"Unknown dataset split in {path}: {labels}")
+            encoded = []
+            for row in batch.select(["fen", "repetition", "trace_text"]).to_pylist():
+                atoms = trace_atoms(
+                    row["trace_text"],
+                    expected_fen=row["fen"] if check_header else None,
+                    expected_repetition=row["repetition"] if check_header else None,
+                )
+                encoded.append(encoder.encode(atoms).tolist())
+                base_atoms += len(atoms)
+            lengths = [len(ids) for ids in encoded]
+            table = _replace(
+                pa.Table.from_batches([batch]),
+                "trace_token_ids",
+                encoded,
+                pa.list_(pa.int32()),
+            )
+            table = _replace(table, "trace_len", lengths, pa.int32())
+            writer.write_table(table, row_group_size=64)
+            shard_rows += len(batch)
+            tokens += sum(lengths)
+    if shard_rows != expected_rows:
+        raise ValueError(f"Shard row count differs from its release: {path}")
+    return {
+        "path": name,
+        "rows": shard_rows,
+        "split": split,
+        "base_atoms": base_atoms,
+        "tokens": tokens,
+    }
+
+
+_TOKENIZE_ENCODER = None
+
+
+def _tokenize_pool_init(entries):
+    global _TOKENIZE_ENCODER
+    _TOKENIZE_ENCODER = MergeEncoder(MergeDictionary(entries))
+
+
+def _tokenize_task(task):
+    return _tokenize_shard(_TOKENIZE_ENCODER, task)
+
+
+def tokenize_dataset(
+    source, output, dictionary=MergeDictionary(), *, batch_size=128, workers=1
+):
     """Stream local releases or HF Parquet into a separate training artifact.
 
     Existing ID/length columns are replaced. All other columns, including
     local-only teacher annotations when present, pass through unchanged.
+    With ``workers`` above one, spawned worker processes encode shards in
+    parallel — spawned, not forked, so no Parquet IO state crosses a fork.
     """
     if batch_size < 1:
         raise ValueError("Tokenization batch size must be positive")
+    if workers < 1:
+        raise ValueError("workers must be positive")
     source, output = Path(source), Path(output)
     if output.exists():
         raise FileExistsError(output)
@@ -98,82 +186,46 @@ def tokenize_dataset(source, output, dictionary=MergeDictionary(), *, batch_size
         ):
             if manifest.get(field) != expected:
                 raise ValueError(f"Unsupported {field} in {source}")
-    encoder = MergeEncoder(dictionary)
     start = time.monotonic()
-    rows = base_atoms = tokens = 0
-    shards = []
     with tempfile.TemporaryDirectory(
         prefix=f".{output.name}-", dir=output.parent
     ) as work:
         work = Path(work)
-        for index, (path, expected_rows, split) in enumerate(parquet_sources(source)):
-            file = pq.ParquetFile(path)
-            unknown = set(file.schema_arrow.names) - set(TRACE_SCHEMA.names)
-            if unknown:
-                raise ValueError(f"Unknown dataset columns: {sorted(unknown)}")
-            for field in HF_SCHEMA:
-                if file.schema_arrow.field(field.name) != field:
-                    raise ValueError(f"Shared field {field.name} has an invalid type")
-            if "split" not in file.schema_arrow.names and split not in {"train", "val"}:
-                raise ValueError(f"No dataset split for {path}")
-            name = f"shard-{index:06d}"
-            (work / name).mkdir()
-            shard_rows = 0
-            schema = file.schema_arrow
-            for field in (
-                TRACE_SCHEMA.field("trace_token_ids"),
-                TRACE_SCHEMA.field("trace_len"),
-            ):
-                column = schema.get_field_index(field.name)
-                schema = (
-                    schema.append(field) if column < 0 else schema.set(column, field)
-                )
-            with pq.ParquetWriter(
-                work / name / "data.parquet",
-                schema,
-                compression="zstd",
-                compression_level=3,
-            ) as writer:
-                for batch in file.iter_batches(
-                    batch_size=batch_size, use_threads=False
-                ):
-                    if "split" in batch.schema.names:
-                        labels = set(batch.column("split").to_pylist())
-                        if labels - {"train", "val"}:
-                            raise ValueError(
-                                f"Unknown dataset split in {path}: {labels}"
-                            )
-                    encoded = []
-                    for row in batch.select(
-                        ["fen", "repetition", "trace_text"]
-                    ).to_pylist():
-                        atoms = trace_atoms(
-                            row["trace_text"],
-                            expected_fen=row["fen"] if not manifest else None,
-                            expected_repetition=row["repetition"]
-                            if not manifest
-                            else None,
-                        )
-                        encoded.append(encoder.encode(atoms).tolist())
-                        base_atoms += len(atoms)
-                    lengths = [len(ids) for ids in encoded]
-                    table = _replace(
-                        pa.Table.from_batches([batch]),
-                        "trace_token_ids",
-                        encoded,
-                        pa.list_(pa.int32()),
-                    )
-                    table = _replace(table, "trace_len", lengths, pa.int32())
-                    writer.write_table(table, row_group_size=64)
-                    shard_rows += len(batch)
-                    tokens += sum(lengths)
-            if shard_rows != expected_rows:
-                raise ValueError(f"Shard row count differs from its release: {path}")
-            shard = {"path": name, "rows": shard_rows}
-            if split is not None:
-                shard["split"] = split
+        tasks = [
+            (
+                path,
+                expected_rows,
+                split,
+                f"shard-{index:06d}",
+                str(work),
+                batch_size,
+                not manifest,
+            )
+            for index, (path, expected_rows, split) in enumerate(
+                parquet_sources(source)
+            )
+        ]
+        if workers > 1 and len(tasks) > 1:
+            context = multiprocessing.get_context("spawn")
+            with context.Pool(
+                workers,
+                initializer=_tokenize_pool_init,
+                initargs=(dictionary.entries,),
+            ) as pool:
+                results = pool.map(_tokenize_task, tasks)
+        else:
+            encoder = MergeEncoder(dictionary)
+            results = [_tokenize_shard(encoder, task) for task in tasks]
+        shards = []
+        rows = base_atoms = tokens = 0
+        for result in results:
+            shard = {"path": result["path"], "rows": result["rows"]}
+            if result["split"] is not None:
+                shard["split"] = result["split"]
             shards.append(shard)
-            rows += shard_rows
+            rows += result["rows"]
+            base_atoms += result["base_atoms"]
+            tokens += result["tokens"]
         write_manifest(
             work / "release.json",
             {
