@@ -267,6 +267,43 @@ def _count_span(span):
     return _count_chunk(_COUNT_STREAMS[start:stop], _COUNT_MAX_LENGTH, _COUNT_FORBIDDEN)
 
 
+def _merge_portions(portions) -> tuple:
+    """Sorted-unique (keys, counts) summed over any number of count tables."""
+    keys = np.concatenate([portion[0] for portion in portions])
+    counts = np.concatenate([portion[1] for portion in portions])
+    order = np.argsort(keys, kind="stable")
+    keys, counts = keys[order], counts[order]
+    boundaries = np.flatnonzero(np.concatenate(([True], keys[1:] != keys[:-1])))
+    return keys[boundaries], np.add.reduceat(counts, boundaries)
+
+
+def _merge_chunk_counts(chunks, group=8) -> dict:
+    """Fold per-chunk count tables into exact per-length totals.
+
+    Counts sum associatively, so folding arrivals into the running totals in
+    small groups is exact while the parent never holds every chunk's table at
+    once; the alternative (one final concat of all chunks) peaks at the sum
+    of all chunk tables, which is what OOMed the 500k-row fit.
+    """
+    totals = {}
+    pending = {}
+
+    def flush(length):
+        portions = pending.pop(length)
+        if length in totals:
+            portions.insert(0, totals[length])
+        totals[length] = _merge_portions(portions)
+
+    for chunk in chunks:
+        for length, portion in chunk.items():
+            pending.setdefault(length, []).append(portion)
+            if len(pending[length]) >= group:
+                flush(length)
+    for length in list(pending):
+        flush(length)
+    return totals
+
+
 def count_candidates(
     sequences,
     *,
@@ -275,16 +312,17 @@ def count_candidates(
     per_length_limit=None,
     forbidden=(),
     workers: int = 1,
-    chunk_atoms: int = 1 << 26,
+    chunk_atoms: int = 1 << 24,
 ) -> list:
     """Occurrence counts of every atom substring of length 2..max_length.
 
     A window never crosses a stream boundary, and a window containing a
     forbidden atom is never counted. Streams are counted in chunks of about
-    ``chunk_atoms`` atoms to bound memory; chunk counts merge exactly because
-    no window crosses a boundary. With ``workers`` above one, forked worker
-    processes count the chunks, inheriting the streams copy-on-write. Only
-    candidates occurring at least ``min_count`` times survive;
+    ``chunk_atoms`` atoms — sized so one worker's sliding-window and sort
+    workspace stays near a few hundred MiB; chunk counts merge exactly
+    because no window crosses a boundary. With ``workers`` above one, forked
+    worker processes count the chunks, inheriting the streams copy-on-write.
+    Only candidates occurring at least ``min_count`` times survive;
     ``per_length_limit`` further caps each length, keeping the highest-saving
     candidates. The result is sorted by potential savings, then count, then
     atoms, so the caller's pool is deterministic.
@@ -315,25 +353,20 @@ def count_candidates(
             with context.Pool(
                 workers, initializer=_count_pool_init, initargs=(max_length, forbidden)
             ) as pool:
-                chunks = pool.map(_count_span, spans)
+                totals = _merge_chunk_counts(pool.imap(_count_span, spans))
         finally:
             _COUNT_STREAMS = None
     else:
-        chunks = [
+        totals = _merge_chunk_counts(
             _count_chunk(streams[start:stop], max_length, forbidden)
             for start, stop in spans
-        ]
+        )
     found = []
     for length in range(MIN_MERGE_LENGTH, max_length + 1):
-        portions = [chunk[length] for chunk in chunks if length in chunk]
-        if not portions:
+        table = totals.get(length)
+        if table is None:
             continue
-        keys = np.concatenate([portion[0] for portion in portions])
-        counts = np.concatenate([portion[1] for portion in portions])
-        order = np.argsort(keys, kind="stable")
-        keys, counts = keys[order], counts[order]
-        boundaries = np.flatnonzero(np.concatenate(([True], keys[1:] != keys[:-1])))
-        keys, counts = keys[boundaries], np.add.reduceat(counts, boundaries)
+        keys, counts = table
         order = np.argsort(-counts, kind="stable")
         order = order[counts[order] >= min_count]
         if per_length_limit is not None:
