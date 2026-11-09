@@ -23,6 +23,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
+from pondera.chess.codec import decode_board, legal_move_indices
+from pondera.chess.vocabulary import FINAL, MOVE
 from pondera.data.packing import (
     PackedDocuments,
     assemble_batch,
@@ -93,14 +95,18 @@ def _move(batch, device):
     }
 
 
-def _loss(model, batch):
+def _forward(model, batch):
     device_type = _module(model).token_embedding.weight.device.type
     with torch.autocast(
         device_type=device_type,
         dtype=torch.bfloat16,
         enabled=device_type in {"cuda", "npu"},
     ):
-        logits = model(batch["input_ids"], batch["cu_seqlens"])
+        return model(batch["input_ids"], batch["cu_seqlens"])
+
+
+def _loss(model, batch):
+    logits = _forward(model, batch)
     labeled = int((batch["labels"] != -100).sum())
     loss = F.cross_entropy(
         logits.float().view(-1, logits.shape[-1]),
@@ -126,6 +132,65 @@ def validation_loss(model, documents, budget, device, rank=0, world_size=1):
     total_labeled = _reduce(total_labeled, device)
     model.train()
     return total_loss / max(total_labeled, 1)
+
+
+@torch.no_grad()
+def zero_move_accuracy(model, documents, budget, device, rank=0, world_size=1):
+    """Legal-move argmax accuracy at each zero document's FINAL position."""
+    import chess
+
+    indices = np.flatnonzero((documents.split == 1) & (documents.presentation == 0))
+    examples = []
+    for index in indices[rank::world_size]:
+        document = documents.document(index)
+        final_positions = np.flatnonzero(document == FINAL)
+        if len(final_positions) != 1 or final_positions[0] + 1 >= len(document):
+            raise ValueError("A zero document needs one FINAL and a following decision")
+        final = int(final_positions[0])
+        fen, _ = decode_board(document[:final])
+        target = int(document[final + 1])
+        legal = [MOVE + move for move in legal_move_indices(chess.Board(fen))]
+        if target not in legal:
+            raise ValueError("The zero decision is not a standalone legal move token")
+        examples.append((document[: final + 1], target, legal))
+
+    model.eval()
+    correct = 0
+    batch = []
+    batch_tokens = 0
+
+    def flush():
+        nonlocal batch, batch_tokens, correct
+        if not batch:
+            return
+        input_ids = np.concatenate([example[0] for example in batch])
+        cu_seqlens = np.zeros(len(batch) + 1, dtype=np.int32)
+        np.cumsum([len(example[0]) for example in batch], out=cu_seqlens[1:])
+        logits = _forward(
+            model, _move({"input_ids": input_ids, "cu_seqlens": cu_seqlens}, device)
+        )
+        for index, (_, target, legal) in enumerate(batch):
+            scores = logits[int(cu_seqlens[index + 1] - 1)].float()
+            ids = torch.as_tensor(legal, device=device)
+            predicted = legal[int(scores[ids].argmax())]
+            correct += predicted == target
+        batch = []
+        batch_tokens = 0
+
+    for example in examples:
+        length = len(example[0])
+        if batch and batch_tokens + length > budget:
+            flush()
+        batch.append(example)
+        batch_tokens += length
+    flush()
+    correct, count = _reduce([correct, len(examples)], device)
+    model.train()
+    return {
+        "correct": correct,
+        "count": count,
+        "accuracy": correct / count if count else 0.0,
+    }
 
 
 def save_training_checkpoint(
@@ -255,6 +320,11 @@ def train(
             record["val_loss"] = validation_loss(
                 model, documents, config.microbatch_tokens, device, rank, world_size
             )
+            zero_metrics = zero_move_accuracy(
+                model, documents, config.microbatch_tokens, device, rank, world_size
+            )
+            record["val_move_accuracy"] = zero_metrics["accuracy"]
+            record["val_zero_documents"] = zero_metrics["count"]
         history.append(record)
         if tracker is not None:
             tracker.log(record, step=update)

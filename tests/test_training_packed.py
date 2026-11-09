@@ -5,18 +5,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import chess
 import torch
 import torch.distributed as dist
 from test_release import CASES, build_run
 
-from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
+from pondera.chess.codec import decode_board, legal_move_indices
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL, MOVE
 from pondera.data.merge_profile import build_profile
-from pondera.data.packing import write_packed
+from pondera.data.packing import PackedDocuments, load_subsets, write_packed
 from pondera.data.pipeline import produce_shards
 from pondera.data.tokenize import tokenize_dataset
 from pondera.models.vanilla import VanillaModel
 from pondera.training.muon import newton_schulz5, split_parameters
-from pondera.training.packed import TrainConfig, train
+from pondera.training.packed import TrainConfig, train, zero_move_accuracy
 
 MODEL = dict(
     num_blocks=1,
@@ -27,7 +29,7 @@ MODEL = dict(
 )
 
 
-def _ddp_worker(rank, store, packed, model_config, output):
+def _ddp_worker(rank, store, packed, model_config, output, config):
     dist.init_process_group(
         "gloo", init_method=f"file://{store}", rank=rank, world_size=2
     )
@@ -40,18 +42,14 @@ def _ddp_worker(rank, store, packed, model_config, output):
         ):
             torch.manual_seed(11)
             model = VanillaModel(**model_config)
+            config.updates = updates
+            config.checkpoint_every = updates
             train(
                 model,
                 model_config,
                 packed,
                 "50k",
-                TrainConfig(
-                    microbatch_tokens=65_536,
-                    update_tokens=65_536,
-                    updates=updates,
-                    val_every=1,
-                    checkpoint_every=updates,
-                ),
+                config,
                 output / name,
                 resume=resume,
                 device="cpu",
@@ -98,9 +96,12 @@ class TrainerTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         config, roots, run, provider = build_run(
-            self.root, cases=CASES, recipe_text="[recipe]\npresentations = {full = 1.0}"
+            self.root,
+            cases=CASES,
+            recipe_text="[recipe]\npresentations = {zero = 0.2, full = 0.5, random = 0.3}",
+            seed=0,
         )
-        roots[0]["split"] = "val"
+        next(root for root in roots if root["presentation"] == "zero")["split"] = "val"
         source = run / "release"
         produce_shards(
             roots, source, config, sidecar_for_root=provider, shard_size=2, workers=1
@@ -126,13 +127,41 @@ class TrainerTests(unittest.TestCase):
         return VanillaModel(**self.model_config)
 
     def config(self, updates):
+        documents = PackedDocuments(self.root / "packed")
+        train_indices = load_subsets(self.root / "packed")["50k"]
         return TrainConfig(
             microbatch_tokens=65_536,
-            update_tokens=65_536,
+            update_tokens=2 * int(documents.lengths[train_indices].sum()),
             updates=updates,
             val_every=2,
             checkpoint_every=updates,
         )
+
+    def test_zero_move_accuracy_masks_illegal_tokens(self):
+        documents = PackedDocuments(self.root / "packed")
+        index = next(
+            i
+            for i, (split, presentation) in enumerate(
+                zip(documents.split, documents.presentation)
+            )
+            if split == 1 and presentation == 0
+        )
+        document = documents.document(index)
+        final = next(i for i, token in enumerate(document) if token == FINAL)
+        fen, _ = decode_board(document[:final])
+        target = int(document[final + 1])
+        legal = [MOVE + move for move in legal_move_indices(chess.Board(fen))]
+        illegal = next(
+            token for token in range(MOVE, CHESS_VOCAB_SIZE) if token not in legal
+        )
+        model = VanillaModel(**dict(self.model_config, num_blocks=0))
+        with torch.no_grad():
+            model.token_embedding.weight.fill_(1)
+            model.head.weight.zero_()
+            model.head.weight[target].fill_(1 / self.model_config["hidden_size"])
+            model.head.weight[illegal].fill_(2 / self.model_config["hidden_size"])
+        result = zero_move_accuracy(model, documents, 65_536, "cpu")
+        self.assertEqual(result, {"correct": 1, "count": 1, "accuracy": 1.0})
 
     def test_loss_decreases(self):
         model = self.make_model()
@@ -147,6 +176,8 @@ class TrainerTests(unittest.TestCase):
         losses = [record["loss"] for record in result["history"]]
         self.assertLess(losses[-1], losses[0])
         self.assertIn("val_loss", result["history"][-1])
+        self.assertIn("val_move_accuracy", result["history"][-1])
+        self.assertEqual(result["history"][-1]["val_zero_documents"], 1)
 
     def test_resume_replays_the_same_losses(self):
         full = self.make_model()
@@ -200,6 +231,7 @@ class TrainerTests(unittest.TestCase):
                 self.root / "packed",
                 self.model_config,
                 output,
+                config,
             ),
             nprocs=2,
             join=True,
@@ -214,6 +246,12 @@ class TrainerTests(unittest.TestCase):
                 self.assertEqual(observed[field], wanted[field])
             self.assertAlmostEqual(observed["loss"], wanted["loss"], places=4)
             self.assertAlmostEqual(observed["val_loss"], wanted["val_loss"], places=4)
+            self.assertAlmostEqual(
+                observed["val_move_accuracy"], wanted["val_move_accuracy"], places=4
+            )
+            self.assertEqual(
+                observed["val_zero_documents"], wanted["val_zero_documents"]
+            )
 
         reference_state = torch.load(
             self.root / "reference" / "checkpoint.pth", weights_only=True
