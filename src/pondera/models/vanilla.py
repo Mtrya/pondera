@@ -105,10 +105,11 @@ class CausalSelfAttention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, num_heads, num_kv_heads):
+    def __init__(self, hidden_size, intermediate_size, num_heads, num_kv_heads, attention_cls=None):
         super().__init__()
         self.norm_attention = RMSNorm(hidden_size)
-        self.attention = CausalSelfAttention(hidden_size, num_heads, num_kv_heads)
+        attention_cls = attention_cls or CausalSelfAttention
+        self.attention = attention_cls(hidden_size, num_heads, num_kv_heads)
         self.norm_ffn = RMSNorm(hidden_size)
         self.gate = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up = nn.Linear(hidden_size, intermediate_size, bias=False)
@@ -132,6 +133,8 @@ class Block(nn.Module):
 class VanillaModel(nn.Module):
     """The frozen vanilla definition; only the attention core varies in Phase 3."""
 
+    attention_cls = None
+
     def __init__(
         self,
         num_blocks,
@@ -146,7 +149,7 @@ class VanillaModel(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, hidden_size)
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         self.blocks = nn.ModuleList(
-            Block(hidden_size, intermediate_size, num_heads, num_kv_heads)
+            Block(hidden_size, intermediate_size, num_heads, num_kv_heads, self.attention_cls)
             for _ in range(num_blocks)
         )
         self.norm = RMSNorm(hidden_size)
