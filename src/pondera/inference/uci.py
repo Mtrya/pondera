@@ -24,7 +24,7 @@ def parse_position(parts: list[str]) -> chess.Board:
     return board
 
 
-def serve(checkpoint: str, device: str) -> None:
+def serve(checkpoint: str, device: str, load=load_model, pick=pick_move) -> None:
     model = None
     board = chess.Board()
     for line in sys.stdin:
@@ -46,8 +46,8 @@ def serve(checkpoint: str, device: str) -> None:
                 from contextlib import redirect_stdout
 
                 with redirect_stdout(sys.stderr):
-                    model = load_model(checkpoint, device)
-            print(f"bestmove {pick_move(model, board, device)}", flush=True)
+                    model = load(checkpoint, device)
+            print(f"bestmove {pick(model, board, device)}", flush=True)
         elif command == "quit":
             break
 

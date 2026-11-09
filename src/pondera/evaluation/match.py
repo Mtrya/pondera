@@ -55,6 +55,9 @@ def run_match(
     stockfish="stockfish",
     openings=None,
     device="cpu",
+    tablebase_path=None,
+    tb_pieces=7,
+    engine_module="pondera.inference.uci",
 ):
     if games < 2 or games % 2 or sf_depth < 1 or concurrency < 1:
         raise ValueError(
@@ -81,7 +84,7 @@ def run_match(
         + shlex.join(
             [
                 "-m",
-                "pondera.inference.uci",
+                engine_module,
                 "--checkpoint",
                 str(checkpoint),
                 "--device",
@@ -120,6 +123,8 @@ def run_match(
         "-srand",
         "42",
     ]
+    if tablebase_path:
+        command += ["-tb", str(tablebase_path), "-tbpieces", str(tb_pieces)]
     metadata = {
         "checkpoint": str(checkpoint),
         "opponent_depth": sf_depth,
@@ -128,6 +133,9 @@ def run_match(
         "search": False,
         "pondering": False,
         "temperature": 0,
+        "engine_module": engine_module,
+        "tablebase_path": str(tablebase_path) if tablebase_path else None,
+        "tb_pieces": tb_pieces if tablebase_path else None,
         "command": command,
         "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
