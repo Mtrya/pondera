@@ -23,7 +23,7 @@ from pondera.data.packing import (
     assemble_batch,
     load_subsets,
     pack_batches,
-    packed_batch,
+    packed_batches,
 )
 from pondera.training.muon import build_optimizers
 
@@ -52,7 +52,13 @@ def _move(batch, device):
 
 
 def _loss(model, batch):
-    logits = model(batch["input_ids"], batch["cu_seqlens"])
+    device_type = model.token_embedding.weight.device.type
+    with torch.autocast(
+        device_type=device_type,
+        dtype=torch.bfloat16,
+        enabled=device_type in {"cuda", "npu"},
+    ):
+        logits = model(batch["input_ids"], batch["cu_seqlens"])
     labeled = int((batch["labels"] != -100).sum())
     loss = F.cross_entropy(
         logits.float().view(-1, logits.shape[-1]),
@@ -82,7 +88,7 @@ def save_training_checkpoint(
 ):
     payload = {
         "format_version": 1,
-        "arch": "vanilla",
+        "arch": model.architecture,
         "model_config": model_config,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dicts": [optimizer.state_dict() for optimizer in optimizers],
@@ -143,15 +149,20 @@ def train(
         + "\n"
     )
     history = []
+    batch_stream = packed_batches(
+        documents,
+        indices,
+        config.seed,
+        config.microbatch_tokens,
+        start_step=micro_step,
+    )
     started = time.monotonic()
     while update < config.updates:
         batches = []
         total_labeled = 0
         total_tokens = 0
         while total_tokens < config.update_tokens:
-            batch = packed_batch(
-                documents, indices, config.seed, config.microbatch_tokens, micro_step
-            )
+            batch = next(batch_stream)
             micro_step += 1
             moved = _move(batch, device)
             moved["epoch"] = batch.get("epoch", 0)
@@ -165,7 +176,7 @@ def train(
         for batch, labeled in batches:
             loss, _ = _loss(model, batch)
             (loss * (labeled / total_labeled)).backward()
-            update_loss += float(loss) * labeled / total_labeled
+            update_loss += float(loss.detach()) * labeled / total_labeled
         for optimizer in optimizers:
             optimizer.step()
         update += 1
@@ -219,6 +230,7 @@ def train(
 def main():
     import argparse
 
+    from pondera.models.linear import LinearVanillaModel
     from pondera.models.vanilla import VanillaModel
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -227,6 +239,9 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--architecture", choices=("vanilla", "linear"), default="vanilla"
+    )
     parser.add_argument("--num-blocks", type=int, default=8)
     parser.add_argument("--hidden-size", type=int, default=1024)
     parser.add_argument("--intermediate-size", type=int, default=2816)
@@ -254,10 +269,14 @@ def main():
     config = TrainConfig(
         **{field: getattr(args, field) for field in TrainConfig.__dataclass_fields__}
     )
+    architecture = args.architecture
     if args.resume:
         state = torch.load(args.resume, map_location="cpu", weights_only=True)
         model_config = state["model_config"]
-    model = VanillaModel(**model_config)
+        architecture = state["arch"]
+    torch.manual_seed(config.seed)
+    model_class = {"vanilla": VanillaModel, "linear": LinearVanillaModel}[architecture]
+    model = model_class(**model_config)
     result = train(
         model,
         model_config,

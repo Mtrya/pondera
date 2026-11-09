@@ -27,31 +27,32 @@ def linear_recurrent(q, k, v):
 
 def linear_chunked(q, k, v, chunk=CHUNK):
     """Chunked parallel form of the same recurrence, fp32 throughout."""
-    q, k, v = (x.float() for x in (q, k, v))
-    group = q.shape[1] // k.shape[1]
-    if group > 1:
-        k = k.repeat_interleave(group, dim=1)
-        v = v.repeat_interleave(group, dim=1)
-    length, heads, dim = q.shape
-    width = v.shape[-1]
-    pad = (-length) % chunk
-    if pad:
-        q = torch.cat([q, q.new_zeros(pad, heads, dim)])
-        k = torch.cat([k, k.new_zeros(pad, heads, dim)])
-        v = torch.cat([v, v.new_zeros(pad, heads, width)])
-    count = (length + pad) // chunk
-    q = q.view(count, chunk, heads, dim).transpose(1, 2)
-    k = k.view(count, chunk, heads, dim).transpose(1, 2)
-    v = v.view(count, chunk, heads, width).transpose(1, 2)
-    scores = q @ k.mT
-    mask = torch.tril(torch.ones(chunk, chunk, dtype=torch.bool, device=q.device))
-    scores = scores.masked_fill(~mask, 0.0)
-    intra = scores @ v
-    states = k.mT @ v
-    exclusive = torch.cumsum(states, dim=0) - states
-    inter = q @ exclusive
-    out = (intra + inter).transpose(1, 2).reshape(count * chunk, heads, width)
-    return out[:length], states.sum(dim=0)
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        q, k, v = (x.float() for x in (q, k, v))
+        group = q.shape[1] // k.shape[1]
+        if group > 1:
+            k = k.repeat_interleave(group, dim=1)
+            v = v.repeat_interleave(group, dim=1)
+        length, heads, dim = q.shape
+        width = v.shape[-1]
+        pad = (-length) % chunk
+        if pad:
+            q = torch.cat([q, q.new_zeros(pad, heads, dim)])
+            k = torch.cat([k, k.new_zeros(pad, heads, dim)])
+            v = torch.cat([v, v.new_zeros(pad, heads, width)])
+        count = (length + pad) // chunk
+        q = q.view(count, chunk, heads, dim).transpose(1, 2)
+        k = k.view(count, chunk, heads, dim).transpose(1, 2)
+        v = v.view(count, chunk, heads, width).transpose(1, 2)
+        scores = q @ k.mT
+        mask = torch.tril(torch.ones(chunk, chunk, dtype=torch.bool, device=q.device))
+        scores = scores.masked_fill(~mask, 0.0)
+        intra = scores @ v
+        states = k.mT @ v
+        exclusive = torch.cumsum(states, dim=0) - states
+        inter = q @ exclusive
+        out = (intra + inter).transpose(1, 2).reshape(count * chunk, heads, width)
+        return out[:length], states.sum(dim=0)
 
 
 def linear_varlen_attention(q, k, v, cu_seqlens, chunk=CHUNK):
@@ -93,3 +94,4 @@ class LinearSelfAttention(CausalSelfAttention):
 
 class LinearVanillaModel(VanillaModel):
     attention_cls = LinearSelfAttention
+    architecture = "linear"

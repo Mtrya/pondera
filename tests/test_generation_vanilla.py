@@ -42,6 +42,13 @@ class GenerationTests(unittest.TestCase):
         fen = chess.Board().fen()
         self.assertEqual(choose_move(self.model, fen, legal_moves=["e2e4"]), "e2e4")
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_choose_move_uses_the_model_device(self):
+        model = self.model.to("cuda")
+        self.assertEqual(
+            choose_move(model, chess.Board().fen(), legal_moves=["e2e4"]), "e2e4"
+        )
+
     def test_puzzle_evaluation_counts_and_consistency(self):
         rows = [json.loads(line) for line in FIXTURES.read_text().splitlines()]
         report = evaluate_puzzles(lambda fen: choose_move(self.model, fen), rows)

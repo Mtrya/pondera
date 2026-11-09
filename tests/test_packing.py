@@ -31,6 +31,7 @@ from pondera.data.packing import (
     nested_subsets,
     pack_batches,
     packed_batch,
+    packed_batches,
     write_packed,
 )
 from pondera.data.pipeline import produce_shards
@@ -224,12 +225,18 @@ class PackingTests(unittest.TestCase):
         first = packed_batch(packed, indices, 640, 2048, 0)
         again = packed_batch(packed, indices, 640, 2048, 0)
         self.assertEqual(first["input_ids"].tolist(), again["input_ids"].tolist())
+        stream = packed_batches(packed, indices, 640, 2048, start_step=1)
         for step in (1, 2, 3):
             batch = packed_batch(packed, indices, 640, 2048, step)
             replayed = packed_batch(packed, indices, 640, 2048, step)
+            streamed = next(stream)
             self.assertEqual(batch["epoch"], replayed["epoch"])
             self.assertEqual(
                 batch["input_ids"].tolist(), replayed["input_ids"].tolist()
+            )
+            self.assertEqual(batch["epoch"], streamed["epoch"])
+            self.assertEqual(
+                batch["input_ids"].tolist(), streamed["input_ids"].tolist()
             )
 
     def test_overlong_documents_are_counted_and_skipped(self):

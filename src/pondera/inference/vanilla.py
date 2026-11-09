@@ -12,13 +12,16 @@ import torch
 
 from pondera.chess.codec import encode_board
 from pondera.chess.vocabulary import FINAL, MOVE, UCI_MOVE_TO_IDX
+from pondera.models.linear import LinearVanillaModel
 from pondera.models.vanilla import VanillaModel
+
+MODEL_CLASSES = {"vanilla": VanillaModel, "linear": LinearVanillaModel}
 
 
 def load_vanilla_checkpoint(path, device="cpu"):
-    """Load a packed-trainer checkpoint into an eval-mode VanillaModel."""
+    """Load either packed-trainer model into eval mode."""
     state = torch.load(path, map_location=device, weights_only=True)
-    model = VanillaModel(**state["model_config"])
+    model = MODEL_CLASSES[state["arch"]](**state["model_config"])
     model.load_state_dict(state["model_state_dict"])
     return model.to(device).eval()
 
@@ -29,10 +32,14 @@ def choose_move(model, fen, repetition=1, legal_moves=None):
     import chess
 
     board = encode_board(fen, repetition)
+    device = model.token_embedding.weight.device
     prefill = torch.as_tensor(
-        np.concatenate([board, np.asarray([FINAL], dtype=board.dtype)]).astype(np.int64)
+        np.concatenate([board, np.asarray([FINAL], dtype=board.dtype)]).astype(
+            np.int64
+        ),
+        device=device,
     )
-    cu_seqlens = torch.tensor([0, prefill.numel()], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, prefill.numel()], dtype=torch.int32, device=device)
     logits, _ = model.forward_cached(prefill, cu_seqlens)
     scores = logits[-1].float()
     if legal_moves is None:

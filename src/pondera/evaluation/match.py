@@ -27,7 +27,9 @@ def parse_result(output: str, expected_games: int) -> MatchResult:
     scores = re.findall(
         r"Games: (\d+), Wins: (\d+), Losses: (\d+), Draws: (\d+)", output
     )
-    elos = re.findall(r"\nElo: (-?[\d.]+|nan) \+/- ([\d.]+|nan)", output)
+    elos = re.findall(
+        r"\nElo: (-?(?:[\d.]+|inf|nan)) \+/- (-?(?:[\d.]+|inf|nan))", output
+    )
     if not scores or not elos:
         raise ValueError("Missing fastchess result")
     games, wins, losses, draws = map(int, scores[-1])

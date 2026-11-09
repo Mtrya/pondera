@@ -29,6 +29,12 @@ class EvaluationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_result(output, 4)
 
+        all_loss = "Games: 2, Wins: 0, Losses: 2, Draws: 0\nElo: -inf +/- -nan\n"
+        result = parse_result(all_loss, 2)
+        self.assertEqual(
+            (result.losses, result.elo_diff, result.elo_ci), (2, None, None)
+        )
+
     def test_real_uci_process(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "model.pth"

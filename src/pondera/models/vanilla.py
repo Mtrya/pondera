@@ -3,8 +3,7 @@
 Full causal attention, NoPE, pre-norm RMSNorm, SiTU-GLU feed-forward, and
 grouped-query attention. No position encoding of any kind; the causal mask
 is the only positional signal. The forward path consumes packed documents
-through ``cu_seqlens`` (the Phase 1 batch contract) and never materializes
-an L×L mask.
+through ``cu_seqlens`` and never materializes an L×L mask.
 """
 
 import torch
@@ -105,7 +104,14 @@ class CausalSelfAttention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, num_heads, num_kv_heads, attention_cls=None):
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        num_heads,
+        num_kv_heads,
+        attention_cls=None,
+    ):
         super().__init__()
         self.norm_attention = RMSNorm(hidden_size)
         attention_cls = attention_cls or CausalSelfAttention
@@ -131,9 +137,10 @@ class Block(nn.Module):
 
 
 class VanillaModel(nn.Module):
-    """The frozen vanilla definition; only the attention core varies in Phase 3."""
+    """Vanilla transformer with a replaceable attention core."""
 
     attention_cls = None
+    architecture = "vanilla"
 
     def __init__(
         self,
@@ -149,7 +156,13 @@ class VanillaModel(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, hidden_size)
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         self.blocks = nn.ModuleList(
-            Block(hidden_size, intermediate_size, num_heads, num_kv_heads, self.attention_cls)
+            Block(
+                hidden_size,
+                intermediate_size,
+                num_heads,
+                num_kv_heads,
+                self.attention_cls,
+            )
             for _ in range(num_blocks)
         )
         self.norm = RMSNorm(hidden_size)

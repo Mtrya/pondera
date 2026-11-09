@@ -42,8 +42,9 @@ that order, whole documents only, never sorted by length; the epoch's final
 batch may be partial. A document longer than the budget — or longer than
 ``MAX_DOCUMENT_TOKENS``, the standing guardrail — is skipped and counted, never
 truncated. The batch sequence is a pure function of (subset, seed, budget):
+``packed_batches`` plans each epoch once during sequential training, while
 ``packed_batch`` reconstructs any step directly, so resume replays length
-metadata only, without reading tokens.
+metadata only, without reading skipped tokens.
 """
 
 import hashlib
@@ -76,7 +77,7 @@ MAX_DOCUMENT_TOKENS = 128 * 1024
 IGNORE_INDEX = -100
 SPLIT_CODES = {"train": 0, "val": 1}
 PRESENTATION_CODES = {"zero": 0, "full": 1, "random": 2}
-# The milestone's data-scale groups; the largest is the full train split.
+# Data-scale groups; the largest is the full train split.
 DATA_SCALE_GROUPS = {"50k": 50_000, "100k": 100_000, "200k": 200_000, "500k": None}
 REFERENCE_BUDGETS = (131_072, 262_144, 524_288, 1_048_576)
 
@@ -188,25 +189,30 @@ def assemble_batch(documents, batch, epoch=None):
     return result
 
 
-def packed_batch(documents, indices, seed, budget, step):
-    """The ``step``-th batch of the deterministic packed sequence.
-
-    Stateless: replays per-epoch plans over length metadata only, then reads
-    exactly one batch's tokens.
-    """
-    if step < 0:
-        raise ValueError("step must be nonnegative")
-    remaining = step
+def packed_batches(documents, indices, seed, budget, start_step=0):
+    """Yield the deterministic packed sequence, planning each epoch once."""
+    if start_step < 0:
+        raise ValueError("start_step must be nonnegative")
+    remaining = start_step
     epoch = 0
     while True:
         order = epoch_order(len(indices), seed, epoch)
         batches, _ = pack_batches(documents.lengths, indices[order], budget)
         if not batches:
             raise ValueError("No packable documents under this budget")
-        if remaining < len(batches):
-            return assemble_batch(documents, batches[remaining], epoch=epoch)
-        remaining -= len(batches)
+        if remaining >= len(batches):
+            remaining -= len(batches)
+            epoch += 1
+            continue
+        for batch in batches[remaining:]:
+            yield assemble_batch(documents, batch, epoch=epoch)
+        remaining = 0
         epoch += 1
+
+
+def packed_batch(documents, indices, seed, budget, step):
+    """The ``step``-th batch, replaying length metadata without reading skips."""
+    return next(packed_batches(documents, indices, seed, budget, start_step=step))
 
 
 def _sha256(path):

@@ -10,9 +10,37 @@ from pondera.models.linear import (
     linear_recurrent,
     linear_varlen_attention,
 )
+from pondera.models.vanilla import VanillaModel
 
 
 class LinearAttentionTests(unittest.TestCase):
+    def test_same_shape_as_softmax(self):
+        config = dict(
+            num_blocks=1,
+            hidden_size=32,
+            intermediate_size=48,
+            num_heads=4,
+            num_kv_heads=2,
+            vocab_size=61,
+        )
+        softmax = VanillaModel(**config)
+        linear = LinearVanillaModel(**config)
+        self.assertEqual(linear.state_dict().keys(), softmax.state_dict().keys())
+        self.assertEqual(
+            linear.non_embedding_parameters(), softmax.non_embedding_parameters()
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_state_stays_fp32_under_autocast(self):
+        q, k, v = (x.cuda().bfloat16() for x in (self.q, self.k, self.v))
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out, state = linear_chunked(q, k, v)
+        reference_out, reference_state = linear_recurrent(q, k, v)
+        self.assertEqual(out.dtype, torch.float32)
+        self.assertEqual(state.dtype, torch.float32)
+        torch.testing.assert_close(out, reference_out, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(state, reference_state, rtol=1e-4, atol=1e-4)
+
     def setUp(self):
         torch.set_num_threads(1)
         torch.manual_seed(9)
