@@ -31,7 +31,7 @@ def merge_and_encode(source, output, config):
     Corpus sampling and optional holdout affect vocabulary fitting only.
     The output keeps all source rows and their training split membership.
     """
-    from pondera.data.merge_profile import build_profile, peak_rss_bytes, render_report
+    from pondera.data.merge_profile import peak_rss_bytes, render_report
 
     output = Path(output)
     if output.exists():
@@ -43,9 +43,10 @@ def merge_and_encode(source, output, config):
         for key, value in settings.items()
         if key not in {"vocab_size", "batch_size"}
     }
-    document, dictionaries = build_profile([source], [config.vocab_size], **options)
-    dictionary = dictionaries[config.vocab_size]
     output.parent.mkdir(parents=True, exist_ok=True)
+    document, dictionary = _fitted_dictionary(
+        checkpoint_path(output), source, config.vocab_size, settings, options
+    )
     with tempfile.TemporaryDirectory(
         prefix=f".{output.name}-", dir=output.parent
     ) as work:
@@ -71,6 +72,48 @@ def merge_and_encode(source, output, config):
         "output": str(output),
         "workflow_seconds": time.monotonic() - started,
     }
+
+
+def checkpoint_path(output):
+    """Where a completed vocabulary fit is recorded beside its output."""
+    return Path(output).parent / f"{Path(output).name}.fit-checkpoint.json"
+
+
+def _fitted_dictionary(checkpoint, source, vocab_size, settings, options):
+    """Load a previous fit from its checkpoint, or run the fit and record it.
+
+    Fitting costs hours at production scale while encoding can fail on
+    transient storage or memory errors, so the fitted dictionary and its
+    profile document persist next to the output before encoding starts. A
+    checkpoint authorizes skipping the fit only when every fitting-relevant
+    setting matches; worker counts and the encoding batch size do not change
+    fit results.
+    """
+    fitting = {
+        key: value
+        for key, value in settings.items()
+        if key not in {"batch_size", "workers"}
+    }
+    if checkpoint.exists():
+        record = json.loads(checkpoint.read_text())
+        if record.get("settings") != fitting:
+            raise ValueError(
+                f"Fit checkpoint settings differ from the config: {checkpoint}"
+            )
+        return record["document"], MergeDictionary(record["entries"])
+    from pondera.data.merge_profile import build_profile
+
+    document, dictionaries = build_profile([source], [vocab_size], **options)
+    dictionary = dictionaries[vocab_size]
+    record = {
+        "settings": fitting,
+        "document": document,
+        "entries": [list(entry) for entry in dictionary.entries],
+    }
+    temporary = checkpoint.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(record) + "\n")
+    temporary.replace(checkpoint)
+    return document, dictionary
 
 
 def _replace(table, name, values, type):

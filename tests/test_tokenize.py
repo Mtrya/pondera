@@ -1,6 +1,7 @@
 """Real teacher traces qualify authoritative text and merged training inputs."""
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -252,6 +253,40 @@ class TokenizeTests(unittest.TestCase):
             profile = json.loads((output / "profile/curve.json").read_text())
             self.assertEqual(profile["corpus"]["fitting"]["rows"], 0)
             self.assertEqual(profile["candidates"]["counted"], 0)
+
+    def test_fit_checkpoint_drives_encoding_and_guards_settings(self):
+        from dataclasses import replace
+
+        config = replace(load_config().merge, vocab_size=CHESS_VOCAB_SIZE)
+        output = self.root / "checkpointed"
+        first = merge_and_encode(self.source, output, config)
+        self.assertEqual(first["entries"], 0)
+
+        checkpoint = output.parent / f"{output.name}.fit-checkpoint.json"
+        record = json.loads(checkpoint.read_text())
+        self.assertEqual(record["settings"]["vocab_size"], CHESS_VOCAB_SIZE)
+        self.assertEqual(record["entries"], [])
+        self.assertEqual(load_manifest(output / "release.json")["merge_entries"], [])
+
+        # A rerun trusts the checkpoint's dictionary instead of refitting: a
+        # tampered-but-valid entry set shows up in the encoded release.
+        record["entries"] = [list(self.dictionary.entries[0])]
+        checkpoint.write_text(json.dumps(record) + "\n")
+        shutil.rmtree(output)
+        resumed = merge_and_encode(self.source, output, config)
+        self.assertEqual(resumed["entries"], 1)
+        self.assertEqual(
+            load_manifest(output / "release.json")["merge_entries"],
+            [list(self.dictionary.entries[0])],
+        )
+
+        # Settings that would change the fit reject the checkpoint.
+        record["settings"]["min_count"] += 1
+        checkpoint.write_text(json.dumps(record) + "\n")
+        shutil.rmtree(output)
+        with self.assertRaises(ValueError):
+            merge_and_encode(self.source, output, config)
+        self.assertFalse(output.exists())
 
     def test_hf_training_artifacts_have_distinct_persistent_identities(self):
         identities = []
