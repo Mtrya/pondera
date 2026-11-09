@@ -214,3 +214,66 @@ def train(
         "seconds": time.monotonic() - started,
         "history": history,
     }
+
+
+def main():
+    import argparse
+
+    from pondera.models.vanilla import VanillaModel
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--packed", required=True, type=Path)
+    parser.add_argument("--subset", default="500k")
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--num-blocks", type=int, default=8)
+    parser.add_argument("--hidden-size", type=int, default=1024)
+    parser.add_argument("--intermediate-size", type=int, default=2816)
+    parser.add_argument("--num-heads", type=int, default=16)
+    parser.add_argument("--num-kv-heads", type=int, default=4)
+    for field in TrainConfig.__dataclass_fields__:
+        default = getattr(TrainConfig, field)
+        if isinstance(default, bool):
+            parser.add_argument(
+                f"--{field.replace('_', '-')}", action="store_true", default=default
+            )
+        else:
+            parser.add_argument(
+                f"--{field.replace('_', '-')}", type=type(default), default=default
+            )
+    args = parser.parse_args()
+    model_config = dict(
+        num_blocks=args.num_blocks,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        vocab_size=PackedDocuments(args.packed).manifest["vocabulary"],
+    )
+    config = TrainConfig(
+        **{field: getattr(args, field) for field in TrainConfig.__dataclass_fields__}
+    )
+    if args.resume:
+        state = torch.load(args.resume, map_location="cpu", weights_only=True)
+        model_config = state["model_config"]
+    model = VanillaModel(**model_config)
+    result = train(
+        model,
+        model_config,
+        args.packed,
+        args.subset,
+        config,
+        args.output,
+        resume=args.resume,
+        device=args.device,
+    )
+    print(
+        json.dumps(
+            {key: value for key, value in result.items() if key != "history"}, indent=2
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
