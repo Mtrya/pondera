@@ -33,6 +33,7 @@ encoding a function of the atom stream and the dictionary alone.
 """
 
 import multiprocessing
+import time
 from collections import Counter
 from dataclasses import dataclass
 from functools import cached_property
@@ -371,6 +372,7 @@ def count_candidates(
         raise ValueError("partitions must be positive")
     retained = {}
     for partition in range(partitions):
+        partition_start = time.monotonic()
         if workers > 1 and len(spans) > 1:
             global _COUNT_STREAMS
             _COUNT_STREAMS = streams
@@ -403,6 +405,11 @@ def count_candidates(
             keep = counts >= min_count
             if keep.any():
                 retained.setdefault(length, []).append((keys[keep], counts[keep]))
+        print(
+            f"count partition {partition + 1}/{partitions} done in "
+            f"{time.monotonic() - partition_start:.0f}s",
+            flush=True,
+        )
     found = []
     for length in range(MIN_MERGE_LENGTH, max_length + 1):
         portions = retained.get(length)
@@ -666,7 +673,7 @@ def select_dictionary(
         return MergeDictionary(())
     streams = _streams(sequences)
     entries = []
-    for _ in range(max_rounds):
+    for round_index in range(max_rounds):
         if len(entries) >= budget:
             break
         dictionary = MergeDictionary(tuple(entries))
@@ -686,6 +693,11 @@ def select_dictionary(
             added += 1
             if added >= block or len(entries) >= budget:
                 break
+        print(
+            f"select round {round_index + 1}: {len(entries)}/{budget} entries, "
+            f"+{added} admitted",
+            flush=True,
+        )
         if added == 0:
             break
     if entries:

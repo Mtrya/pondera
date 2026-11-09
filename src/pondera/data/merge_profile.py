@@ -335,6 +335,10 @@ def build_profile(
     selection_positions = set(positions[::selection_stride])
     selection = [row.atoms for row in fitting if row.position in selection_positions]
     load_seconds = time.monotonic() - started
+    print(
+        f"loaded {len(loaded)} rows ({len(fitting)} fitting) in {load_seconds:.0f}s",
+        flush=True,
+    )
     count_start = time.monotonic()
     candidates = (
         count_candidates(
@@ -346,6 +350,11 @@ def build_profile(
         )
         if any(size > CHESS_VOCAB_SIZE for size in vocab_sizes)
         else []
+    )
+    print(
+        f"counted {len(candidates)} candidates in "
+        f"{time.monotonic() - count_start:.0f}s",
+        flush=True,
     )
     document = {
         "corpus": {
@@ -393,9 +402,15 @@ def build_profile(
             workers=workers,
         )
         select_seconds = time.monotonic() - selection_start
+        print(
+            f"selected {len(dictionary)} entries for vocab {size} in "
+            f"{select_seconds:.0f}s",
+            flush=True,
+        )
         measure_start = time.monotonic()
         measured, usage = _measure(measurement, dictionary, workers=workers)
         unseen, _ = _measure(heldout, dictionary, workers=workers)
+        print(f"measured in {time.monotonic() - measure_start:.0f}s", flush=True)
         dictionaries[size] = dictionary
         document["tiers"].append(
             {
