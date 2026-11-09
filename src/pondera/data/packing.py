@@ -41,10 +41,10 @@ Packing rules: within one epoch the group's documents are shuffled once
 that order, whole documents only, never sorted by length; the epoch's final
 batch may be partial. A document longer than the budget — or longer than
 ``MAX_DOCUMENT_TOKENS``, the standing guardrail — is skipped and counted, never
-truncated. The batch sequence is a pure function of (subset, seed, budget):
-``packed_batches`` plans each epoch once during sequential training, while
-``packed_batch`` reconstructs any step directly, so resume replays length
-metadata only, without reading skipped tokens.
+truncated. The global batch sequence is a pure function of (subset, seed,
+budget): ``packed_batches`` plans each epoch once and can yield an interleaved
+rank view, while ``packed_batch`` reconstructs any step directly, so resume
+replays length metadata only, without reading skipped tokens.
 """
 
 import hashlib
@@ -189,24 +189,29 @@ def assemble_batch(documents, batch, epoch=None):
     return result
 
 
-def packed_batches(documents, indices, seed, budget, start_step=0):
-    """Yield the deterministic packed sequence, planning each epoch once."""
+def packed_batches(
+    documents, indices, seed, budget, start_step=0, rank=0, world_size=1
+):
+    """Yield one rank's view of the global sequence, planning each epoch once."""
     if start_step < 0:
         raise ValueError("start_step must be nonnegative")
-    remaining = start_step
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError("Require 0 <= rank < world_size")
+    step = start_step
     epoch = 0
     while True:
         order = epoch_order(len(indices), seed, epoch)
         batches, _ = pack_batches(documents.lengths, indices[order], budget)
         if not batches:
             raise ValueError("No packable documents under this budget")
-        if remaining >= len(batches):
-            remaining -= len(batches)
+        if step >= len(batches):
+            step -= len(batches)
             epoch += 1
             continue
-        for batch in batches[remaining:]:
-            yield assemble_batch(documents, batch, epoch=epoch)
-        remaining = 0
+        while step < len(batches):
+            yield assemble_batch(documents, batches[step], epoch=epoch)
+            step += world_size
+        step -= len(batches)
         epoch += 1
 
 

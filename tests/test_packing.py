@@ -239,6 +239,21 @@ class PackingTests(unittest.TestCase):
                 batch["input_ids"].tolist(), streamed["input_ids"].tolist()
             )
 
+        streams = [
+            packed_batches(
+                packed, indices, 640, 2048, start_step=rank, rank=rank, world_size=2
+            )
+            for rank in range(2)
+        ]
+        for step in range(4):
+            for rank, stream in enumerate(streams):
+                expected = packed_batch(packed, indices, 640, 2048, 2 * step + rank)
+                actual = next(stream)
+                self.assertEqual(expected["epoch"], actual["epoch"])
+                self.assertEqual(
+                    expected["input_ids"].tolist(), actual["input_ids"].tolist()
+                )
+
     def test_overlong_documents_are_counted_and_skipped(self):
         directory = self.root / "synthetic"
         rows = [

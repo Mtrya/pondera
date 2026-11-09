@@ -1,10 +1,12 @@
 """Trainer smoke: loss decreases, resume replays the same loss sequence."""
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from test_release import CASES, build_run
 
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
@@ -23,6 +25,39 @@ MODEL = dict(
     num_heads=4,
     num_kv_heads=2,
 )
+
+
+def _ddp_worker(rank, store, packed, model_config, output):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store}", rank=rank, world_size=2
+    )
+    try:
+        torch.set_num_threads(1)
+        output = Path(output)
+        for name, updates, resume in (
+            ("partial", 1, None),
+            ("resumed", 2, output / "partial" / "checkpoint.pth"),
+        ):
+            torch.manual_seed(11)
+            model = VanillaModel(**model_config)
+            train(
+                model,
+                model_config,
+                packed,
+                "50k",
+                TrainConfig(
+                    microbatch_tokens=65_536,
+                    update_tokens=65_536,
+                    updates=updates,
+                    val_every=1,
+                    checkpoint_every=updates,
+                ),
+                output / name,
+                resume=resume,
+                device="cpu",
+            )
+    finally:
+        dist.destroy_process_group()
 
 
 class MuonTests(unittest.TestCase):
@@ -145,6 +180,57 @@ class TrainerTests(unittest.TestCase):
         self.assertEqual(len(actual), len(expected))
         for a, b in zip(actual, expected):
             self.assertAlmostEqual(a, b, places=5)
+
+    def test_distributed_matches_single_process_and_resume(self):
+        config = self.config(2)
+        config.val_every = 1
+        reference = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            config,
+            self.root / "reference",
+        )
+        output = self.root / "distributed"
+        torch.multiprocessing.spawn(
+            _ddp_worker,
+            args=(
+                self.root / "store",
+                self.root / "packed",
+                self.model_config,
+                output,
+            ),
+            nprocs=2,
+            join=True,
+        )
+        actual = []
+        for name in ("partial", "resumed"):
+            actual.extend(json.loads((output / name / "history.json").read_text()))
+        expected = reference["history"]
+        self.assertEqual(len(actual), len(expected))
+        for observed, wanted in zip(actual, expected):
+            for field in ("update", "micro_step", "tokens", "labeled_tokens", "epoch"):
+                self.assertEqual(observed[field], wanted[field])
+            self.assertAlmostEqual(observed["loss"], wanted["loss"], places=4)
+            self.assertAlmostEqual(observed["val_loss"], wanted["val_loss"], places=4)
+
+        reference_state = torch.load(
+            self.root / "reference" / "checkpoint.pth", weights_only=True
+        )
+        distributed_state = torch.load(
+            output / "resumed" / "checkpoint.pth", weights_only=True
+        )
+        reference_weights = reference_state["model_state_dict"]
+        distributed_weights = distributed_state["model_state_dict"]
+        self.assertEqual(distributed_weights.keys(), reference_weights.keys())
+        self.assertTrue(
+            all(not key.startswith("module.") for key in distributed_weights)
+        )
+        for key, wanted in reference_weights.items():
+            torch.testing.assert_close(
+                distributed_weights[key], wanted, rtol=1e-4, atol=1e-5
+            )
 
 
 if __name__ == "__main__":
