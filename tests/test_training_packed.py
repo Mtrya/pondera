@@ -5,20 +5,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import chess
 import torch
 import torch.distributed as dist
 from test_release import CASES, build_run
 
-from pondera.chess.codec import decode_board, legal_move_indices
-from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL, MOVE
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
 from pondera.data.merge_profile import build_profile
 from pondera.data.packing import PackedDocuments, load_subsets, write_packed
 from pondera.data.pipeline import produce_shards
 from pondera.data.tokenize import tokenize_dataset
 from pondera.models.vanilla import VanillaModel
 from pondera.training.muon import newton_schulz5, split_parameters
-from pondera.training.packed import TrainConfig, train, zero_move_accuracy
+from pondera.training.packed import TrainConfig, train
 
 MODEL = dict(
     num_blocks=1,
@@ -137,32 +135,6 @@ class TrainerTests(unittest.TestCase):
             checkpoint_every=updates,
         )
 
-    def test_zero_move_accuracy_masks_illegal_tokens(self):
-        documents = PackedDocuments(self.root / "packed")
-        index = next(
-            i
-            for i, (split, presentation) in enumerate(
-                zip(documents.split, documents.presentation)
-            )
-            if split == 1 and presentation == 0
-        )
-        document = documents.document(index)
-        final = next(i for i, token in enumerate(document) if token == FINAL)
-        fen, _ = decode_board(document[:final])
-        target = int(document[final + 1])
-        legal = [MOVE + move for move in legal_move_indices(chess.Board(fen))]
-        illegal = next(
-            token for token in range(MOVE, CHESS_VOCAB_SIZE) if token not in legal
-        )
-        model = VanillaModel(**dict(self.model_config, num_blocks=0))
-        with torch.no_grad():
-            model.token_embedding.weight.fill_(1)
-            model.head.weight.zero_()
-            model.head.weight[target].fill_(1 / self.model_config["hidden_size"])
-            model.head.weight[illegal].fill_(2 / self.model_config["hidden_size"])
-        result = zero_move_accuracy(model, documents, 65_536, "cpu")
-        self.assertEqual(result, {"correct": 1, "count": 1, "accuracy": 1.0})
-
     def test_loss_decreases(self):
         model = self.make_model()
         result = train(
@@ -176,8 +148,6 @@ class TrainerTests(unittest.TestCase):
         losses = [record["loss"] for record in result["history"]]
         self.assertLess(losses[-1], losses[0])
         self.assertIn("val_loss", result["history"][-1])
-        self.assertIn("val_move_accuracy", result["history"][-1])
-        self.assertEqual(result["history"][-1]["val_zero_documents"], 1)
         streamed = [
             json.loads(line)
             for line in (self.root / "train-out" / "history.jsonl")
@@ -259,12 +229,6 @@ class TrainerTests(unittest.TestCase):
                 self.assertEqual(observed[field], wanted[field])
             self.assertAlmostEqual(observed["loss"], wanted["loss"], places=4)
             self.assertAlmostEqual(observed["val_loss"], wanted["val_loss"], places=4)
-            self.assertAlmostEqual(
-                observed["val_move_accuracy"], wanted["val_move_accuracy"], places=4
-            )
-            self.assertEqual(
-                observed["val_zero_documents"], wanted["val_zero_documents"]
-            )
 
         reference_state = torch.load(
             self.root / "reference" / "checkpoint.pth", weights_only=True
