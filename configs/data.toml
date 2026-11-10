@@ -1,4 +1,5 @@
 seed = 640
+max_document_tokens = 131072
 
 [sources.elite]
 kind = "pgn"

@@ -8,8 +8,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-DATA_FORMAT_VERSION = 11
-TRACE_ARRAYS = ("trace_token_ids", "trace_len")
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
+
+DATA_FORMAT_VERSION = 12
+TRACE_ARRAYS = ("trace_atom_ids", "trace_atom_count")
 STATE_ARRAYS = ("state_best", "state_value")
 DATA_ARRAYS = (*TRACE_ARRAYS, *STATE_ARRAYS, "state_count")
 HF_SCHEMA = pa.schema(
@@ -31,8 +33,8 @@ LOCAL_ONLY_SCHEMA = pa.schema(
     [
         ("root_id", pa.string()),
         ("split", pa.string()),
-        ("trace_token_ids", pa.list_(pa.int32())),
-        ("trace_len", pa.int32()),
+        ("trace_atom_ids", pa.list_(pa.int32())),
+        ("trace_atom_count", pa.int32()),
         ("state_best", pa.list_(pa.int32())),
         ("state_value", pa.list_(pa.int32())),
     ]
@@ -151,7 +153,7 @@ class RaggedArray:
 def _arrays_from_table(table, names):
     result = {}
     for name in names:
-        if name == "trace_len":
+        if name == "trace_atom_count":
             result[name] = table[name].to_numpy()
             continue
         column = "state_best" if name == "state_count" else name
@@ -182,10 +184,14 @@ def validate_trace_arrays(arrays, rows=None):
             raise ValueError(f"Trace array {name} has a different row count")
         if array.dtype != np.int32:
             raise ValueError(f"Trace array {name} has an unexpected dtype")
-    trace = arrays.get("trace_token_ids")
+    trace = arrays.get("trace_atom_ids")
     if trace is not None and np.any(trace.lengths < 1):
         raise ValueError("Trace rows cannot be empty")
-    lengths = arrays.get("trace_len")
+    if trace is not None and np.any(
+        (trace.values < 0) | (trace.values >= CHESS_VOCAB_SIZE)
+    ):
+        raise ValueError("Local trace arrays must contain base atom IDs")
+    lengths = arrays.get("trace_atom_count")
     if (
         lengths is not None
         and trace is not None

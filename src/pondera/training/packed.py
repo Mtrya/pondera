@@ -4,10 +4,10 @@ Muon owns hidden matrices, AdamW the rest (training/muon.py). One optimizer
 update consumes whole microbatches until its token target is met; each
 microbatch's equal-weight next-token CE is normalized by that microbatch's
 labeled positions and weighted by its share of the update's actual labeled
-tokens. The batch sequence is a pure function of (subset, seed, budget,
-step), so resume replays it exactly from the saved micro step. With data
-parallelism the token target is global, ranks consume interleaved batches,
-and the DDP gradient average is rescaled to the global labeled-token count.
+tokens. Resume starts at the saved number of consumed documents in a fixed
+selection and shuffled epoch order. With data parallelism the token target
+is global, ranks consume interleaved batches, and the DDP gradient average
+is rescaled to the global labeled-token count.
 """
 
 import importlib
@@ -18,7 +18,6 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -27,10 +26,9 @@ from torch.nn.parallel import DistributedDataParallel
 from pondera.data.packing import (
     PackedDocuments,
     assemble_batch,
-    load_subsets,
     pack_batches,
     packed_batch_indices,
-    presentation_batch_count,
+    select_documents,
 )
 from pondera.training.muon import build_optimizers
 
@@ -43,6 +41,8 @@ class TrainConfig:
     microbatch_tokens: int = 65_536
     update_tokens: int = 524_288
     presentations: float = 1.0
+    documents: int | None = None
+    max_document_tokens: int | None = None
     updates: int | None = None
     val_every: int = 10
     checkpoint_every: int = 50
@@ -127,10 +127,9 @@ def _loss(model, batch):
 
 
 @torch.no_grad()
-def validation_loss(model, documents, budget, device, rank=0, world_size=1):
-    indices = np.flatnonzero(documents.split == 1)
+def validation_loss(model, documents, budget, device, indices, rank=0, world_size=1):
     model.eval()
-    batches, _ = pack_batches(documents.lengths, indices, budget)
+    batches = pack_batches(documents.lengths, indices, budget)
     total_loss = 0.0
     total_labeled = 0
     for batch in batches[rank::world_size]:
@@ -157,7 +156,7 @@ def save_training_checkpoint(
 ):
     model = _module(model)
     payload = {
-        "format_version": 2,
+        "format_version": 3,
         **run_config,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dicts": [optimizer.state_dict() for optimizer in optimizers],
@@ -165,7 +164,7 @@ def save_training_checkpoint(
         "update": update,
         "presented_documents": presented_documents,
         "swanlab_run_id": swanlab_run_id,
-        "subset_indices": indices.tolist(),
+        "document_indices": indices.tolist(),
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -192,7 +191,6 @@ def train(
     model,
     model_config,
     packed_dir,
-    subset,
     config: TrainConfig,
     output_dir,
     resume=None,
@@ -206,19 +204,52 @@ def train(
     if world_size > 1:
         dist.barrier()
     documents = PackedDocuments(packed_dir)
-    indices = load_subsets(packed_dir)[subset]
+    cap = (
+        documents.manifest["max_document_tokens"]
+        if config.max_document_tokens is None
+        else config.max_document_tokens
+    )
+    indices = select_documents(
+        documents, seed=config.seed, count=config.documents, max_document_tokens=cap
+    )
+    validation_indices = select_documents(
+        documents, seed=config.seed, split="val", max_document_tokens=cap
+    )
+    if not len(indices):
+        raise ValueError("No eligible training documents selected")
+    for selected in (indices, validation_indices):
+        maximum = int(documents.lengths[selected].max()) if len(selected) else 0
+        if maximum > config.microbatch_tokens:
+            raise ValueError(
+                f"Selected document length {maximum} exceeds microbatch budget {config.microbatch_tokens}"
+            )
+    if (
+        config.update_tokens < 1
+        or (config.updates is not None and config.updates < 1)
+        or config.presentations <= 0
+    ):
+        raise ValueError("Update tokens, updates, and presentations must be positive")
     run_config = {
         "arch": model.architecture,
         "model_config": model_config,
         "train_config": asdict(config),
-        "subset": subset,
+        "selection": {
+            "documents": len(indices),
+            "max_document_tokens": cap,
+            "validation_documents": len(validation_indices),
+        },
         "data_identity": {
             key: documents.manifest[key]
             for key in ("source_dataset_id", "documents", "tokens")
         },
         "tokenizer_identity": {
             key: documents.manifest[key]
-            for key in ("grammar_version", "tokenizer_version", "merge_entries")
+            for key in (
+                "grammar_version",
+                "tokenizer_version",
+                "merge_boundaries",
+                "merge_entries",
+            )
         },
     }
     if run_config["data_identity"]["source_dataset_id"] is None:
@@ -233,13 +264,13 @@ def train(
     micro_step = update = presented_documents = 0
     if resume is not None:
         state = torch.load(resume, map_location=device, weights_only=True)
-        if state["format_version"] != 2:
+        if state["format_version"] != 3:
             raise ValueError("Unsupported training checkpoint format")
         for key in ("arch", "model_config", "data_identity", "tokenizer_identity"):
             if state[key] != run_config[key]:
                 raise ValueError(f"Resume {key} differs from checkpoint")
-        if state["subset_indices"] != indices.tolist():
-            raise ValueError("Resume subset differs from checkpoint")
+        if state["document_indices"] != indices.tolist():
+            raise ValueError("Resume document selection differs from checkpoint")
         for key in ("seed", "microbatch_tokens"):
             if state["train_config"][key] != run_config["train_config"][key]:
                 raise ValueError(f"Resume {key} differs from checkpoint")
@@ -253,16 +284,8 @@ def train(
         micro_step, update = state["micro_step"], state["update"]
         presented_documents = state["presented_documents"]
     swanlab_run_id = state.get("swanlab_run_id") if resume is not None else None
-    final_step = (
-        presentation_batch_count(
-            documents,
-            indices,
-            config.seed,
-            config.microbatch_tokens,
-            config.presentations,
-        )
-        if config.updates is None
-        else None
+    target_documents = (
+        int(len(indices) * config.presentations) if config.updates is None else None
     )
     if world_size > 1:
         distributed_args = (
@@ -296,12 +319,12 @@ def train(
         indices,
         config.seed,
         config.microbatch_tokens,
-        start_step=micro_step,
-        presentations=config.presentations if final_step is not None else None,
+        start_document=presented_documents,
+        presentations=config.presentations if target_documents is not None else None,
     )
     started = time.monotonic()
     while (config.updates is not None and update < config.updates) or (
-        final_step is not None and micro_step < final_step
+        target_documents is not None and presented_documents < target_documents
     ):
         update_started = time.monotonic()
         batches = []
@@ -309,11 +332,14 @@ def train(
         total_tokens = 0
         last_epoch = 0
         while total_tokens < config.update_tokens and (
-            final_step is None or micro_step < final_step
+            target_documents is None or presented_documents < target_documents
         ):
             local_indices = []
             for batch_rank in range(world_size):
-                if final_step is not None and micro_step >= final_step:
+                if (
+                    target_documents is not None
+                    and presented_documents >= target_documents
+                ):
                     break
                 document_indices, last_epoch = next(batch_stream)
                 tokens = int(documents.lengths[document_indices].sum())
@@ -361,10 +387,16 @@ def train(
             "tokens_per_second": total_tokens / update_seconds,
         }
         if config.val_every and (
-            update % config.val_every == 0 or micro_step == final_step
+            update % config.val_every == 0 or presented_documents == target_documents
         ):
             record["val_loss"] = validation_loss(
-                model, documents, config.microbatch_tokens, device, rank, world_size
+                model,
+                documents,
+                config.microbatch_tokens,
+                device,
+                validation_indices,
+                rank,
+                world_size,
             )
         history.append(record)
         if tracker is not None:
@@ -425,7 +457,6 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packed", required=True, type=Path)
-    parser.add_argument("--subset", default="500k")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device", default="cpu")
@@ -448,7 +479,7 @@ def main():
         else:
             parser.add_argument(
                 f"--{field.replace('_', '-')}",
-                type=int if field == "updates" else type(default),
+                type=int if default is None else type(default),
                 default=default,
             )
     args = parser.parse_args()
@@ -475,7 +506,6 @@ def main():
         model,
         model_config,
         args.packed,
-        args.subset,
         config,
         args.output,
         resume=args.resume,

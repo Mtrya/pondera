@@ -19,12 +19,11 @@ from pondera.data.dataset import load_manifest, write_manifest
 from pondera.data.merge_profile import build_profile
 from pondera.data.packing import (
     PackedDocuments,
-    load_subsets,
-    presentation_batch_count,
-    write_packed,
+    packed_batch_indices,
+    select_documents,
 )
 from pondera.data.pipeline import produce_shards
-from pondera.data.tokenize import tokenize_dataset
+from pondera.data.tokenize import encode_dataset
 from pondera.models.linear import LinearVanillaModel
 from pondera.models.vanilla import VanillaModel
 from pondera.training.muon import Muon, newton_schulz5, split_parameters
@@ -55,7 +54,6 @@ def _ddp_worker(rank, store, packed, model_config, output, config, runs, model_c
                 model,
                 model_config,
                 packed,
-                "50k",
                 config,
                 output / name,
                 resume=resume,
@@ -152,9 +150,10 @@ class TrainerTests(unittest.TestCase):
             block=4,
             max_rounds=64,
         )
-        tokenized = self.root / "tokenized"
-        tokenize_dataset(source, tokenized, dictionaries[CHESS_VOCAB_SIZE + 64])
-        write_packed(tokenized, self.root / "packed", seed=640)
+        self.source = source
+        encode_dataset(
+            source, self.root / "packed", dictionaries[CHESS_VOCAB_SIZE + 64]
+        )
         self.model_config = dict(
             MODEL,
             vocab_size=CHESS_VOCAB_SIZE + len(dictionaries[CHESS_VOCAB_SIZE + 64]),
@@ -166,7 +165,9 @@ class TrainerTests(unittest.TestCase):
 
     def config(self, updates):
         documents = PackedDocuments(self.root / "packed")
-        train_indices = load_subsets(self.root / "packed")["50k"]
+        train_indices = select_documents(
+            PackedDocuments(self.root / "packed"), seed=640
+        )
         return TrainConfig(
             microbatch_tokens=65_536,
             update_tokens=2 * int(documents.lengths[train_indices].sum()),
@@ -182,7 +183,6 @@ class TrainerTests(unittest.TestCase):
             model,
             self.model_config,
             self.root / "packed",
-            "50k",
             self.config(6),
             self.root / "train-out",
         )
@@ -220,7 +220,6 @@ class TrainerTests(unittest.TestCase):
                 LinearVanillaModel(**self.model_config),
                 self.model_config,
                 self.root / "packed",
-                "50k",
                 config,
                 output,
             )
@@ -246,7 +245,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             self.config(4),
             self.root / "full",
             device=device,
@@ -255,7 +253,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             self.config(2),
             self.root / "partial",
             device=device,
@@ -266,7 +263,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             copied,
-            "50k",
             self.config(4),
             self.root / "resumed",
             resume=self.root / "partial" / "checkpoint.pth",
@@ -283,6 +279,16 @@ class TrainerTests(unittest.TestCase):
             for line in (self.root / name / "history.jsonl").read_text().splitlines()
         ]
         self.assertEqual(streamed, actual)
+        reference_state = torch.load(
+            self.root / "full" / "checkpoint.pth", weights_only=True
+        )
+        resumed_state = torch.load(
+            self.root / "resumed" / "checkpoint.pth", weights_only=True
+        )
+        for key, value in reference_state["model_state_dict"].items():
+            torch.testing.assert_close(
+                resumed_state["model_state_dict"][key], value, rtol=0, atol=0
+            )
 
     def test_resume_replays_the_same_losses(self):
         self.check_resume_replays_the_same_losses("cpu")
@@ -296,7 +302,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             self.config(1),
             self.root / "lr-partial",
         )
@@ -308,7 +313,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             config,
             self.root / "lr-resumed",
             resume=self.root / "lr-partial" / "checkpoint.pth",
@@ -330,7 +334,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             self.config(1),
             output,
         )
@@ -344,22 +347,19 @@ class TrainerTests(unittest.TestCase):
                         self.make_model(),
                         self.model_config,
                         self.root / "packed",
-                        "50k",
                         config,
                         self.root / f"changed-{field}",
                         resume=checkpoint,
                     )
-        manifest = load_manifest(self.root / "packed" / "subsets.json")
-        manifest["subsets"]["smaller"] = manifest["subsets"]["50k"][:1]
-        write_manifest(self.root / "packed" / "subsets.json", manifest)
+        config = self.config(2)
+        config.documents = 1
         with self.assertRaises(ValueError):
             train(
                 self.make_model(),
                 self.model_config,
                 self.root / "packed",
-                "smaller",
-                self.config(2),
-                self.root / "changed-subset",
+                config,
+                self.root / "changed-selection",
                 resume=checkpoint,
             )
         with self.assertRaises(ValueError):
@@ -367,7 +367,6 @@ class TrainerTests(unittest.TestCase):
                 LinearVanillaModel(**self.model_config),
                 self.model_config,
                 self.root / "packed",
-                "50k",
                 self.config(2),
                 self.root / "changed-architecture",
                 resume=checkpoint,
@@ -379,24 +378,21 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             self.config(1),
             output,
         )
-        manifest = load_manifest(self.root / "tokenized" / "release.json")
-        for name, source, entries in (
-            ("new-dataset", Path(manifest["source"]), manifest["merge_entries"]),
-            (
-                "new-dictionary",
-                self.root / "tokenized",
-                manifest["merge_entries"][::-1],
-            ),
+        manifest = load_manifest(self.root / "packed" / "packing.json")
+        for name, entries in (
+            ("new-dataset", manifest["merge_entries"]),
+            ("new-dictionary", manifest["merge_entries"][::-1]),
         ):
             with self.subTest(name=name):
-                tokenized = self.root / name
-                tokenize_dataset(source, tokenized, MergeDictionary(entries))
                 packed = self.root / f"{name}-packed"
-                write_packed(tokenized, packed, seed=640)
+                encode_dataset(self.source, packed, MergeDictionary(entries))
+                if name == "new-dataset":
+                    changed = load_manifest(packed / "packing.json")
+                    changed["source_dataset_id"] = "another-dataset"
+                    write_manifest(packed / "packing.json", changed)
                 self.assertEqual(
                     PackedDocuments(packed).manifest["vocabulary"],
                     self.model_config["vocab_size"],
@@ -406,7 +402,6 @@ class TrainerTests(unittest.TestCase):
                         self.make_model(),
                         self.model_config,
                         packed,
-                        "50k",
                         self.config(2),
                         self.root / f"{name}-out",
                         resume=output / "checkpoint.pth",
@@ -418,7 +413,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             self.config(1),
             output,
         )
@@ -428,7 +422,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             self.config(3),
             output,
             resume=old_checkpoint,
@@ -441,7 +434,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             self.config(3),
             output,
             resume=old_checkpoint,
@@ -455,7 +447,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             self.config(4),
             output,
             resume=output / "checkpoint.pth",
@@ -466,7 +457,7 @@ class TrainerTests(unittest.TestCase):
 
     def test_fractional_presentations_and_resume(self):
         documents = PackedDocuments(self.root / "packed")
-        count = len(load_subsets(self.root / "packed")["50k"])
+        count = len(select_documents(PackedDocuments(self.root / "packed"), seed=640))
 
         def config(presentations):
             result = self.config(1)
@@ -481,7 +472,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             config(1.5),
             self.root / "presentation-full",
         )
@@ -489,7 +479,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             config(0.75),
             self.root / "presentation-partial",
         )
@@ -497,7 +486,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             config(1.5),
             self.root / "presentation-resumed",
             resume=self.root / "presentation-partial" / "checkpoint.pth",
@@ -505,12 +493,24 @@ class TrainerTests(unittest.TestCase):
         expected_count = count + count // 2
         self.assertEqual(reference["presented_documents"], expected_count)
         self.assertEqual(reference["presentations"], expected_count / count)
-        expected = [record["loss"] for record in reference["history"]]
-        actual = [record["loss"] for record in partial["history"] + resumed["history"]]
-        self.assertEqual(len(actual), len(expected))
-        for observed, wanted in zip(actual, expected):
-            self.assertAlmostEqual(observed, wanted, places=5)
+        # Extending a completed target preserves document progress. The old
+        # partial optimizer update need not match an originally longer run.
+        self.assertEqual(partial["presented_documents"], int(count * 0.75))
         self.assertEqual(resumed["presented_documents"], expected_count)
+        expected_new_tokens = sum(
+            int(documents.lengths[batch].sum())
+            for batch, _ in packed_batch_indices(
+                documents,
+                select_documents(documents, seed=640),
+                640,
+                config(1.5).microbatch_tokens,
+                start_document=partial["presented_documents"],
+                presentations=1.5,
+            )
+        )
+        self.assertEqual(
+            sum(record["tokens"] for record in resumed["history"]), expected_new_tokens
+        )
 
     def test_distributed_matches_single_process_and_resume(self):
         config = self.config(2)
@@ -520,7 +520,6 @@ class TrainerTests(unittest.TestCase):
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            "50k",
             config,
             self.root / "reference",
         )
@@ -575,13 +574,21 @@ class TrainerTests(unittest.TestCase):
 
     def test_distributed_finishes_uneven_presentation(self):
         documents = PackedDocuments(self.root / "packed")
-        indices = load_subsets(self.root / "packed")["50k"]
+        indices = select_documents(PackedDocuments(self.root / "packed"), seed=640)
         config = self.config(1)
         config.updates = None
         config.microbatch_tokens = int(documents.lengths.max())
         config.val_every = 1
-        batches = presentation_batch_count(
-            documents, indices, config.seed, config.microbatch_tokens, 1.0
+        batches = len(
+            list(
+                packed_batch_indices(
+                    documents,
+                    indices,
+                    config.seed,
+                    config.microbatch_tokens,
+                    presentations=1.0,
+                )
+            )
         )
         self.assertEqual(batches % 2, 1)
         for model_class in (VanillaModel, LinearVanillaModel):
@@ -592,7 +599,6 @@ class TrainerTests(unittest.TestCase):
                     model_class(**self.model_config),
                     self.model_config,
                     self.root / "packed",
-                    "50k",
                     config,
                     root / "reference",
                 )

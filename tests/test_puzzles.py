@@ -15,10 +15,12 @@ import pyarrow.parquet as pq
 from tools.export_hf import export_hf
 from trace_fixtures import trace_config_text
 
+from pondera.chess.codec import encode_board
 from pondera.chess.merge import MergeDictionary, decode
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
 from pondera.data.config import load_config
 from pondera.data.dataset import load_manifest, parquet_sources
+from pondera.data.packing import PackedDocuments
 from pondera.data.pipeline import validate_release
 from pondera.data.roots import prepare_pool
 from pondera.data.roots.pool import _claimable, read_roots
@@ -219,23 +221,25 @@ class PuzzleTests(unittest.TestCase):
                 config.merge, vocab_size=CHESS_VOCAB_SIZE + 8, min_count=1, batch_size=1
             ),
         )
-        self.assertEqual(result["rows"], 2)
+        self.assertEqual(result["documents"], 2)
         dictionary = MergeDictionary(
-            load_manifest(training / "release.json")["merge_entries"]
+            load_manifest(training / "packing.json")["merge_entries"]
         )
         rows = [
             row
-            for path, _, _ in parquet_sources(training)
+            for path, _, _ in parquet_sources(exported)
             for row in pq.read_table(path).to_pylist()
         ]
-        self.assertEqual(sum(row["split"] == "train" for row in rows), 2)
-        for row in rows:
+        documents = PackedDocuments(training)
+        self.assertEqual(int((documents.split == 0).sum()), 2)
+        for index, row in enumerate(rows):
             source = json.loads(row["source"])
             self.assertIn(source["puzzle"]["PuzzleId"], {"00008", "0000D"})
             self.assertEqual(source["repo_id"], "Lichess/chess-puzzles")
             self.assertEqual(
-                decode(row["trace_token_ids"], dictionary).tolist(),
-                trace_atoms(row["trace_text"]).tolist(),
+                decode(documents.document(index), dictionary).tolist(),
+                encode_board(row["fen"], row["repetition"]).tolist()
+                + trace_atoms(row["trace_text"]).tolist(),
             )
 
 

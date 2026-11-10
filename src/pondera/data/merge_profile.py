@@ -20,24 +20,22 @@ import pyarrow.parquet as pq
 
 from pondera.chess.merge import (
     count_candidates,
-    encode_corpus,
     select_dictionary,
     usage_counts,
 )
 from pondera.chess.vocabulary import (
     CHESS_TOKENIZER_VERSION,
     CHESS_VOCAB_SIZE,
-    FINAL,
     LINES,
 )
-from pondera.data.dataset import DATA_FORMAT_VERSION, load_manifest, parquet_sources
-from pondera.data.text import trace_atoms
+from pondera.data.dataset import load_manifest, parquet_sources
+from pondera.data.text import (
+    MERGE_BOUNDARIES,
+    encode_traces,
+    merge_segments,
+    trace_atoms,
+)
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
-
-# Fitting never admits a composite containing FINAL: zero-presentation
-# generation prefills FINAL on its own, so the dictionary must keep it a
-# standalone token for training and generation tokenization to agree.
-FORBIDDEN_FITTING_ATOMS = (FINAL,)
 
 
 @dataclass(frozen=True)
@@ -119,8 +117,6 @@ def load_rows(release, *, max_roots=None, workers=1):
     release = Path(release)
     manifest = load_manifest(release / "release.json") if release.is_dir() else {}
     if manifest:
-        if manifest.get("format_version") not in {9, DATA_FORMAT_VERSION}:
-            raise ValueError(f"Unsupported dataset format in {release}")
         for field, expected in (
             ("grammar_version", TRACE_GRAMMAR_VERSION),
             ("tokenizer_version", CHESS_TOKENIZER_VERSION),
@@ -195,7 +191,7 @@ def _summary(rows):
 
 
 def _measure(rows, dictionary, workers=1):
-    encodings = encode_corpus((row.atoms for row in rows), dictionary, workers=workers)
+    encodings = encode_traces((row.atoms for row in rows), dictionary, workers=workers)
     usage = usage_counts(encodings, dictionary)
     total = _empty()
     slices = {
@@ -333,7 +329,10 @@ def build_profile(
     heldout = [row for row in loaded if row.position in heldout_positions]
     positions = sorted({row.position for row in fitting})
     selection_positions = set(positions[::selection_stride])
-    selection = [row.atoms for row in fitting if row.position in selection_positions]
+    selection_rows = [row for row in fitting if row.position in selection_positions]
+    selection = [
+        segment for row in selection_rows for segment in merge_segments(row.atoms)
+    ]
     load_seconds = time.monotonic() - started
     print(
         f"loaded {len(loaded)} rows ({len(fitting)} fitting) in {load_seconds:.0f}s",
@@ -342,10 +341,9 @@ def build_profile(
     count_start = time.monotonic()
     candidates = (
         count_candidates(
-            (row.atoms for row in fitting),
+            (segment for row in fitting for segment in merge_segments(row.atoms)),
             min_count=min_count,
             per_length_limit=per_length_limit,
-            forbidden=FORBIDDEN_FITTING_ATOMS,
             workers=workers,
         )
         if any(size > CHESS_VOCAB_SIZE for size in vocab_sizes)
@@ -369,14 +367,14 @@ def build_profile(
             "selection": {
                 "stride": selection_stride,
                 "roots": len(selection_positions),
-                "rows": len(selection),
+                "rows": len(selection_rows),
                 "atoms": sum(map(len, selection)),
             },
         },
         "candidates": {
             "min_count": min_count,
             "per_length_limit": per_length_limit,
-            "forbidden": list(FORBIDDEN_FITTING_ATOMS),
+            "boundaries": MERGE_BOUNDARIES,
             "counted": len(candidates),
             "retained_by_length": dict(
                 Counter(len(candidate.atoms) for candidate in candidates)

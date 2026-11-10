@@ -508,7 +508,7 @@ def _root_row(root, synthesized, presentation):
         / 1000
         if synthesized.round_audits[-1].wdl is not None
         else None,
-        "trace_len": len(row.tokens),
+        "trace_atom_count": len(row.tokens),
         "final_move": row.final_move,
         "mate_distance": row.mate_distance,
     }
@@ -559,7 +559,7 @@ def _write_shard(directory, records, metadata, presentations):
         for presentation in presentations[root["root_id"]]:
             row = synthesized.rows[presentation]
             payload = _root_row(root, synthesized, presentation)
-            payload["trace_token_ids"] = row.tokens
+            payload["trace_atom_ids"] = row.tokens
             for name, field in (("state_best", "best"), ("state_value", "value")):
                 payload[name] = [
                     getattr(boundary, field) for boundary in row.boundaries
@@ -629,7 +629,7 @@ def _check_shard_layout(output, shard, roots):
 def _profile_shard(output, shard, profile):
     directory = Path(output) / shard["path"]
     rows = read_root_rows(directory)
-    tokens = load_trace_arrays(directory, ("trace_token_ids",))["trace_token_ids"]
+    tokens = load_trace_arrays(directory, ("trace_atom_ids",))["trace_atom_ids"]
     champions = {row["root_id"]: row for row in _read_champions(directory)}
     for index, row in enumerate(rows):
         final = np.flatnonzero(tokens[index] == FINAL)
@@ -638,7 +638,7 @@ def _profile_shard(output, shard, profile):
         profile.add_stored(
             row,
             champions[row["root_id"]]["stats"],
-            row["trace_len"],
+            row["trace_atom_count"],
             int(final[0]),
         )
 
@@ -1336,8 +1336,8 @@ def _validate_shard_rows(
                 _check_champion_round(root_id, entry, board, value_mate, max_ply)
             checked_champions.add(root_id)
 
-        length = int(arrays["trace_len"][index])
-        tokens = arrays["trace_token_ids"][index]
+        length = int(arrays["trace_atom_count"][index])
+        tokens = arrays["trace_atom_ids"][index]
         program = replay(
             tokens,
             row["fen"],
@@ -2179,6 +2179,7 @@ def produce_shards(
                 release_path,
                 {
                     **release_metadata,
+                    "dataset_id": current.get("dataset_id") or uuid4().hex,
                     "metadata": identity,
                     "dropped": dropped,
                     "shards": [shards_by_index[key] for key in sorted(shards_by_index)],

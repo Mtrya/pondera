@@ -161,6 +161,7 @@ class DataConfig:
     release: ReleaseConfig
     sampling: SamplingConfig
     merge: MergeConfig
+    max_document_tokens: int = 131_072
 
     def search_dict(self):
         return {
@@ -295,10 +296,18 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     path = Path(path)
     with path.open("rb") as handle:
         values = tomllib.load(handle)
-    allowed = {"seed", "sources", "search", "synthesis", "release", "merge"}
+    allowed = {
+        "seed",
+        "sources",
+        "search",
+        "synthesis",
+        "release",
+        "merge",
+        "max_document_tokens",
+    }
     if set(values) - allowed:
         raise ValueError(f"Unknown config section: {sorted(set(values) - allowed)[0]}")
-    for section in allowed - {"seed"}:
+    for section in allowed - {"seed", "max_document_tokens"}:
         if section not in values:
             raise ValueError(f"Missing config section: [{section}]")
     seed = _integer("seed", "seed", values.get("seed", 640))
@@ -416,4 +425,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         _integer("merge", "batch_size", merge["batch_size"], 1),
         _integer("merge", "workers", merge.get("workers", 1), 1),
     )
-    return DataConfig(seed, sources, search, synthesis, release, sampling, merge)
+    cap = _integer(
+        "data", "max_document_tokens", values.get("max_document_tokens", 131_072), 1
+    )
+    return DataConfig(seed, sources, search, synthesis, release, sampling, merge, cap)

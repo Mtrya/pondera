@@ -21,7 +21,7 @@ Python 3.13 or later is required. Stockfish and fastchess are external executabl
 The package is a library. Train a model from a packed dataset:
 
 ```bash
-uv run python -m pondera.training.packed --packed PACKED --subset 500k --architecture vanilla --output RUN --device cuda
+uv run python -m pondera.training.packed --packed PACKED --documents 500000 --microbatch-tokens 131072 --architecture vanilla --output RUN --device cuda
 ```
 
 Experiment configurations live with their run directories; the repository tracks configurations only for published reference runs. See [data synthesis](docs/data.md) for the current offline pipeline and [architecture](docs/architecture.md) for module boundaries and repository conventions.
