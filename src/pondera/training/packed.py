@@ -112,6 +112,7 @@ def _loss(model, batch):
 
 @torch.no_grad()
 def validation_loss(model, documents, budget, device, indices, rank=0, world_size=1):
+    model = _module(model)
     model.eval()
     batches = pack_batches(documents.lengths, indices, budget)
     total_loss = 0.0
