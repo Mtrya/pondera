@@ -14,19 +14,24 @@ def solve_puzzle(choose_move, row):
     board = chess.Board(row["FEN"])
     moves = row["Moves"].split()
     board.push_uci(moves[0])
-    first = choose_move(board.fen())
-    first_correct = first == moves[1]
-    if not first_correct:
-        return False, False
-    board.push_uci(moves[1])
-    for index in range(2, len(moves), 2):
-        board.push_uci(moves[index])
-        if index + 1 >= len(moves):
+    first_correct = False
+    for index in range(1, len(moves), 2):
+        try:
+            candidate = chess.Move.from_uci(choose_move(board.fen()))
+        except ValueError:
+            return first_correct, False
+        if candidate not in board.legal_moves:
+            return first_correct, False
+        board.push(candidate)
+        correct = candidate.uci() == moves[index] or board.is_checkmate()
+        if index == 1:
+            first_correct = correct
+        if not correct:
+            return first_correct, False
+        if board.is_checkmate() or index + 2 >= len(moves):
             return True, True
-        if choose_move(board.fen()) != moves[index + 1]:
-            return True, False
         board.push_uci(moves[index + 1])
-    return True, True
+    return first_correct, first_correct
 
 
 def evaluate_puzzles(

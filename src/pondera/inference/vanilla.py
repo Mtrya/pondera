@@ -13,18 +13,12 @@ import torch
 from pondera.chess.codec import encode_board
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import FINAL, MOVE, UCI_MOVE_TO_IDX
-from pondera.models.linear import LinearVanillaModel
-from pondera.models.vanilla import VanillaModel
-
-MODEL_CLASSES = {"vanilla": VanillaModel, "linear": LinearVanillaModel}
+from pondera.inference.trace import load_checkpoint
 
 
 def load_vanilla_checkpoint(path, device="cpu"):
     """Load either packed-trainer model into eval mode."""
-    state = torch.load(path, map_location=device, weights_only=True)
-    model = MODEL_CLASSES[state["arch"]](**state["model_config"])
-    model.load_state_dict(state["model_state_dict"])
-    return model.to(device).eval()
+    return load_checkpoint(path, device).model
 
 
 @torch.no_grad()

@@ -28,6 +28,14 @@ Model architecture and dimensions, data selection, optimization, token budgets, 
 
 Shared data and training recipes live in `configs/`. Experiment configurations live with their run directories; only published reference runs add experiment configurations to the repository. See [data synthesis](docs/data.md) for the current offline pipeline and [architecture](docs/architecture.md) for module boundaries and repository conventions.
 
+Evaluate a checkpoint's unconstrained answers on held-out roots and/or Lichess puzzles:
+
+```bash
+uv run python -m pondera.evaluation --config configs/eval.toml --checkpoint RUN/checkpoint.pth --roots HELD_OUT_ROOTS --cache REFERENCE.sqlite --output EVALUATION --engine STOCKFISH --device cpu
+```
+
+The evaluator compares zero reasoning with the configured thinking budget, reports answer validity, engine-scored move quality, root-value accuracy, and PV quality, and reuses engine references across checkpoints. Add `--puzzles PUZZLES` for first-move and whole-puzzle success. See [evaluation](src/pondera/evaluation/README.md) for input and scoring contracts.
+
 ## Development
 
 ```bash
