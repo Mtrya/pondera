@@ -55,6 +55,29 @@ class LinearAttentionTests(unittest.TestCase):
             torch.testing.assert_close(out, reference_out, rtol=1e-4, atol=1e-4)
             torch.testing.assert_close(state, reference_state, rtol=1e-4, atol=1e-4)
 
+    def test_future_chunk_values_cannot_erase_earlier_state(self):
+        q = torch.ones(128, 1, 1)
+        k = torch.ones_like(q)
+        v = torch.ones_like(q)
+        original, _ = linear_chunked(q, k, v)
+        v[-1] = 1e10
+        changed, _ = linear_chunked(q, k, v)
+        torch.testing.assert_close(changed[:-1], original[:-1], rtol=0, atol=0)
+        # Token 64 reads 64 preceding unit updates and its own unit update.
+        self.assertEqual(changed[64].item(), 65.0)
+
+    def test_multiple_chunks_match_recurrence_and_gradients(self):
+        q, k, v = (torch.randn(129, 2, 8, requires_grad=True) for _ in range(3))
+        out, state = linear_chunked(q, k, v)
+        reference_out, reference_state = linear_recurrent(q, k, v)
+        torch.testing.assert_close(out, reference_out, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(state, reference_state, rtol=1e-4, atol=1e-4)
+        weight = torch.randn_like(out)
+        actual = torch.autograd.grad(out, (q, k, v), weight)
+        expected = torch.autograd.grad(reference_out, (q, k, v), weight)
+        for gradient, reference in zip(actual, expected):
+            torch.testing.assert_close(gradient, reference, rtol=1e-4, atol=1e-4)
+
     def test_state_is_zeroed_at_document_boundaries(self):
         cu = torch.tensor([0, 7, 19], dtype=torch.int32)
         packed = linear_varlen_attention(self.q, self.k, self.v, cu)

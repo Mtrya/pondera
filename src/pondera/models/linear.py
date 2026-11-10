@@ -49,7 +49,9 @@ def linear_chunked(q, k, v, chunk=CHUNK):
         scores = scores.masked_fill(~mask, 0.0)
         intra = scores @ v
         states = k.mT @ v
-        exclusive = torch.cumsum(states, dim=0) - states
+        exclusive = torch.cat(
+            [torch.zeros_like(states[:1]), torch.cumsum(states[:-1], dim=0)], dim=0
+        )
         inter = q @ exclusive
         out = (intra + inter).transpose(1, 2).reshape(count * chunk, heads, width)
         return out[:length], states.sum(dim=0)

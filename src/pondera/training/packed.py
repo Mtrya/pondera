@@ -106,6 +106,13 @@ def _forward(model, batch):
 
 
 def _loss(model, batch):
+    if not batch["input_ids"].numel():
+        # An idle rank participates in DDP with zero gradient and no presented tokens.
+        moved = {
+            "input_ids": batch["input_ids"].new_zeros(1),
+            "cu_seqlens": batch["cu_seqlens"].new_tensor([0, 1]),
+        }
+        return _forward(model, moved).float().sum() * 0.0, 0
     logits = _forward(model, batch)
     labeled = int((batch["labels"] != -100).sum())
     loss = F.cross_entropy(
@@ -138,32 +145,44 @@ def save_training_checkpoint(
     path,
     model,
     optimizers,
-    model_config,
+    run_config,
     micro_step,
     update,
     presented_documents,
-    config,
-    manifest,
+    indices,
     swanlab_run_id=None,
 ):
     model = _module(model)
     payload = {
-        "format_version": 1,
-        "arch": model.architecture,
-        "model_config": model_config,
+        "format_version": 2,
+        **run_config,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dicts": [optimizer.state_dict() for optimizer in optimizers],
         "micro_step": micro_step,
         "update": update,
         "presented_documents": presented_documents,
         "swanlab_run_id": swanlab_run_id,
-        "train_config": asdict(config),
-        "data_identity": manifest.get("source", {}),
-        "tokenizer_identity": manifest.get("vocabulary", {}),
+        "subset_indices": indices.tolist(),
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
     os.replace(temporary, path)
+
+
+def _open_history(path, update):
+    """Discard records after the checkpoint, including an interrupted final write."""
+    handle = path.open("a+", buffering=1)
+    handle.seek(0)
+    while True:
+        position = handle.tell()
+        line = handle.readline()
+        if not line:
+            break
+        if not line.endswith("\n") or json.loads(line)["update"] > update:
+            handle.seek(position)
+            handle.truncate()
+            break
+    return handle
 
 
 def train(
@@ -185,6 +204,22 @@ def train(
         dist.barrier()
     documents = PackedDocuments(packed_dir)
     indices = load_subsets(packed_dir)[subset]
+    run_config = {
+        "arch": model.architecture,
+        "model_config": model_config,
+        "train_config": asdict(config),
+        "subset": subset,
+        "data_identity": {
+            key: documents.manifest[key]
+            for key in ("source_dataset_id", "documents", "tokens")
+        },
+        "tokenizer_identity": {
+            key: documents.manifest[key]
+            for key in ("grammar_version", "tokenizer_version", "merge_entries")
+        },
+    }
+    if run_config["data_identity"]["source_dataset_id"] is None:
+        raise ValueError("Packed training data needs a dataset_id from encoding")
     model.to(device)
     optimizers = build_optimizers(
         model,
@@ -195,12 +230,23 @@ def train(
     micro_step = update = presented_documents = 0
     if resume is not None:
         state = torch.load(resume, map_location=device, weights_only=True)
+        if state["format_version"] != 2:
+            raise ValueError("Unsupported training checkpoint format")
+        for key in ("arch", "model_config", "data_identity", "tokenizer_identity"):
+            if state[key] != run_config[key]:
+                raise ValueError(f"Resume {key} differs from checkpoint")
+        if state["subset_indices"] != indices.tolist():
+            raise ValueError("Resume subset differs from checkpoint")
+        for key in ("seed", "microbatch_tokens"):
+            if state["train_config"][key] != run_config["train_config"][key]:
+                raise ValueError(f"Resume {key} differs from checkpoint")
         model.load_state_dict(state["model_state_dict"])
         for optimizer, saved in zip(optimizers, state["optimizer_state_dicts"]):
             learning_rates = [group["lr"] for group in optimizer.param_groups]
             optimizer.load_state_dict(saved)
             for group, learning_rate in zip(optimizer.param_groups, learning_rates):
                 group["lr"] = learning_rate
+                group["weight_decay"] = config.weight_decay
         micro_step, update = state["micro_step"], state["update"]
         presented_documents = state["presented_documents"]
     swanlab_run_id = state.get("swanlab_run_id") if resume is not None else None
@@ -215,10 +261,6 @@ def train(
         if config.updates is None
         else None
     )
-    if final_step is not None and final_step % world_size:
-        raise ValueError(
-            f"{final_step} batches cannot be divided across {world_size} ranks"
-        )
     if world_size > 1:
         distributed_args = (
             {} if device.type == "cpu" else {"device_ids": [device.index]}
@@ -234,40 +276,17 @@ def train(
         tracker = swanlab.init(
             project="pondera-model-arch",
             experiment_name=output_dir.name,
-            config={
-                "subset": subset,
-                "model": model_config,
-                "train": asdict(config),
-                "data": {
-                    key: documents.manifest[key]
-                    for key in (
-                        "source_dataset_id",
-                        "tokens_sha256",
-                        "offsets_sha256",
-                        "merge_entries_sha256",
-                    )
-                },
-            },
+            config=run_config,
             logdir=logdir,
             id=swanlab_run_id,
             resume="allow",
         )
         swanlab_run_id = tracker.public.run_id
     if rank == 0:
-        (output_dir / "config.json").write_text(
-            json.dumps(
-                {"model": model_config, "train": asdict(config), "subset": subset},
-                indent=2,
-            )
-            + "\n"
-        )
+        (output_dir / "config.json").write_text(json.dumps(run_config, indent=2) + "\n")
     history = []
     history_log = (
-        (output_dir / "history.jsonl").open(
-            "a" if resume is not None else "w", buffering=1
-        )
-        if rank == 0
-        else None
+        _open_history(output_dir / "history.jsonl", update) if rank == 0 else None
     )
     batch_stream = packed_batches(
         documents,
@@ -291,7 +310,11 @@ def train(
         while total_tokens < config.update_tokens and (
             final_step is None or micro_step < final_step
         ):
-            batch = next(batch_stream)
+            batch = (
+                assemble_batch(documents, [])
+                if final_step is not None and micro_step + rank >= final_step
+                else next(batch_stream)
+            )
             labeled = int((batch["labels"] != -100).sum())
             step_tokens, step_labeled, step_documents = _reduce(
                 [batch["tokens"], labeled, batch["documents"]], device
@@ -299,7 +322,11 @@ def train(
             total_tokens += step_tokens
             total_labeled += step_labeled
             presented_documents += step_documents
-            micro_step += world_size
+            micro_step += (
+                world_size
+                if final_step is None
+                else min(world_size, final_step - micro_step)
+            )
             batches.append((batch, labeled))
             last_epoch = batch.get("epoch", 0)
         for optimizer in optimizers:
@@ -353,27 +380,24 @@ def train(
                 output_dir / "checkpoint.pth",
                 model,
                 optimizers,
-                model_config,
+                run_config,
                 micro_step,
                 update,
                 presented_documents,
-                config,
-                documents.manifest,
+                indices,
                 swanlab_run_id=swanlab_run_id,
             )
     if rank == 0:
         history_log.close()
-        (output_dir / "history.json").write_text(json.dumps(history, indent=2) + "\n")
         save_training_checkpoint(
             output_dir / "checkpoint.pth",
             model,
             optimizers,
-            model_config,
+            run_config,
             micro_step,
             update,
             presented_documents,
-            config,
-            documents.manifest,
+            indices,
             swanlab_run_id=swanlab_run_id,
         )
     if tracker is not None:

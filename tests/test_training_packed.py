@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,11 +13,19 @@ import torch.distributed as dist
 from swanlab.toolkit.callback import SwanKitCallback
 from test_release import CASES, build_run
 
+from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
+from pondera.data.dataset import load_manifest, write_manifest
 from pondera.data.merge_profile import build_profile
-from pondera.data.packing import PackedDocuments, load_subsets, write_packed
+from pondera.data.packing import (
+    PackedDocuments,
+    load_subsets,
+    presentation_batch_count,
+    write_packed,
+)
 from pondera.data.pipeline import produce_shards
 from pondera.data.tokenize import tokenize_dataset
+from pondera.models.linear import LinearVanillaModel
 from pondera.models.vanilla import VanillaModel
 from pondera.training.muon import Muon, newton_schulz5, split_parameters
 from pondera.training.packed import TrainConfig, train
@@ -30,21 +39,18 @@ MODEL = dict(
 )
 
 
-def _ddp_worker(rank, store, packed, model_config, output, config):
+def _ddp_worker(rank, store, packed, model_config, output, config, runs, model_class):
     dist.init_process_group(
         "gloo", init_method=f"file://{store}", rank=rank, world_size=2
     )
     try:
         torch.set_num_threads(1)
         output = Path(output)
-        for name, updates, resume in (
-            ("partial", 1, None),
-            ("resumed", 2, output / "partial" / "checkpoint.pth"),
-        ):
+        for name, updates, resume in runs:
             torch.manual_seed(11)
-            model = VanillaModel(**model_config)
+            model = model_class(**model_config)
             config.updates = updates
-            config.checkpoint_every = updates
+            config.checkpoint_every = 1
             train(
                 model,
                 model_config,
@@ -193,6 +199,7 @@ class TrainerTests(unittest.TestCase):
 
     def test_swanlab_offline_tracking(self):
         events = []
+        architectures = []
 
         class Recorder(SwanKitCallback):
             def __str__(self):
@@ -200,6 +207,7 @@ class TrainerTests(unittest.TestCase):
 
             def on_log(self, data, step, *args, **kwargs):
                 events.append((data.copy(), step))
+                architectures.append(swanlab.config["arch"])
 
         config = self.config(2)
         config.track = True
@@ -209,7 +217,7 @@ class TrainerTests(unittest.TestCase):
         try:
             swanlab.register_callbacks([Recorder()])
             result = train(
-                self.make_model(),
+                LinearVanillaModel(**self.model_config),
                 self.model_config,
                 self.root / "packed",
                 "50k",
@@ -223,6 +231,9 @@ class TrainerTests(unittest.TestCase):
                 os.environ["SWANLAB_MODE"] = previous_mode
         self.assertEqual([step for _, step in events], [1, 2])
         self.assertEqual([data for data, _ in events], result["history"])
+        self.assertEqual(architectures, ["linear", "linear"])
+        local_config = json.loads((output / "config.json").read_text())
+        self.assertEqual(local_config["arch"], "linear")
         state = torch.load(output / "checkpoint.pth", weights_only=True)
         self.assertIsInstance(state["swanlab_run_id"], str)
         self.assertTrue(state["swanlab_run_id"])
@@ -249,10 +260,12 @@ class TrainerTests(unittest.TestCase):
             self.root / "partial",
             device=device,
         )
+        copied = self.root / "packed-copy"
+        shutil.copytree(self.root / "packed", copied)
         resumed = train(
             self.make_model(),
             self.model_config,
-            self.root / "packed",
+            copied,
             "50k",
             self.config(4),
             self.root / "resumed",
@@ -278,7 +291,7 @@ class TrainerTests(unittest.TestCase):
     def test_cuda_resume_replays_the_same_losses(self):
         self.check_resume_replays_the_same_losses("cuda")
 
-    def test_resume_uses_requested_learning_rates(self):
+    def test_resume_uses_requested_optimizer_settings(self):
         train(
             self.make_model(),
             self.model_config,
@@ -290,6 +303,7 @@ class TrainerTests(unittest.TestCase):
         config = self.config(2)
         config.muon_lr = 0.01
         config.adamw_lr = 0.00015
+        config.weight_decay = 0.7
         train(
             self.make_model(),
             self.model_config,
@@ -307,6 +321,148 @@ class TrainerTests(unittest.TestCase):
             for optimizer in state["optimizer_state_dicts"]
         ]
         self.assertEqual(rates, [[0.01], [0.00015]])
+        for optimizer in state["optimizer_state_dicts"]:
+            self.assertEqual(optimizer["param_groups"][0]["weight_decay"], 0.7)
+
+    def test_resume_rejects_changed_sampler_and_architecture(self):
+        output = self.root / "sampler-partial"
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            self.config(1),
+            output,
+        )
+        checkpoint = output / "checkpoint.pth"
+        for field in ("seed", "microbatch_tokens"):
+            with self.subTest(field=field):
+                config = self.config(2)
+                setattr(config, field, getattr(config, field) + 1)
+                with self.assertRaises(ValueError):
+                    train(
+                        self.make_model(),
+                        self.model_config,
+                        self.root / "packed",
+                        "50k",
+                        config,
+                        self.root / f"changed-{field}",
+                        resume=checkpoint,
+                    )
+        manifest = load_manifest(self.root / "packed" / "subsets.json")
+        manifest["subsets"]["smaller"] = manifest["subsets"]["50k"][:1]
+        write_manifest(self.root / "packed" / "subsets.json", manifest)
+        with self.assertRaises(ValueError):
+            train(
+                self.make_model(),
+                self.model_config,
+                self.root / "packed",
+                "smaller",
+                self.config(2),
+                self.root / "changed-subset",
+                resume=checkpoint,
+            )
+        with self.assertRaises(ValueError):
+            train(
+                LinearVanillaModel(**self.model_config),
+                self.model_config,
+                self.root / "packed",
+                "50k",
+                self.config(2),
+                self.root / "changed-architecture",
+                resume=checkpoint,
+            )
+
+    def test_resume_rejects_new_dataset_and_reordered_dictionary(self):
+        output = self.root / "identity-partial"
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            self.config(1),
+            output,
+        )
+        manifest = load_manifest(self.root / "tokenized" / "release.json")
+        for name, source, entries in (
+            ("new-dataset", Path(manifest["source"]), manifest["merge_entries"]),
+            (
+                "new-dictionary",
+                self.root / "tokenized",
+                manifest["merge_entries"][::-1],
+            ),
+        ):
+            with self.subTest(name=name):
+                tokenized = self.root / name
+                tokenize_dataset(source, tokenized, MergeDictionary(entries))
+                packed = self.root / f"{name}-packed"
+                write_packed(tokenized, packed, seed=640)
+                self.assertEqual(
+                    PackedDocuments(packed).manifest["vocabulary"],
+                    self.model_config["vocab_size"],
+                )
+                with self.assertRaises(ValueError):
+                    train(
+                        self.make_model(),
+                        self.model_config,
+                        packed,
+                        "50k",
+                        self.config(2),
+                        self.root / f"{name}-out",
+                        resume=output / "checkpoint.pth",
+                    )
+
+    def test_history_follows_checkpoint_on_same_directory_resume(self):
+        output = self.root / "history-resume"
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            self.config(1),
+            output,
+        )
+        old_checkpoint = self.root / "old-checkpoint.pth"
+        shutil.copy2(output / "checkpoint.pth", old_checkpoint)
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            self.config(3),
+            output,
+            resume=old_checkpoint,
+        )
+        history_path = output / "history.jsonl"
+        expected = [
+            json.loads(line)["loss"] for line in history_path.read_text().splitlines()
+        ]
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            self.config(3),
+            output,
+            resume=old_checkpoint,
+        )
+        records = [json.loads(line) for line in history_path.read_text().splitlines()]
+        self.assertEqual([record["update"] for record in records], [1, 2, 3])
+        self.assertEqual([record["loss"] for record in records], expected)
+        with history_path.open("a") as handle:
+            handle.write('{"update":')
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            self.config(4),
+            output,
+            resume=output / "checkpoint.pth",
+        )
+        records = [json.loads(line) for line in history_path.read_text().splitlines()]
+        self.assertEqual([record["update"] for record in records], [1, 2, 3, 4])
+        self.assertEqual([record["loss"] for record in records[:3]], expected)
 
     def test_fractional_presentations_and_resume(self):
         documents = PackedDocuments(self.root / "packed")
@@ -376,13 +532,21 @@ class TrainerTests(unittest.TestCase):
                 self.model_config,
                 output,
                 config,
+                (
+                    ("partial", 1, None),
+                    ("resumed", 2, output / "partial" / "checkpoint.pth"),
+                ),
+                VanillaModel,
             ),
             nprocs=2,
             join=True,
         )
         actual = []
         for name in ("partial", "resumed"):
-            actual.extend(json.loads((output / name / "history.json").read_text()))
+            actual.extend(
+                json.loads(line)
+                for line in (output / name / "history.jsonl").read_text().splitlines()
+            )
         expected = reference["history"]
         self.assertEqual(len(actual), len(expected))
         for observed, wanted in zip(actual, expected):
@@ -407,6 +571,76 @@ class TrainerTests(unittest.TestCase):
             torch.testing.assert_close(
                 distributed_weights[key], wanted, rtol=1e-4, atol=1e-5
             )
+
+    def test_distributed_finishes_uneven_presentation(self):
+        documents = PackedDocuments(self.root / "packed")
+        indices = load_subsets(self.root / "packed")["50k"]
+        config = self.config(1)
+        config.updates = None
+        config.microbatch_tokens = int(documents.lengths.max())
+        config.val_every = 1
+        batches = presentation_batch_count(
+            documents, indices, config.seed, config.microbatch_tokens, 1.0
+        )
+        self.assertEqual(batches % 2, 1)
+        for model_class in (VanillaModel, LinearVanillaModel):
+            with self.subTest(architecture=model_class.architecture):
+                root = self.root / model_class.architecture
+                torch.manual_seed(11)
+                reference = train(
+                    model_class(**self.model_config),
+                    self.model_config,
+                    self.root / "packed",
+                    "50k",
+                    config,
+                    root / "reference",
+                )
+                output = root / "distributed"
+                torch.multiprocessing.spawn(
+                    _ddp_worker,
+                    args=(
+                        root / "store",
+                        self.root / "packed",
+                        self.model_config,
+                        output,
+                        config,
+                        (("full", None, None),),
+                        model_class,
+                    ),
+                    nprocs=2,
+                    join=True,
+                )
+                actual = torch.load(
+                    output / "full" / "checkpoint.pth", weights_only=True
+                )
+                expected = torch.load(
+                    root / "reference" / "checkpoint.pth", weights_only=True
+                )
+                self.assertEqual(actual["micro_step"], batches)
+                self.assertEqual(actual["presented_documents"], len(indices))
+                observed = [
+                    json.loads(line)
+                    for line in (output / "full" / "history.jsonl")
+                    .read_text()
+                    .splitlines()
+                ]
+                self.assertEqual(len(observed), reference["updates"])
+                for record, wanted in zip(observed, reference["history"]):
+                    for field in (
+                        "micro_step",
+                        "tokens",
+                        "labeled_tokens",
+                        "presentations",
+                    ):
+                        self.assertEqual(record[field], wanted[field])
+                    self.assertAlmostEqual(record["loss"], wanted["loss"], places=4)
+                    self.assertAlmostEqual(
+                        record["val_loss"], wanted["val_loss"], places=4
+                    )
+                for key, weight in expected["model_state_dict"].items():
+                    torch.testing.assert_close(
+                        actual["model_state_dict"][key], weight, rtol=1e-4, atol=1e-5
+                    )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 """Packed training streams: layout, batch contract, and sampler invariants."""
 
-import hashlib
 import json
 import random
 import subprocess
@@ -10,12 +9,14 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 from test_release import CASES, build_run
 
 from pondera.chess.codec import decode_board, encode_board
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, FINAL, MOVE
 from pondera.data.dataset import (
+    TRACE_SCHEMA,
     load_manifest,
     parquet_sources,
     write_manifest,
@@ -141,14 +142,9 @@ class PackingTests(unittest.TestCase):
             manifest["vocabulary"], CHESS_VOCAB_SIZE + len(self.dictionary)
         )
         self.assertEqual(manifest["source_dataset_id"], source["dataset_id"])
+        self.assertEqual(manifest["merge_entries"], source["merge_entries"])
         self.assertEqual(manifest["documents"], len(self.rows))
         self.assertEqual(manifest["tokens"], sum(len(row) for row in self.expected))
-        self.assertEqual(
-            manifest["tokens_sha256"],
-            hashlib.sha256(
-                (self.root / "packed" / "tokens.u16").read_bytes()
-            ).hexdigest(),
-        )
         expected_splits = np.asarray(
             [0 if row["split"] == "train" else 1 for row in self.rows], np.uint8
         )
@@ -164,6 +160,36 @@ class PackingTests(unittest.TestCase):
         self.assertEqual(stats["documents"], len(self.rows))
         self.assertEqual(stats["dropped_overlong"], 0)
         self.assertEqual(stats["splits"], {"train": len(train), "val": 1})
+
+    def test_documents_survive_arrow_batch_boundaries(self):
+        source = self.root / "many-rows"
+        source.mkdir()
+        rows = self.rows * 40
+        pq.write_table(
+            pa.Table.from_pylist(rows, schema=TRACE_SCHEMA),
+            source / "data.parquet",
+            row_group_size=17,
+        )
+        manifest = load_manifest(self.tokenized / "release.json")
+        manifest["shards"] = [{"path": "data.parquet", "rows": len(rows)}]
+        write_manifest(source / "release.json", manifest)
+        output = self.root / "many-packed"
+        write_packed(source, output, seed=640)
+        packed = PackedDocuments(output)
+        self.assertEqual(len(packed), len(rows))
+        for index in range(len(rows)):
+            np.testing.assert_array_equal(
+                packed.document(index), self.expected[index % len(self.expected)]
+            )
+
+    def test_incomplete_shard_is_not_published(self):
+        manifest = load_manifest(self.tokenized / "release.json")
+        manifest["shards"][0]["rows"] += 1
+        write_manifest(self.tokenized / "release.json", manifest)
+        output = self.root / "incomplete-packed"
+        with self.assertRaises(ValueError):
+            write_packed(self.tokenized, output, seed=640)
+        self.assertFalse(output.exists())
 
     def test_batches_follow_the_contract(self):
         self.pack()

@@ -15,8 +15,8 @@ Layout of a packed directory:
   starting at 0. Document ``i`` occupies ``[offsets[i], offsets[i+1])``.
 - ``split.u8``: per document, 0 = train / 1 = val.
 - ``presentation.u8``: per document, 0 = zero / 1 = full / 2 = random.
-- ``packing.json``: format version, source dataset identity, vocabulary
-  identity (merge entries hash), counts, content hashes.
+- ``packing.json``: format version, source dataset identity, tokenizer
+  versions, inline merge entries, and counts.
 - ``subsets.json``: nested data-scale manifests over train document indices
   (seeded permutation prefixes; the largest group is every train document).
 - ``stats.json``: length distributions, drop counts, and reference packing
@@ -47,8 +47,6 @@ rank view, while ``packed_batch`` reconstructs any step directly, so resume
 replays length metadata only, without reading skipped tokens.
 """
 
-import hashlib
-import json
 import random
 import tempfile
 import time
@@ -72,7 +70,7 @@ from pondera.data.dataset import (
 )
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
-PACKED_FORMAT_VERSION = 1
+PACKED_FORMAT_VERSION = 2
 MAX_DOCUMENT_TOKENS = 128 * 1024
 IGNORE_INDEX = -100
 SPLIT_CODES = {"train": 0, "val": 1}
@@ -251,14 +249,6 @@ def packed_batch(documents, indices, seed, budget, step):
     return next(packed_batches(documents, indices, seed, budget, start_step=step))
 
 
-def _sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 24), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _quantiles(lengths):
     if not len(lengths):
         return None
@@ -329,47 +319,50 @@ def write_packed(
         prefix=f".{output.name}-", dir=output.parent
     ) as staging:
         staging = Path(staging)
-        chunks = []
         boundaries = [0]
         splits = []
         presentations = []
         position = 0
-        for path, expected_rows, shard_split in parquet_sources(source):
-            file = pq.ParquetFile(path)
-            columns = ["fen", "repetition", "presentation", "trace_token_ids"]
-            columns.extend(
-                name for name in ("split",) if name in file.schema_arrow.names
-            )
-            table = file.read(columns=columns, use_threads=False)
-            if len(table) != expected_rows:
-                raise ValueError(f"Shard row count differs from its release: {path}")
-            documents = []
-            for row in table.to_pylist():
-                label = row["split"] if "split" in row else shard_split
-                if label not in SPLIT_CODES:
-                    raise ValueError(f"Unknown dataset split in {path}: {label}")
-                trace = np.asarray(row["trace_token_ids"], dtype=np.uint16)
-                if len(trace) and int(trace.max()) >= vocabulary:
-                    raise ValueError(f"Token id exceeds the vocabulary in {path}")
-                document = np.concatenate(
-                    [
-                        encode_board(row["fen"], row["repetition"]).astype(np.uint16),
-                        trace,
-                    ]
+        with (staging / "tokens.u16").open("wb") as token_file:
+            for path, expected_rows, shard_split in parquet_sources(source):
+                file = pq.ParquetFile(path)
+                columns = ["fen", "repetition", "presentation", "trace_token_ids"]
+                columns.extend(
+                    name for name in ("split",) if name in file.schema_arrow.names
                 )
-                documents.append(document)
-                position += len(document)
-                boundaries.append(position)
-                splits.append(SPLIT_CODES[label])
-                presentations.append(PRESENTATION_CODES[row["presentation"]])
-            if documents:
-                chunks.append(np.concatenate(documents))
-        tokens = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.uint16)
+                rows = 0
+                for batch in file.iter_batches(
+                    batch_size=64, columns=columns, use_threads=False
+                ):
+                    for row in batch.to_pylist():
+                        label = row["split"] if "split" in row else shard_split
+                        if label not in SPLIT_CODES:
+                            raise ValueError(
+                                f"Unknown dataset split in {path}: {label}"
+                            )
+                        trace = np.asarray(row["trace_token_ids"], dtype=np.uint16)
+                        if len(trace) and int(trace.max()) >= vocabulary:
+                            raise ValueError(
+                                f"Token id exceeds the vocabulary in {path}"
+                            )
+                        board = encode_board(row["fen"], row["repetition"]).astype(
+                            np.uint16
+                        )
+                        board.tofile(token_file)
+                        trace.tofile(token_file)
+                        position += len(board) + len(trace)
+                        boundaries.append(position)
+                        splits.append(SPLIT_CODES[label])
+                        presentations.append(PRESENTATION_CODES[row["presentation"]])
+                        rows += 1
+                if rows != expected_rows:
+                    raise ValueError(
+                        f"Shard row count differs from its release: {path}"
+                    )
         offsets = np.asarray(boundaries, dtype=np.int64)
         splits = np.asarray(splits, dtype=np.uint8)
         presentations = np.asarray(presentations, dtype=np.uint8)
 
-        tokens.tofile(staging / "tokens.u16")
         offsets.tofile(staging / "offsets.i64")
         splits.tofile(staging / "split.u8")
         presentations.tofile(staging / "presentation.u8")
@@ -386,9 +379,6 @@ def write_packed(
                 },
             },
         )
-        entries_hash = hashlib.sha256(
-            json.dumps(manifest.get("merge_entries", [])).encode()
-        ).hexdigest()
         write_manifest(
             staging / "packing.json",
             {
@@ -397,20 +387,18 @@ def write_packed(
                 "source_dataset_id": manifest.get("dataset_id"),
                 "grammar_version": TRACE_GRAMMAR_VERSION,
                 "tokenizer_version": CHESS_TOKENIZER_VERSION,
-                "merge_entries_sha256": entries_hash,
+                "merge_entries": dictionary.entries,
                 "vocabulary": vocabulary,
                 "seed": seed,
                 "max_document_tokens": max_document_tokens,
                 "documents": len(boundaries) - 1,
-                "tokens": int(len(tokens)),
-                "tokens_sha256": _sha256(staging / "tokens.u16"),
-                "offsets_sha256": _sha256(staging / "offsets.i64"),
+                "tokens": position,
             },
         )
         packed = PackedDocuments(staging)
         statistics = {
             "documents": len(boundaries) - 1,
-            "tokens": int(len(tokens)),
+            "tokens": position,
             "max_document_tokens": max_document_tokens,
             "dropped_overlong": int((lengths > max_document_tokens).sum()),
             "length": _quantiles(lengths),

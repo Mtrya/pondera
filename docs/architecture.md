@@ -20,7 +20,9 @@ The board tokenizer has one format shared by offline data preparation and runtim
 
 Both policy baselines are fixed-depth causal Transformers over one packed token stream, with NoPE, pre-norm RMSNorm, SiTU-GLU feed-forward networks, and grouped-query attention. The vanilla model uses causal softmax attention. The linear-attention model uses an identity feature map, no decay and unnormalized readout, with fp32 chunk and recurrent states. Model configuration contains dimensions and vocabulary size; the checkpoint's `arch` field selects the implementation.
 
-Packed-trainer checkpoints use `format_version = 1` and retain model and optimizer states, the actual number of presented traces, data and tokenizer identities, training configuration, and the SwanLab run ID. Generation reuses the board encoding, appends a standalone `FINAL`, masks the next-token distribution to legal decisions, and returns the highest-scoring move. The UCI protocol loop is independent of checkpoint loading and move selection; `pondera.inference.vanilla_uci` serves these checkpoints and is the default match engine.
+Packed-trainer checkpoints use `format_version = 2` and retain model and optimizer states, the actual number of presented traces, dataset identity, tokenizer versions and merge entries, selected document indices, training configuration, and the SwanLab run ID. Resume requires the same architecture, model dimensions, dataset, tokenizer, selected documents, sampling seed, and microbatch token budget. Requested learning rates and weight decay override the saved optimizer settings. Local `config.json` and SwanLab share the same configuration, including architecture; `history.jsonl` is the local training history, and resume discards records beyond the loaded checkpoint before appending.
+
+Generation reuses the board encoding, appends a standalone `FINAL`, masks the next-token distribution to legal decisions, and returns the highest-scoring move. The UCI protocol loop is independent of checkpoint loading and move selection; `pondera.inference.vanilla_uci` serves these checkpoints and is the default match engine.
 
 ## Repository hygiene
 
