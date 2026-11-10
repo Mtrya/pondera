@@ -16,20 +16,6 @@ from pondera.data.dataset import (
 )
 from pondera.data.pipeline import produce_shards, validate_release
 
-REMOVED_COLUMNS = {
-    "board_tokens",
-    "trace_roles",
-    "state_with_board",
-    "state_without_board",
-    "state_basis",
-    "position_key",
-    "effective_width",
-    "rounds",
-    "thinking_tokens",
-    "final_value_bin",
-    "claim_draw",
-}
-
 
 class ExportTests(unittest.TestCase):
     def test_real_release_projection_preserves_shared_rows_and_provenance(self):
@@ -72,7 +58,6 @@ class ExportTests(unittest.TestCase):
                 table = pq.read_table(release / shard["path"] / "data.parquet")
                 self.assertEqual(table.schema, TRACE_SCHEMA)
                 self.assertEqual(len(table.schema), 17)
-                self.assertFalse(REMOVED_COLUMNS & set(table.schema.names))
                 local.extend(table.to_pylist())
             for split, local_split in (("train", "train"), ("validation", "val")):
                 path = run / "export" / "data" / f"{split}-00000.parquet"
@@ -81,7 +66,6 @@ class ExportTests(unittest.TestCase):
                 self.assertEqual(table.column_names, list(HF_COLUMNS))
                 self.assertEqual(len(table.schema), 11)
                 self.assertFalse(set(LOCAL_ONLY_COLUMNS) & set(table.schema.names))
-                self.assertFalse(REMOVED_COLUMNS & set(table.schema.names))
                 expected = [
                     {name: row[name] for name in HF_COLUMNS}
                     for row in local

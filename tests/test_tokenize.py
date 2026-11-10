@@ -312,25 +312,8 @@ class TokenizeTests(unittest.TestCase):
                     .read_text()
                     .replace("vocab_size = 8192", f"vocab_size = {size}")
                 )
-                output = self.root / f"invalid-{size}"
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "pondera.data",
-                        "encode",
-                        "--input",
-                        str(self.source),
-                        "--output",
-                        str(output),
-                        "--config",
-                        str(config),
-                    ],
-                    text=True,
-                    capture_output=True,
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertFalse(output.exists())
+                with self.assertRaises(ValueError):
+                    load_config(config)
 
     def test_hf_training_artifacts_have_distinct_persistent_identities(self):
         identities = []

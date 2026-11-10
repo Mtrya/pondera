@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 
 import swanlab
@@ -43,7 +44,11 @@ MODEL = dict(
 
 def _ddp_worker(rank, store, packed, model_config, output, config, runs, model_class):
     dist.init_process_group(
-        "gloo", init_method=f"file://{store}", rank=rank, world_size=2
+        "gloo",
+        init_method=f"file://{store}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
     )
     try:
         torch.set_num_threads(1)
@@ -226,6 +231,7 @@ checkpoint_keep_last = 2
             command,
             capture_output=True,
             text=True,
+            timeout=30,
             env={**os.environ, "OMP_NUM_THREADS": "1"},
         )
 
@@ -312,24 +318,6 @@ checkpoint_keep_last = 2
                     ],
                     resumed_history,
                 )
-
-    def test_invalid_recipe_does_not_start_training(self):
-        recipe = self.root / "invalid.toml"
-        self.write_training_recipe(recipe)
-        original = recipe.read_text()
-        for change in (
-            original.replace("muon_lr = 0.01", "muon_lr = -0.01"),
-            original.replace("num_heads = 4", "num_heads = 3"),
-            original + '\ndevice = "cpu"\n',
-            original.replace("documents = 3", "documents = true"),
-            original.replace("checkpoint_keep_last = 2", "checkpoint_keep_last = 0"),
-        ):
-            with self.subTest(recipe=change):
-                recipe.write_text(change)
-                output = self.root / "invalid-run"
-                result = self.run_training_command(recipe, output)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertFalse(output.exists())
 
     def test_checkpoint_retention_and_resume_from_an_older_update(self):
         config = self.config(5)

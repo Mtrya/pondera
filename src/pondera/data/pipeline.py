@@ -1717,13 +1717,14 @@ def _close_direct_engine():
 
 
 def _direct_worker(index, root):
-    global _DIRECT_ENGINE
-    if _DIRECT_STOPPING.is_set():
-        raise InterruptedError("Curation stopped")
-    # Startup failures abort the run before a root attempt is counted.
-    if _DIRECT_ENGINE is None:
-        _DIRECT_ENGINE = _start_engine(_DIRECT_ENGINE_PATH, _DIRECT_CONFIG)
+    global _DIRECT_ENGINE, _DIRECT_WORKING
     try:
+        _DIRECT_WORKING = True
+        if _DIRECT_STOPPING.is_set():
+            raise InterruptedError("Curation stopped")
+        # Startup failures abort the run before a root attempt is counted.
+        if _DIRECT_ENGINE is None:
+            _DIRECT_ENGINE = _start_engine(_DIRECT_ENGINE_PATH, _DIRECT_CONFIG)
         record = _collect_root(
             root, _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_NAME, _DIRECT_TEACHER
         )
@@ -1731,27 +1732,32 @@ def _direct_worker(index, root):
     except BaseException:
         _close_direct_engine()
         raise
+    finally:
+        _DIRECT_WORKING = False
 
 
 def _interrupt_direct_worker(signum, frame):
-    # The executor catches task exceptions; leave subsequent interruption
-    # disabled while the task unwinds and reaps its engine process.
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    raise InterruptedError("Curation stopped")
+    # Interrupting an idle worker can break the executor's queue receive.
+    # SIGTERM remains available for the executor to terminate a broken pool.
+    if _DIRECT_WORKING:
+        signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+        raise InterruptedError("Curation stopped")
 
 
 def _init_direct_worker(
     config, engine_path, engine_name, teacher, cache, stopping, worker_pids
 ):
     global _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_ENGINE_PATH, _DIRECT_NAME
-    global _DIRECT_TEACHER, _DIRECT_CACHE, _DIRECT_STOPPING
+    global _DIRECT_TEACHER, _DIRECT_CACHE, _DIRECT_STOPPING, _DIRECT_WORKING
     _DIRECT_CONFIG = config
     _DIRECT_ENGINE_PATH = engine_path
     _DIRECT_ENGINE = None
     _DIRECT_CACHE = cache
     _DIRECT_STOPPING = stopping
+    _DIRECT_WORKING = False
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, _interrupt_direct_worker)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGUSR1, _interrupt_direct_worker)
     Finalize(None, _close_direct_engine, exitpriority=10)
     _DIRECT_NAME = engine_name
     _DIRECT_TEACHER = teacher
@@ -1904,7 +1910,7 @@ def _synthesize_groups(
         for pid in pids:
             if pid:
                 try:
-                    os.kill(pid, signal.SIGTERM)
+                    os.kill(pid, signal.SIGUSR1)
                 except ProcessLookupError:
                     pass
         raise

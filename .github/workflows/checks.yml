@@ -2,14 +2,20 @@ name: Checks
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       OMP_NUM_THREADS: "1"
     steps:
@@ -22,7 +28,7 @@ jobs:
         run: |
           uv venv
           uv export --frozen --all-extras --group dev --no-hashes --no-emit-project > /tmp/requirements.txt
-          uv pip install --torch-backend cpu -c /tmp/requirements.txt -e '.[training]' --group dev
+          uv pip install --torch-backend cpu -c /tmp/requirements.txt -e . --group dev
       - name: Install Stockfish
         run: |
           sudo apt-get update
@@ -45,6 +51,7 @@ jobs:
         run: |
           command -v stockfish
           fastchess --version
-          uv run --no-sync python -m unittest discover -s tests -v
+          ulimit -c 0
+          timeout --signal=ABRT --kill-after=10s 5m uv run --no-sync python -X faulthandler -m unittest discover -s tests -v
       - name: Build distributions
         run: uv build
