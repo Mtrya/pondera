@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from pondera.chess.codec import encode_board
+from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import FINAL, MOVE, UCI_MOVE_TO_IDX
 from pondera.models.linear import LinearVanillaModel
 from pondera.models.vanilla import VanillaModel
@@ -42,14 +43,15 @@ def choose_move(model, fen, repetition=1, legal_moves=None):
     cu_seqlens = torch.tensor([0, prefill.numel()], dtype=torch.int32, device=device)
     logits, _ = model.forward_cached(prefill, cu_seqlens)
     scores = logits[-1].float()
+    position = chess.Board(fen)
     if legal_moves is None:
-        legal_moves = [move.uci() for move in chess.Board(fen).legal_moves]
+        legal_moves = [move.uci() for move in position.legal_moves]
     candidates = [
-        (MOVE + UCI_MOVE_TO_IDX[uci], uci)
+        (MOVE + UCI_MOVE_TO_IDX[reflect_uci(uci) if not position.turn else uci], uci)
         for uci in legal_moves
         if uci in UCI_MOVE_TO_IDX
     ]
     if not candidates:
         raise ValueError("No legal move has a vocabulary token")
-    token, uci = max(candidates, key=lambda pair: float(scores[pair[0]]))
-    return uci
+    tokens = torch.tensor([token for token, _ in candidates], device=device)
+    return candidates[int(scores[tokens].argmax())][1]

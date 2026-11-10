@@ -64,7 +64,11 @@ class EvaluationTests(unittest.TestCase):
                     "--checkpoint",
                     str(checkpoint),
                 ],
-                input="uci\nisready\nposition startpos moves e2e4\ngo\nquit\n",
+                input=(
+                    "uci\nisready\nposition startpos moves e2e4\ngo\n"
+                    "position fen 7k/6Q1/6K1/8/8/8/8/8 b - - 0 1\ngo\nisready\n"
+                    "position fen 7k/5Q2/6K1/8/8/8/8/8 b - - 0 1\ngo\nisready\nquit\n"
+                ),
                 text=True,
                 capture_output=True,
                 check=True,
@@ -74,12 +78,12 @@ class EvaluationTests(unittest.TestCase):
             lines = process.stdout.splitlines()
             self.assertIn("uciok", lines)
             self.assertIn("readyok", lines)
-            best = next(
-                line.split()[1] for line in lines if line.startswith("bestmove ")
-            )
+            best = [line.split()[1] for line in lines if line.startswith("bestmove ")]
             board = chess.Board()
             board.push_uci("e2e4")
-            self.assertIn(chess.Move.from_uci(best), board.legal_moves)
+            self.assertIn(chess.Move.from_uci(best[0]), board.legal_moves)
+            self.assertEqual(best[1:], ["0000", "0000"])
+            self.assertEqual(lines.count("readyok"), 3)
             self.assertTrue(
                 all(
                     line.startswith(("id ", "uciok", "readyok", "bestmove "))

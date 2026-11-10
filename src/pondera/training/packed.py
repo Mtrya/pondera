@@ -14,6 +14,7 @@ import importlib
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from pondera.data.packing import (
     assemble_batch,
     load_subsets,
     pack_batches,
-    packed_batches,
+    packed_batch_indices,
     presentation_batch_count,
 )
 from pondera.training.muon import build_optimizers
@@ -87,11 +88,13 @@ def _reduce(value, device, op=dist.ReduceOp.SUM):
 
 
 def _move(batch, device):
-    dtypes = {"input_ids": torch.long, "labels": torch.long, "cu_seqlens": torch.int32}
     return {
-        key: torch.as_tensor(value, dtype=dtypes[key], device=device)
-        for key, value in batch.items()
-        if key in dtypes
+        "input_ids": torch.as_tensor(
+            batch["input_ids"], dtype=torch.long, device=device
+        ),
+        "labels": torch.as_tensor(batch["labels"], dtype=torch.long, device=device),
+        "cu_seqlens": batch["cu_seqlens"].tolist(),
+        "labeled_tokens": batch["tokens"] - batch["documents"],
     }
 
 
@@ -110,11 +113,11 @@ def _loss(model, batch):
         # An idle rank participates in DDP with zero gradient and no presented tokens.
         moved = {
             "input_ids": batch["input_ids"].new_zeros(1),
-            "cu_seqlens": batch["cu_seqlens"].new_tensor([0, 1]),
+            "cu_seqlens": [0, 1],
         }
         return _forward(model, moved).float().sum() * 0.0, 0
     logits = _forward(model, batch)
-    labeled = int((batch["labels"] != -100).sum())
+    labeled = batch["labeled_tokens"]
     loss = F.cross_entropy(
         logits.float().view(-1, logits.shape[-1]),
         batch["labels"].view(-1),
@@ -288,14 +291,12 @@ def train(
     history_log = (
         _open_history(output_dir / "history.jsonl", update) if rank == 0 else None
     )
-    batch_stream = packed_batches(
+    batch_stream = packed_batch_indices(
         documents,
         indices,
         config.seed,
         config.microbatch_tokens,
-        start_step=micro_step + rank,
-        rank=rank,
-        world_size=world_size,
+        start_step=micro_step,
         presentations=config.presentations if final_step is not None else None,
     )
     started = time.monotonic()
@@ -310,37 +311,37 @@ def train(
         while total_tokens < config.update_tokens and (
             final_step is None or micro_step < final_step
         ):
-            batch = (
-                assemble_batch(documents, [])
-                if final_step is not None and micro_step + rank >= final_step
-                else next(batch_stream)
-            )
-            labeled = int((batch["labels"] != -100).sum())
-            step_tokens, step_labeled, step_documents = _reduce(
-                [batch["tokens"], labeled, batch["documents"]], device
-            )
-            total_tokens += step_tokens
-            total_labeled += step_labeled
-            presented_documents += step_documents
-            micro_step += (
-                world_size
-                if final_step is None
-                else min(world_size, final_step - micro_step)
-            )
-            batches.append((batch, labeled))
-            last_epoch = batch.get("epoch", 0)
+            local_indices = []
+            for batch_rank in range(world_size):
+                if final_step is not None and micro_step >= final_step:
+                    break
+                document_indices, last_epoch = next(batch_stream)
+                tokens = int(documents.lengths[document_indices].sum())
+                total_tokens += tokens
+                total_labeled += tokens - len(document_indices)
+                presented_documents += len(document_indices)
+                micro_step += 1
+                if batch_rank == rank:
+                    local_indices = document_indices
+            batch = assemble_batch(documents, local_indices)
+            batches.append((batch, batch["tokens"] - batch["documents"]))
         for optimizer in optimizers:
             optimizer.zero_grad()
-        update_loss = 0.0
-        for batch, labeled in batches:
+        update_loss = torch.zeros((), device=device)
+        for index, (batch, labeled) in enumerate(batches):
             moved = _move(batch, device)
-            loss, _ = _loss(model, moved)
-            (loss * (labeled * world_size / total_labeled)).backward()
-            update_loss += float(loss.detach()) * labeled
-        update_loss = _reduce(update_loss, device) / total_labeled
-        last_epoch = _reduce(last_epoch, device, op=dist.ReduceOp.MAX)
+            context = (
+                model.no_sync()
+                if world_size > 1 and index + 1 < len(batches)
+                else nullcontext()
+            )
+            with context:
+                loss, _ = _loss(model, moved)
+                (loss * (labeled * world_size / total_labeled)).backward()
+            update_loss += loss.detach() * labeled
         for optimizer in optimizers:
             optimizer.step()
+        update_loss = float(_reduce(update_loss, device)) / total_labeled
         if device.type in {"cuda", "npu"}:
             if device.type == "cuda":
                 torch.cuda.synchronize(device)

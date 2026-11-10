@@ -514,6 +514,7 @@ class TrainerTests(unittest.TestCase):
 
     def test_distributed_matches_single_process_and_resume(self):
         config = self.config(2)
+        config.update_tokens *= 2
         config.val_every = 1
         reference = train(
             self.make_model(),

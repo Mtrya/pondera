@@ -208,7 +208,7 @@ def presentation_batch_count(documents, indices, seed, budget, presentations):
     )
 
 
-def packed_batches(
+def packed_batch_indices(
     documents,
     indices,
     seed,
@@ -218,7 +218,7 @@ def packed_batches(
     world_size=1,
     presentations=None,
 ):
-    """Yield one rank's view of the global sequence, planning each epoch once.
+    """Yield (document indices, epoch) without reading tokens.
 
     A fractional final presentation takes a prefix of that epoch's shuffled
     documents, rounded down to a whole document, rather than splitting a batch.
@@ -238,10 +238,27 @@ def packed_batches(
             epoch += 1
             continue
         while step < len(batches):
-            yield assemble_batch(documents, batches[step], epoch=epoch)
+            yield batches[step], epoch
             step += world_size
         step -= len(batches)
         epoch += 1
+
+
+def packed_batches(
+    documents,
+    indices,
+    seed,
+    budget,
+    start_step=0,
+    rank=0,
+    world_size=1,
+    presentations=None,
+):
+    """Materialize one rank's batches from the deterministic index sequence."""
+    for batch, epoch in packed_batch_indices(
+        documents, indices, seed, budget, start_step, rank, world_size, presentations
+    ):
+        yield assemble_batch(documents, batch, epoch=epoch)
 
 
 def packed_batch(documents, indices, seed, budget, step):

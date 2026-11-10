@@ -289,6 +289,53 @@ class TokenizeTests(unittest.TestCase):
             merge_and_encode(self.source, output, config)
         self.assertFalse(output.exists())
 
+    def test_fit_checkpoint_rejects_a_different_source_or_release(self):
+        from dataclasses import replace
+
+        config = replace(load_config().merge, vocab_size=CHESS_VOCAB_SIZE)
+        output = self.root / "source-checkpoint"
+        merge_and_encode(self.source, output, config)
+        shutil.rmtree(output)
+        other = self.root / "other-source"
+        shutil.copytree(self.source, other)
+        with self.assertRaises(ValueError):
+            merge_and_encode(other, output, config)
+        manifest = load_manifest(self.source / "release.json")
+        manifest["dataset_id"] = "replacement-dataset"
+        write_manifest(self.source / "release.json", manifest)
+        with self.assertRaises(ValueError):
+            merge_and_encode(self.source, output, config)
+        self.assertFalse(output.exists())
+
+    def test_encode_rejects_vocabulary_budgets_outside_packed_range(self):
+        for size in (CHESS_VOCAB_SIZE - 1, 65536):
+            with self.subTest(size=size):
+                config = self.root / "invalid-vocabulary.toml"
+                config.write_text(
+                    Path("configs/data.toml")
+                    .read_text()
+                    .replace("vocab_size = 8192", f"vocab_size = {size}")
+                )
+                output = self.root / f"invalid-{size}"
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pondera.data",
+                        "encode",
+                        "--input",
+                        str(self.source),
+                        "--output",
+                        str(output),
+                        "--config",
+                        str(config),
+                    ],
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+
     def test_hf_training_artifacts_have_distinct_persistent_identities(self):
         identities = []
         for index, row in enumerate(self.original[:2]):

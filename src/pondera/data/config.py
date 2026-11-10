@@ -7,6 +7,8 @@ import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
+
 DEFAULT_CONFIG_PATH = Path("configs/data.toml")
 PRESENTATION_NAMES = ("zero", "full", "random")
 
@@ -395,8 +397,11 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     holdout = _probability("merge", "holdout_fraction", merge["holdout_fraction"])
     if holdout == 1:
         raise ValueError("[merge] holdout_fraction must be less than one")
+    vocab_size = _integer("merge", "vocab_size", merge["vocab_size"], CHESS_VOCAB_SIZE)
+    if vocab_size > 65535:
+        raise ValueError("[merge] vocab_size must fit the uint16 packed layout")
     merge = MergeConfig(
-        _integer("merge", "vocab_size", merge["vocab_size"], 1),
+        vocab_size,
         fit_split,
         holdout,
         _integer("merge", "max_roots", merge["max_roots"], 1)

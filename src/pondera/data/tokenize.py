@@ -85,14 +85,19 @@ def _fitted_dictionary(checkpoint, source, vocab_size, settings, options):
     Fitting costs hours at production scale while encoding can fail on
     transient storage or memory errors, so the fitted dictionary and its
     profile document persist next to the output before encoding starts. A
-    checkpoint authorizes skipping the fit only when every fitting-relevant
-    setting matches; worker counts and the encoding batch size do not change
-    fit results.
+    checkpoint authorizes skipping the fit only when its source and every
+    fitting-relevant setting match; worker counts and the encoding batch size
+    do not change fit results.
     """
     fitting = {
         key: value
         for key, value in settings.items()
         if key not in {"batch_size", "workers"}
+    }
+    source = Path(source).resolve()
+    fitting["source"] = {
+        "path": str(source),
+        "manifest": load_manifest(source / "release.json") if source.is_dir() else None,
     }
     if checkpoint.exists():
         record = json.loads(checkpoint.read_text())

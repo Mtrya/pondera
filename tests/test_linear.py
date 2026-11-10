@@ -78,6 +78,35 @@ class LinearAttentionTests(unittest.TestCase):
         for gradient, reference in zip(actual, expected):
             torch.testing.assert_close(gradient, reference, rtol=1e-4, atol=1e-4)
 
+    def test_batched_documents_match_recurrence_and_gradients(self):
+        lengths = [1, 63, 64, 65, 129, 17]
+        cu = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32
+        )
+        devices = ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)
+        for device in devices:
+            with self.subTest(device=device):
+                q = torch.randn(sum(lengths), 4, 8, device=device, requires_grad=True)
+                k = torch.randn(sum(lengths), 2, 8, device=device, requires_grad=True)
+                v = torch.randn(sum(lengths), 2, 5, device=device, requires_grad=True)
+                out = linear_varlen_attention(q, k, v, cu)
+                expected = torch.cat(
+                    [
+                        linear_recurrent(
+                            q[start:stop],
+                            k[start:stop].repeat_interleave(2, dim=1),
+                            v[start:stop].repeat_interleave(2, dim=1),
+                        )[0]
+                        for start, stop in zip(cu[:-1].tolist(), cu[1:].tolist())
+                    ]
+                )
+                torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+                weight = torch.randn_like(out)
+                actual_gradients = torch.autograd.grad(out, (q, k, v), weight)
+                expected_gradients = torch.autograd.grad(expected, (q, k, v), weight)
+                for actual, reference in zip(actual_gradients, expected_gradients):
+                    torch.testing.assert_close(actual, reference, rtol=1e-4, atol=1e-4)
+
     def test_state_is_zeroed_at_document_boundaries(self):
         cu = torch.tensor([0, 7, 19], dtype=torch.int32)
         packed = linear_varlen_attention(self.q, self.k, self.v, cu)

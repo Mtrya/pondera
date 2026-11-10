@@ -2,13 +2,15 @@
 
 import argparse
 
+from pondera.chess.tracker import repetition_count
 from pondera.inference.uci import serve
 from pondera.inference.vanilla import choose_move, load_vanilla_checkpoint
 
 
 def pick(model, board, device):
-    repetition = 2 if board.is_repetition() else 1
-    return choose_move(model, board.fen(), repetition=repetition)
+    if board.is_game_over():
+        return "0000"
+    return choose_move(model, board.fen(), repetition=repetition_count(board))
 
 
 def main():

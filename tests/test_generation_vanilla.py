@@ -7,9 +7,10 @@ from pathlib import Path
 import chess
 import torch
 
-from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, MOVE, REPETITION, UCI_MOVE_TO_IDX
 from pondera.evaluation.puzzles import evaluate_puzzles, solve_puzzle
 from pondera.inference.vanilla import choose_move
+from pondera.inference.vanilla_uci import pick
 from pondera.models.vanilla import VanillaModel
 
 FIXTURES = Path(__file__).parent / "fixtures" / "lichess_puzzles" / "rows.jsonl"
@@ -41,6 +42,38 @@ class GenerationTests(unittest.TestCase):
     def test_legal_move_mask_drives_the_choice(self):
         fen = chess.Board().fen()
         self.assertEqual(choose_move(self.model, fen, legal_moves=["e2e4"]), "e2e4")
+
+    def test_black_decisions_use_the_root_players_move_frame(self):
+        with torch.no_grad():
+            for parameter in self.model.parameters():
+                if parameter.ndim == 2:
+                    parameter.zero_()
+            self.model.token_embedding.weight.fill_(1)
+            self.model.head.weight[MOVE + UCI_MOVE_TO_IDX["e2e4"]].fill_(1)
+        # Zero projections leave unit embeddings; only e2e4 has a positive logit.
+        for turn, candidates, expected in (
+            ("w", ["a2a3", "e2e4"], "e2e4"),
+            ("b", ["a7a6", "e7e5"], "e7e5"),
+        ):
+            fen = f"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR {turn} KQkq - 0 1"
+            self.assertEqual(
+                choose_move(self.model, fen, legal_moves=candidates), expected
+            )
+
+    def test_uci_move_history_reaches_the_repetition_atom(self):
+        inputs = []
+        handle = self.model.token_embedding.register_forward_pre_hook(
+            lambda module, args: inputs.append(args[0].tolist())
+        )
+        self.addCleanup(handle.remove)
+        board = chess.Board()
+        for count in range(1, 5):
+            self.assertIn(
+                chess.Move.from_uci(pick(self.model, board, "cpu")), board.legal_moves
+            )
+            self.assertEqual(inputs[-1][-2], REPETITION + count - 1)
+            for move in ("g1f3", "g8f6", "f3g1", "f6g8"):
+                board.push_uci(move)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_choose_move_uses_the_model_device(self):

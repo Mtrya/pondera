@@ -44,7 +44,7 @@ def eager_varlen_attention(q, k, v, cu_seqlens, is_causal=True):
     return torch.cat(outputs) if outputs else q.new_empty(0, *q.shape[1:])
 
 
-def varlen_attention(q, k, v, cu_seqlens, is_causal=True):
+def varlen_attention(q, k, v, cu_seqlens, is_causal=True, max_seqlen=None):
     """Causal GQA over packed documents: [T, H, D] × [T, H_kv, D]² → [T, H, D].
 
     CUDA half-precision uses the fused varlen flash kernel; everything else
@@ -53,18 +53,23 @@ def varlen_attention(q, k, v, cu_seqlens, is_causal=True):
     a single query already sees its whole past, so no causal mask applies.
     """
     if is_causal and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
-        max_q = max_k = int(
-            (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-            if len(cu_seqlens) > 1
-            else 0
-        )
+        if max_seqlen is None:
+            max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
         return torch.ops.aten._flash_attention_forward(
-            q, k, v, cu_seqlens, cu_seqlens, max_q, max_k, 0.0, True, False
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, True, False
         )[0]
     return eager_varlen_attention(q, k, v, cu_seqlens, is_causal)
 
 
 class CausalSelfAttention(nn.Module):
+    @staticmethod
+    def prepare(cu_seqlens, device):
+        """Compute shared sequence metadata on the host once per forward."""
+        cu = torch.as_tensor(cu_seqlens, dtype=torch.int32, device="cpu")
+        lengths = cu[1:] - cu[:-1]
+        maximum = int(lengths.max()) if lengths.numel() else 0
+        return cu.to(device, non_blocking=True), maximum
+
     def __init__(self, hidden_size, num_heads, num_kv_heads):
         super().__init__()
         if hidden_size % num_heads or num_heads % num_kv_heads:
@@ -85,9 +90,12 @@ class CausalSelfAttention(nn.Module):
             self.v(x).view(shape),
         )
 
-    def forward(self, x, cu_seqlens):
+    def forward(self, x, prepared):
+        cu_seqlens, maximum = prepared
         q, k, v = self._project(x)
-        return self.o(varlen_attention(q, k, v, cu_seqlens).reshape(x.shape))
+        return self.o(
+            varlen_attention(q, k, v, cu_seqlens, max_seqlen=maximum).reshape(x.shape)
+        )
 
     def forward_cached(self, x, cu_seqlens, cache=None):
         """One full sequence or an incremental step; cache is per-layer (k, v)."""
@@ -124,8 +132,8 @@ class Block(nn.Module):
     def _ffn(self, x):
         return self.down(situ_glu(self.gate(x), self.up(x)))
 
-    def forward(self, x, cu_seqlens):
-        x = x + self.attention(self.norm_attention(x), cu_seqlens)
+    def forward(self, x, prepared):
+        x = x + self.attention(self.norm_attention(x), prepared)
         return x + self._ffn(self.norm_ffn(x))
 
     def forward_cached(self, x, cu_seqlens, cache=None):
@@ -169,9 +177,11 @@ class VanillaModel(nn.Module):
         self.head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def forward(self, input_ids, cu_seqlens):
+        attention_cls = self.attention_cls or CausalSelfAttention
+        prepared = attention_cls.prepare(cu_seqlens, input_ids.device)
         x = self.token_embedding(input_ids)
         for block in self.blocks:
-            x = block(x, cu_seqlens)
+            x = block(x, prepared)
         return self.head(self.norm(x))
 
     def forward_cached(self, input_ids, cu_seqlens, caches=None):
