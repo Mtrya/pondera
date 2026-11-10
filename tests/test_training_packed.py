@@ -178,6 +178,13 @@ class TrainerTests(unittest.TestCase):
         self.assertIn("val_loss", result["history"][-1])
         self.assertIn("val_move_accuracy", result["history"][-1])
         self.assertEqual(result["history"][-1]["val_zero_documents"], 1)
+        streamed = [
+            json.loads(line)
+            for line in (self.root / "train-out" / "history.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        self.assertEqual(streamed, result["history"])
 
     def test_resume_replays_the_same_losses(self):
         full = self.make_model()
@@ -211,6 +218,12 @@ class TrainerTests(unittest.TestCase):
         self.assertEqual(len(actual), len(expected))
         for a, b in zip(actual, expected):
             self.assertAlmostEqual(a, b, places=5)
+        streamed = [
+            json.loads(line)["loss"]
+            for name in ("partial", "resumed")
+            for line in (self.root / name / "history.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(streamed, actual)
 
     def test_distributed_matches_single_process_and_resume(self):
         config = self.config(2)

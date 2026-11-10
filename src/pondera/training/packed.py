@@ -271,6 +271,13 @@ def train(
             + "\n"
         )
     history = []
+    history_log = (
+        (output_dir / "history.jsonl").open(
+            "a" if resume is not None else "w", buffering=1
+        )
+        if rank == 0
+        else None
+    )
     batch_stream = packed_batches(
         documents,
         indices,
@@ -328,6 +335,9 @@ def train(
         history.append(record)
         if tracker is not None:
             tracker.log(record, step=update)
+        if history_log is not None:
+            history_log.write(json.dumps(record) + "\n")
+            print(json.dumps(record), flush=True)
         if (
             rank == 0
             and config.checkpoint_every
@@ -344,6 +354,7 @@ def train(
                 documents.manifest,
             )
     if rank == 0:
+        history_log.close()
         (output_dir / "history.json").write_text(json.dumps(history, indent=2) + "\n")
         save_training_checkpoint(
             output_dir / "checkpoint.pth",
