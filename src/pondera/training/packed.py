@@ -46,7 +46,7 @@ class TrainConfig:
     val_every: int = 10
     checkpoint_every: int = 50
     seed: int = 640
-    track: bool = False
+    track: bool = True
 
 
 def _module(model):
@@ -144,6 +144,7 @@ def save_training_checkpoint(
     presented_documents,
     config,
     manifest,
+    swanlab_run_id=None,
 ):
     model = _module(model)
     payload = {
@@ -155,6 +156,7 @@ def save_training_checkpoint(
         "micro_step": micro_step,
         "update": update,
         "presented_documents": presented_documents,
+        "swanlab_run_id": swanlab_run_id,
         "train_config": asdict(config),
         "data_identity": manifest.get("source", {}),
         "tokenizer_identity": manifest.get("vocabulary", {}),
@@ -201,6 +203,7 @@ def train(
                 group["lr"] = learning_rate
         micro_step, update = state["micro_step"], state["update"]
         presented_documents = state["presented_documents"]
+    swanlab_run_id = state.get("swanlab_run_id") if resume is not None else None
     final_step = (
         presentation_batch_count(
             documents,
@@ -226,11 +229,30 @@ def train(
     if rank == 0 and config.track:
         import swanlab
 
+        logdir = output_dir / "swanlog"
+        logdir.mkdir(exist_ok=True)
         tracker = swanlab.init(
             project="pondera-model-arch",
-            config={"subset": subset, "model": model_config, **asdict(config)},
+            experiment_name=output_dir.name,
+            config={
+                "subset": subset,
+                "model": model_config,
+                "train": asdict(config),
+                "data": {
+                    key: documents.manifest[key]
+                    for key in (
+                        "source_dataset_id",
+                        "tokens_sha256",
+                        "offsets_sha256",
+                        "merge_entries_sha256",
+                    )
+                },
+            },
+            logdir=logdir,
+            id=swanlab_run_id,
             resume="allow",
         )
+        swanlab_run_id = tracker.public.run_id
     if rank == 0:
         (output_dir / "config.json").write_text(
             json.dumps(
@@ -261,6 +283,7 @@ def train(
     while (config.updates is not None and update < config.updates) or (
         final_step is not None and micro_step < final_step
     ):
+        update_started = time.monotonic()
         batches = []
         total_labeled = 0
         total_tokens = 0
@@ -291,6 +314,12 @@ def train(
         last_epoch = _reduce(last_epoch, device, op=dist.ReduceOp.MAX)
         for optimizer in optimizers:
             optimizer.step()
+        if device.type in {"cuda", "npu"}:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            else:
+                torch.npu.synchronize(device)
+        update_seconds = time.monotonic() - update_started
         update += 1
         record = {
             "update": update,
@@ -300,6 +329,8 @@ def train(
             "labeled_tokens": total_labeled,
             "presentations": presented_documents / len(indices),
             "epoch": last_epoch,
+            "update_seconds": update_seconds,
+            "tokens_per_second": total_tokens / update_seconds,
         }
         if config.val_every and (
             update % config.val_every == 0 or micro_step == final_step
@@ -328,6 +359,7 @@ def train(
                 presented_documents,
                 config,
                 documents.manifest,
+                swanlab_run_id=swanlab_run_id,
             )
     if rank == 0:
         history_log.close()
@@ -342,6 +374,7 @@ def train(
             presented_documents,
             config,
             documents.manifest,
+            swanlab_run_id=swanlab_run_id,
         )
     if tracker is not None:
         tracker.finish()
@@ -383,7 +416,9 @@ def main():
         default = getattr(TrainConfig, field)
         if isinstance(default, bool):
             parser.add_argument(
-                f"--{field.replace('_', '-')}", action="store_true", default=default
+                f"--{field.replace('_', '-')}",
+                action=argparse.BooleanOptionalAction,
+                default=default,
             )
         else:
             parser.add_argument(

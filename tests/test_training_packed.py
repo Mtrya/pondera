@@ -1,12 +1,15 @@
 """Trainer smoke: loss decreases, resume replays the same loss sequence."""
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
+import swanlab
 import torch
 import torch.distributed as dist
+from swanlab.toolkit.callback import SwanKitCallback
 from test_release import CASES, build_run
 
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
@@ -164,6 +167,7 @@ class TrainerTests(unittest.TestCase):
             updates=updates,
             val_every=2,
             checkpoint_every=updates,
+            track=False,
         )
 
     def test_loss_decreases(self):
@@ -186,6 +190,45 @@ class TrainerTests(unittest.TestCase):
             .splitlines()
         ]
         self.assertEqual(streamed, result["history"])
+
+    def test_swanlab_offline_tracking(self):
+        events = []
+
+        class Recorder(SwanKitCallback):
+            def __str__(self):
+                return "training-event-recorder"
+
+            def on_log(self, data, step, *args, **kwargs):
+                events.append((data.copy(), step))
+
+        config = self.config(2)
+        config.track = True
+        previous_mode = os.environ.get("SWANLAB_MODE")
+        os.environ["SWANLAB_MODE"] = "offline"
+        output = self.root / "tracked"
+        try:
+            swanlab.register_callbacks([Recorder()])
+            result = train(
+                self.make_model(),
+                self.model_config,
+                self.root / "packed",
+                "50k",
+                config,
+                output,
+            )
+        finally:
+            if previous_mode is None:
+                os.environ.pop("SWANLAB_MODE", None)
+            else:
+                os.environ["SWANLAB_MODE"] = previous_mode
+        self.assertEqual([step for _, step in events], [1, 2])
+        self.assertEqual([data for data, _ in events], result["history"])
+        state = torch.load(output / "checkpoint.pth", weights_only=True)
+        self.assertIsInstance(state["swanlab_run_id"], str)
+        self.assertTrue(state["swanlab_run_id"])
+        artifacts = list((output / "swanlog").glob("run-*/backup.swanlab"))
+        self.assertTrue(artifacts)
+        self.assertGreater(artifacts[0].stat().st_size, 0)
 
     def check_resume_replays_the_same_losses(self, device):
         reference = train(
