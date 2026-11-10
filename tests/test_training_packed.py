@@ -204,6 +204,36 @@ class TrainerTests(unittest.TestCase):
     def test_cuda_resume_replays_the_same_losses(self):
         self.check_resume_replays_the_same_losses("cuda")
 
+    def test_resume_uses_requested_learning_rates(self):
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            self.config(1),
+            self.root / "lr-partial",
+        )
+        config = self.config(2)
+        config.muon_lr = 0.01
+        config.adamw_lr = 0.00015
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            config,
+            self.root / "lr-resumed",
+            resume=self.root / "lr-partial" / "checkpoint.pth",
+        )
+        state = torch.load(
+            self.root / "lr-resumed" / "checkpoint.pth", weights_only=True
+        )
+        rates = [
+            [group["lr"] for group in optimizer["param_groups"]]
+            for optimizer in state["optimizer_state_dicts"]
+        ]
+        self.assertEqual(rates, [[0.01], [0.00015]])
+
     def test_distributed_matches_single_process_and_resume(self):
         config = self.config(2)
         config.val_every = 1

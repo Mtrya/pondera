@@ -184,7 +184,10 @@ def train(
         state = torch.load(resume, map_location=device, weights_only=True)
         model.load_state_dict(state["model_state_dict"])
         for optimizer, saved in zip(optimizers, state["optimizer_state_dicts"]):
+            learning_rates = [group["lr"] for group in optimizer.param_groups]
             optimizer.load_state_dict(saved)
+            for group, learning_rate in zip(optimizer.param_groups, learning_rates):
+                group["lr"] = learning_rate
         micro_step, update = state["micro_step"], state["update"]
     if world_size > 1:
         distributed_args = (
