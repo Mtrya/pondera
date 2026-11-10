@@ -172,6 +172,7 @@ def train(
         dist.barrier()
     documents = PackedDocuments(packed_dir)
     indices = load_subsets(packed_dir)[subset]
+    model.to(device)
     optimizers = build_optimizers(
         model,
         muon_lr=config.muon_lr,
@@ -185,7 +186,6 @@ def train(
         for optimizer, saved in zip(optimizers, state["optimizer_state_dicts"]):
             optimizer.load_state_dict(saved)
         micro_step, update = state["micro_step"], state["update"]
-    model.to(device)
     if world_size > 1:
         distributed_args = (
             {} if device.type == "cpu" else {"device_ids": [device.index]}

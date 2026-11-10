@@ -156,8 +156,7 @@ class TrainerTests(unittest.TestCase):
         ]
         self.assertEqual(streamed, result["history"])
 
-    def test_resume_replays_the_same_losses(self):
-        full = self.make_model()
+    def check_resume_replays_the_same_losses(self, device):
         reference = train(
             self.make_model(),
             self.model_config,
@@ -165,23 +164,26 @@ class TrainerTests(unittest.TestCase):
             "50k",
             self.config(4),
             self.root / "full",
+            device=device,
         )
         partial = train(
-            full,
+            self.make_model(),
             self.model_config,
             self.root / "packed",
             "50k",
             self.config(2),
             self.root / "partial",
+            device=device,
         )
         resumed = train(
-            full,
+            self.make_model(),
             self.model_config,
             self.root / "packed",
             "50k",
             self.config(4),
             self.root / "resumed",
             resume=self.root / "partial" / "checkpoint.pth",
+            device=device,
         )
         expected = [record["loss"] for record in reference["history"]]
         actual = [record["loss"] for record in partial["history"] + resumed["history"]]
@@ -194,6 +196,13 @@ class TrainerTests(unittest.TestCase):
             for line in (self.root / name / "history.jsonl").read_text().splitlines()
         ]
         self.assertEqual(streamed, actual)
+
+    def test_resume_replays_the_same_losses(self):
+        self.check_resume_replays_the_same_losses("cpu")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA resume requires a GPU")
+    def test_cuda_resume_replays_the_same_losses(self):
+        self.check_resume_replays_the_same_losses("cuda")
 
     def test_distributed_matches_single_process_and_resume(self):
         config = self.config(2)
