@@ -1,8 +1,6 @@
-"""Ragged Parquet trace storage shared by HF and local training readers."""
+"""Ragged Parquet trace storage shared by HF and local dataset pipelines."""
 
 import json
-from bisect import bisect_right
-from collections import OrderedDict
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,13 +8,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from pondera.chess.codec import encode_board
-from pondera.chess.merge import MergeDictionary
-from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
-from pondera.data.trace import TRACE_GRAMMAR_VERSION
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
 
-DATA_FORMAT_VERSION = 11
-TRACE_ARRAYS = ("trace_token_ids", "trace_len")
+DATA_FORMAT_VERSION = 12
+TRACE_ARRAYS = ("trace_atom_ids", "trace_atom_count")
 STATE_ARRAYS = ("state_best", "state_value")
 DATA_ARRAYS = (*TRACE_ARRAYS, *STATE_ARRAYS, "state_count")
 HF_SCHEMA = pa.schema(
@@ -38,8 +33,8 @@ LOCAL_ONLY_SCHEMA = pa.schema(
     [
         ("root_id", pa.string()),
         ("split", pa.string()),
-        ("trace_token_ids", pa.list_(pa.int32())),
-        ("trace_len", pa.int32()),
+        ("trace_atom_ids", pa.list_(pa.int32())),
+        ("trace_atom_count", pa.int32()),
         ("state_best", pa.list_(pa.int32())),
         ("state_value", pa.list_(pa.int32())),
     ]
@@ -158,7 +153,7 @@ class RaggedArray:
 def _arrays_from_table(table, names):
     result = {}
     for name in names:
-        if name == "trace_len":
+        if name == "trace_atom_count":
             result[name] = table[name].to_numpy()
             continue
         column = "state_best" if name == "state_count" else name
@@ -189,10 +184,14 @@ def validate_trace_arrays(arrays, rows=None):
             raise ValueError(f"Trace array {name} has a different row count")
         if array.dtype != np.int32:
             raise ValueError(f"Trace array {name} has an unexpected dtype")
-    trace = arrays.get("trace_token_ids")
+    trace = arrays.get("trace_atom_ids")
     if trace is not None and np.any(trace.lengths < 1):
         raise ValueError("Trace rows cannot be empty")
-    lengths = arrays.get("trace_len")
+    if trace is not None and np.any(
+        (trace.values < 0) | (trace.values >= CHESS_VOCAB_SIZE)
+    ):
+        raise ValueError("Local trace arrays must contain base atom IDs")
+    lengths = arrays.get("trace_atom_count")
     if (
         lengths is not None
         and trace is not None
@@ -208,102 +207,3 @@ def validate_trace_arrays(arrays, rows=None):
             and not np.array_equal(array.lengths, best.lengths)
         ):
             raise ValueError(f"Truncation-state array {name} has inconsistent lengths")
-
-
-def trace_data_identity(directory):
-    """The published dataset identity, generation settings, and encoding."""
-    manifest = load_manifest(Path(directory) / "release.json")
-    identity = {
-        name: manifest.get(name)
-        for name in (
-            "format_version",
-            "grammar_version",
-            "tokenizer_version",
-            "dataset_id",
-            "metadata",
-            "shards",
-        )
-    }
-    identity["merge_entries"] = MergeDictionary(
-        manifest.get("merge_entries", ())
-    ).entries
-    return identity
-
-
-class TracePositions:
-    """Read the selected trace encoding and derive only its initial board."""
-
-    CACHE_GROUPS = 8
-
-    def __init__(self, directory, split):
-        if split not in {"train", "val"}:
-            raise ValueError(f"Unknown trace split: {split}")
-        directory = Path(directory)
-        self.manifest = load_manifest(directory / "release.json")
-        self.dictionary = MergeDictionary(self.manifest.get("merge_entries", ()))
-        for field, expected in (
-            ("format_version", DATA_FORMAT_VERSION),
-            ("tokenizer_version", CHESS_TOKENIZER_VERSION),
-            ("grammar_version", TRACE_GRAMMAR_VERSION),
-        ):
-            if self.manifest.get(field) != expected:
-                raise ValueError(
-                    f"Unsupported dataset {field}: {self.manifest.get(field)}"
-                )
-        self.index = []
-        self.shards = []
-        self.cache = OrderedDict()
-        for path, rows, split_label in parquet_sources(directory):
-            file = pq.ParquetFile(path)
-            for name in ("fen", "repetition", *TRACE_ARRAYS):
-                if file.schema_arrow.field(name) != TRACE_SCHEMA.field(name):
-                    raise ValueError(
-                        f"Training column {name} has an invalid type: {path}"
-                    )
-            if file.metadata.num_rows != rows:
-                raise ValueError(f"Shard row count differs from its release: {path}")
-            starts, count = [], 0
-            for group in range(file.num_row_groups):
-                starts.append(count)
-                count += file.metadata.row_group(group).num_rows
-            splits = (
-                file.read(columns=["split"], use_threads=False)["split"].to_pylist()
-                if "split" in file.schema_arrow.names
-                else [split_label] * rows
-            )
-            shard_index = len(self.shards)
-            self.shards.append((path, starts))
-            for row, label in enumerate(splits):
-                if label not in {"train", "val"}:
-                    raise ValueError(f"Unknown shard split: {label}")
-                if label == split:
-                    group = bisect_right(starts, row) - 1
-                    self.index.append((shard_index, group, row - starts[group]))
-
-    def __len__(self):
-        return len(self.index)
-
-    def __getitem__(self, index):
-        shard, group, row = self.index[index]
-        key = (shard, group)
-        if key not in self.cache:
-            file = pq.ParquetFile(self.shards[shard][0])
-            table = file.read_row_group(
-                group,
-                columns=["fen", "repetition", *TRACE_ARRAYS],
-                use_threads=False,
-            )
-            arrays = _arrays_from_table(table, TRACE_ARRAYS)
-            arrays["fen"] = table["fen"].to_pylist()
-            arrays["repetition"] = table["repetition"].to_pylist()
-            self.cache[key] = arrays
-            if len(self.cache) > self.CACHE_GROUPS:
-                self.cache.popitem(last=False)
-        self.cache.move_to_end(key)
-        arrays = self.cache[key]
-        tokens = arrays["trace_token_ids"][row].copy()
-        return (
-            encode_board(arrays["fen"][row], arrays["repetition"][row]),
-            tokens,
-            int(arrays["trace_len"][row]),
-        )

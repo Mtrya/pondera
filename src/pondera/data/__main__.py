@@ -53,7 +53,12 @@ def main():
     else:
         from pondera.data.tokenize import merge_and_encode
 
-        result = merge_and_encode(args.input, args.output, config.merge)
+        result = merge_and_encode(
+            args.input,
+            args.output,
+            config.merge,
+            max_document_tokens=config.max_document_tokens,
+        )
     print(json.dumps(result, indent=2))
 
 

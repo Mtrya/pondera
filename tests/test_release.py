@@ -19,7 +19,6 @@ from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
 from pondera.data.config import load_config, parse_recipe
 from pondera.data.dataset import (
     DATA_ARRAYS,
-    TracePositions,
     load_manifest,
     read_root_rows,
     write_manifest,
@@ -111,7 +110,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(len(self.result["shards"]), 3)
         self.assertEqual([shard["rows"] for shard in self.result["shards"]], [2, 2, 1])
         release = load_manifest(self.release / "release.json")
-        self.assertEqual(release["format_version"], 11)
+        self.assertEqual(release["format_version"], 12)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
         self.assertEqual(
@@ -154,7 +153,7 @@ class ReleaseTests(unittest.TestCase):
             for name, dtype in expected.items():
                 self.assertEqual(table.schema.field(name).type, dtype)
             for row in table.to_pylist():
-                self.assertEqual(len(row["trace_token_ids"]), row["trace_len"])
+                self.assertEqual(len(row["trace_atom_ids"]), row["trace_atom_count"])
                 self.assertEqual(len(row["state_best"]), len(row["state_value"]))
                 self.assertTrue(row["trace_text"].endswith(" END"))
 
@@ -194,8 +193,8 @@ class ReleaseTests(unittest.TestCase):
                 )
             }
             for index, row in enumerate(rows):
-                length = int(arrays["trace_len"][index])
-                tokens = arrays["trace_token_ids"][index][:length]
+                length = int(arrays["trace_atom_count"][index])
+                tokens = arrays["trace_atom_ids"][index][:length]
                 program = replay(
                     tokens,
                     row["fen"],
@@ -217,10 +216,13 @@ class ReleaseTests(unittest.TestCase):
                 ]
                 self.assertEqual(int(arrays["state_count"][index]), len(thought))
         self.assertEqual(set(suffixes), {root["root_id"] for root in self.roots})
-        positions = TracePositions(self.release, "train")
+        positions = [
+            item["row"]
+            for item in read_release_rows(self.release).values()
+            if item["row"]["split"] == "train"
+        ]
         self.assertEqual(len(positions), len(CASES))
-        row = positions[0]
-        self.assertGreater(int(row[2]), 0)
+        self.assertGreater(positions[0]["trace_atom_count"], 0)
 
     def test_resume_and_shard_recovery(self):
 
@@ -296,7 +298,7 @@ class ReleaseTests(unittest.TestCase):
         path = self.release / "shard-000000" / "data.parquet"
         table = pq.read_table(path)
         rows = table.to_pylist()
-        rows[0]["trace_len"] += 1
+        rows[0]["trace_atom_count"] += 1
         pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), path)
         with self.assertRaises(ValueError):
             validate_release(self.release, workers=1)
@@ -830,8 +832,8 @@ joint = [{width = 1, depth = 4, probability = 1.0}]
             self.assertTrue(validation["ok"])
             shard = base / "release" / "shard-000000"
             arrays = load_trace_arrays(shard, DATA_ARRAYS)
-            self.assertEqual(arrays["trace_token_ids"].dtype, np.int32)
-            self.assertEqual(arrays["trace_len"].dtype, np.int32)
+            self.assertEqual(arrays["trace_atom_ids"].dtype, np.int32)
+            self.assertEqual(arrays["trace_atom_count"].dtype, np.int32)
             self.assertEqual(arrays["state_count"].dtype, np.int32)
             for name in ("state_best", "state_value"):
                 self.assertEqual(arrays[name].dtype, np.int32)
@@ -839,7 +841,7 @@ joint = [{width = 1, depth = 4, probability = 1.0}]
             full = next(
                 index for index, row in enumerate(rows) if row["presentation"] == "full"
             )
-            tokens = arrays["trace_token_ids"][full]
+            tokens = arrays["trace_atom_ids"][full]
             program = replay(tokens, rows[full]["fen"], rows[full]["repetition"], 3)
             depths = [
                 index

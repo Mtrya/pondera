@@ -4,11 +4,13 @@ import chess
 import numpy as np
 
 from pondera.chess.codec import decode_value_token, encode_board, mate_token
-from pondera.chess.merge import MergeDictionary, decode
+from pondera.chess.merge import MergeDictionary, decode, encode_corpus
 from pondera.chess.symmetry import TOKEN_MIRROR, reflect_uci
 from pondera.chess.vocabulary import (
     BACK,
     BOARD,
+    CHESS_VOCAB_SIZE,
+    DELIM,
     DEPTH,
     END,
     FINAL,
@@ -30,6 +32,58 @@ _VALUES = {
     f"value:{decode_value_token(VALUE + index):+.3f}": VALUE + index
     for index in range(VALUE_BINS)
 }
+
+# These atoms and the decision after FINAL must have their own predictions.
+STANDALONE_ATOMS = tuple(range(DELIM, CHESS_VOCAB_SIZE))
+MERGE_BOUNDARIES = {
+    "standalone_atoms": list(STANDALONE_ATOMS),
+    "standalone_final_decision": True,
+}
+
+
+def merge_segments(atoms):
+    """Split a trace where composites may not cross or absorb a boundary."""
+    atoms = np.asarray(atoms, dtype=np.int32)
+    controls = np.flatnonzero(atoms >= DELIM)
+    decisions = np.flatnonzero(atoms == FINAL) + 2
+    cuts = np.unique(
+        np.concatenate(([0, len(atoms)], controls, controls + 1, decisions))
+    )
+    return [atoms[start:end] for start, end in zip(cuts[:-1], cuts[1:]) if end > start]
+
+
+def validate_trace_dictionary(dictionary):
+    if any(atom >= DELIM for entry in dictionary.entries for atom in entry):
+        raise ValueError("A trace composite contains a control atom")
+
+
+def encode_trace(atoms, encoder):
+    """Apply the exact encoder independently within each permitted segment."""
+    if not len(encoder.dictionary):
+        return np.asarray(atoms, dtype=np.int32)
+    return np.concatenate(
+        [
+            encoder.encode(segment) if len(segment) > 1 else segment
+            for segment in merge_segments(atoms)
+        ]
+    )
+
+
+def encode_traces(traces, dictionary, workers=1):
+    """Encode a corpus with the same boundaries used in dictionary fitting."""
+    validate_trace_dictionary(dictionary)
+    if not len(dictionary):
+        return [np.asarray(atoms, dtype=np.int32) for atoms in traces]
+    groups = [merge_segments(atoms) for atoms in traces]
+    encoded = encode_corpus(
+        (segment for group in groups for segment in group), dictionary, workers=workers
+    )
+    result = []
+    position = 0
+    for group in groups:
+        result.append(np.concatenate(encoded[position : position + len(group)]))
+        position += len(group)
+    return result
 
 
 def _position(words, index):

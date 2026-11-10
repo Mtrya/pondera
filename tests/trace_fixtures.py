@@ -80,9 +80,9 @@ def read_release_rows(directory):
     for shard in release["shards"]:
         _, rows, arrays = verify_shard_files(directory, shard)
         for index, row in enumerate(rows):
-            length = int(arrays["trace_len"][index])
+            length = int(arrays["trace_atom_count"][index])
             count = int(arrays["state_count"][index])
-            tokens = arrays["trace_token_ids"][index][:length]
+            tokens = arrays["trace_atom_ids"][index][:length]
             output[(row["root_id"], row["presentation"])] = {
                 "row": row,
                 "trace_tokens": tuple(int(value) for value in tokens),

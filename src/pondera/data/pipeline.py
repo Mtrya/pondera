@@ -508,7 +508,7 @@ def _root_row(root, synthesized, presentation):
         / 1000
         if synthesized.round_audits[-1].wdl is not None
         else None,
-        "trace_len": len(row.tokens),
+        "trace_atom_count": len(row.tokens),
         "final_move": row.final_move,
         "mate_distance": row.mate_distance,
     }
@@ -559,7 +559,7 @@ def _write_shard(directory, records, metadata, presentations):
         for presentation in presentations[root["root_id"]]:
             row = synthesized.rows[presentation]
             payload = _root_row(root, synthesized, presentation)
-            payload["trace_token_ids"] = row.tokens
+            payload["trace_atom_ids"] = row.tokens
             for name, field in (("state_best", "best"), ("state_value", "value")):
                 payload[name] = [
                     getattr(boundary, field) for boundary in row.boundaries
@@ -629,7 +629,7 @@ def _check_shard_layout(output, shard, roots):
 def _profile_shard(output, shard, profile):
     directory = Path(output) / shard["path"]
     rows = read_root_rows(directory)
-    tokens = load_trace_arrays(directory, ("trace_token_ids",))["trace_token_ids"]
+    tokens = load_trace_arrays(directory, ("trace_atom_ids",))["trace_atom_ids"]
     champions = {row["root_id"]: row for row in _read_champions(directory)}
     for index, row in enumerate(rows):
         final = np.flatnonzero(tokens[index] == FINAL)
@@ -638,7 +638,7 @@ def _profile_shard(output, shard, profile):
         profile.add_stored(
             row,
             champions[row["root_id"]]["stats"],
-            row["trace_len"],
+            row["trace_atom_count"],
             int(final[0]),
         )
 
@@ -1336,8 +1336,8 @@ def _validate_shard_rows(
                 _check_champion_round(root_id, entry, board, value_mate, max_ply)
             checked_champions.add(root_id)
 
-        length = int(arrays["trace_len"][index])
-        tokens = arrays["trace_token_ids"][index]
+        length = int(arrays["trace_atom_count"][index])
+        tokens = arrays["trace_atom_ids"][index]
         program = replay(
             tokens,
             row["fen"],
@@ -1717,13 +1717,14 @@ def _close_direct_engine():
 
 
 def _direct_worker(index, root):
-    global _DIRECT_ENGINE
-    if _DIRECT_STOPPING.is_set():
-        raise InterruptedError("Curation stopped")
-    # Startup failures abort the run before a root attempt is counted.
-    if _DIRECT_ENGINE is None:
-        _DIRECT_ENGINE = _start_engine(_DIRECT_ENGINE_PATH, _DIRECT_CONFIG)
+    global _DIRECT_ENGINE, _DIRECT_WORKING
     try:
+        _DIRECT_WORKING = True
+        if _DIRECT_STOPPING.is_set():
+            raise InterruptedError("Curation stopped")
+        # Startup failures abort the run before a root attempt is counted.
+        if _DIRECT_ENGINE is None:
+            _DIRECT_ENGINE = _start_engine(_DIRECT_ENGINE_PATH, _DIRECT_CONFIG)
         record = _collect_root(
             root, _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_NAME, _DIRECT_TEACHER
         )
@@ -1731,27 +1732,32 @@ def _direct_worker(index, root):
     except BaseException:
         _close_direct_engine()
         raise
+    finally:
+        _DIRECT_WORKING = False
 
 
 def _interrupt_direct_worker(signum, frame):
-    # The executor catches task exceptions; leave subsequent interruption
-    # disabled while the task unwinds and reaps its engine process.
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    raise InterruptedError("Curation stopped")
+    # Interrupting an idle worker can break the executor's queue receive.
+    # SIGTERM remains available for the executor to terminate a broken pool.
+    if _DIRECT_WORKING:
+        signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+        raise InterruptedError("Curation stopped")
 
 
 def _init_direct_worker(
     config, engine_path, engine_name, teacher, cache, stopping, worker_pids
 ):
     global _DIRECT_CONFIG, _DIRECT_ENGINE, _DIRECT_ENGINE_PATH, _DIRECT_NAME
-    global _DIRECT_TEACHER, _DIRECT_CACHE, _DIRECT_STOPPING
+    global _DIRECT_TEACHER, _DIRECT_CACHE, _DIRECT_STOPPING, _DIRECT_WORKING
     _DIRECT_CONFIG = config
     _DIRECT_ENGINE_PATH = engine_path
     _DIRECT_ENGINE = None
     _DIRECT_CACHE = cache
     _DIRECT_STOPPING = stopping
+    _DIRECT_WORKING = False
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, _interrupt_direct_worker)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGUSR1, _interrupt_direct_worker)
     Finalize(None, _close_direct_engine, exitpriority=10)
     _DIRECT_NAME = engine_name
     _DIRECT_TEACHER = teacher
@@ -1904,7 +1910,7 @@ def _synthesize_groups(
         for pid in pids:
             if pid:
                 try:
-                    os.kill(pid, signal.SIGTERM)
+                    os.kill(pid, signal.SIGUSR1)
                 except ProcessLookupError:
                     pass
         raise
@@ -2179,6 +2185,7 @@ def produce_shards(
                 release_path,
                 {
                     **release_metadata,
+                    "dataset_id": current.get("dataset_id") or uuid4().hex,
                     "metadata": identity,
                     "dropped": dropped,
                     "shards": [shards_by_index[key] for key in sorted(shards_by_index)],

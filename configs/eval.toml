@@ -1,0 +1,22 @@
+[generation]
+# Zero-reasoning is always evaluated as a baseline, alongside this budget.
+reasoning_tokens = 256
+# Model tokens after FINAL; END is never inserted or forced.
+answer_tokens = 128
+
+[evaluation]
+# At most this many unique roots or puzzles, sampled reproducibly per input.
+limit = 128
+seed = 640
+
+[engine]
+# Nodes per candidate move, with fresh search state for each candidate.
+nodes = 10000
+threads = 1
+hash_mb = 64
+# All PV moves are checked for legality; engine-grade this many continuation plies.
+# Set zero to skip engine scoring of PV continuations.
+pv_plies = 8
+
+[puzzles]
+rating_bounds = [0, 1200, 1600, 2000]

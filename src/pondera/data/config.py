@@ -7,6 +7,8 @@ import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
+
 DEFAULT_CONFIG_PATH = Path("configs/data.toml")
 PRESENTATION_NAMES = ("zero", "full", "random")
 
@@ -136,7 +138,7 @@ class SamplingConfig:
 
 @dataclass(frozen=True)
 class MergeConfig:
-    budget: int
+    vocab_size: int
     fit_split: str
     holdout_fraction: float
     max_roots: int | None
@@ -147,6 +149,7 @@ class MergeConfig:
     max_rounds: int
     top: int
     batch_size: int
+    workers: int
 
 
 @dataclass(frozen=True)
@@ -158,6 +161,7 @@ class DataConfig:
     release: ReleaseConfig
     sampling: SamplingConfig
     merge: MergeConfig
+    max_document_tokens: int = 131_072
 
     def search_dict(self):
         return {
@@ -292,10 +296,18 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     path = Path(path)
     with path.open("rb") as handle:
         values = tomllib.load(handle)
-    allowed = {"seed", "sources", "search", "synthesis", "release", "merge"}
+    allowed = {
+        "seed",
+        "sources",
+        "search",
+        "synthesis",
+        "release",
+        "merge",
+        "max_document_tokens",
+    }
     if set(values) - allowed:
         raise ValueError(f"Unknown config section: {sorted(set(values) - allowed)[0]}")
-    for section in allowed - {"seed"}:
+    for section in allowed - {"seed", "max_document_tokens"}:
         if section not in values:
             raise ValueError(f"Missing config section: [{section}]")
     seed = _integer("seed", "seed", values.get("seed", 640))
@@ -376,7 +388,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         values["merge"],
         "merge",
         {
-            "budget",
+            "vocab_size",
             "fit_split",
             "holdout_fraction",
             "min_count",
@@ -386,7 +398,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "top",
             "batch_size",
         },
-        {"max_roots", "block"},
+        {"max_roots", "block", "workers"},
     )
     fit_split = merge["fit_split"]
     if fit_split not in {"all", "train", "val"}:
@@ -394,8 +406,11 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     holdout = _probability("merge", "holdout_fraction", merge["holdout_fraction"])
     if holdout == 1:
         raise ValueError("[merge] holdout_fraction must be less than one")
+    vocab_size = _integer("merge", "vocab_size", merge["vocab_size"], CHESS_VOCAB_SIZE)
+    if vocab_size > 65535:
+        raise ValueError("[merge] vocab_size must fit the uint16 packed layout")
     merge = MergeConfig(
-        _integer("merge", "budget", merge["budget"], 0),
+        vocab_size,
         fit_split,
         holdout,
         _integer("merge", "max_roots", merge["max_roots"], 1)
@@ -408,5 +423,9 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         _integer("merge", "max_rounds", merge["max_rounds"], 1),
         _integer("merge", "top", merge["top"], 0),
         _integer("merge", "batch_size", merge["batch_size"], 1),
+        _integer("merge", "workers", merge.get("workers", 1), 1),
     )
-    return DataConfig(seed, sources, search, synthesis, release, sampling, merge)
+    cap = _integer(
+        "data", "max_document_tokens", values.get("max_document_tokens", 131_072), 1
+    )
+    return DataConfig(seed, sources, search, synthesis, release, sampling, merge, cap)

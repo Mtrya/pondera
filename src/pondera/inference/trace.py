@@ -1,408 +1,243 @@
-"""Greedy trace generation under the trace grammar's next-token mask."""
+"""Architecture-independent autoregressive generation and FINAL answer parsing."""
 
-from copy import copy
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 import chess
-import numpy as np
 import torch
 
-from pondera.chess.codec import BOARD_TOKENS_MAX, encode_boards
-from pondera.chess.merge import MergeDictionary
+from pondera.chess.codec import decode_value_token, encode_board
+from pondera.chess.merge import MergeDictionary, MergeDictionaryError, decode
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import (
     CHESS_VOCAB_SIZE,
+    END,
     FINAL,
+    IDX_TO_UCI_MOVE,
+    MATE_LOSS,
+    MATE_WIN,
     MOVE,
     PAD,
-    UCI_MOVE_TO_IDX,
+    VALUE,
+    VALUE_BINS,
 )
-from pondera.data.trace import CLAIM_DRAW, TraceError, TraceWriter, replay
+from pondera.models.linear import LinearVanillaModel
+from pondera.models.vanilla import VanillaModel
 
-FIXED = "fixed"
-AUTONOMOUS = "autonomous"
-STOP_FINAL = "final"
-STOP_BUDGET = "budget"
-STOP_CAP = "cap"
-_SUFFIX_STEPS = 256
+MODEL_CLASSES = {"vanilla": VanillaModel, "linear": LinearVanillaModel}
 
 
-@dataclass(frozen=True)
-class GenerationProtocol:
-    """A fixed thinking budget or safety cap, in expanded base atoms."""
-
-    kind: str
-    budget: int | None = None
-    safety_cap: int | None = None
-
-    def __post_init__(self):
-        if self.kind == FIXED:
-            if self.budget is None or self.budget < 0 or self.safety_cap is not None:
-                raise ValueError("A fixed protocol needs a nonnegative budget")
-        elif self.kind == AUTONOMOUS:
-            if (
-                self.safety_cap is None
-                or self.safety_cap < 0
-                or self.budget is not None
-            ):
-                raise ValueError("An autonomous protocol needs a nonnegative cap")
-        else:
-            raise ValueError(f"Unknown generation protocol: {self.kind}")
+@dataclass
+class Answer:
+    final_found: bool = False
+    end_found: bool = False
+    format_valid: bool = False
+    move_legal: bool = False
+    pv_legal: bool = False
+    decision: str | None = None
+    value_bin: int | None = None
+    value: float | None = None
+    mate_distance: int | None = None
+    pv: list[str] = field(default_factory=list)
+    legal_pv_plies: int = 0
+    errors: list[str] = field(default_factory=list)
 
     @property
-    def limit(self):
-        return self.budget if self.kind == FIXED else self.safety_cap
+    def valid(self):
+        return self.format_valid and self.move_legal and self.pv_legal
 
 
-def fixed_budget(budget: int) -> GenerationProtocol:
-    """Force FINAL after ``budget`` thinking atoms, completing any BOARD."""
-    return GenerationProtocol(FIXED, budget=budget)
+def parse_answer(tokens, dictionary, fen, repetition=1):
+    """Parse expanded atoms; the reasoning before FINAL is deliberately opaque.
+
+    No canonical tokenization is required. A composite may cross value/PV or
+    decision/value boundaries. PV moves follow the decision, in the root frame.
+    """
+    answer = Answer()
+    try:
+        atoms = decode(tokens, dictionary).tolist()
+    except (MergeDictionaryError, IndexError):
+        answer.errors.append("invalid_token_id")
+        return answer
+    finals = [index for index, atom in enumerate(atoms) if atom == FINAL]
+    answer.final_found = bool(finals)
+    answer.end_found = END in atoms
+    if not finals:
+        answer.errors.append("missing_final")
+        return answer
+    if len(finals) != 1:
+        answer.errors.append("multiple_final")
+        return answer
+    suffix = atoms[finals[0] + 1 :]
+    end_after_final = END in suffix
+    if not end_after_final:
+        answer.errors.append("missing_end")
+    elif suffix[-1] != END or suffix.count(END) != 1:
+        answer.errors.append("trailing_after_end")
+    body = suffix[: suffix.index(END)] if end_after_final else suffix
+    if not body or not MOVE <= body[0] < VALUE:
+        answer.errors.append("missing_decision")
+        return answer
+    board = chess.Board(fen)
+    mirrored = board.turn == chess.BLACK
+
+    def move_name(atom):
+        move = IDX_TO_UCI_MOVE[atom - MOVE]
+        return reflect_uci(move) if mirrored and move != "<claim_draw>" else move
+
+    answer.decision = move_name(body[0])
+    claim = answer.decision == "<claim_draw>"
+    answer.move_legal = (
+        not board.is_game_over()
+        and repetition < 5
+        and (
+            repetition >= 3 or board.halfmove_clock >= 100
+            if claim
+            else chess.Move.from_uci(answer.decision) in board.legal_moves
+        )
+    )
+    if not answer.move_legal:
+        answer.errors.append("illegal_decision")
+    if len(body) < 2 or not VALUE <= body[1] < MATE_WIN:
+        answer.errors.append("missing_value")
+        return answer
+    answer.value_bin = body[1] - VALUE
+    answer.value = decode_value_token(body[1])
+    position = 2
+    if position < len(body) and MATE_WIN <= body[position] < PAD:
+        atom = body[position]
+        win = atom < MATE_LOSS
+        answer.mate_distance = atom - MATE_WIN if win else -(atom - MATE_LOSS)
+        if answer.value_bin != (VALUE_BINS - 1 if win else 0):
+            answer.errors.append("mate_value_mismatch")
+        position += 1
+    for atom in body[position:]:
+        if not MOVE <= atom < VALUE or IDX_TO_UCI_MOVE[atom - MOVE] == "<claim_draw>":
+            answer.errors.append("invalid_pv_token")
+            return answer
+        answer.pv.append(move_name(atom))
+    answer.format_valid = not any(
+        error != "illegal_decision" for error in answer.errors
+    )
+    if claim:
+        answer.pv_legal = answer.move_legal and not answer.pv
+        if answer.pv:
+            answer.format_valid = False
+            answer.errors.append("claim_with_pv")
+        return answer
+    if not answer.move_legal:
+        return answer
+    board.push_uci(answer.decision)
+    for move in answer.pv:
+        parsed = chess.Move.from_uci(move)
+        if board.is_game_over() or parsed not in board.legal_moves:
+            answer.errors.append("illegal_pv")
+            return answer
+        board.push(parsed)
+        answer.legal_pv_plies += 1
+    answer.pv_legal = True
+    return answer
 
 
-def autonomous(safety_cap: int) -> GenerationProtocol:
-    """Allow FINAL at any boundary; force it only at ``safety_cap``."""
-    return GenerationProtocol(AUTONOMOUS, safety_cap=safety_cap)
-
-
-@dataclass(frozen=True)
-class RootPosition:
-    fen: str
-    repetition: int = 1
-    teacher_width: int = 1
-
-    def __post_init__(self):
-        if self.repetition < 1:
-            raise ValueError("Root repetition must be positive")
-        if self.teacher_width < 1:
-            raise ValueError("Teacher width must be positive")
-
-
-def _effective_teacher_width(root_fen: str, teacher_width: int) -> int:
-    return min(teacher_width, chess.Board(root_fen).legal_moves.count())
-
-
-@dataclass(frozen=True)
-class GeneratedTrace:
-    root_fen: str
-    repetition: int
-    mirrored: bool
-    tokens: tuple
-    thinking_tokens: int
+@dataclass
+class Generation:
+    tokens: list[int]
+    answer: Answer
+    reasoning_tokens: int
+    answer_tokens: int
+    generated_tokens: int
+    forced_final: bool
     stop: str
-    final_move: str
-    root_move_tokens: tuple
-    root_move_log_probs: tuple
-    teacher_width: int = 1
+    seconds: float
+    expanded_atoms: int
 
 
-@dataclass(frozen=True)
-class TraceAssessment:
-    structural: bool
-    error: str | None
-    final_move: str | None
-    max_depth: int
-    max_width: int
-    root_width: int
-    evaluations: int
-    evaluation_revisions: int
-    copy_first_move: str | None
-    overturned: bool | None
+@dataclass
+class Predictor:
+    model: torch.nn.Module
+    dictionary: MergeDictionary
+    metadata: dict
 
+    @torch.inference_mode()
+    def generate(self, fen, repetition=1, *, reasoning_tokens=0, answer_tokens=128):
+        """Greedy full-prefix forwards, with no masking or answer repair.
 
-def _framed_move_token(uci, mirrored):
-    framed = reflect_uci(uci) if mirrored else uci
-    return MOVE + UCI_MOVE_TO_IDX[framed]
-
-
-def legal_tokens(writer: TraceWriter, final_allowed: bool, cache=None) -> tuple:
-    return writer.allowed_tokens(final_allowed, cache)
-
-
-class _GenerationRow:
-    def __init__(self, root: RootPosition, protocol: GenerationProtocol):
-        self.fen = root.fen
-        self.repetition = root.repetition
-        self.teacher_width = root.teacher_width
-        self.protocol = protocol
-        self.writer = TraceWriter(
-            root.fen,
-            root.repetition,
-            teacher_width=_effective_teacher_width(root.fen, root.teacher_width),
-        )
-        self.decision_tokens = self.writer.decision_tokens
-        self.root_move_tokens = tuple(
-            sorted(token for token in self.decision_tokens if token != CLAIM_DRAW)
-        )
-        self.legal_cache = {}
-        self.root_move_log_probs = ()
-        self.thinking = 0
-        self.stop = None
-        self.final_move = None
-
-    def set_move_distribution(self, logits, decisions):
-        """Condition on legal tokens that emit a root decision at this step."""
-        if not self.root_move_tokens:
-            self.root_move_log_probs = ()
-            return
-        values = []
-        for move in self.root_move_tokens:
-            ids = [token for token, decision in decisions.items() if decision == move]
-            values.append(torch.logsumexp(logits[ids].float(), 0))
-        values = torch.stack(values)
-        self.root_move_log_probs = tuple(
-            torch.log_softmax(values, -1).tolist()
-            if torch.isfinite(values).any()
-            else [-float("inf")] * len(values)
-        )
-
-    def next_tokens(self, protocol):
-        if self.writer.finished:
-            return (PAD,), False
-        if self.writer.final_written:
-            return legal_tokens(self.writer, False, self.legal_cache), False
-        at_limit = self.thinking >= protocol.limit and not self.writer.completing_board
-        if at_limit:
-            return (FINAL,), True
-        ids = legal_tokens(self.writer, protocol.kind == AUTONOMOUS, self.legal_cache)
-        return ids or legal_tokens(self.writer, True, self.legal_cache), False
-
-    def accepts(self, atoms, protocol):
-        trial = copy(self)
-        trial.writer = self.writer.copy()
-        for atom in atoms:
-            if trial.writer.finished:
-                return False
-            allowed, forced = trial.next_tokens(protocol)
-            if atom not in allowed:
-                return False
-            trial.apply(atom, forced)
-        return True
-
-    def decision_in(self, atoms):
-        if self.writer.awaiting_final_move:
-            return atoms[0]
-        if not self.writer.final_written and FINAL in atoms:
-            index = atoms.index(FINAL) + 1
-            if index < len(atoms):
-                return atoms[index]
-        return None
-
-    def _check_emitted(self, token):
-        if int(self.writer.tokens[-1]) != token:
-            raise RuntimeError("TraceWriter emitted a different token")
-
-    def apply(self, token, forced):
-        if self.writer.finished:
-            return
-        if token == FINAL:
-            self.writer.begin_final()
-            self._check_emitted(token)
-            if self.protocol.kind == FIXED:
-                self.stop = STOP_BUDGET
-            else:
-                self.stop = STOP_CAP if forced else STOP_FINAL
-            return
-        thought = not self.writer.final_written
-        self.writer.apply(token)
-        self._check_emitted(token)
-        if thought:
-            self.thinking += 1
-        if self.final_move is None and self.writer.final_move is not None:
-            self.final_move = self.writer.final_move
-
-    def trace(self) -> GeneratedTrace:
-        if not self.writer.finished or self.stop is None:
-            raise RuntimeError("Generation did not reach a final decision")
-        return GeneratedTrace(
-            self.fen,
-            self.repetition,
-            self.writer.mirrored,
-            tuple(int(token) for token in self.writer.tokens),
-            self.thinking,
-            self.stop,
-            self.final_move,
-            self.root_move_tokens,
-            self.root_move_log_probs,
-            self.teacher_width,
-        )
-
-
-def _choose(rows, logits, protocol, dictionary=MergeDictionary()):
-    masks = np.zeros(tuple(logits.shape), dtype=bool)
-    forced = np.zeros(len(rows), dtype=bool)
-    choices = np.full(len(rows), PAD, dtype=np.int32)
-    starts = np.asarray([entry[0] for entry in dictionary.entries])
-    scores = logits.float().cpu().numpy()
-    for index, row in enumerate(rows):
-        ids, forced[index] = row.next_tokens(protocol)
-        masks[index, list(ids)] = True
-        if not row.writer.finished:
-            masks[index, CHESS_VOCAB_SIZE:] = np.isin(starts, ids)
-        candidates = np.flatnonzero(masks[index])
-        accepted = {}
-
-        def atoms(token):
-            return (
-                dictionary.expansion(token) if token >= CHESS_VOCAB_SIZE else (token,)
+        Budgets count model calls, not expanded atoms. The answer allowance
+        counts tokens after FINAL. A model-emitted FINAL consumes a reasoning
+        call; inserting FINAL at the limit consumes no call. END is never forced.
+        """
+        if reasoning_tokens < 0 or answer_tokens < 1:
+            raise ValueError(
+                "Require nonnegative reasoning and positive answer budgets"
             )
+        device = next(self.model.parameters()).device
+        prefix = encode_board(fen, repetition).tolist()
+        tokens = []
+        reasoning_count = answer_count = generated = 0
+        forced = False
+        stop = "answer_budget"
+        self.model.eval()
+        started = time.monotonic()
 
-        def legal(token):
-            if token not in accepted:
-                accepted[token] = token < CHESS_VOCAB_SIZE or row.accepts(
-                    atoms(token), protocol
-                )
-            return accepted[token]
+        def step():
+            ids = torch.tensor(prefix + tokens, dtype=torch.long, device=device)
+            logits = self.model(ids, [0, len(ids)])
+            token = int(logits[-1].argmax())
+            tokens.append(token)
+            expanded = (
+                self.dictionary.expansion(token)
+                if token >= CHESS_VOCAB_SIZE
+                else (token,)
+            )
+            return expanded
 
-        # Check complete expansions lazily, in greedy score order.
-        for token in candidates[np.argsort(-scores[index, candidates], kind="stable")]:
-            if legal(int(token)):
-                choices[index] = token
+        for _ in range(reasoning_tokens):
+            expanded = step()
+            reasoning_count += 1
+            generated += 1
+            if FINAL in expanded:
+                if END in expanded:
+                    stop = "end"
                 break
-        if row.decision_in(atoms(int(choices[index]))) is not None:
-            decisions = {}
-            for token in candidates:
-                decision = row.decision_in(atoms(int(token)))
-                if decision is not None and legal(int(token)):
-                    decisions[int(token)] = decision
-            row.set_move_distribution(logits[index], decisions)
-    return choices, forced
-
-
-def _generate_batch(model, roots, protocol):
-    device = next(model.parameters()).device
-    ids = torch.from_numpy(
-        encode_boards([root.fen for root in roots], [root.repetition for root in roots])
-    ).to(device)
-    rows = [_GenerationRow(root, protocol) for root in roots]
-    dictionary = model.merge_dictionary
-    logits, cache = model.prefill(ids)
-    bound = protocol.limit + BOARD_TOKENS_MAX + 1 + _SUFFIX_STEPS
-    for _ in range(bound):
-        if all(row.writer.finished for row in rows):
-            break
-        choices, forced = _choose(rows, logits, protocol, dictionary)
-        for index, row in enumerate(rows):
-            token = int(choices[index])
-            atoms = (
-                dictionary.expansion(token) if token >= CHESS_VOCAB_SIZE else (token,)
-            )
-            for atom in atoms:
-                _, at_limit = row.next_tokens(protocol)
-                row.apply(atom, at_limit)
-        step = np.array(
-            [
-                PAD if row.writer.finished else int(choices[index])
-                for index, row in enumerate(rows)
-            ],
-            dtype=np.int32,
+            if END in expanded:
+                stop = "end_before_final"
+                break
+        else:
+            tokens.append(FINAL)
+            forced = True
+        if stop not in {"end", "end_before_final"}:
+            for _ in range(answer_tokens):
+                expanded = step()
+                answer_count += 1
+                generated += 1
+                if END in expanded:
+                    stop = "end"
+                    break
+        return Generation(
+            tokens=tokens,
+            answer=parse_answer(tokens, self.dictionary, fen, repetition),
+            reasoning_tokens=reasoning_count,
+            answer_tokens=answer_count,
+            generated_tokens=generated,
+            forced_final=forced,
+            stop=stop,
+            seconds=time.monotonic() - started,
+            expanded_atoms=len(decode(tokens, self.dictionary)),
         )
-        if all(row.writer.finished for row in rows):
-            break
-        logits, cache = model.decode(
-            torch.from_numpy(step).unsqueeze(1).to(device), cache
-        )
-    if any(not row.writer.finished for row in rows):
-        raise RuntimeError("Generation did not finish within its protocol bound")
-    return [row.trace() for row in rows]
 
 
-@torch.inference_mode()
-def generate(model, roots, protocol, batch_size=32):
-    if batch_size < 1:
-        raise ValueError("Batch size must be positive")
-    roots = list(roots)
-    traces = []
-    for start in range(0, len(roots), batch_size):
-        traces.extend(
-            _generate_batch(model, roots[start : start + batch_size], protocol)
-        )
-    return traces
-
-
-def _first_round(program):
-    round_number = 0
-    moves = []
-    evaluations = {}
-    completed = False
-    for step in program.steps:
-        if step.operation == "depth":
-            round_number += 1
-        elif step.operation == "move" and round_number == 1 and len(step.path) == 1:
-            if step.uci not in moves:
-                moves.append(step.uci)
-        elif step.operation == "evaluate" and round_number == 1:
-            if len(step.path) == 1:
-                evaluations[step.path[0]] = step.evaluation
-            elif len(step.path) == 0:
-                completed = True
-    if round_number == 0:
-        return None
-    champion = None
-    best = None
-    if completed:
-        for move in moves:
-            value = evaluations.get(move)
-            if value is None:
-                continue
-            if best is None or value > best:
-                champion, best = move, value
-    if champion is None and moves:
-        champion = moves[0]
-    return champion
-
-
-def assess(trace: GeneratedTrace) -> TraceAssessment:
-    try:
-        program = replay(
-            trace.tokens,
-            trace.root_fen,
-            trace.repetition,
-            teacher_width=_effective_teacher_width(trace.root_fen, trace.teacher_width),
-        )
-    except TraceError as error:
-        return TraceAssessment(False, str(error), None, 0, 0, 0, 0, 0, None, None)
-    structural = program.final_move == trace.final_move
-    detail = None if structural else "replayed final move disagrees with the writer"
-    evaluations = 0
-    revisions = 0
-    last_evaluations = {}
-    children = {}
-    for step in program.steps:
-        if step.operation == "evaluate":
-            evaluations += 1
-            token = program.tokens[step.start]
-            previous = last_evaluations.get(step.path)
-            if previous is not None and previous != token:
-                revisions += 1
-            last_evaluations[step.path] = token
-        elif step.operation == "move":
-            children.setdefault(step.path[:-1], set()).add(step.path[-1])
-    max_depth = max(
-        (len(step.path) for step in program.steps if step.operation == "move"),
-        default=0,
-    )
-    max_width = max((len(moves) for moves in children.values()), default=0)
-    root_width = len(children.get((), ()))
-    copy_first = _first_round(program)
-    overturned = None if copy_first is None else program.final_move != copy_first
-    return TraceAssessment(
-        structural,
-        detail,
-        program.final_move,
-        max_depth,
-        max_width,
-        root_width,
-        evaluations,
-        revisions,
-        copy_first,
-        overturned,
-    )
-
-
-def move_log_probability(trace: GeneratedTrace, move: str) -> float:
-    token = _framed_move_token(move, trace.mirrored)
-    try:
-        index = trace.root_move_tokens.index(token)
-    except ValueError:
-        raise ValueError(f"Not a legal root move: {move}") from None
-    return trace.root_move_log_probs[index]
+def load_checkpoint(path, device="cpu"):
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    model = MODEL_CLASSES[state["arch"]](**state["model_config"])
+    model.load_state_dict(state["model_state_dict"])
+    identity = state.get("tokenizer_identity", {})
+    dictionary = MergeDictionary(identity.get("merge_entries", ()))
+    if state["model_config"]["vocab_size"] != CHESS_VOCAB_SIZE + len(dictionary):
+        raise ValueError("Checkpoint vocabulary and merge entries disagree")
+    metadata = {
+        key: state[key]
+        for key in ("arch", "model_config", "update", "presented_documents")
+        if key in state
+    }
+    metadata["tokenizer_identity"] = identity
+    return Predictor(model.to(device).eval(), dictionary, metadata)
