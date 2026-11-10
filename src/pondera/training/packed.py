@@ -29,6 +29,7 @@ from pondera.data.packing import (
     load_subsets,
     pack_batches,
     packed_batches,
+    presentation_batch_count,
 )
 from pondera.training.muon import build_optimizers
 
@@ -40,7 +41,8 @@ class TrainConfig:
     weight_decay: float = 0.0
     microbatch_tokens: int = 65_536
     update_tokens: int = 524_288
-    updates: int = 100
+    presentations: float = 1.0
+    updates: int | None = None
     val_every: int = 10
     checkpoint_every: int = 50
     seed: int = 640
@@ -133,7 +135,15 @@ def validation_loss(model, documents, budget, device, rank=0, world_size=1):
 
 
 def save_training_checkpoint(
-    path, model, optimizers, model_config, micro_step, update, config, manifest
+    path,
+    model,
+    optimizers,
+    model_config,
+    micro_step,
+    update,
+    presented_documents,
+    config,
+    manifest,
 ):
     model = _module(model)
     payload = {
@@ -144,6 +154,7 @@ def save_training_checkpoint(
         "optimizer_state_dicts": [optimizer.state_dict() for optimizer in optimizers],
         "micro_step": micro_step,
         "update": update,
+        "presented_documents": presented_documents,
         "train_config": asdict(config),
         "data_identity": manifest.get("source", {}),
         "tokenizer_identity": manifest.get("vocabulary", {}),
@@ -179,7 +190,7 @@ def train(
         adamw_lr=config.adamw_lr,
         weight_decay=config.weight_decay,
     )
-    micro_step = update = 0
+    micro_step = update = presented_documents = 0
     if resume is not None:
         state = torch.load(resume, map_location=device, weights_only=True)
         model.load_state_dict(state["model_state_dict"])
@@ -189,6 +200,22 @@ def train(
             for group, learning_rate in zip(optimizer.param_groups, learning_rates):
                 group["lr"] = learning_rate
         micro_step, update = state["micro_step"], state["update"]
+        presented_documents = state["presented_documents"]
+    final_step = (
+        presentation_batch_count(
+            documents,
+            indices,
+            config.seed,
+            config.microbatch_tokens,
+            config.presentations,
+        )
+        if config.updates is None
+        else None
+    )
+    if final_step is not None and final_step % world_size:
+        raise ValueError(
+            f"{final_step} batches cannot be divided across {world_size} ranks"
+        )
     if world_size > 1:
         distributed_args = (
             {} if device.type == "cpu" else {"device_ids": [device.index]}
@@ -228,19 +255,27 @@ def train(
         start_step=micro_step + rank,
         rank=rank,
         world_size=world_size,
+        presentations=config.presentations if final_step is not None else None,
     )
     started = time.monotonic()
-    while update < config.updates:
+    while (config.updates is not None and update < config.updates) or (
+        final_step is not None and micro_step < final_step
+    ):
         batches = []
         total_labeled = 0
         total_tokens = 0
         last_epoch = 0
-        while total_tokens < config.update_tokens:
+        while total_tokens < config.update_tokens and (
+            final_step is None or micro_step < final_step
+        ):
             batch = next(batch_stream)
             labeled = int((batch["labels"] != -100).sum())
-            step_tokens, step_labeled = _reduce([batch["tokens"], labeled], device)
+            step_tokens, step_labeled, step_documents = _reduce(
+                [batch["tokens"], labeled, batch["documents"]], device
+            )
             total_tokens += step_tokens
             total_labeled += step_labeled
+            presented_documents += step_documents
             micro_step += world_size
             batches.append((batch, labeled))
             last_epoch = batch.get("epoch", 0)
@@ -263,9 +298,12 @@ def train(
             "loss": update_loss,
             "tokens": total_tokens,
             "labeled_tokens": total_labeled,
+            "presentations": presented_documents / len(indices),
             "epoch": last_epoch,
         }
-        if config.val_every and update % config.val_every == 0:
+        if config.val_every and (
+            update % config.val_every == 0 or micro_step == final_step
+        ):
             record["val_loss"] = validation_loss(
                 model, documents, config.microbatch_tokens, device, rank, world_size
             )
@@ -287,6 +325,7 @@ def train(
                 model_config,
                 micro_step,
                 update,
+                presented_documents,
                 config,
                 documents.manifest,
             )
@@ -300,6 +339,7 @@ def train(
             model_config,
             micro_step,
             update,
+            presented_documents,
             config,
             documents.manifest,
         )
@@ -310,6 +350,8 @@ def train(
     return {
         "updates": update,
         "micro_steps": micro_step,
+        "presented_documents": presented_documents,
+        "presentations": presented_documents / len(indices),
         "seconds": time.monotonic() - started,
         "history": history,
         "rank": rank,
@@ -345,7 +387,9 @@ def main():
             )
         else:
             parser.add_argument(
-                f"--{field.replace('_', '-')}", type=type(default), default=default
+                f"--{field.replace('_', '-')}",
+                type=int if field == "updates" else type(default),
+                default=default,
             )
     args = parser.parse_args()
     model_config = dict(

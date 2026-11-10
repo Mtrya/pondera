@@ -15,7 +15,7 @@ from pondera.data.packing import PackedDocuments, load_subsets, write_packed
 from pondera.data.pipeline import produce_shards
 from pondera.data.tokenize import tokenize_dataset
 from pondera.models.vanilla import VanillaModel
-from pondera.training.muon import newton_schulz5, split_parameters
+from pondera.training.muon import Muon, newton_schulz5, split_parameters
 from pondera.training.packed import TrainConfig, train
 
 MODEL = dict(
@@ -61,11 +61,42 @@ class MuonTests(unittest.TestCase):
         torch.manual_seed(0)
         matrix = torch.randn(8, 8)
         update = newton_schulz5(matrix)
-        singular = torch.linalg.svdvals(update)
+        singular = torch.linalg.svdvals(update.float())
         # The quintic iteration compresses the singular spectrum toward one
         # without finishing it: five steps leave a bounded band around one,
         # far tighter than the input's spread (here [0.78, 5.49]).
         self.assertTrue(bool(((singular - 1).abs() < 0.5).all()))
+
+    def test_matches_pytorch_original_muon(self):
+        torch.manual_seed(640)
+        shapes = [(8, 8), (8, 32), (32, 8)]
+        parameters = [torch.nn.Parameter(torch.randn(shape)) for shape in shapes]
+        reference_parameters = [
+            torch.nn.Parameter(parameter.detach().clone()) for parameter in parameters
+        ]
+        optimizer = Muon(parameters, lr=0.02, momentum=0.95)
+        reference = torch.optim.Muon(
+            reference_parameters,
+            lr=0.02,
+            weight_decay=0,
+            momentum=0.95,
+            nesterov=True,
+            ns_steps=5,
+            adjust_lr_fn="original",
+        )
+        for _ in range(2):
+            for index, (parameter, expected) in enumerate(
+                zip(parameters, reference_parameters)
+            ):
+                gradient = torch.randn_like(parameter) * (index + 1)
+                parameter.grad = gradient.clone()
+                expected.grad = gradient.clone()
+            optimizer.step()
+            reference.step()
+        # BF16 addmm in the reference differs from Keller's separate matrix
+        # operations by rounding; the two-step updates retain that tolerance.
+        for parameter, expected in zip(parameters, reference_parameters):
+            torch.testing.assert_close(parameter, expected, rtol=0.01, atol=0.002)
 
     def test_split_rule(self):
         model = VanillaModel(**MODEL, vocab_size=CHESS_VOCAB_SIZE)
@@ -233,6 +264,54 @@ class TrainerTests(unittest.TestCase):
             for optimizer in state["optimizer_state_dicts"]
         ]
         self.assertEqual(rates, [[0.01], [0.00015]])
+
+    def test_fractional_presentations_and_resume(self):
+        documents = PackedDocuments(self.root / "packed")
+        count = len(load_subsets(self.root / "packed")["50k"])
+
+        def config(presentations):
+            result = self.config(1)
+            result.updates = None
+            result.presentations = presentations
+            result.microbatch_tokens = int(documents.lengths.max())
+            result.update_tokens = 1
+            result.val_every = 0
+            return result
+
+        reference = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            config(1.5),
+            self.root / "presentation-full",
+        )
+        partial = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            config(0.75),
+            self.root / "presentation-partial",
+        )
+        resumed = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            "50k",
+            config(1.5),
+            self.root / "presentation-resumed",
+            resume=self.root / "presentation-partial" / "checkpoint.pth",
+        )
+        expected_count = count + count // 2
+        self.assertEqual(reference["presented_documents"], expected_count)
+        self.assertEqual(reference["presentations"], expected_count / count)
+        expected = [record["loss"] for record in reference["history"]]
+        actual = [record["loss"] for record in partial["history"] + resumed["history"]]
+        self.assertEqual(len(actual), len(expected))
+        for observed, wanted in zip(actual, expected):
+            self.assertAlmostEqual(observed, wanted, places=5)
+        self.assertEqual(resumed["presented_documents"], expected_count)
 
     def test_distributed_matches_single_process_and_resume(self):
         config = self.config(2)

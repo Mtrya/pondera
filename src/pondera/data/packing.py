@@ -189,19 +189,50 @@ def assemble_batch(documents, batch, epoch=None):
     return result
 
 
+def _epoch_batches(documents, indices, seed, budget, epoch, presentations=None):
+    count = len(indices)
+    if presentations is not None:
+        count = min(count, int(count * (presentations - epoch)))
+    if count <= 0:
+        return []
+    order = epoch_order(len(indices), seed, epoch)
+    batches, _ = pack_batches(documents.lengths, indices[order[:count]], budget)
+    return batches
+
+
+def presentation_batch_count(documents, indices, seed, budget, presentations):
+    """Count batches through a whole or fractional number of presentations."""
+    if presentations <= 0:
+        raise ValueError("presentations must be positive")
+    return sum(
+        len(_epoch_batches(documents, indices, seed, budget, epoch, presentations))
+        for epoch in range(int(presentations) + (presentations % 1 > 0))
+    )
+
+
 def packed_batches(
-    documents, indices, seed, budget, start_step=0, rank=0, world_size=1
+    documents,
+    indices,
+    seed,
+    budget,
+    start_step=0,
+    rank=0,
+    world_size=1,
+    presentations=None,
 ):
-    """Yield one rank's view of the global sequence, planning each epoch once."""
+    """Yield one rank's view of the global sequence, planning each epoch once.
+
+    A fractional final presentation takes a prefix of that epoch's shuffled
+    documents, rounded down to a whole document, rather than splitting a batch.
+    """
     if start_step < 0:
         raise ValueError("start_step must be nonnegative")
     if world_size < 1 or not 0 <= rank < world_size:
         raise ValueError("Require 0 <= rank < world_size")
     step = start_step
     epoch = 0
-    while True:
-        order = epoch_order(len(indices), seed, epoch)
-        batches, _ = pack_batches(documents.lengths, indices[order], budget)
+    while presentations is None or epoch < presentations:
+        batches = _epoch_batches(documents, indices, seed, budget, epoch, presentations)
         if not batches:
             raise ValueError("No packable documents under this budget")
         if step >= len(batches):

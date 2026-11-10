@@ -2,8 +2,9 @@
 
 Muon owns 2D hidden matrices; AdamW owns embeddings, the output head,
 norms, biases, and scalars. The split is identical for every architecture.
-The update is RMS-matched by sqrt(max(fan_in, fan_out)) and the
-Newton–Schulz iteration uses the standard five steps.
+The update follows Keller Jordan's original Muon: the orthogonalized
+update is scaled by sqrt(max(1, fan_out / fan_in)), and the Newton–Schulz
+iteration uses the standard five steps.
 """
 
 import torch
@@ -13,7 +14,7 @@ from torch import nn
 def newton_schulz5(gradient, steps=5):
     """Orthogonalize a matrix with the quintic Newton–Schulz iteration."""
     a, b, c = 3.4445, -4.7750, 2.0315
-    x = gradient.to(torch.bfloat16 if gradient.is_cuda else torch.float32)
+    x = gradient.bfloat16()
     transposed = x.shape[-2] > x.shape[-1]
     if transposed:
         x = x.mT
@@ -25,9 +26,24 @@ def newton_schulz5(gradient, steps=5):
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr, momentum=0.95, nesterov=True, ns_steps=5):
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        weight_decay=0.0,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+    ):
         super().__init__(
-            params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+            params,
+            dict(
+                lr=lr,
+                weight_decay=weight_decay,
+                momentum=momentum,
+                nesterov=nesterov,
+                ns_steps=ns_steps,
+            ),
         )
 
     @torch.no_grad()
@@ -41,14 +57,15 @@ class Muon(torch.optim.Optimizer):
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(param.grad)
                 buffer = state["momentum_buffer"]
-                buffer.mul_(group["momentum"]).add_(param.grad)
+                buffer.lerp_(param.grad, 1 - group["momentum"])
                 gradient = (
-                    param.grad.add(buffer, alpha=group["momentum"])
+                    param.grad.lerp(buffer, group["momentum"])
                     if group["nesterov"]
                     else buffer
                 )
                 update = newton_schulz5(gradient, group["ns_steps"])
-                scale = max(param.shape[-2], param.shape[-1]) ** 0.5
+                scale = max(1, param.shape[-2] / param.shape[-1]) ** 0.5
+                param.mul_(1 - group["lr"] * group["weight_decay"])
                 param.add_(update.to(param.dtype), alpha=-group["lr"] * scale)
         return loss
 
@@ -64,9 +81,15 @@ def split_parameters(model: nn.Module):
     return muon, adamw
 
 
-def build_optimizers(model, *, muon_lr, adamw_lr, weight_decay=0.0):
+def build_optimizers(model, *, muon_lr=0.02, adamw_lr=3e-4, weight_decay=0.0):
     muon_params, adamw_params = split_parameters(model)
     return [
-        Muon(muon_params, lr=muon_lr),
-        torch.optim.AdamW(adamw_params, lr=adamw_lr, weight_decay=weight_decay),
+        Muon(muon_params, lr=muon_lr, weight_decay=weight_decay),
+        torch.optim.AdamW(
+            adamw_params,
+            lr=adamw_lr,
+            betas=(0.9, 0.95),
+            eps=1e-10,
+            weight_decay=weight_decay,
+        ),
     ]
