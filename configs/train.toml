@@ -1,0 +1,26 @@
+[model]
+architecture = "vanilla" # vanilla softmax attention, or linear attention
+num_blocks = 8
+hidden_size = 1024
+intermediate_size = 2816
+num_heads = 16
+num_kv_heads = 4
+# Vocabulary size comes from the encoded dataset.
+
+[training]
+seed = 640
+muon_lr = 0.02
+adamw_lr = 0.0003
+weight_decay = 0.0
+microbatch_tokens = 131072
+update_tokens = 524288
+presentations = 1.0
+# Omit documents to use every eligible training document.
+# documents = 50000
+# Omit max_document_tokens to use the encoded dataset's recipe cap.
+# max_document_tokens = 131072
+# If set, updates replaces presentations as the stopping condition.
+# updates = 1000
+val_every = 10
+checkpoint_every = 50
+checkpoint_keep_last = 3

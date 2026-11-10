@@ -21,10 +21,12 @@ Python 3.13 or later is required. Stockfish and fastchess are external executabl
 The package is a library. Train a model from a packed dataset:
 
 ```bash
-uv run python -m pondera.training.packed --packed PACKED --documents 500000 --microbatch-tokens 131072 --architecture vanilla --output RUN --device cuda
+uv run python -m pondera.training.packed --config configs/train.toml --packed ENCODED --output RUN --device cuda
 ```
 
-Experiment configurations live with their run directories; the repository tracks configurations only for published reference runs. See [data synthesis](docs/data.md) for the current offline pipeline and [architecture](docs/architecture.md) for module boundaries and repository conventions.
+Model architecture and dimensions, data selection, optimization, token budgets, stopping targets, validation cadence, and checkpoint retention are configured in [configs/train.toml](configs/train.toml). Dataset/output/checkpoint paths, device selection, and `--track` / `--no-track` remain command arguments. Resume uses the same recipe with `--resume RUN/checkpoint.pth`; change tunables in the TOML, and incompatible model or sampling settings are rejected.
+
+Shared data and training recipes live in `configs/`. Experiment configurations live with their run directories; only published reference runs add experiment configurations to the repository. See [data synthesis](docs/data.md) for the current offline pipeline and [architecture](docs/architecture.md) for module boundaries and repository conventions.
 
 ## Development
 

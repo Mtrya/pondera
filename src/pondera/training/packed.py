@@ -15,7 +15,7 @@ import json
 import os
 import time
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -30,24 +30,8 @@ from pondera.data.packing import (
     packed_batch_indices,
     select_documents,
 )
+from pondera.training.config import DEFAULT_CONFIG_PATH, TrainConfig, load_config
 from pondera.training.muon import build_optimizers
-
-
-@dataclass
-class TrainConfig:
-    muon_lr: float = 0.02
-    adamw_lr: float = 3e-4
-    weight_decay: float = 0.0
-    microbatch_tokens: int = 65_536
-    update_tokens: int = 524_288
-    presentations: float = 1.0
-    documents: int | None = None
-    max_document_tokens: int | None = None
-    updates: int | None = None
-    val_every: int = 10
-    checkpoint_every: int = 50
-    seed: int = 640
-    track: bool = True
 
 
 def _module(model):
@@ -152,8 +136,11 @@ def save_training_checkpoint(
     update,
     presented_documents,
     indices,
+    keep_last,
     swanlab_run_id=None,
 ):
+    if keep_last < 1:
+        raise ValueError("checkpoint_keep_last must be positive")
     model = _module(model)
     payload = {
         "format_version": 3,
@@ -166,9 +153,24 @@ def save_training_checkpoint(
         "swanlab_run_id": swanlab_run_id,
         "document_indices": indices.tolist(),
     }
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    snapshot = path.with_name(f"checkpoint-{update:08d}.pth")
+    temporary = snapshot.with_suffix(snapshot.suffix + ".tmp")
     torch.save(payload, temporary)
-    os.replace(temporary, path)
+    os.replace(temporary, snapshot)
+    latest = path.with_suffix(path.suffix + ".link")
+    latest.unlink(missing_ok=True)
+    latest.symlink_to(snapshot.name)
+    os.replace(latest, path)
+    snapshots = sorted(
+        (int(candidate.stem.removeprefix("checkpoint-")), candidate)
+        for candidate in path.parent.glob("checkpoint-*.pth")
+        if candidate.stem.removeprefix("checkpoint-").isdigit()
+    )
+    eligible = [candidate for step, candidate in snapshots if step <= update]
+    retained = set(eligible[-keep_last:])
+    for _, candidate in snapshots:
+        if candidate not in retained:
+            candidate.unlink()
 
 
 def _open_history(path, update):
@@ -195,6 +197,7 @@ def train(
     output_dir,
     resume=None,
     device="cpu",
+    track=True,
 ):
     device, rank, world_size = _distributed(device)
     output_dir = Path(output_dir)
@@ -294,7 +297,7 @@ def train(
         model = DistributedDataParallel(model, **distributed_args)
     model.train()
     tracker = None
-    if rank == 0 and config.track:
+    if rank == 0 and track:
         import swanlab
 
         logdir = output_dir / "swanlog"
@@ -418,6 +421,7 @@ def train(
                 update,
                 presented_documents,
                 indices,
+                keep_last=config.checkpoint_keep_last,
                 swanlab_run_id=swanlab_run_id,
             )
     if rank == 0:
@@ -431,6 +435,7 @@ def train(
             update,
             presented_documents,
             indices,
+            keep_last=config.checkpoint_keep_last,
             swanlab_run_id=swanlab_run_id,
         )
     if tracker is not None:
@@ -456,49 +461,19 @@ def main():
     from pondera.models.vanilla import VanillaModel
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, type=Path)
     parser.add_argument("--packed", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument(
-        "--architecture", choices=("vanilla", "linear"), default="vanilla"
-    )
-    parser.add_argument("--num-blocks", type=int, default=8)
-    parser.add_argument("--hidden-size", type=int, default=1024)
-    parser.add_argument("--intermediate-size", type=int, default=2816)
-    parser.add_argument("--num-heads", type=int, default=16)
-    parser.add_argument("--num-kv-heads", type=int, default=4)
-    for field in TrainConfig.__dataclass_fields__:
-        default = getattr(TrainConfig, field)
-        if isinstance(default, bool):
-            parser.add_argument(
-                f"--{field.replace('_', '-')}",
-                action=argparse.BooleanOptionalAction,
-                default=default,
-            )
-        else:
-            parser.add_argument(
-                f"--{field.replace('_', '-')}",
-                type=int if default is None else type(default),
-                default=default,
-            )
+    parser.add_argument("--track", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
-    model_config = dict(
-        num_blocks=args.num_blocks,
-        hidden_size=args.hidden_size,
-        intermediate_size=args.intermediate_size,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        vocab_size=PackedDocuments(args.packed).manifest["vocabulary"],
-    )
-    config = TrainConfig(
-        **{field: getattr(args, field) for field in TrainConfig.__dataclass_fields__}
-    )
-    architecture = args.architecture
-    if args.resume:
-        state = torch.load(args.resume, map_location="cpu", weights_only=True)
-        model_config = state["model_config"]
-        architecture = state["arch"]
+    model_settings, config = load_config(args.config)
+    architecture = model_settings["architecture"]
+    model_config = {
+        name: value for name, value in model_settings.items() if name != "architecture"
+    }
+    model_config["vocab_size"] = PackedDocuments(args.packed).manifest["vocabulary"]
     torch.manual_seed(config.seed)
     model_class = {"vanilla": VanillaModel, "linear": LinearVanillaModel}[architecture]
     model = model_class(**model_config)
@@ -510,6 +485,7 @@ def main():
         args.output,
         resume=args.resume,
         device=args.device,
+        track=args.track,
     )
     if result["rank"] == 0:
         print(

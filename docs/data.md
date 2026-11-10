@@ -2,21 +2,21 @@
 
 This page describes the current offline data pipeline. The grammar and array layout are still changing; `pondera.data.trace` and `pondera.data.dataset` are the exact schema authorities.
 
-Training never runs the engine. Data preparation uses `python -m pondera.data` with four commands sharing `configs/data.toml`:
+Training never runs the engine. Data preparation uses `python -m pondera.data` with three commands sharing `configs/data.toml`:
 
     game archive -> stratified root pool -> instrumented Stockfish
                  -> streamed sidecar decoding and synthesis
-                 -> Parquet release -> merge fitting and encoding
-                 -> packed training streams -> training
+                 -> curated Parquet -> merge fitting and encoding
+                 -> memory-mapped documents -> training
 
 ```bash
 python -m pondera.data prepare --config configs/data.toml --output ROOTS
 python -m pondera.data curate --config configs/data.toml --input ROOTS --output TRACES --engine STOCKFISH
-python -m pondera.data encode --config configs/data.toml --input TRACES --output TRAINING
-python -m pondera.data pack --config configs/data.toml --input TRAINING --output PACKED
+python -m pondera.data encode --config configs/data.toml --input TRACES --output ENCODED
+python -m pondera.training.packed --config configs/train.toml --packed ENCODED --output RUN --device cuda
 ```
 
-`prepare` provisions the enabled sources into `ROOTS/source/` and builds `roots.jsonl`; `--cache CACHE` changes the local download location, and repeated `--input NAME=PATH` arguments supply existing inputs for named sources. It does not start an engine. `curate` reads a prepared directory or root JSONL file and produces traces without rewriting the pool. `encode` fits one merge dictionary at the configured total vocabulary size and encodes the complete input dataset in the same workflow. Local inputs, outputs, cache, and the engine executable are command arguments; source identities, recipe, and execution settings come from TOML.
+`prepare` provisions the enabled sources into `ROOTS/source/` and builds `roots.jsonl`; `--cache CACHE` changes the local download location, and repeated `--input NAME=PATH` arguments supply existing inputs for named sources. It does not start an engine. `curate` reads a prepared directory or root JSONL file and produces traces without rewriting the pool. `encode` fits one merge dictionary at the configured total vocabulary size and writes the final training memory maps directly. Local inputs, outputs, cache, and the instrumented Stockfish executable are command arguments; source identities, recipe, and execution settings come from TOML. Training reads the encoded directory, takes tunables from `configs/train.toml`, and keeps dataset/output/checkpoint paths, device selection, and telemetry enablement in command arguments.
 
 ## Roots
 
@@ -99,9 +99,9 @@ Training reads compressed IDs directly, with one equal-weight next-token CE per 
 
 `python -m pondera.data encode` writes the streams that training reads. Each document contains the base `encode_board(fen, repetition)` prefix followed by its encoded trace, with no separator. Packed format 3 stores `tokens.u16`, `offsets.i64`, per-document `split.u8` and `presentation.u8`, `stats.json`, and `packing.json` with dataset identity, tokenizer versions, merge boundaries and entries, and the document cap. Every encoded document stays in the store.
 
-The data recipe's `max_document_tokens` defaults to 131072 and counts encoded tokens including the board prefix. Training selects eligible train documents from stored lengths and takes a seeded permutation prefix: `--documents N` chooses at most N documents, and omission selects all eligible train documents. Smaller selections are nested prefixes of the same permutation. `--max-document-tokens` overrides the stored recipe cap without refitting or re-encoding. The resolved cap and counts are recorded in run configuration; checkpoints retain selected document indices. The same cap applies to validation. Microbatch size is a separate constraint: training rejects a selected document exceeding `--microbatch-tokens`, rather than silently skipping it. The configured cap may exceed the microbatch budget when the actual selected documents fit.
+The data recipe's `max_document_tokens` defaults to 131072 and counts encoded tokens including the board prefix. Training reads `[model]` and `[training]` from `configs/train.toml`. It selects eligible train documents from stored lengths and takes a seeded permutation prefix: `[training].documents = N` chooses at most N documents, and omission selects all eligible train documents. Smaller selections are nested prefixes of the same permutation. `[training].max_document_tokens` overrides the stored data-recipe cap without refitting or re-encoding. The resolved cap and counts are recorded in run configuration; checkpoints retain selected document indices. The same cap applies to validation. Microbatch size is a separate constraint: training rejects a selected document exceeding `[training].microbatch_tokens`, rather than silently skipping it. The configured cap may exceed the microbatch budget when the actual selected documents fit.
 
-Within each epoch the fixed selection is shuffled using `(seed, epoch)` and packed greedily in that order, whole documents only, never sorted by length. Batches use at most the microbatch token budget, without padding. `--presentations` stops after the requested number of documents, rounded down, and may close a partial final batch. `presented_documents` is the resume cursor: the next epoch and position follow directly from this count and the selection size. Changing a presentation target cannot omit or repeat documents. Same-configuration resume at a completed optimizer update reproduces uninterrupted training; extending a completed target preserves document order but may change the optimizer trajectory because the earlier partial update has already happened. Checkpoints do not retain partial gradients.
+Within each epoch the fixed selection is shuffled using `(seed, epoch)` and packed greedily in that order, whole documents only, never sorted by length. Batches use at most the microbatch token budget, without padding. `[training].presentations` stops after the requested number of documents, rounded down, and may close a partial final batch. `presented_documents` is the resume cursor: the next epoch and position follow directly from this count and the selection size. Changing a presentation target cannot omit or repeat documents. Same-configuration resume at a completed optimizer update reproduces uninterrupted training; extending a completed target preserves document order but may change the optimizer trajectory because the earlier partial update has already happened. `[training].updates`, when set, uses a total optimizer-update target instead of the presentation target. Checkpoints do not retain partial gradients.
 
 An optimizer update accumulates whole microbatches to a global token target and normalizes loss by its actual global labeled-token count. Ranks materialize only their assigned batches. When the final distributed round has fewer batches than ranks, idle ranks contribute zero gradient and no presented tokens or documents. Resume locates the next document from length metadata without reading earlier tokens.
 

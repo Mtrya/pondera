@@ -3,6 +3,8 @@
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,8 +28,9 @@ from pondera.data.pipeline import produce_shards
 from pondera.data.tokenize import encode_dataset
 from pondera.models.linear import LinearVanillaModel
 from pondera.models.vanilla import VanillaModel
+from pondera.training.config import TrainConfig
 from pondera.training.muon import Muon, newton_schulz5, split_parameters
-from pondera.training.packed import TrainConfig, train
+from pondera.training.packed import train
 
 MODEL = dict(
     num_blocks=1,
@@ -58,6 +61,7 @@ def _ddp_worker(rank, store, packed, model_config, output, config, runs, model_c
                 output / name,
                 resume=resume,
                 device="cpu",
+                track=False,
             )
     finally:
         dist.destroy_process_group()
@@ -174,8 +178,229 @@ class TrainerTests(unittest.TestCase):
             updates=updates,
             val_every=2,
             checkpoint_every=updates,
+        )
+
+    def write_training_recipe(self, path, architecture="vanilla", updates=2):
+        path.write_text(f"""
+[model]
+architecture = "{architecture}"
+num_blocks = 1
+hidden_size = 32
+intermediate_size = 48
+num_heads = 4
+num_kv_heads = 2
+
+[training]
+seed = 11
+muon_lr = 0.01
+adamw_lr = 0.0007
+weight_decay = 0.05
+microbatch_tokens = 1024
+update_tokens = 1
+updates = {updates}
+documents = 3
+max_document_tokens = 65536
+val_every = 1
+checkpoint_every = 1
+checkpoint_keep_last = 2
+""")
+
+    def run_training_command(self, recipe, output, resume=None):
+        command = [
+            sys.executable,
+            "-m",
+            "pondera.training.packed",
+            "--config",
+            str(recipe),
+            "--packed",
+            str(self.root / "packed"),
+            "--output",
+            str(output),
+            "--device",
+            "cpu",
+            "--no-track",
+        ]
+        if resume is not None:
+            command.extend(["--resume", str(resume)])
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "OMP_NUM_THREADS": "1"},
+        )
+
+    def test_toml_training_and_resume_match_uninterrupted_training(self):
+        for architecture in ("vanilla", "linear"):
+            with self.subTest(architecture=architecture):
+                recipe = self.root / f"{architecture}.toml"
+                full = self.root / f"{architecture}-full"
+                partial = self.root / f"{architecture}-partial"
+                self.write_training_recipe(recipe, architecture)
+                result = self.run_training_command(recipe, full)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.write_training_recipe(recipe, architecture, updates=1)
+                result = self.run_training_command(recipe, partial)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.write_training_recipe(recipe, architecture)
+                result = self.run_training_command(
+                    recipe, partial, partial / "checkpoint.pth"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = torch.load(full / "checkpoint.pth", weights_only=True)
+                actual = torch.load(partial / "checkpoint.pth", weights_only=True)
+                self.assertEqual(actual["arch"], architecture)
+                self.assertEqual(actual["model_config"], self.model_config)
+                self.assertEqual(actual["presented_documents"], 6)
+                self.assertEqual(
+                    actual["selection"],
+                    {
+                        "documents": 3,
+                        "max_document_tokens": 65536,
+                        "validation_documents": 1,
+                    },
+                )
+                self.assertEqual(actual["train_config"]["seed"], 11)
+                self.assertEqual(actual["train_config"]["microbatch_tokens"], 1024)
+                self.assertEqual(actual["train_config"]["update_tokens"], 1)
+                self.assertEqual(actual["train_config"]["checkpoint_keep_last"], 2)
+                self.assertEqual(
+                    [
+                        optimizer["param_groups"][0]["lr"]
+                        for optimizer in actual["optimizer_state_dicts"]
+                    ],
+                    [0.01, 0.0007],
+                )
+                self.assertTrue(
+                    all(
+                        optimizer["param_groups"][0]["weight_decay"] == 0.05
+                        for optimizer in actual["optimizer_state_dicts"]
+                    )
+                )
+                self.assertEqual(
+                    json.loads((partial / "config.json").read_text())["train_config"],
+                    actual["train_config"],
+                )
+                reference_history = [
+                    json.loads(line)
+                    for line in (full / "history.jsonl").read_text().splitlines()
+                ]
+                resumed_history = [
+                    json.loads(line)
+                    for line in (partial / "history.jsonl").read_text().splitlines()
+                ]
+                self.assertEqual(
+                    [record["loss"] for record in resumed_history],
+                    [record["loss"] for record in reference_history],
+                )
+                for name, weight in expected["model_state_dict"].items():
+                    torch.testing.assert_close(
+                        actual["model_state_dict"][name], weight, rtol=0, atol=0
+                    )
+                # The requested model in TOML must not be silently replaced
+                # with checkpoint settings during resume.
+                recipe.write_text(
+                    recipe.read_text().replace("hidden_size = 32", "hidden_size = 64")
+                )
+                result = self.run_training_command(
+                    recipe, partial, partial / "checkpoint.pth"
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    [
+                        json.loads(line)
+                        for line in (partial / "history.jsonl").read_text().splitlines()
+                    ],
+                    resumed_history,
+                )
+
+    def test_invalid_recipe_does_not_start_training(self):
+        recipe = self.root / "invalid.toml"
+        self.write_training_recipe(recipe)
+        original = recipe.read_text()
+        for change in (
+            original.replace("muon_lr = 0.01", "muon_lr = -0.01"),
+            original.replace("num_heads = 4", "num_heads = 3"),
+            original + '\ndevice = "cpu"\n',
+            original.replace("documents = 3", "documents = true"),
+            original.replace("checkpoint_keep_last = 2", "checkpoint_keep_last = 0"),
+        ):
+            with self.subTest(recipe=change):
+                recipe.write_text(change)
+                output = self.root / "invalid-run"
+                result = self.run_training_command(recipe, output)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+
+    def test_checkpoint_retention_and_resume_from_an_older_update(self):
+        config = self.config(5)
+        config.checkpoint_every = 1
+        config.checkpoint_keep_last = 2
+        output = self.root / "retained"
+        output.mkdir()
+        unrelated = output / "manual.pth"
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
             track=False,
         )
+        unrelated.write_bytes(b"independent artifact")
+
+        def snapshots():
+            return sorted(
+                (torch.load(path, weights_only=True)["update"], path)
+                for path in output.glob("checkpoint-*.pth")
+            )
+
+        saved = snapshots()
+        self.assertEqual([step for step, _ in saved], [4, 5])
+        self.assertEqual(
+            torch.load(output / "checkpoint.pth", weights_only=True)["update"], 5
+        )
+        # The latest path must share storage with the numbered checkpoint.
+        self.assertTrue((output / "checkpoint.pth").samefile(saved[-1][1]))
+        config.updates = 4
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            resume=saved[0][1],
+            track=False,
+        )
+        self.assertEqual([step for step, _ in snapshots()], [4])
+        self.assertEqual(
+            torch.load(output / "checkpoint.pth", weights_only=True)["update"], 4
+        )
+        config.updates = 6
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            resume=output / "checkpoint.pth",
+            track=False,
+        )
+        saved = snapshots()
+        self.assertEqual([step for step, _ in saved], [5, 6])
+        config.checkpoint_keep_last = 1
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            resume=output / "checkpoint.pth",
+            track=False,
+        )
+        saved = snapshots()
+        self.assertEqual([step for step, _ in saved], [6])
+        self.assertTrue((output / "checkpoint.pth").samefile(saved[0][1]))
+        self.assertEqual(unrelated.read_bytes(), b"independent artifact")
 
     def test_loss_decreases(self):
         model = self.make_model()
@@ -185,6 +410,7 @@ class TrainerTests(unittest.TestCase):
             self.root / "packed",
             self.config(6),
             self.root / "train-out",
+            track=False,
         )
         losses = [record["loss"] for record in result["history"]]
         self.assertLess(losses[-1], losses[0])
@@ -210,7 +436,6 @@ class TrainerTests(unittest.TestCase):
                 architectures.append(swanlab.config["arch"])
 
         config = self.config(2)
-        config.track = True
         previous_mode = os.environ.get("SWANLAB_MODE")
         os.environ["SWANLAB_MODE"] = "offline"
         output = self.root / "tracked"
@@ -222,6 +447,7 @@ class TrainerTests(unittest.TestCase):
                 self.root / "packed",
                 config,
                 output,
+                track=True,
             )
         finally:
             if previous_mode is None:
@@ -248,6 +474,7 @@ class TrainerTests(unittest.TestCase):
             self.config(4),
             self.root / "full",
             device=device,
+            track=False,
         )
         partial = train(
             self.make_model(),
@@ -256,6 +483,7 @@ class TrainerTests(unittest.TestCase):
             self.config(2),
             self.root / "partial",
             device=device,
+            track=False,
         )
         copied = self.root / "packed-copy"
         shutil.copytree(self.root / "packed", copied)
@@ -267,6 +495,7 @@ class TrainerTests(unittest.TestCase):
             self.root / "resumed",
             resume=self.root / "partial" / "checkpoint.pth",
             device=device,
+            track=False,
         )
         expected = [record["loss"] for record in reference["history"]]
         actual = [record["loss"] for record in partial["history"] + resumed["history"]]
@@ -304,6 +533,7 @@ class TrainerTests(unittest.TestCase):
             self.root / "packed",
             self.config(1),
             self.root / "lr-partial",
+            track=False,
         )
         config = self.config(2)
         config.muon_lr = 0.01
@@ -316,6 +546,7 @@ class TrainerTests(unittest.TestCase):
             config,
             self.root / "lr-resumed",
             resume=self.root / "lr-partial" / "checkpoint.pth",
+            track=False,
         )
         state = torch.load(
             self.root / "lr-resumed" / "checkpoint.pth", weights_only=True
@@ -336,6 +567,7 @@ class TrainerTests(unittest.TestCase):
             self.root / "packed",
             self.config(1),
             output,
+            track=False,
         )
         checkpoint = output / "checkpoint.pth"
         for field in ("seed", "microbatch_tokens"):
@@ -350,6 +582,7 @@ class TrainerTests(unittest.TestCase):
                         config,
                         self.root / f"changed-{field}",
                         resume=checkpoint,
+                        track=False,
                     )
         config = self.config(2)
         config.documents = 1
@@ -361,6 +594,7 @@ class TrainerTests(unittest.TestCase):
                 config,
                 self.root / "changed-selection",
                 resume=checkpoint,
+                track=False,
             )
         with self.assertRaises(ValueError):
             train(
@@ -370,6 +604,7 @@ class TrainerTests(unittest.TestCase):
                 self.config(2),
                 self.root / "changed-architecture",
                 resume=checkpoint,
+                track=False,
             )
 
     def test_resume_rejects_new_dataset_and_reordered_dictionary(self):
@@ -380,6 +615,7 @@ class TrainerTests(unittest.TestCase):
             self.root / "packed",
             self.config(1),
             output,
+            track=False,
         )
         manifest = load_manifest(self.root / "packed" / "packing.json")
         for name, entries in (
@@ -405,6 +641,7 @@ class TrainerTests(unittest.TestCase):
                         self.config(2),
                         self.root / f"{name}-out",
                         resume=output / "checkpoint.pth",
+                        track=False,
                     )
 
     def test_history_follows_checkpoint_on_same_directory_resume(self):
@@ -415,6 +652,7 @@ class TrainerTests(unittest.TestCase):
             self.root / "packed",
             self.config(1),
             output,
+            track=False,
         )
         old_checkpoint = self.root / "old-checkpoint.pth"
         shutil.copy2(output / "checkpoint.pth", old_checkpoint)
@@ -425,6 +663,7 @@ class TrainerTests(unittest.TestCase):
             self.config(3),
             output,
             resume=old_checkpoint,
+            track=False,
         )
         history_path = output / "history.jsonl"
         expected = [
@@ -437,6 +676,7 @@ class TrainerTests(unittest.TestCase):
             self.config(3),
             output,
             resume=old_checkpoint,
+            track=False,
         )
         records = [json.loads(line) for line in history_path.read_text().splitlines()]
         self.assertEqual([record["update"] for record in records], [1, 2, 3])
@@ -450,6 +690,7 @@ class TrainerTests(unittest.TestCase):
             self.config(4),
             output,
             resume=output / "checkpoint.pth",
+            track=False,
         )
         records = [json.loads(line) for line in history_path.read_text().splitlines()]
         self.assertEqual([record["update"] for record in records], [1, 2, 3, 4])
@@ -474,6 +715,7 @@ class TrainerTests(unittest.TestCase):
             self.root / "packed",
             config(1.5),
             self.root / "presentation-full",
+            track=False,
         )
         partial = train(
             self.make_model(),
@@ -481,6 +723,7 @@ class TrainerTests(unittest.TestCase):
             self.root / "packed",
             config(0.75),
             self.root / "presentation-partial",
+            track=False,
         )
         resumed = train(
             self.make_model(),
@@ -489,6 +732,7 @@ class TrainerTests(unittest.TestCase):
             config(1.5),
             self.root / "presentation-resumed",
             resume=self.root / "presentation-partial" / "checkpoint.pth",
+            track=False,
         )
         expected_count = count + count // 2
         self.assertEqual(reference["presented_documents"], expected_count)
@@ -522,6 +766,7 @@ class TrainerTests(unittest.TestCase):
             self.root / "packed",
             config,
             self.root / "reference",
+            track=False,
         )
         output = self.root / "distributed"
         torch.multiprocessing.spawn(
@@ -601,6 +846,7 @@ class TrainerTests(unittest.TestCase):
                     self.root / "packed",
                     config,
                     root / "reference",
+                    track=False,
                 )
                 output = root / "distributed"
                 torch.multiprocessing.spawn(
