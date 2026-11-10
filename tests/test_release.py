@@ -19,7 +19,6 @@ from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
 from pondera.data.config import load_config, parse_recipe
 from pondera.data.dataset import (
     DATA_ARRAYS,
-    TracePositions,
     load_manifest,
     read_root_rows,
     write_manifest,
@@ -217,10 +216,13 @@ class ReleaseTests(unittest.TestCase):
                 ]
                 self.assertEqual(int(arrays["state_count"][index]), len(thought))
         self.assertEqual(set(suffixes), {root["root_id"] for root in self.roots})
-        positions = TracePositions(self.release, "train")
+        positions = [
+            item["row"]
+            for item in read_release_rows(self.release).values()
+            if item["row"]["split"] == "train"
+        ]
         self.assertEqual(len(positions), len(CASES))
-        row = positions[0]
-        self.assertGreater(int(row[2]), 0)
+        self.assertGreater(positions[0]["trace_len"], 0)
 
     def test_resume_and_shard_recovery(self):
 

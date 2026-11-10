@@ -22,23 +22,22 @@ from pondera.data.dataset import (
     DATA_FORMAT_VERSION,
     HF_COLUMNS,
     HF_SCHEMA,
-    TracePositions,
     load_manifest,
     parquet_sources,
-    trace_data_identity,
     write_manifest,
 )
-from pondera.data.merge_profile import build_profile, load_full_rows, write_artifacts
+from pondera.data.merge_profile import (
+    build_profile,
+    load_full_rows,
+    load_rows,
+    write_artifacts,
+)
 from pondera.data.pipeline import EngineTimeoutError, produce_shards, validate_release
-from pondera.data.text import ROLE_MIXED, trace_atoms
+from pondera.data.text import trace_atoms
 from pondera.data.tokenize import merge_and_encode, tokenize_dataset
-from pondera.data.trace import ROLE_FINAL_MOVE, load_sidecar, synthesize_root
-from pondera.models.checkpoint import load_model, read_checkpoint, save_checkpoint
-from pondera.models.policy import create_model
-from pondera.training.trace import TraceCollator, TrainConfig, trace_loss_parts, train
+from pondera.data.trace import load_sidecar, synthesize_root
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
-MODEL = {"num_blocks": 1, "hidden_size": 16, "intermediate_size": 32, "num_heads": 2}
 
 
 class TextTests(unittest.TestCase):
@@ -168,7 +167,9 @@ class TokenizeTests(unittest.TestCase):
                 self.assertEqual(document["corpus"]["loaded"]["rows"], 3)
                 self.assertEqual(len(document["tiers"]), 1)
                 self.assertGreater(document["timing"]["workflow_peak_rss_bytes"], 0)
-                self.assertEqual(len(TracePositions(output, "train")), 4)
+                self.assertEqual(
+                    sum(row.split == "train" for row in load_rows(output)), 4
+                )
 
     def test_conversion_replaces_the_cache_from_authoritative_text(self):
         path = self.source / "shard-000000" / "data.parquet"
@@ -217,7 +218,7 @@ class TokenizeTests(unittest.TestCase):
         self.assertEqual(summary["rows"], len(roots) - len(dropped))
         for path, rows, _ in parquet_sources(output):
             self.assertEqual(pq.ParquetFile(path).metadata.num_rows, rows)
-        self.assertEqual(len(TracePositions(output, "train")), 3)
+        self.assertEqual(sum(row.split == "train" for row in load_rows(output)), 3)
         again = directory / "encoded-again"
         tokenize_dataset(output, again, self.dictionary)
         self.assertEqual(self.rows(again), self.rows(output))
@@ -299,10 +300,12 @@ class TokenizeTests(unittest.TestCase):
             )
             output = self.root / f"hf-encoded-{index}"
             tokenize_dataset(source.parent, output)
-            identities.append(trace_data_identity(output))
+            identities.append(load_manifest(output / "release.json")["dataset_id"])
             copied = self.root / f"reencoded-{index}"
             tokenize_dataset(output, copied)
-            self.assertEqual(trace_data_identity(copied), identities[-1])
+            self.assertEqual(
+                load_manifest(copied / "release.json")["dataset_id"], identities[-1]
+            )
         self.assertNotEqual(identities[0], identities[1])
 
     def test_hf_import_rejects_a_different_root_header(self):
@@ -354,7 +357,10 @@ class TokenizeTests(unittest.TestCase):
             DATA_FORMAT_VERSION,
         )
         self.assert_preserved(self.rows(output))
-        self.assertEqual(TracePositions(output, "train").dictionary, self.dictionary)
+        self.assertEqual(
+            MergeDictionary(load_manifest(output / "release.json")["merge_entries"]),
+            self.dictionary,
+        )
         converted = load_full_rows(output)
         for before, after in zip(original, converted):
             np.testing.assert_array_equal(before.atoms, after.atoms)
@@ -375,88 +381,8 @@ class TokenizeTests(unittest.TestCase):
             set(actual[0]),
             {*HF_COLUMNS, "trace_token_ids", "trace_len"},
         )
-        self.assertEqual(len(TracePositions(output, "train")), 4)
-        self.assertEqual(len(TracePositions(output, "val")), 1)
-
-    def test_merged_tokens_feed_real_loss_and_reload_with_the_dictionary(self):
-        output = self.root / "encoded"
-        tokenize_dataset(self.source, output, self.dictionary)
-        data = TracePositions(output, "train")
-        self.assertEqual(data.dictionary, self.dictionary)
-        self.assertEqual(
-            load_manifest(output / "release.json")["merge_entries"],
-            [list(entry) for entry in self.dictionary.entries],
-        )
-        model = create_model({**MODEL, "merge_entries": data.dictionary.entries})
-        batch = TraceCollator(data.dictionary)(
-            [data[index] for index in range(len(data))]
-        )
-        self.assertTrue(bool((batch["trace_ids"] >= CHESS_VOCAB_SIZE).any()))
-        self.assertTrue(bool((batch["trace_roles"] == ROLE_MIXED).any()))
-        final = batch["final_move_index"]
-        for index, position in enumerate(final):
-            self.assertEqual(
-                int(batch["trace_roles"][index, position]), ROLE_FINAL_MOVE
-            )
-            target = int(batch["trace_ids"][index, position])
-            self.assertGreaterEqual(target, CHESS_VOCAB_SIZE)
-            self.assertIn(FINAL, self.dictionary.expansion(target))
-        loss, ce, logits, generated = trace_loss_parts(model, batch)
-        self.assertEqual(
-            int(generated.sum()), sum(data[index][2] for index in range(len(data)))
-        )
-        self.assertEqual(logits.shape[-1], CHESS_VOCAB_SIZE + len(self.dictionary))
-        torch.testing.assert_close(loss, ce[generated].mean())
-        training_batch = TraceCollator(data.dictionary, diagnostics=False)(
-            [data[index] for index in range(len(data))]
-        )
-        self.assertEqual(set(training_batch), {"ids", "trace_ids"})
-        training_loss, _, _, _ = trace_loss_parts(model, training_batch)
-        torch.testing.assert_close(training_loss, loss)
-        loss.backward()
-        self.assertTrue(bool(torch.isfinite(model.head.weight.grad).all()))
-        checkpoint = self.root / "model.pth"
-        model.eval()
-        with torch.no_grad():
-            expected = model.trace_logits(batch["ids"], batch["trace_ids"])
-        save_checkpoint(checkpoint, model, MODEL)
-        loaded = load_model(checkpoint)
-        self.assertEqual(loaded.merge_dictionary, self.dictionary)
-        with torch.no_grad():
-            actual = loaded.trace_logits(batch["ids"], batch["trace_ids"])
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        identity = trace_data_identity(output)
-        manifest = load_manifest(output / "release.json")
-        manifest["merge_entries"] = tuple(reversed(self.dictionary.entries))
-        write_manifest(output / "release.json", manifest)
-        self.assertNotEqual(trace_data_identity(output), identity)
-
-    def test_training_resume_uses_the_dataset_dictionary(self):
-        data = self.root / "encoded"
-        tokenize_dataset(self.source, data, self.dictionary)
-        config = TrainConfig(
-            model=MODEL,
-            batch_size=2,
-            epochs=1,
-            workers=0,
-            precision="fp32",
-            train_probe_positions=0,
-            val_every=100,
-            save_every=100,
-        )
-        output = self.root / "train"
-        first = train(config, data, output, max_steps=1)
-        checkpoint = read_checkpoint(first)
-        self.assertEqual(
-            checkpoint["model_config"]["merge_entries"], self.dictionary.entries
-        )
-        final = train(config, data, output, resume=first, max_steps=2)
-        self.assertEqual(read_checkpoint(final)["step"], 2)
-        manifest = load_manifest(data / "release.json")
-        manifest["merge_entries"] = tuple(reversed(self.dictionary.entries))
-        write_manifest(data / "release.json", manifest)
-        with self.assertRaises(ValueError):
-            train(config, data, output, resume=final, max_steps=2)
+        self.assertEqual(sum(row.split == "train" for row in load_rows(output)), 4)
+        self.assertEqual(sum(row.split == "val" for row in load_rows(output)), 1)
 
     def test_fitting_never_admits_a_composite_containing_final(self):
         document, dictionaries = build_profile(
@@ -607,8 +533,6 @@ class TokenizeTests(unittest.TestCase):
                     tokenize_dataset(
                         self.source, self.root / "invalid", self.dictionary
                     )
-                with self.assertRaises(ValueError):
-                    TracePositions(self.source, "train")
 
 
 if __name__ == "__main__":

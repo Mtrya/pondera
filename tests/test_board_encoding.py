@@ -6,9 +6,9 @@ import torch
 
 from pondera.chess.codec import decode_board, encode_board, encode_boards
 from pondera.chess.domain import PIECE_TO_IDX
+from pondera.chess.symmetry import TOKEN_MIRROR
 from pondera.chess.tracker import repetition_count
 from pondera.chess.vocabulary import SIDE
-from pondera.models.board import black_to_move, reflect_board_tokens
 
 
 def assert_decoded_board(test, tokens, fen, repetition):
@@ -81,10 +81,12 @@ class BoardEncodingTests(unittest.TestCase):
             "7k/8/8/8/8/8/p7/7K b - - 0 80",
             chess.STARTING_FEN,
         ]
-        ids = torch.from_numpy(encode_boards(fens, [3, 2, 1]))
-        black = black_to_move(ids)
-        changed = reflect_board_tokens(ids, black)
-        torch.testing.assert_close(reflect_board_tokens(changed, black), ids)
+        ids = torch.from_numpy(encode_boards(fens, [3, 2, 1])).long()
+        black = torch.tensor([chess.Board(fen).turn == chess.BLACK for fen in fens])
+        mirror = torch.from_numpy(TOKEN_MIRROR)
+        changed = torch.where(black[:, None], mirror[ids], ids)
+        restored = torch.where(black[:, None], mirror[changed], changed)
+        torch.testing.assert_close(restored, ids)
         for index, fen in enumerate(fens):
             expected = chess.Board(fen)
             if expected.turn == chess.BLACK:

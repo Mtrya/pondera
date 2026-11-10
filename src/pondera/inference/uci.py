@@ -1,12 +1,8 @@
-"""UCI protocol for fixed-compute policy inference."""
+"""UCI protocol with caller-supplied model loading and move selection."""
 
-import argparse
 import sys
 
 import chess
-
-from pondera.inference.policy import pick_move
-from pondera.models.checkpoint import load_model
 
 
 def parse_position(parts: list[str]) -> chess.Board:
@@ -24,7 +20,7 @@ def parse_position(parts: list[str]) -> chess.Board:
     return board
 
 
-def serve(checkpoint: str, device: str, load=load_model, pick=pick_move) -> None:
+def serve(checkpoint: str, device: str, *, load, pick) -> None:
     model = None
     board = chess.Board()
     for line in sys.stdin:
@@ -50,15 +46,3 @@ def serve(checkpoint: str, device: str, load=load_model, pick=pick_move) -> None
             print(f"bestmove {pick(model, board, device)}", flush=True)
         elif command == "quit":
             break
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--device", default="cpu")
-    args = parser.parse_args()
-    serve(args.checkpoint, args.device)
-
-
-if __name__ == "__main__":
-    main()

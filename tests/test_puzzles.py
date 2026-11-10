@@ -18,7 +18,7 @@ from trace_fixtures import trace_config_text
 from pondera.chess.merge import MergeDictionary, decode
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
 from pondera.data.config import load_config
-from pondera.data.dataset import TracePositions, load_manifest, parquet_sources
+from pondera.data.dataset import load_manifest, parquet_sources
 from pondera.data.pipeline import validate_release
 from pondera.data.roots import prepare_pool
 from pondera.data.roots.pool import _claimable, read_roots
@@ -223,16 +223,20 @@ class PuzzleTests(unittest.TestCase):
         dictionary = MergeDictionary(
             load_manifest(training / "release.json")["merge_entries"]
         )
-        self.assertEqual(len(TracePositions(training, "train")), 2)
-        for path, _, _ in parquet_sources(training):
-            for row in pq.read_table(path).to_pylist():
-                source = json.loads(row["source"])
-                self.assertIn(source["puzzle"]["PuzzleId"], {"00008", "0000D"})
-                self.assertEqual(source["repo_id"], "Lichess/chess-puzzles")
-                self.assertEqual(
-                    decode(row["trace_token_ids"], dictionary).tolist(),
-                    trace_atoms(row["trace_text"]).tolist(),
-                )
+        rows = [
+            row
+            for path, _, _ in parquet_sources(training)
+            for row in pq.read_table(path).to_pylist()
+        ]
+        self.assertEqual(sum(row["split"] == "train" for row in rows), 2)
+        for row in rows:
+            source = json.loads(row["source"])
+            self.assertIn(source["puzzle"]["PuzzleId"], {"00008", "0000D"})
+            self.assertEqual(source["repo_id"], "Lichess/chess-puzzles")
+            self.assertEqual(
+                decode(row["trace_token_ids"], dictionary).tolist(),
+                trace_atoms(row["trace_text"]).tolist(),
+            )
 
 
 if __name__ == "__main__":

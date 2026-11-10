@@ -5,22 +5,22 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 | Location | Responsibility |
 |---|---|
 | `chess/` | Action vocabulary, rule-only path tracking, lossless board token encoding, exact symmetry transforms, and min-cost merge dictionaries |
-| `models/` | Neural model and checkpoint serialization |
-| `data/` | Root preparation, trace curation, and vocabulary fitting plus encoding under one TOML recipe; release validation, authoritative text conversion, and training dataset readers |
+| `models/` | Neural model definitions |
+| `data/` | Root preparation, trace curation, and vocabulary fitting plus encoding under one TOML recipe; release validation, authoritative text conversion, and packed training datasets |
 | `tools/export_hf.py` | Bounded projection of an accepted local release into the shared eleven-column Hugging Face dataset; schema definitions remain in `data/` |
 | `training/` | Supervised optimization and resumable training state |
-| `inference/` | Legal move selection, masked trace generation and budget assessment, and the UCI protocol |
-| `evaluation/` | External match orchestration and opening assets |
+| `inference/` | Checkpoint loading, legal move selection, and the UCI protocol |
+| `evaluation/` | External match orchestration, graded puzzles, Syzygy adjudication, and opening assets |
 | `tests/` | Behavioral and integration tests |
 | `results/` | Reviewed summaries of completed evaluations |
 
-Representation code does not import application layers. Models depend on representation, while training and inference depend on models. Training reads encoded datasets and dataset identity checks from `data`; it does not call collection, synthesis, search, or evaluation code. Evaluation orchestrates inference and external engines. Data and evaluation do not import training. Import contracts enforce these boundaries.
+Representation code does not import application layers, and models do not import workflows. Training and inference use the model definitions. Training reads packed datasets and dataset identity checks from `data`; it does not call collection, synthesis, search, or evaluation code. Evaluation orchestrates inference and external engines. Data and evaluation do not import training. Import contracts enforce these boundaries.
 
-The board tokenizer has one format shared by offline data preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving piece placement and the first four FEN fields exactly. Base token IDs and names are generated directly from the arithmetic layout in `chess/vocabulary.py`. The fullmove counter is not encoded; halfmove clocks of 100 and above and repetition counts above four share their respective top atoms. A single checkpoint format (`format_version = 1`) serves training, inference, and evaluation; older formats are not read.
+The board tokenizer has one format shared by offline data preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving piece placement and the first four FEN fields exactly. Base token IDs and names are generated directly from the arithmetic layout in `chess/vocabulary.py`. The fullmove counter is not encoded; halfmove clocks of 100 and above and repetition counts above four share their respective top atoms.
 
-The policy is a fixed-depth causal Transformer over a bidirectional board-token prefix and a causal trace suffix, with prefix caching for generation. Model configuration contains dimensions, dropout, the tokenizer format version, and the selected dictionary's flat atom expansions. Embedding and output dimensions follow that vocabulary; checkpoints retain the expansions so token IDs remain interpretable. There is no architecture selector.
+Both policy baselines are fixed-depth causal Transformers over one packed token stream, with NoPE, pre-norm RMSNorm, SiTU-GLU feed-forward networks, and grouped-query attention. The vanilla model uses causal softmax attention. The linear-attention model uses an identity feature map, no decay and unnormalized readout, with fp32 chunk and recurrent states. Model configuration contains dimensions and vocabulary size; the checkpoint's `arch` field selects the implementation.
 
-Generation feeds compressed token IDs to the model and expands them through the trace grammar. A composite is eligible only when its entire expansion is legal and respects the thinking budget, measured in expanded base atoms; returned traces remain expanded for replay. Move selection returns the emitted root decision. Diagnostic move probabilities condition on legal decision-bearing tokens at that generation step and sum alternatives that encode the same move.
+Packed-trainer checkpoints use `format_version = 1` and retain model and optimizer states, the actual number of presented traces, data and tokenizer identities, training configuration, and the SwanLab run ID. Generation reuses the board encoding, appends a standalone `FINAL`, masks the next-token distribution to legal decisions, and returns the highest-scoring move. The UCI protocol loop is independent of checkpoint loading and move selection; `pondera.inference.vanilla_uci` serves these checkpoints and is the default match engine.
 
 ## Repository hygiene
 

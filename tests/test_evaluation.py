@@ -7,17 +7,34 @@ import unittest
 from pathlib import Path
 
 import chess
+import torch
 
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
 from pondera.evaluation.match import parse_result, run_match
-from pondera.models.checkpoint import save_checkpoint
-from pondera.models.policy import create_model
+from pondera.models.vanilla import VanillaModel
 
 CONFIG = {
     "num_blocks": 1,
     "hidden_size": 16,
     "intermediate_size": 32,
     "num_heads": 2,
+    "num_kv_heads": 2,
 }
+
+
+def save_model(path):
+    config = {**CONFIG, "vocab_size": CHESS_VOCAB_SIZE}
+    torch.manual_seed(640)
+    model = VanillaModel(**config)
+    torch.save(
+        {
+            "format_version": 1,
+            "arch": "vanilla",
+            "model_config": config,
+            "model_state_dict": model.state_dict(),
+        },
+        path,
+    )
 
 
 class EvaluationTests(unittest.TestCase):
@@ -38,12 +55,12 @@ class EvaluationTests(unittest.TestCase):
     def test_real_uci_process(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "model.pth"
-            save_checkpoint(checkpoint, create_model(CONFIG), CONFIG)
+            save_model(checkpoint)
             process = subprocess.run(
                 [
                     sys.executable,
                     "-m",
-                    "pondera.inference.uci",
+                    "pondera.inference.vanilla_uci",
                     "--checkpoint",
                     str(checkpoint),
                 ],
@@ -75,7 +92,7 @@ class EvaluationTests(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "pondera.inference.uci",
+                "pondera.inference.vanilla_uci",
                 "--checkpoint",
                 "/nonexistent/model.pth",
             ],
@@ -95,7 +112,7 @@ class EvaluationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkpoint = root / "model.pth"
-            save_checkpoint(checkpoint, create_model(CONFIG), CONFIG)
+            save_model(checkpoint)
             openings = root / "openings.epd"
             openings.write_text("7k/5K2/6Q1/8/8/8/8/8 w - -\n")
             result = run_match(

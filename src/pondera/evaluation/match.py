@@ -59,7 +59,7 @@ def run_match(
     device="cpu",
     tablebase_path=None,
     tb_pieces=7,
-    engine_module="pondera.inference.uci",
+    engine_module="pondera.inference.vanilla_uci",
 ):
     if games < 2 or games % 2 or sf_depth < 1 or concurrency < 1:
         raise ValueError(
