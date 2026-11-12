@@ -199,6 +199,8 @@ num_kv_heads = 2
 seed = 11
 muon_lr = 0.01
 adamw_lr = 0.0007
+warmup_fraction = 0.5
+min_lr_ratio = 0.1
 weight_decay = 0.05
 microbatch_tokens = 1024
 update_tokens = 1
@@ -244,12 +246,8 @@ checkpoint_keep_last = 2
                 self.write_training_recipe(recipe, architecture)
                 result = self.run_training_command(recipe, full)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.write_training_recipe(recipe, architecture, updates=1)
-                result = self.run_training_command(recipe, partial)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.write_training_recipe(recipe, architecture)
                 result = self.run_training_command(
-                    recipe, partial, partial / "checkpoint.pth"
+                    recipe, partial, full / "checkpoint-00000001.pth"
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = torch.load(full / "checkpoint.pth", weights_only=True)
@@ -269,13 +267,14 @@ checkpoint_keep_last = 2
                 self.assertEqual(actual["train_config"]["microbatch_tokens"], 1024)
                 self.assertEqual(actual["train_config"]["update_tokens"], 1)
                 self.assertEqual(actual["train_config"]["checkpoint_keep_last"], 2)
-                self.assertEqual(
-                    [
-                        optimizer["param_groups"][0]["lr"]
-                        for optimizer in actual["optimizer_state_dicts"]
-                    ],
-                    [0.01, 0.0007],
-                )
+                self.assertEqual(actual["train_config"]["warmup_fraction"], 0.5)
+                self.assertEqual(actual["train_config"]["min_lr_ratio"], 0.1)
+                for optimizer, expected_lr in zip(
+                    actual["optimizer_state_dicts"], (0.001, 0.00007)
+                ):
+                    self.assertAlmostEqual(
+                        optimizer["param_groups"][0]["lr"], expected_lr
+                    )
                 self.assertTrue(
                     all(
                         optimizer["param_groups"][0]["weight_decay"] == 0.05
@@ -296,7 +295,7 @@ checkpoint_keep_last = 2
                 ]
                 self.assertEqual(
                     [record["loss"] for record in resumed_history],
-                    [record["loss"] for record in reference_history],
+                    [record["loss"] for record in reference_history[1:]],
                 )
                 for name, weight in expected["model_state_dict"].items():
                     torch.testing.assert_close(
@@ -390,6 +389,98 @@ checkpoint_keep_last = 2
         self.assertTrue((output / "checkpoint.pth").samefile(saved[0][1]))
         self.assertEqual(unrelated.read_bytes(), b"independent artifact")
 
+    def test_warmup_cosine_rates_follow_update_and_document_budgets(self):
+        states = []
+        for budget in ("updates", "presentations"):
+            with self.subTest(budget=budget):
+                config = self.config(4)
+                config.warmup_fraction = 0.5
+                config.min_lr_ratio = 0.1
+                config.checkpoint_every = 1
+                config.checkpoint_keep_last = 4
+                expected = (
+                    (0.01, 0.00015),
+                    (0.02, 0.0003),
+                    (0.011, 0.000165),
+                    (0.002, 0.00003),
+                )
+                if budget == "presentations":
+                    # Three two-presentation updates, then one short final update.
+                    # Warmup ends at 4/7; update three reaches 6/7, a 2/3 cosine phase.
+                    config.updates = None
+                    config.presentations = 7
+                    config.warmup_fraction = 4 / 7
+                    expected = (*expected[:2], (0.0065, 0.0000975), expected[-1])
+                output = self.root / f"schedule-{budget}"
+                result = train(
+                    self.make_model(),
+                    self.model_config,
+                    self.root / "packed",
+                    config,
+                    output,
+                    track=False,
+                )
+                self.assertEqual(len(result["history"]), len(expected))
+                for record, (muon_lr, adamw_lr) in zip(result["history"], expected):
+                    self.assertAlmostEqual(record["muon_lr"], muon_lr)
+                    self.assertAlmostEqual(record["adamw_lr"], adamw_lr)
+                first = torch.load(
+                    output / "checkpoint-00000001.pth", weights_only=True
+                )
+                final = torch.load(output / "checkpoint.pth", weights_only=True)
+                for optimizer, expected_lr in zip(
+                    final["optimizer_state_dicts"], expected[-1]
+                ):
+                    self.assertAlmostEqual(
+                        optimizer["param_groups"][0]["lr"], expected_lr
+                    )
+                states.append((first, final))
+        for key, weight in states[0][0]["model_state_dict"].items():
+            torch.testing.assert_close(
+                states[1][0]["model_state_dict"][key], weight, rtol=0, atol=0
+            )
+
+        # Equivalent effective rates must produce the same first optimizer update.
+        config = self.config(1)
+        config.muon_lr = 0.01
+        config.adamw_lr = 0.00015
+        config.warmup_fraction = 0
+        config.min_lr_ratio = 1
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            self.root / "constant",
+            track=False,
+        )
+        constant = torch.load(self.root / "constant/checkpoint.pth", weights_only=True)
+        for key, weight in constant["model_state_dict"].items():
+            torch.testing.assert_close(
+                states[0][0]["model_state_dict"][key], weight, rtol=0, atol=0
+            )
+
+    def test_invalid_direct_schedule_fails_before_creating_outputs(self):
+        for field, value in (
+            ("warmup_fraction", 1),
+            ("min_lr_ratio", -0.1),
+            ("min_lr_ratio", float("nan")),
+        ):
+            with self.subTest(field=field, value=value):
+                config = self.config(1)
+                setattr(config, field, value)
+                output = self.root / "invalid-schedule"
+                with self.assertRaises(ValueError):
+                    train(
+                        self.make_model(),
+                        self.model_config,
+                        self.root / "packed",
+                        config,
+                        output,
+                        track=False,
+                    )
+                self.assertFalse(output.exists())
+
     def test_loss_decreases(self):
         model = self.make_model()
         result = train(
@@ -455,64 +546,72 @@ checkpoint_keep_last = 2
         self.assertGreater(artifacts[0].stat().st_size, 0)
 
     def check_resume_replays_the_same_losses(self, device):
+        config = self.config(4)
+        config.warmup_fraction = 0.5
+        config.checkpoint_every = 1
+        config.checkpoint_keep_last = 4
         reference = train(
             self.make_model(),
             self.model_config,
             self.root / "packed",
-            self.config(4),
+            config,
             self.root / "full",
-            device=device,
-            track=False,
-        )
-        partial = train(
-            self.make_model(),
-            self.model_config,
-            self.root / "packed",
-            self.config(2),
-            self.root / "partial",
             device=device,
             track=False,
         )
         copied = self.root / "packed-copy"
         shutil.copytree(self.root / "packed", copied)
-        resumed = train(
-            self.make_model(),
-            self.model_config,
-            copied,
-            self.config(4),
-            self.root / "resumed",
-            resume=self.root / "partial" / "checkpoint.pth",
-            device=device,
-            track=False,
-        )
-        expected = [record["loss"] for record in reference["history"]]
-        actual = [record["loss"] for record in partial["history"] + resumed["history"]]
-        self.assertEqual(len(actual), len(expected))
-        for a, b in zip(actual, expected):
-            self.assertAlmostEqual(a, b, places=5)
-        streamed = [
-            json.loads(line)["loss"]
-            for name in ("partial", "resumed")
-            for line in (self.root / name / "history.jsonl").read_text().splitlines()
-        ]
-        self.assertEqual(streamed, actual)
         reference_state = torch.load(
             self.root / "full" / "checkpoint.pth", weights_only=True
         )
-        resumed_state = torch.load(
-            self.root / "resumed" / "checkpoint.pth", weights_only=True
-        )
-        for key, value in reference_state["model_state_dict"].items():
-            torch.testing.assert_close(
-                resumed_state["model_state_dict"][key], value, rtol=0, atol=0
-            )
+        for start in (1, 3):
+            with self.subTest(resume_update=start):
+                output = self.root / f"resumed-{start}"
+                resumed = train(
+                    self.make_model(),
+                    self.model_config,
+                    copied,
+                    config,
+                    output,
+                    resume=self.root / "full" / f"checkpoint-{start:08d}.pth",
+                    device=device,
+                    track=False,
+                )
+                for actual, expected in zip(
+                    resumed["history"], reference["history"][start:], strict=True
+                ):
+                    for field in ("loss", "muon_lr", "adamw_lr"):
+                        self.assertAlmostEqual(actual[field], expected[field], places=5)
+                streamed = [
+                    json.loads(line)
+                    for line in (output / "history.jsonl").read_text().splitlines()
+                ]
+                self.assertEqual(streamed, resumed["history"])
+                resumed_state = torch.load(output / "checkpoint.pth", weights_only=True)
+                for key, value in reference_state["model_state_dict"].items():
+                    torch.testing.assert_close(
+                        resumed_state["model_state_dict"][key], value, rtol=0, atol=0
+                    )
 
     def test_resume_replays_the_same_losses(self):
         self.check_resume_replays_the_same_losses("cpu")
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA resume requires a GPU")
     def test_cuda_resume_replays_the_same_losses(self):
-        self.check_resume_replays_the_same_losses("cuda")
+        # Exact weight replay requires deterministic FlashAttention backward.
+        deterministic = torch.are_deterministic_algorithms_enabled()
+        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        torch.use_deterministic_algorithms(True)
+        try:
+            self.check_resume_replays_the_same_losses("cuda")
+        finally:
+            torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+            if workspace is None:
+                os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+            else:
+                os.environ["CUBLAS_WORKSPACE_CONFIG"] = workspace
 
     def test_resume_uses_requested_optimizer_settings(self):
         train(
@@ -526,6 +625,7 @@ checkpoint_keep_last = 2
         config = self.config(2)
         config.muon_lr = 0.01
         config.adamw_lr = 0.00015
+        config.min_lr_ratio = 0.25
         config.weight_decay = 0.7
         train(
             self.make_model(),
@@ -543,7 +643,7 @@ checkpoint_keep_last = 2
             [group["lr"] for group in optimizer["param_groups"]]
             for optimizer in state["optimizer_state_dicts"]
         ]
-        self.assertEqual(rates, [[0.01], [0.00015]])
+        self.assertEqual(rates, [[0.0025], [0.0000375]])
         for optimizer in state["optimizer_state_dicts"]:
             self.assertEqual(optimizer["param_groups"][0]["weight_decay"], 0.7)
 
@@ -766,8 +866,8 @@ checkpoint_keep_last = 2
                 output,
                 config,
                 (
-                    ("partial", 1, None),
-                    ("resumed", 2, output / "partial" / "checkpoint.pth"),
+                    ("partial", 2, None),
+                    ("resumed", 2, output / "partial" / "checkpoint-00000001.pth"),
                 ),
                 VanillaModel,
             ),
@@ -776,10 +876,11 @@ checkpoint_keep_last = 2
         )
         actual = []
         for name in ("partial", "resumed"):
-            actual.extend(
+            rows = [
                 json.loads(line)
                 for line in (output / name / "history.jsonl").read_text().splitlines()
-            )
+            ]
+            actual.extend(rows[:1] if name == "partial" else rows)
         expected = reference["history"]
         self.assertEqual(len(actual), len(expected))
         for observed, wanted in zip(actual, expected):
@@ -787,6 +888,8 @@ checkpoint_keep_last = 2
                 self.assertEqual(observed[field], wanted[field])
             self.assertAlmostEqual(observed["loss"], wanted["loss"], places=4)
             self.assertAlmostEqual(observed["val_loss"], wanted["val_loss"], places=4)
+            self.assertEqual(observed["muon_lr"], wanted["muon_lr"])
+            self.assertEqual(observed["adamw_lr"], wanted["adamw_lr"])
 
         reference_state = torch.load(
             self.root / "reference" / "checkpoint.pth", weights_only=True

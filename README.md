@@ -26,6 +26,8 @@ uv run python -m pondera.training.packed --config configs/train.toml --packed EN
 
 Model architecture and dimensions, data selection, optimization, token budgets, stopping targets, validation cadence, and checkpoint retention are configured in [configs/train.toml](configs/train.toml). Dataset/output/checkpoint paths, device selection, and `--track` / `--no-track` remain command arguments. Resume uses the same recipe with `--resume RUN/checkpoint.pth`; change tunables in the TOML, and incompatible model or sampling settings are rejected.
 
+Muon and AdamW use linear warmup followed by cosine decay. Their configured learning rates are peaks; `warmup_fraction` defaults to 0.05 and `min_lr_ratio` to 0.1. The schedule follows the configured update or presentation budget, and actual rates are logged with each optimizer update.
+
 Shared data and training recipes live in `configs/`. Experiment configurations live with their run directories; only published reference runs add experiment configurations to the repository. See [data synthesis](docs/data.md) for the current offline pipeline and [architecture](docs/architecture.md) for module boundaries and repository conventions.
 
 Evaluate a checkpoint's unconstrained answers on held-out roots and/or Lichess puzzles:

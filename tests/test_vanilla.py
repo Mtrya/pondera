@@ -4,6 +4,7 @@ import unittest
 
 import torch
 
+from pondera.models.linear import LinearVanillaModel
 from pondera.models.vanilla import VanillaModel, situ_glu, varlen_attention
 
 MODEL = dict(
@@ -51,6 +52,46 @@ class VanillaTests(unittest.TestCase):
                 ]
             )
         torch.testing.assert_close(packed, separate, rtol=1e-6, atol=1e-6)
+
+    def test_activation_checkpointing_preserves_logits_and_gradients(self):
+        ids, cu = packed_ids()
+        labels = torch.randint(0, MODEL["vocab_size"], ids.shape)
+        for model_class in (VanillaModel, LinearVanillaModel):
+            with self.subTest(architecture=model_class.architecture):
+                original = model_class(**MODEL).train()
+                recomputed = model_class(**MODEL).train()
+                recomputed.load_state_dict(original.state_dict())
+                recomputed.activation_checkpointing = True
+
+                def forward_with_saved_elements(model):
+                    saved = []
+
+                    def pack(tensor):
+                        saved.append(tensor.numel())
+                        return tensor
+
+                    with torch.autograd.graph.saved_tensors_hooks(
+                        pack, lambda tensor: tensor
+                    ):
+                        logits = model(ids, cu)
+                    return logits, sum(saved)
+
+                logits, original_saved = forward_with_saved_elements(original)
+                checkpointed_logits, checkpointed_saved = forward_with_saved_elements(
+                    recomputed
+                )
+                self.assertLess(checkpointed_saved, original_saved)
+                torch.testing.assert_close(logits, checkpointed_logits, rtol=0, atol=0)
+                torch.nn.functional.cross_entropy(logits, labels).backward()
+                torch.nn.functional.cross_entropy(
+                    checkpointed_logits, labels
+                ).backward()
+                for parameter, checkpointed in zip(
+                    original.parameters(), recomputed.parameters()
+                ):
+                    torch.testing.assert_close(
+                        parameter.grad, checkpointed.grad, rtol=0, atol=0
+                    )
 
     def test_situ_glu_output_is_elementwise_bounded(self):
         gate = torch.randn(64, 8) * 100

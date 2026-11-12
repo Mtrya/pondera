@@ -12,6 +12,7 @@ is rescaled to the global labeled-token count.
 
 import importlib
 import json
+import math
 import os
 import time
 from contextlib import nullcontext
@@ -69,6 +70,13 @@ def _reduce(value, device, op=dist.ReduceOp.SUM):
     tensor = torch.as_tensor(value, device=device)
     dist.all_reduce(tensor, op=op)
     return tensor.tolist()
+
+
+def _lr_scale(progress, warmup_fraction, min_lr_ratio):
+    if progress < warmup_fraction:
+        return progress / warmup_fraction
+    decay = (progress - warmup_fraction) / (1 - warmup_fraction)
+    return min_lr_ratio + (1 - min_lr_ratio) * (1 + math.cos(math.pi * decay)) / 2
 
 
 def _move(batch, device):
@@ -200,6 +208,7 @@ def train(
     device="cpu",
     track=True,
 ):
+    config.validate()
     device, rank, world_size = _distributed(device)
     output_dir = Path(output_dir)
     if output_dir.exists() and any(output_dir.iterdir()) and resume is None:
@@ -227,12 +236,6 @@ def train(
             raise ValueError(
                 f"Selected document length {maximum} exceeds microbatch budget {config.microbatch_tokens}"
             )
-    if (
-        config.update_tokens < 1
-        or (config.updates is not None and config.updates < 1)
-        or config.presentations <= 0
-    ):
-        raise ValueError("Update tokens, updates, and presentations must be positive")
     run_config = {
         "arch": model.architecture,
         "model_config": model_config,
@@ -259,6 +262,7 @@ def train(
     if run_config["data_identity"]["source_dataset_id"] is None:
         raise ValueError("Packed training data needs a dataset_id from encoding")
     model.to(device)
+    model.activation_checkpointing = config.activation_checkpointing
     optimizers = build_optimizers(
         model,
         muon_lr=config.muon_lr,
@@ -280,10 +284,8 @@ def train(
                 raise ValueError(f"Resume {key} differs from checkpoint")
         model.load_state_dict(state["model_state_dict"])
         for optimizer, saved in zip(optimizers, state["optimizer_state_dicts"]):
-            learning_rates = [group["lr"] for group in optimizer.param_groups]
             optimizer.load_state_dict(saved)
-            for group, learning_rate in zip(optimizer.param_groups, learning_rates):
-                group["lr"] = learning_rate
+            for group in optimizer.param_groups:
                 group["weight_decay"] = config.weight_decay
         micro_step, update = state["micro_step"], state["update"]
         presented_documents = state["presented_documents"]
@@ -369,7 +371,16 @@ def train(
                 loss, _ = _loss(model, moved)
                 (loss * (labeled * world_size / total_labeled)).backward()
             update_loss += loss.detach() * labeled
-        for optimizer in optimizers:
+        # Use the budget fraction completed by this update, including a short final batch.
+        progress = (
+            (update + 1) / config.updates
+            if config.updates is not None
+            else presented_documents / target_documents
+        )
+        lr_scale = _lr_scale(progress, config.warmup_fraction, config.min_lr_ratio)
+        for optimizer, peak_lr in zip(optimizers, (config.muon_lr, config.adamw_lr)):
+            for group in optimizer.param_groups:
+                group["lr"] = peak_lr * lr_scale
             optimizer.step()
         update_loss = float(_reduce(update_loss, device)) / total_labeled
         if device.type in {"cuda", "npu"}:
@@ -389,6 +400,8 @@ def train(
             "epoch": last_epoch,
             "update_seconds": update_seconds,
             "tokens_per_second": total_tokens / update_seconds,
+            "muon_lr": optimizers[0].param_groups[0]["lr"],
+            "adamw_lr": optimizers[1].param_groups[0]["lr"],
         }
         if config.val_every and (
             update % config.val_every == 0 or presented_documents == target_documents

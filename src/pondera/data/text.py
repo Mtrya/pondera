@@ -4,7 +4,7 @@ import chess
 import numpy as np
 
 from pondera.chess.codec import decode_value_token, encode_board, mate_token
-from pondera.chess.merge import MergeDictionary, decode, encode_corpus
+from pondera.chess.merge import MergeDictionary, MergeEncoder, decode, encode_corpus
 from pondera.chess.symmetry import TOKEN_MIRROR, reflect_uci
 from pondera.chess.vocabulary import (
     BACK,
@@ -42,13 +42,10 @@ MERGE_BOUNDARIES = {
 
 
 def merge_segments(atoms):
-    """Split a trace where composites may not cross or absorb a boundary."""
+    """Isolate the final decision; dictionaries already exclude control atoms."""
     atoms = np.asarray(atoms, dtype=np.int32)
-    controls = np.flatnonzero(atoms >= DELIM)
     decisions = np.flatnonzero(atoms == FINAL) + 2
-    cuts = np.unique(
-        np.concatenate(([0, len(atoms)], controls, controls + 1, decisions))
-    )
+    cuts = np.unique(np.concatenate(([0, len(atoms)], decisions)))
     return [atoms[start:end] for start, end in zip(cuts[:-1], cuts[1:]) if end > start]
 
 
@@ -57,16 +54,23 @@ def validate_trace_dictionary(dictionary):
         raise ValueError("A trace composite contains a control atom")
 
 
-def encode_trace(atoms, encoder):
-    """Apply the exact encoder independently within each permitted segment."""
-    if not len(encoder.dictionary):
-        return np.asarray(atoms, dtype=np.int32)
-    return np.concatenate(
-        [
-            encoder.encode(segment) if len(segment) > 1 else segment
-            for segment in merge_segments(atoms)
-        ]
-    )
+class TraceEncoder(MergeEncoder):
+    """Validate a trace dictionary once, then encode within its merge boundaries."""
+
+    def __init__(self, dictionary):
+        validate_trace_dictionary(dictionary)
+        super().__init__(dictionary)
+
+    def encode(self, atoms):
+        if not len(self.dictionary):
+            return np.asarray(atoms, dtype=np.int32)
+        encode = super().encode
+        return np.concatenate(
+            [
+                encode(segment) if len(segment) > 1 else segment
+                for segment in merge_segments(atoms)
+            ]
+        )
 
 
 def encode_traces(traces, dictionary, workers=1):

@@ -13,7 +13,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from pondera.chess.codec import encode_board
-from pondera.chess.merge import MergeDictionary, MergeEncoder
+from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION, CHESS_VOCAB_SIZE
 from pondera.data.dataset import (
     HF_SCHEMA,
@@ -24,7 +24,7 @@ from pondera.data.dataset import (
 from pondera.data.packing import PACKED_FORMAT_VERSION, PRESENTATION_CODES, SPLIT_CODES
 from pondera.data.text import (
     MERGE_BOUNDARIES,
-    encode_trace,
+    TraceEncoder,
     trace_atoms,
     validate_trace_dictionary,
 )
@@ -160,7 +160,7 @@ def _encode_shard(encoder, task):
                     expected_fen=row["fen"] if check_header else None,
                     expected_repetition=row["repetition"] if check_header else None,
                 )
-                trace = encode_trace(atoms, encoder)
+                trace = encoder.encode(atoms)
                 board = encode_board(row["fen"], row["repetition"])
                 board.astype(np.uint16).tofile(handle)
                 trace.astype(np.uint16).tofile(handle)
@@ -187,7 +187,7 @@ _TOKENIZE_ENCODER = None
 
 def _tokenize_pool_init(entries):
     global _TOKENIZE_ENCODER
-    _TOKENIZE_ENCODER = MergeEncoder(MergeDictionary(entries))
+    _TOKENIZE_ENCODER = TraceEncoder(MergeDictionary(entries))
 
 
 def _tokenize_task(task):
@@ -252,7 +252,7 @@ def encode_dataset(
             ) as pool:
                 results = pool.map(_tokenize_task, tasks)
         else:
-            encoder = MergeEncoder(dictionary)
+            encoder = TraceEncoder(dictionary)
             results = [_encode_shard(encoder, task) for task in tasks]
         position = rows = base_atoms = trace_tokens = 0
         with (

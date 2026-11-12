@@ -164,7 +164,7 @@ def _streams32(sequences) -> list:
 
 
 def _spans(masses, span_mass) -> list:
-    """Contiguous [start, stop) spans each holding at most ``span_mass`` mass."""
+    """Group contiguous whole items toward ``span_mass`` total mass."""
     spans = []
     start, mass = 0, 0
     for index, value in enumerate(masses):
@@ -619,19 +619,42 @@ def _expand(token: int, expansions) -> tuple:
     return (token,) if token < MERGE_ID_BASE else expansions[token]
 
 
+def _pair_chunks(encodings, chunk_size):
+    """Pack adjacent pairs without crossing streams or exceeding chunk_size."""
+    chunks = []
+    for encoded in encodings:
+        if len(encoded) > chunk_size + 1:
+            chunks.extend(
+                encoded[start : start + chunk_size + 1]
+                for start in range(0, len(encoded) - 1, chunk_size)
+            )
+        elif len(encoded) > 1:
+            chunks.append(encoded)
+    for start, stop in _spans([len(chunk) - 1 for chunk in chunks], chunk_size):
+        yield np.concatenate(
+            [
+                (chunk[:-1].astype(np.uint64) << np.uint64(32))
+                | chunk[1:].astype(np.uint64)
+                for chunk in chunks[start:stop]
+            ]
+        )
+
+
 def _merge_counts(encodings, expansions, pool) -> list:
     """Rank the adjacent token pairs of an encoding by realized occurrences.
 
     Merging one pair replaces two tokens by one, so every occurrence saves
     exactly one token; raw pair counts rank the block, with the atoms as the
-    deterministic tie-break.
+    deterministic tie-break. Count packed int32 pairs in bounded NumPy chunks
+    instead of constructing a Python tuple for every occurrence.
     """
     counts = Counter()
-    for encoded in encodings:
-        values = encoded.tolist()
-        counts.update(zip(values, values[1:]))
+    for pairs in _pair_chunks(encodings, 1 << 24):
+        keys, frequencies = np.unique(pairs, return_counts=True)
+        counts.update(dict(zip(keys.tolist(), frequencies.tolist())))
     merges = {}
-    for (left, right), count in counts.items():
+    for pair, count in counts.items():
+        left, right = pair >> 32, pair & 0xFFFFFFFF
         atoms = _expand(left, expansions) + _expand(right, expansions)
         if len(atoms) > MAX_MERGE_LENGTH or atoms not in pool:
             continue

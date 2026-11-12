@@ -19,6 +19,8 @@ _MODEL_DIMENSIONS = (
 class TrainConfig:
     muon_lr: float = 0.02
     adamw_lr: float = 3e-4
+    warmup_fraction: float = 0.05
+    min_lr_ratio: float = 0.1
     weight_decay: float = 0.0
     microbatch_tokens: int = 131_072
     update_tokens: int = 524_288
@@ -30,6 +32,51 @@ class TrainConfig:
     checkpoint_every: int = 50
     checkpoint_keep_last: int = 3
     seed: int = 640
+    activation_checkpointing: bool = True
+
+    def validate(self):
+        if type(self.activation_checkpointing) is not bool:
+            raise ValueError("[training] activation_checkpointing must be a boolean")
+        for name in ("warmup_fraction", "min_lr_ratio"):
+            value = getattr(self, name)
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or not 0 <= value <= 1
+                or (name == "warmup_fraction" and value == 1)
+            ):
+                interval = "[0, 1)" if name == "warmup_fraction" else "[0, 1]"
+                raise ValueError(f"[training] {name} must be finite and in {interval}")
+        for name in (
+            "microbatch_tokens",
+            "update_tokens",
+            "documents",
+            "max_document_tokens",
+            "updates",
+            "val_every",
+            "checkpoint_every",
+            "checkpoint_keep_last",
+            "seed",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _integer(
+                    "training",
+                    name,
+                    value,
+                    0 if name in {"val_every", "checkpoint_every", "seed"} else 1,
+                )
+        for name in ("muon_lr", "adamw_lr", "weight_decay", "presentations"):
+            value = getattr(self, name)
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or value < 0
+                or (name == "presentations" and value == 0)
+            ):
+                raise ValueError(
+                    f"[training] {name} must be finite and {'positive' if name == 'presentations' else 'nonnegative'}"
+                )
 
 
 def _table(values, name, allowed):
@@ -76,34 +123,5 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         values["training"], "training", {field.name for field in fields(TrainConfig)}
     )
     config = TrainConfig(**training)
-    for name in (
-        "microbatch_tokens",
-        "update_tokens",
-        "documents",
-        "max_document_tokens",
-        "updates",
-        "val_every",
-        "checkpoint_every",
-        "checkpoint_keep_last",
-        "seed",
-    ):
-        value = getattr(config, name)
-        if value is not None:
-            _integer(
-                "training",
-                name,
-                value,
-                0 if name in {"val_every", "checkpoint_every", "seed"} else 1,
-            )
-    for name in ("muon_lr", "adamw_lr", "weight_decay", "presentations"):
-        value = getattr(config, name)
-        if (
-            type(value) not in (int, float)
-            or not math.isfinite(value)
-            or value < 0
-            or (name == "presentations" and value == 0)
-        ):
-            raise ValueError(
-                f"[training] {name} must be finite and {'positive' if name == 'presentations' else 'nonnegative'}"
-            )
+    config.validate()
     return model, config

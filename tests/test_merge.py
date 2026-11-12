@@ -13,6 +13,7 @@ from pondera.chess.merge import (
     Candidate,
     MergeDictionary,
     MergeDictionaryError,
+    _pair_chunks,
     count_candidates,
     decode,
     encode,
@@ -106,6 +107,20 @@ def greedy_pairs(tokens, steps):
 
 
 class CountingTests(unittest.TestCase):
+    def test_pair_chunks_bound_long_streams_without_losing_boundary_pairs(self):
+        encodings = [
+            np.array(row, dtype=np.int32)
+            for row in ([1, 2, 1, 2, 1, 2, 3, 4], [], [4, 1], [9], [7, 1, 2])
+        ]
+        counts = Counter()
+        for chunk in _pair_chunks(encodings, 3):
+            self.assertLessEqual(len(chunk), 3)
+            counts.update((int(key) >> 32, int(key) & 0xFFFFFFFF) for key in chunk)
+        self.assertEqual(
+            counts,
+            {(1, 2): 4, (2, 1): 2, (2, 3): 1, (3, 4): 1, (4, 1): 1, (7, 1): 1},
+        )
+
     def test_counts_match_the_hand_derived_windows(self):
         candidates = count_candidates([[1, 2, 1, 2]], min_count=1)
         self.assertEqual(
