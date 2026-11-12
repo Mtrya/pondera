@@ -13,6 +13,10 @@ seed = 640
 activation_checkpointing = true
 muon_lr = 0.02
 adamw_lr = 0.0003
+# Linear warmup over the first 5% of the training budget, then cosine decay.
+warmup_fraction = 0.05
+# Final learning rates as a fraction of the peaks above.
+min_lr_ratio = 0.1
 weight_decay = 0.0
 microbatch_tokens = 131072
 update_tokens = 524288

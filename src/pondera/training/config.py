@@ -19,6 +19,8 @@ _MODEL_DIMENSIONS = (
 class TrainConfig:
     muon_lr: float = 0.02
     adamw_lr: float = 3e-4
+    warmup_fraction: float = 0.05
+    min_lr_ratio: float = 0.1
     weight_decay: float = 0.0
     microbatch_tokens: int = 131_072
     update_tokens: int = 524_288
@@ -79,6 +81,16 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     config = TrainConfig(**training)
     if type(config.activation_checkpointing) is not bool:
         raise ValueError("[training] activation_checkpointing must be a boolean")
+    for name in ("warmup_fraction", "min_lr_ratio"):
+        value = getattr(config, name)
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or not 0 <= value <= 1
+            or (name == "warmup_fraction" and value == 1)
+        ):
+            interval = "[0, 1)" if name == "warmup_fraction" else "[0, 1]"
+            raise ValueError(f"[training] {name} must be finite and in {interval}")
     for name in (
         "microbatch_tokens",
         "update_tokens",
