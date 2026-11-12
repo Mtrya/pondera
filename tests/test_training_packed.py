@@ -398,10 +398,19 @@ checkpoint_keep_last = 2
                 config.min_lr_ratio = 0.1
                 config.checkpoint_every = 1
                 config.checkpoint_keep_last = 4
+                expected = (
+                    (0.01, 0.00015),
+                    (0.02, 0.0003),
+                    (0.011, 0.000165),
+                    (0.002, 0.00003),
+                )
                 if budget == "presentations":
-                    # Each update consumes two full presentations of this fixture.
+                    # Three two-presentation updates, then one short final update.
+                    # Warmup ends at 4/7; update three reaches 6/7, a 2/3 cosine phase.
                     config.updates = None
-                    config.presentations = 8
+                    config.presentations = 7
+                    config.warmup_fraction = 4 / 7
+                    expected = (*expected[:2], (0.0065, 0.0000975), expected[-1])
                 output = self.root / f"schedule-{budget}"
                 result = train(
                     self.make_model(),
@@ -410,13 +419,6 @@ checkpoint_keep_last = 2
                     config,
                     output,
                     track=False,
-                )
-                # Two linear warmup steps, then cosine midpoint and floor.
-                expected = (
-                    (0.01, 0.00015),
-                    (0.02, 0.0003),
-                    (0.011, 0.000165),
-                    (0.002, 0.00003),
                 )
                 self.assertEqual(len(result["history"]), len(expected))
                 for record, (muon_lr, adamw_lr) in zip(result["history"], expected):
@@ -433,9 +435,9 @@ checkpoint_keep_last = 2
                         optimizer["param_groups"][0]["lr"], expected_lr
                     )
                 states.append((first, final))
-        for key, weight in states[0][1]["model_state_dict"].items():
+        for key, weight in states[0][0]["model_state_dict"].items():
             torch.testing.assert_close(
-                states[1][1]["model_state_dict"][key], weight, rtol=0, atol=0
+                states[1][0]["model_state_dict"][key], weight, rtol=0, atol=0
             )
 
         # Equivalent effective rates must produce the same first optimizer update.
@@ -457,6 +459,27 @@ checkpoint_keep_last = 2
             torch.testing.assert_close(
                 states[0][0]["model_state_dict"][key], weight, rtol=0, atol=0
             )
+
+    def test_invalid_direct_schedule_fails_before_creating_outputs(self):
+        for field, value in (
+            ("warmup_fraction", 1),
+            ("min_lr_ratio", -0.1),
+            ("min_lr_ratio", float("nan")),
+        ):
+            with self.subTest(field=field, value=value):
+                config = self.config(1)
+                setattr(config, field, value)
+                output = self.root / "invalid-schedule"
+                with self.assertRaises(ValueError):
+                    train(
+                        self.make_model(),
+                        self.model_config,
+                        self.root / "packed",
+                        config,
+                        output,
+                        track=False,
+                    )
+                self.assertFalse(output.exists())
 
     def test_loss_decreases(self):
         model = self.make_model()

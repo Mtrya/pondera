@@ -208,6 +208,7 @@ def train(
     device="cpu",
     track=True,
 ):
+    config.validate()
     device, rank, world_size = _distributed(device)
     output_dir = Path(output_dir)
     if output_dir.exists() and any(output_dir.iterdir()) and resume is None:
@@ -235,12 +236,6 @@ def train(
             raise ValueError(
                 f"Selected document length {maximum} exceeds microbatch budget {config.microbatch_tokens}"
             )
-    if (
-        config.update_tokens < 1
-        or (config.updates is not None and config.updates < 1)
-        or config.presentations <= 0
-    ):
-        raise ValueError("Update tokens, updates, and presentations must be positive")
     run_config = {
         "arch": model.architecture,
         "model_config": model_config,

@@ -17,7 +17,7 @@ from test_release import CASES, build_run
 from tools.export_hf import export_hf
 
 from pondera.chess.codec import encode_board
-from pondera.chess.merge import MergeDictionary, MergeEncoder, decode
+from pondera.chess.merge import MergeDictionary, decode
 from pondera.chess.vocabulary import (
     BACK,
     BOARD,
@@ -45,7 +45,7 @@ from pondera.data.merge_profile import (
 )
 from pondera.data.packing import PackedDocuments
 from pondera.data.pipeline import EngineTimeoutError, produce_shards, validate_release
-from pondera.data.text import encode_trace, encode_traces, trace_atoms
+from pondera.data.text import TraceEncoder, encode_traces, trace_atoms
 from pondera.data.tokenize import encode_dataset, merge_and_encode
 from pondera.data.trace import load_sidecar, synthesize_root
 
@@ -406,11 +406,11 @@ class TokenizeTests(unittest.TestCase):
         self.assertGreater(len(dictionary), 0)
         for entry in dictionary.entries:
             self.assertTrue(all(atom < DELIM for atom in entry))
-        encoder = MergeEncoder(dictionary)
+        encoder = TraceEncoder(dictionary)
         for row in self.original:
             atoms = row["trace_atom_ids"]
             self.assertEqual(atoms.count(FINAL), 1)
-            encoded = encode_trace(atoms, encoder)
+            encoded = encoder.encode(atoms)
             self.assertEqual(int(np.count_nonzero(encoded == FINAL)), 1)
 
     def test_final_decision_is_standalone_even_with_a_matching_pair(self):
@@ -420,20 +420,22 @@ class TokenizeTests(unittest.TestCase):
         )
         dictionary = MergeDictionary([(MOVE + 1, VALUE + 1)])
         expected = [DEPTH, CHESS_VOCAB_SIZE, BACK, FINAL, MOVE + 1, VALUE + 1, END]
-        np.testing.assert_array_equal(
-            encode_trace(atoms, MergeEncoder(dictionary)), expected
-        )
+        np.testing.assert_array_equal(TraceEncoder(dictionary).encode(atoms), expected)
         np.testing.assert_array_equal(encode_traces([atoms], dictionary)[0], expected)
         np.testing.assert_array_equal(decode(expected, dictionary), atoms)
 
     def test_each_control_is_rejected_in_an_external_dictionary(self):
         for atom in (BACK, RESET, BOARD, FINAL, REFUTED, DEPTH, END):
-            with self.subTest(atom=atom), self.assertRaises(ValueError):
-                encode_dataset(
-                    self.source,
-                    self.root / "bad-dictionary",
-                    MergeDictionary([(atom, MOVE + 1)]),
-                )
+            with self.subTest(atom=atom):
+                dictionary = MergeDictionary([(atom, MOVE + 1)])
+                with self.assertRaises(ValueError):
+                    TraceEncoder(dictionary)
+                with self.assertRaises(ValueError):
+                    encode_traces([[atom, MOVE + 1]], dictionary)
+                with self.assertRaises(ValueError):
+                    encode_dataset(
+                        self.source, self.root / "bad-dictionary", dictionary
+                    )
 
     def test_parallel_profile_and_tokenization_match_sequential(self):
         document, dictionaries = build_profile(

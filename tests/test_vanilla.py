@@ -62,8 +62,25 @@ class VanillaTests(unittest.TestCase):
                 recomputed = model_class(**MODEL).train()
                 recomputed.load_state_dict(original.state_dict())
                 recomputed.activation_checkpointing = True
-                logits = original(ids, cu)
-                checkpointed_logits = recomputed(ids, cu)
+
+                def forward_with_saved_elements(model):
+                    saved = []
+
+                    def pack(tensor):
+                        saved.append(tensor.numel())
+                        return tensor
+
+                    with torch.autograd.graph.saved_tensors_hooks(
+                        pack, lambda tensor: tensor
+                    ):
+                        logits = model(ids, cu)
+                    return logits, sum(saved)
+
+                logits, original_saved = forward_with_saved_elements(original)
+                checkpointed_logits, checkpointed_saved = forward_with_saved_elements(
+                    recomputed
+                )
+                self.assertLess(checkpointed_saved, original_saved)
                 torch.testing.assert_close(logits, checkpointed_logits, rtol=0, atol=0)
                 torch.nn.functional.cross_entropy(logits, labels).backward()
                 torch.nn.functional.cross_entropy(
