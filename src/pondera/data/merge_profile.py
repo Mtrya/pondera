@@ -31,6 +31,7 @@ from pondera.chess.vocabulary import (
 from pondera.data.dataset import load_manifest, parquet_sources
 from pondera.data.text import (
     MERGE_BOUNDARIES,
+    STANDALONE_ATOMS,
     encode_traces,
     merge_segments,
     trace_atoms,
@@ -345,6 +346,7 @@ def build_profile(
             min_count=min_count,
             per_length_limit=per_length_limit,
             workers=workers,
+            forbidden=STANDALONE_ATOMS,
         )
         if any(size > CHESS_VOCAB_SIZE for size in vocab_sizes)
         else []

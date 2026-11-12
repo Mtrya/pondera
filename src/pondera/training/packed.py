@@ -259,6 +259,7 @@ def train(
     if run_config["data_identity"]["source_dataset_id"] is None:
         raise ValueError("Packed training data needs a dataset_id from encoding")
     model.to(device)
+    model.activation_checkpointing = config.activation_checkpointing
     optimizers = build_optimizers(
         model,
         muon_lr=config.muon_lr,

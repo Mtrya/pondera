@@ -624,14 +624,23 @@ def _merge_counts(encodings, expansions, pool) -> list:
 
     Merging one pair replaces two tokens by one, so every occurrence saves
     exactly one token; raw pair counts rank the block, with the atoms as the
-    deterministic tie-break.
+    deterministic tie-break. Count packed int32 pairs in bounded NumPy chunks
+    instead of constructing a Python tuple for every occurrence.
     """
     counts = Counter()
-    for encoded in encodings:
-        values = encoded.tolist()
-        counts.update(zip(values, values[1:]))
+    for start, stop in _spans([len(encoded) for encoded in encodings], 1 << 24):
+        pairs = np.concatenate(
+            [
+                (encoded[:-1].astype(np.uint64) << np.uint64(32))
+                | encoded[1:].astype(np.uint64)
+                for encoded in encodings[start:stop]
+            ]
+        )
+        keys, frequencies = np.unique(pairs, return_counts=True)
+        counts.update(dict(zip(keys.tolist(), frequencies.tolist())))
     merges = {}
-    for (left, right), count in counts.items():
+    for pair, count in counts.items():
+        left, right = pair >> 32, pair & 0xFFFFFFFF
         atoms = _expand(left, expansions) + _expand(right, expansions)
         if len(atoms) > MAX_MERGE_LENGTH or atoms not in pool:
             continue

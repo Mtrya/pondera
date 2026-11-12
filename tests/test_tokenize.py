@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from itertools import groupby
 from pathlib import Path
 
 import numpy as np
@@ -44,7 +45,7 @@ from pondera.data.merge_profile import (
 )
 from pondera.data.packing import PackedDocuments
 from pondera.data.pipeline import EngineTimeoutError, produce_shards, validate_release
-from pondera.data.text import encode_trace, encode_traces, merge_segments, trace_atoms
+from pondera.data.text import encode_trace, encode_traces, trace_atoms
 from pondera.data.tokenize import encode_dataset, merge_and_encode
 from pondera.data.trace import load_sidecar, synthesize_root
 
@@ -99,11 +100,10 @@ class TokenizeTests(unittest.TestCase):
             atoms = row["trace_atom_ids"]
             final = atoms.index(FINAL)
             entries.append(tuple(atoms[final + 1 : final + 3]))
-            entries.extend(
-                tuple(segment[:8])
-                for segment in merge_segments(atoms)
-                if len(segment) > 1
-            )
+            for allowed, span in groupby(atoms, key=lambda atom: atom < DELIM):
+                segment = tuple(span)[:8]
+                if allowed and len(segment) > 1:
+                    entries.append(segment)
         self.dictionary = MergeDictionary(tuple(dict.fromkeys(entries)))
 
     @staticmethod

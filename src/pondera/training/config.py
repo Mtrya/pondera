@@ -30,6 +30,7 @@ class TrainConfig:
     checkpoint_every: int = 50
     checkpoint_keep_last: int = 3
     seed: int = 640
+    activation_checkpointing: bool = True
 
 
 def _table(values, name, allowed):
@@ -76,6 +77,8 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         values["training"], "training", {field.name for field in fields(TrainConfig)}
     )
     config = TrainConfig(**training)
+    if type(config.activation_checkpointing) is not bool:
+        raise ValueError("[training] activation_checkpointing must be a boolean")
     for name in (
         "microbatch_tokens",
         "update_tokens",

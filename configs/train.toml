@@ -9,6 +9,8 @@ num_kv_heads = 4
 
 [training]
 seed = 640
+# Recompute block activations during backward to fit long documents.
+activation_checkpointing = true
 muon_lr = 0.02
 adamw_lr = 0.0003
 weight_decay = 0.0

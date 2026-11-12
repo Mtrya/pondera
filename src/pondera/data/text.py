@@ -42,13 +42,10 @@ MERGE_BOUNDARIES = {
 
 
 def merge_segments(atoms):
-    """Split a trace where composites may not cross or absorb a boundary."""
+    """Isolate the final decision; dictionaries already exclude control atoms."""
     atoms = np.asarray(atoms, dtype=np.int32)
-    controls = np.flatnonzero(atoms >= DELIM)
     decisions = np.flatnonzero(atoms == FINAL) + 2
-    cuts = np.unique(
-        np.concatenate(([0, len(atoms)], controls, controls + 1, decisions))
-    )
+    cuts = np.unique(np.concatenate(([0, len(atoms)], decisions)))
     return [atoms[start:end] for start, end in zip(cuts[:-1], cuts[1:]) if end > start]
 
 

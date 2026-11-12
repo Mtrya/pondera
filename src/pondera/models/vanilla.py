@@ -8,6 +8,7 @@ through ``cu_seqlens`` and never materializes an L×L mask.
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 class RMSNorm(nn.Module):
@@ -161,6 +162,7 @@ class VanillaModel(nn.Module):
     ):
         super().__init__()
         self.vocab_size = vocab_size
+        self.activation_checkpointing = False
         self.token_embedding = nn.Embedding(vocab_size, hidden_size)
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         self.blocks = nn.ModuleList(
@@ -181,7 +183,10 @@ class VanillaModel(nn.Module):
         prepared = attention_cls.prepare(cu_seqlens, input_ids.device)
         x = self.token_embedding(input_ids)
         for block in self.blocks:
-            x = block(x, prepared)
+            if self.training and self.activation_checkpointing:
+                x = checkpoint(block, x, prepared, use_reentrant=False)
+            else:
+                x = block(x, prepared)
         return self.head(self.norm(x))
 
     def forward_cached(self, input_ids, cu_seqlens, caches=None):
