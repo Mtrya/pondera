@@ -10,6 +10,7 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
 import swanlab
 import torch
 import torch.distributed as dist
@@ -17,7 +18,7 @@ from swanlab.toolkit.callback import SwanKitCallback
 from test_release import CASES, build_run
 
 from pondera.chess.merge import MergeDictionary
-from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
+from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, END, FINAL
 from pondera.data.dataset import load_manifest, write_manifest
 from pondera.data.merge_profile import build_profile
 from pondera.data.packing import (
@@ -31,7 +32,7 @@ from pondera.models.linear import LinearVanillaModel
 from pondera.models.vanilla import VanillaModel
 from pondera.training.config import TrainConfig
 from pondera.training.muon import Muon, newton_schulz5, split_parameters
-from pondera.training.packed import train
+from pondera.training.packed import _loss, _move, _supervise, train, validation_loss
 
 MODEL = dict(
     num_blocks=1,
@@ -502,6 +503,88 @@ checkpoint_keep_last = 2
         ]
         self.assertEqual(streamed, result["history"])
 
+    def test_final_decision_gradients_match_two_independent_decisions(self):
+        model, reference = self.make_model(), self.make_model()
+        # Two decisions have equal weight despite unequal context lengths. Other
+        # tokens, a terminal FINAL without a label, and an idle batch add no loss.
+        parts = (
+            ([12, FINAL, 1001, END], [FINAL, 1001, END, -100], [0, 4]),
+            (
+                [14, 15, 16, FINAL, 1002, END, 19, 20, FINAL],
+                [15, 16, FINAL, 1002, END, -100, 20, FINAL, -100],
+                [0, 6, 9],
+            ),
+            ([19, 20, FINAL], [20, FINAL, -100], [0, 3]),
+            ([], [], [0]),
+        )
+        observed_loss = 0
+        counts = []
+        for inputs, labels, boundaries in parts:
+            batch = {
+                "input_ids": np.asarray(inputs, dtype=np.int32),
+                "labels": np.asarray(labels, dtype=np.int32),
+                "cu_seqlens": np.asarray(boundaries, dtype=np.int32),
+                "tokens": len(inputs),
+                "documents": len(boundaries) - 1,
+            }
+            selected = _supervise(batch, "final_decision")
+            loss, labeled = _loss(model, _move(selected, "cpu"))
+            counts.append(labeled)
+            weighted = loss * (labeled / 2)
+            weighted.backward()
+            observed_loss += float(weighted.detach())
+        self.assertEqual(counts, [1, 1, 0, 0])
+        logits = torch.stack(
+            [
+                reference(torch.tensor([12, FINAL, 1001, END]), [0, 4])[1],
+                reference(torch.tensor([14, 15, 16, FINAL, 1002, END]), [0, 6])[3],
+            ]
+        )
+        expected_loss = torch.nn.functional.cross_entropy(
+            logits, torch.tensor([1001, 1002])
+        )
+        expected_loss.backward()
+        self.assertAlmostEqual(observed_loss, float(expected_loss.detach()), places=6)
+        for actual, expected in zip(
+            model.parameters(), reference.parameters(), strict=True
+        ):
+            torch.testing.assert_close(actual.grad, expected.grad, rtol=1e-5, atol=1e-6)
+        for network in (model, reference):
+            torch.optim.SGD(network.parameters(), lr=0.01).step()
+        for actual, expected in zip(
+            model.parameters(), reference.parameters(), strict=True
+        ):
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+
+    def test_final_decision_rejects_updates_and_validation_without_labels(self):
+        packed = self.root / "no-final"
+        shutil.copytree(self.root / "packed", packed)
+        tokens = np.memmap(packed / "tokens.u16", np.uint16, mode="r+")
+        tokens[tokens == FINAL] = END
+        tokens.flush()
+        config = self.config(1)
+        config.objective = "final_decision"
+        with self.assertRaises(ValueError):
+            train(
+                self.make_model(),
+                self.model_config,
+                packed,
+                config,
+                self.root / "no-label-run",
+                track=False,
+            )
+        self.assertFalse((self.root / "no-label-run/checkpoint.pth").exists())
+        documents = PackedDocuments(packed)
+        with self.assertRaises(ValueError):
+            validation_loss(
+                self.make_model(),
+                documents,
+                config.microbatch_tokens,
+                "cpu",
+                select_documents(documents, seed=config.seed, split="val"),
+                objective=config.objective,
+            )
+
     def test_swanlab_offline_tracking(self):
         events = []
         architectures = []
@@ -658,10 +741,14 @@ checkpoint_keep_last = 2
             track=False,
         )
         checkpoint = output / "checkpoint.pth"
-        for field in ("seed", "microbatch_tokens"):
+        for field, value in (
+            ("seed", self.config(2).seed + 1),
+            ("microbatch_tokens", self.config(2).microbatch_tokens + 1),
+            ("objective", "final_decision"),
+        ):
             with self.subTest(field=field):
                 config = self.config(2)
-                setattr(config, field, getattr(config, field) + 1)
+                setattr(config, field, value)
                 with self.assertRaises(ValueError):
                     train(
                         self.make_model(),
@@ -846,6 +933,7 @@ checkpoint_keep_last = 2
 
     def test_distributed_matches_single_process_and_resume(self):
         config = self.config(2)
+        config.objective = "final_decision"
         config.update_tokens *= 2
         config.val_every = 1
         reference = train(
@@ -884,7 +972,14 @@ checkpoint_keep_last = 2
         expected = reference["history"]
         self.assertEqual(len(actual), len(expected))
         for observed, wanted in zip(actual, expected):
-            for field in ("update", "micro_step", "tokens", "labeled_tokens", "epoch"):
+            for field in (
+                "update",
+                "micro_step",
+                "tokens",
+                "labeled_tokens",
+                "val_labeled_tokens",
+                "epoch",
+            ):
                 self.assertEqual(observed[field], wanted[field])
             self.assertAlmostEqual(observed["loss"], wanted["loss"], places=4)
             self.assertAlmostEqual(observed["val_loss"], wanted["val_loss"], places=4)
@@ -927,9 +1022,17 @@ checkpoint_keep_last = 2
             )
         )
         self.assertEqual(batches % 2, 1)
-        for model_class in (VanillaModel, LinearVanillaModel):
-            with self.subTest(architecture=model_class.architecture):
-                root = self.root / model_class.architecture
+        for model_class, objective in (
+            (VanillaModel, "all_tokens"),
+            (LinearVanillaModel, "all_tokens"),
+            (VanillaModel, "final_decision"),
+            (LinearVanillaModel, "final_decision"),
+        ):
+            with self.subTest(
+                architecture=model_class.architecture, objective=objective
+            ):
+                config.objective = objective
+                root = self.root / f"{model_class.architecture}-{objective}"
                 torch.manual_seed(11)
                 reference = train(
                     model_class(**self.model_config),
@@ -969,11 +1072,18 @@ checkpoint_keep_last = 2
                     .splitlines()
                 ]
                 self.assertEqual(len(observed), reference["updates"])
+                if objective == "final_decision":
+                    self.assertEqual(
+                        sum(record["labeled_tokens"] for record in observed),
+                        len(indices),
+                    )
+                    self.assertEqual(observed[-1]["val_labeled_tokens"], 1)
                 for record, wanted in zip(observed, reference["history"]):
                     for field in (
                         "micro_step",
                         "tokens",
                         "labeled_tokens",
+                        "val_labeled_tokens",
                         "presentations",
                     ):
                         self.assertEqual(record[field], wanted[field])
@@ -981,10 +1091,22 @@ checkpoint_keep_last = 2
                     self.assertAlmostEqual(
                         record["val_loss"], wanted["val_loss"], places=4
                     )
-                for key, weight in expected["model_state_dict"].items():
-                    torch.testing.assert_close(
-                        actual["model_state_dict"][key], weight, rtol=1e-4, atol=1e-5
-                    )
+                # At the first update, momentum is proportional to the gradient.
+                # Compare before Muon's BF16 orthogonalization can amplify tiny
+                # differences from the distributed reduction order.
+                for observed_optimizer, expected_optimizer in zip(
+                    actual["optimizer_state_dicts"],
+                    expected["optimizer_state_dicts"],
+                    strict=True,
+                ):
+                    for parameter, state in expected_optimizer["state"].items():
+                        for name, value in state.items():
+                            torch.testing.assert_close(
+                                observed_optimizer["state"][parameter][name],
+                                value,
+                                rtol=1e-5,
+                                atol=1e-8,
+                            )
 
 
 if __name__ == "__main__":

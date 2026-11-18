@@ -2,8 +2,8 @@
 
 Muon owns hidden matrices, AdamW the rest (training/muon.py). One optimizer
 update consumes whole microbatches until its token target is met; each
-microbatch's equal-weight next-token CE is normalized by that microbatch's
-labeled positions and weighted by its share of the update's actual labeled
+microbatch's next-token CE is normalized by that microbatch's supervised
+positions and weighted by its share of the update's actual labeled
 tokens. Resume starts at the saved number of consumed documents in a fixed
 selection and shuffled epoch order. With data parallelism the token target
 is global, ranks consume interleaved batches, and the DDP gradient average
@@ -19,11 +19,13 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
+from pondera.chess.vocabulary import FINAL
 from pondera.data.packing import (
     PackedDocuments,
     assemble_batch,
@@ -79,6 +81,19 @@ def _lr_scale(progress, warmup_fraction, min_lr_ratio):
     return min_lr_ratio + (1 - min_lr_ratio) * (1 + math.cos(math.pi * decay)) / 2
 
 
+def _supervise(batch, objective):
+    if objective == "final_decision":
+        labels = batch["labels"].copy()
+        labels[batch["input_ids"] != FINAL] = -100
+        labeled = int(np.count_nonzero(labels != -100))
+    elif objective == "all_tokens":
+        labels = batch["labels"]
+        labeled = batch["tokens"] - batch["documents"]
+    else:
+        raise ValueError(f"Unknown training objective: {objective}")
+    return {**batch, "labels": labels, "labeled_tokens": labeled}
+
+
 def _move(batch, device):
     return {
         "input_ids": torch.as_tensor(
@@ -86,7 +101,7 @@ def _move(batch, device):
         ),
         "labels": torch.as_tensor(batch["labels"], dtype=torch.long, device=device),
         "cu_seqlens": batch["cu_seqlens"].tolist(),
-        "labeled_tokens": batch["tokens"] - batch["documents"],
+        "labeled_tokens": batch["labeled_tokens"],
     }
 
 
@@ -110,6 +125,9 @@ def _loss(model, batch):
         return _forward(model, moved).float().sum() * 0.0, 0
     logits = _forward(model, batch)
     labeled = batch["labeled_tokens"]
+    if not labeled:
+        # A nonempty unsupervised batch still participates in the same forward/DDP.
+        return logits.float().sum() * 0.0, 0
     loss = F.cross_entropy(
         logits.float().view(-1, logits.shape[-1]),
         batch["labels"].view(-1),
@@ -119,21 +137,34 @@ def _loss(model, batch):
 
 
 @torch.no_grad()
-def validation_loss(model, documents, budget, device, indices, rank=0, world_size=1):
+def validation_loss(
+    model,
+    documents,
+    budget,
+    device,
+    indices,
+    rank=0,
+    world_size=1,
+    objective="all_tokens",
+):
     model = _module(model)
     model.eval()
     batches = pack_batches(documents.lengths, indices, budget)
     total_loss = 0.0
     total_labeled = 0
     for batch in batches[rank::world_size]:
-        moved = _move(assemble_batch(documents, list(batch)), device)
+        moved = _move(
+            _supervise(assemble_batch(documents, list(batch)), objective), device
+        )
         loss, labeled = _loss(model, moved)
         total_loss += float(loss) * labeled
         total_labeled += labeled
     total_loss = _reduce(total_loss, device)
     total_labeled = _reduce(total_labeled, device)
     model.train()
-    return total_loss / max(total_labeled, 1)
+    if not total_labeled:
+        raise ValueError(f"No supervised validation labels for objective {objective}")
+    return total_loss / total_labeled, total_labeled
 
 
 def save_training_checkpoint(
@@ -282,6 +313,8 @@ def train(
         for key in ("seed", "microbatch_tokens"):
             if state["train_config"][key] != run_config["train_config"][key]:
                 raise ValueError(f"Resume {key} differs from checkpoint")
+        if state["train_config"].get("objective") != config.objective:
+            raise ValueError("Resume objective differs from checkpoint")
         model.load_state_dict(state["model_state_dict"])
         for optimizer, saved in zip(optimizers, state["optimizer_state_dicts"]):
             optimizer.load_state_dict(saved)
@@ -329,103 +362,129 @@ def train(
         presentations=config.presentations if target_documents is not None else None,
     )
     started = time.monotonic()
-    while (config.updates is not None and update < config.updates) or (
-        target_documents is not None and presented_documents < target_documents
-    ):
-        update_started = time.monotonic()
-        batches = []
-        total_labeled = 0
-        total_tokens = 0
-        last_epoch = 0
-        while total_tokens < config.update_tokens and (
-            target_documents is None or presented_documents < target_documents
+    try:
+        while (config.updates is not None and update < config.updates) or (
+            target_documents is not None and presented_documents < target_documents
         ):
-            local_indices = []
-            for batch_rank in range(world_size):
-                if (
-                    target_documents is not None
-                    and presented_documents >= target_documents
-                ):
-                    break
-                document_indices, last_epoch = next(batch_stream)
-                tokens = int(documents.lengths[document_indices].sum())
-                total_tokens += tokens
-                total_labeled += tokens - len(document_indices)
-                presented_documents += len(document_indices)
-                micro_step += 1
-                if batch_rank == rank:
-                    local_indices = document_indices
-            batch = assemble_batch(documents, local_indices)
-            batches.append((batch, batch["tokens"] - batch["documents"]))
-        for optimizer in optimizers:
-            optimizer.zero_grad()
-        update_loss = torch.zeros((), device=device)
-        for index, (batch, labeled) in enumerate(batches):
-            moved = _move(batch, device)
-            context = (
-                model.no_sync()
-                if world_size > 1 and index + 1 < len(batches)
-                else nullcontext()
+            update_started = time.monotonic()
+            batches = []
+            total_labeled = 0
+            total_tokens = 0
+            last_epoch = 0
+            while total_tokens < config.update_tokens and (
+                target_documents is None or presented_documents < target_documents
+            ):
+                local_indices = []
+                for batch_rank in range(world_size):
+                    if (
+                        target_documents is not None
+                        and presented_documents >= target_documents
+                    ):
+                        break
+                    document_indices, last_epoch = next(batch_stream)
+                    tokens = int(documents.lengths[document_indices].sum())
+                    total_tokens += tokens
+                    presented_documents += len(document_indices)
+                    micro_step += 1
+                    if batch_rank == rank:
+                        local_indices = document_indices
+                batch = _supervise(
+                    assemble_batch(documents, local_indices), config.objective
+                )
+                total_labeled += batch["labeled_tokens"]
+                batches.append(batch)
+            total_labeled = _reduce(total_labeled, device)
+            if not total_labeled:
+                raise ValueError(
+                    f"No supervised update labels for objective {config.objective}"
+                )
+            for optimizer in optimizers:
+                optimizer.zero_grad()
+            update_loss = torch.zeros((), device=device)
+            for index, batch in enumerate(batches):
+                labeled = batch["labeled_tokens"]
+                moved = _move(batch, device)
+                context = (
+                    model.no_sync()
+                    if world_size > 1 and index + 1 < len(batches)
+                    else nullcontext()
+                )
+                with context:
+                    loss, _ = _loss(model, moved)
+                    (loss * (labeled * world_size / total_labeled)).backward()
+                update_loss += loss.detach() * labeled
+            # Use the budget fraction completed by this update, including a short final batch.
+            progress = (
+                (update + 1) / config.updates
+                if config.updates is not None
+                else presented_documents / target_documents
             )
-            with context:
-                loss, _ = _loss(model, moved)
-                (loss * (labeled * world_size / total_labeled)).backward()
-            update_loss += loss.detach() * labeled
-        # Use the budget fraction completed by this update, including a short final batch.
-        progress = (
-            (update + 1) / config.updates
-            if config.updates is not None
-            else presented_documents / target_documents
-        )
-        lr_scale = _lr_scale(progress, config.warmup_fraction, config.min_lr_ratio)
-        for optimizer, peak_lr in zip(optimizers, (config.muon_lr, config.adamw_lr)):
-            for group in optimizer.param_groups:
-                group["lr"] = peak_lr * lr_scale
-            optimizer.step()
-        update_loss = float(_reduce(update_loss, device)) / total_labeled
-        if device.type in {"cuda", "npu"}:
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            else:
-                torch.npu.synchronize(device)
-        update_seconds = time.monotonic() - update_started
-        update += 1
-        record = {
-            "update": update,
-            "micro_step": micro_step,
-            "loss": update_loss,
-            "tokens": total_tokens,
-            "labeled_tokens": total_labeled,
-            "presentations": presented_documents / len(indices),
-            "epoch": last_epoch,
-            "update_seconds": update_seconds,
-            "tokens_per_second": total_tokens / update_seconds,
-            "muon_lr": optimizers[0].param_groups[0]["lr"],
-            "adamw_lr": optimizers[1].param_groups[0]["lr"],
-        }
-        if config.val_every and (
-            update % config.val_every == 0 or presented_documents == target_documents
-        ):
-            record["val_loss"] = validation_loss(
-                model,
-                documents,
-                config.microbatch_tokens,
-                device,
-                validation_indices,
-                rank,
-                world_size,
-            )
-        history.append(record)
-        if tracker is not None:
-            tracker.log(record, step=update)
-        if history_log is not None:
-            history_log.write(json.dumps(record) + "\n")
-            print(json.dumps(record), flush=True)
-        if (
-            rank == 0
-            and config.checkpoint_every
-            and update % config.checkpoint_every == 0
-        ):
+            lr_scale = _lr_scale(progress, config.warmup_fraction, config.min_lr_ratio)
+            for optimizer, peak_lr in zip(
+                optimizers, (config.muon_lr, config.adamw_lr)
+            ):
+                for group in optimizer.param_groups:
+                    group["lr"] = peak_lr * lr_scale
+                optimizer.step()
+            update_loss = float(_reduce(update_loss, device)) / total_labeled
+            if device.type in {"cuda", "npu"}:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                else:
+                    torch.npu.synchronize(device)
+            update_seconds = time.monotonic() - update_started
+            update += 1
+            record = {
+                "update": update,
+                "micro_step": micro_step,
+                "loss": update_loss,
+                "tokens": total_tokens,
+                "labeled_tokens": total_labeled,
+                "presentations": presented_documents / len(indices),
+                "epoch": last_epoch,
+                "update_seconds": update_seconds,
+                "tokens_per_second": total_tokens / update_seconds,
+                "muon_lr": optimizers[0].param_groups[0]["lr"],
+                "adamw_lr": optimizers[1].param_groups[0]["lr"],
+            }
+            if config.val_every and (
+                update % config.val_every == 0
+                or presented_documents == target_documents
+            ):
+                record["val_loss"], record["val_labeled_tokens"] = validation_loss(
+                    model,
+                    documents,
+                    config.microbatch_tokens,
+                    device,
+                    validation_indices,
+                    rank,
+                    world_size,
+                    config.objective,
+                )
+            history.append(record)
+            if tracker is not None:
+                tracker.log(record, step=update)
+            if history_log is not None:
+                history_log.write(json.dumps(record) + "\n")
+                print(json.dumps(record), flush=True)
+            if (
+                rank == 0
+                and config.checkpoint_every
+                and update % config.checkpoint_every == 0
+            ):
+                save_training_checkpoint(
+                    output_dir / "checkpoint.pth",
+                    model,
+                    optimizers,
+                    run_config,
+                    micro_step,
+                    update,
+                    presented_documents,
+                    indices,
+                    keep_last=config.checkpoint_keep_last,
+                    swanlab_run_id=swanlab_run_id,
+                )
+        if rank == 0:
             save_training_checkpoint(
                 output_dir / "checkpoint.pth",
                 model,
@@ -438,22 +497,11 @@ def train(
                 keep_last=config.checkpoint_keep_last,
                 swanlab_run_id=swanlab_run_id,
             )
-    if rank == 0:
-        history_log.close()
-        save_training_checkpoint(
-            output_dir / "checkpoint.pth",
-            model,
-            optimizers,
-            run_config,
-            micro_step,
-            update,
-            presented_documents,
-            indices,
-            keep_last=config.checkpoint_keep_last,
-            swanlab_run_id=swanlab_run_id,
-        )
-    if tracker is not None:
-        tracker.finish()
+    finally:
+        if history_log is not None:
+            history_log.close()
+        if tracker is not None:
+            tracker.finish()
     if world_size > 1:
         dist.barrier()
     return {

@@ -6,6 +6,8 @@ is the only positional signal. The forward path consumes packed documents
 through ``cu_seqlens`` and never materializes an L×L mask.
 """
 
+from functools import cache
+
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -45,10 +47,51 @@ def eager_varlen_attention(q, k, v, cu_seqlens, is_causal=True):
     return torch.cat(outputs) if outputs else q.new_empty(0, *q.shape[1:])
 
 
-def varlen_attention(q, k, v, cu_seqlens, is_causal=True, max_seqlen=None):
+@cache
+def _npu_causal_mask(device):
+    # Reuse across layers, including when inference precedes training.
+    with torch.inference_mode(False):
+        return torch.ones((2048, 2048), dtype=torch.bool, device=device).triu_(1)
+
+
+def _npu_varlen_attention(q, k, v, ends):
+    import torch_npu
+
+    if not ends:
+        return q.new_empty(0, *q.shape[1:])
+    mask = _npu_causal_mask(q.device)
+    outputs = []
+    start = 0
+    # Bound each operator call's document count without changing the batch.
+    for offset in range(0, len(ends), 1024):
+        group = ends[offset : offset + 1024]
+        stop = group[-1]
+        local_ends = [end - start for end in group] if start else group
+        outputs.append(
+            torch_npu.npu_fusion_attention(
+                q[start:stop],
+                k[start:stop],
+                v[start:stop],
+                head_num=q.shape[1],
+                input_layout="TND",
+                scale=q.shape[-1] ** -0.5,
+                keep_prob=1.0,
+                actual_seq_qlen=local_ends,
+                actual_seq_kvlen=local_ends,
+                atten_mask=mask,
+                sparse_mode=2,
+            )[0]
+        )
+        start = stop
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+
+
+def varlen_attention(
+    q, k, v, cu_seqlens, is_causal=True, max_seqlen=None, sequence_ends=None
+):
     """Causal GQA over packed documents: [T, H, D] × [T, H_kv, D]² → [T, H, D].
 
-    CUDA half-precision uses the fused varlen flash kernel; everything else
+    CUDA and NPU half-precision use fused varlen kernels; everything else
     falls back to the per-document eager path (also the fp32 reference).
     Incremental decode (one query against a longer history) is always eager:
     a single query already sees its whole past, so no causal mask applies.
@@ -59,6 +102,14 @@ def varlen_attention(q, k, v, cu_seqlens, is_causal=True, max_seqlen=None):
         return torch.ops.aten._flash_attention_forward(
             q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, True, False
         )[0]
+    if (
+        is_causal
+        and q.device.type == "npu"
+        and q.dtype in (torch.float16, torch.bfloat16)
+    ):
+        if sequence_ends is None:
+            sequence_ends = cu_seqlens[1:].tolist()
+        return _npu_varlen_attention(q, k, v, sequence_ends)
     return eager_varlen_attention(q, k, v, cu_seqlens, is_causal)
 
 
@@ -69,7 +120,11 @@ class CausalSelfAttention(nn.Module):
         cu = torch.as_tensor(cu_seqlens, dtype=torch.int32, device="cpu")
         lengths = cu[1:] - cu[:-1]
         maximum = int(lengths.max()) if lengths.numel() else 0
-        return cu.to(device, non_blocking=True), maximum
+        device = torch.device(device)
+        ends = cu[1:].tolist() if device.type == "npu" else None
+        if device.type == "cuda":
+            cu = cu.to(device, non_blocking=True)
+        return cu, maximum, ends
 
     def __init__(self, hidden_size, num_heads, num_kv_heads):
         super().__init__()
@@ -92,10 +147,12 @@ class CausalSelfAttention(nn.Module):
         )
 
     def forward(self, x, prepared):
-        cu_seqlens, maximum = prepared
+        cu_seqlens, maximum, ends = prepared
         q, k, v = self._project(x)
         return self.o(
-            varlen_attention(q, k, v, cu_seqlens, max_seqlen=maximum).reshape(x.shape)
+            varlen_attention(
+                q, k, v, cu_seqlens, max_seqlen=maximum, sequence_ends=ends
+            ).reshape(x.shape)
         )
 
     def forward_cached(self, x, cu_seqlens, cache=None):

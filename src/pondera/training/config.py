@@ -17,6 +17,7 @@ _MODEL_DIMENSIONS = (
 
 @dataclass
 class TrainConfig:
+    objective: str = "all_tokens"
     muon_lr: float = 0.02
     adamw_lr: float = 3e-4
     warmup_fraction: float = 0.05
@@ -35,6 +36,10 @@ class TrainConfig:
     activation_checkpointing: bool = True
 
     def validate(self):
+        if self.objective not in ("all_tokens", "final_decision"):
+            raise ValueError(
+                "[training] objective must be all_tokens or final_decision"
+            )
         if type(self.activation_checkpointing) is not bool:
             raise ValueError("[training] activation_checkpointing must be a boolean")
         for name in ("warmup_fraction", "min_lr_ratio"):

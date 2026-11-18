@@ -111,23 +111,38 @@ class Reference:
             ).fetchone()[0]
         )
 
-    def grade(self, fen, repetition, answer, *, pv_plies=0):
-        """Root move quality and root-value accuracy for a valid answer."""
-        if not answer.valid:
-            raise ValueError("Only valid answers receive engine quality scores")
+    def grade_decision(self, fen, repetition, decision):
+        """Grade a legal move or draw claim independently of any answer suffix."""
         board = chess.Board(fen)
-        root_turn = board.turn
+        if (
+            not board.is_valid()
+            or board.is_game_over()
+            or type(repetition) is not int
+            or not 1 <= repetition < 5
+        ):
+            raise ValueError("Decision grading needs a valid playable root")
+        if decision == "<claim_draw>":
+            if not can_claim(board, repetition):
+                raise ValueError("The position does not permit a draw claim")
+        else:
+            try:
+                move = chess.Move.from_uci(decision)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "Decision must be a legal UCI move or draw claim"
+                ) from error
+            if move not in board.legal_moves:
+                raise ValueError("Decision is not legal in this position")
         scores = self.scores(board)
         searched_best = max(scores.values(), key=score_key)
-        root_value = searched_best["value"]
         if can_claim(board, repetition):
             scores = {**scores, "<claim_draw>": {"cp": 0, "mate": None, "value": 0.0}}
         best = max(scores.values(), key=score_key)
-        chosen = scores[answer.decision]
+        chosen = scores[decision]
         rank = 1 + sum(
             score_key(score) > score_key(chosen) for score in scores.values()
         )
-        result = {
+        return {
             "reference": best,
             "chosen": chosen,
             "move_rank": rank,
@@ -137,17 +152,31 @@ class Reference:
             if best["cp"] is not None and chosen["cp"] is not None
             else None,
             "expected_score_loss": (best["value"] - chosen["value"]) / 2,
-            "root_value": root_value,
-            "value_absolute_error": abs(answer.value - root_value),
-            "value_bin_correct": answer.value_bin == value_bin(root_value),
-            "mate_distance_correct": (
-                answer.mate_distance == cap_mate_distance(searched_best["mate"])
-                if searched_best["mate"] is not None
-                else None
-            ),
-            "pv": [],
+            "root_value": searched_best["value"],
+            "root_mate": searched_best["mate"],
         }
+
+    def grade(self, fen, repetition, answer, *, pv_plies=0):
+        """Move, value and PV quality for a complete valid answer."""
+        if not answer.valid:
+            raise ValueError("Only valid answers receive full answer quality scores")
+        result = self.grade_decision(fen, repetition, answer.decision)
+        root_value = result["root_value"]
+        result.update(
+            {
+                "value_absolute_error": abs(answer.value - root_value),
+                "value_bin_correct": answer.value_bin == value_bin(root_value),
+                "mate_distance_correct": (
+                    answer.mate_distance == cap_mate_distance(result["root_mate"])
+                    if result["root_mate"] is not None
+                    else None
+                ),
+                "pv": [],
+            }
+        )
         if answer.decision != "<claim_draw>":
+            board = chess.Board(fen)
+            root_turn = board.turn
             board.push_uci(answer.decision)
             for move in answer.pv[:pv_plies]:
                 options = self.scores(board)

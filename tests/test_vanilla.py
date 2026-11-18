@@ -1,11 +1,17 @@
 """Vanilla model invariants: causality, bounded FFN, packed/eager equivalence."""
 
 import unittest
+from importlib.util import find_spec
 
 import torch
 
 from pondera.models.linear import LinearVanillaModel
-from pondera.models.vanilla import VanillaModel, situ_glu, varlen_attention
+from pondera.models.vanilla import (
+    VanillaModel,
+    eager_varlen_attention,
+    situ_glu,
+    varlen_attention,
+)
 
 MODEL = dict(
     num_blocks=2,
@@ -122,11 +128,91 @@ class VanillaTests(unittest.TestCase):
         k = torch.randn(11, 2, 16, device="cuda", dtype=torch.bfloat16)
         v = torch.randn(11, 2, 16, device="cuda", dtype=torch.bfloat16)
         cu = torch.tensor([0, 5, 11], dtype=torch.int32, device="cuda")
-        from pondera.models.vanilla import eager_varlen_attention
-
         fused = varlen_attention(q, k, v, cu)
         reference = eager_varlen_attention(q, k, v, cu)
         self.assertLessEqual((fused - reference).abs().max().item(), 1e-3)
+
+
+class NPUAttentionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if find_spec("torch_npu") is None:
+            raise unittest.SkipTest("fused varlen needs torch_npu")
+        import torch_npu  # noqa: F401
+
+        if not torch.npu.is_available():
+            raise unittest.SkipTest("fused varlen needs an NPU")
+        cls.device = torch.device("npu:0")
+        torch.npu.set_device(cls.device)
+
+    def setUp(self):
+        torch.set_num_threads(1)
+        torch.manual_seed(640)
+
+    def test_fused_gqa_forward_gradients_and_isolation(self):
+        cu = torch.tensor([0, 1, 4, 21, 150], dtype=torch.int32)
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                rounded = [
+                    torch.randn(150, heads, 64).to(dtype) for heads in (16, 4, 4)
+                ]
+                reference = [value.float().requires_grad_() for value in rounded]
+                inputs = [value.to(self.device).requires_grad_() for value in rounded]
+                gradient = torch.randn(150, 16, 64).to(dtype)
+                # A cached mask first created in inference must also work in training.
+                with torch.inference_mode():
+                    varlen_attention(*inputs, cu)
+                expected = eager_varlen_attention(*reference, cu)
+                expected.backward(gradient.float())
+                actual = varlen_attention(*inputs, cu)
+                actual.backward(gradient.to(self.device))
+                for measured, target in (
+                    (actual, expected),
+                    *((value.grad, ref.grad) for value, ref in zip(inputs, reference)),
+                ):
+                    difference = measured.detach().float().cpu() - target.detach()
+                    self.assertLess(
+                        (difference.norm() / target.detach().norm()).item(), 0.02
+                    )
+
+                with torch.no_grad():
+                    changed = [value.detach().clone() for value in inputs]
+                    changed[1][-1] += 10
+                    changed[2][-1] -= 10
+                    altered = varlen_attention(*changed, cu)
+                    torch.testing.assert_close(
+                        actual[:-1], altered[:-1], rtol=0, atol=0
+                    )
+                    changed = [value.detach().clone() for value in inputs]
+                    changed[1][:21] += 10
+                    changed[2][:21] -= 10
+                    altered = varlen_attention(*changed, cu)
+                    torch.testing.assert_close(
+                        actual[21:], altered[21:], rtol=0, atol=0
+                    )
+
+    def test_document_split_preserves_outputs_and_value_gradients(self):
+        # 1023 singleton documents, then lengths 3, 2, 1 across the split.
+        cu = torch.tensor([*range(1024), 1026, 1028, 1029], dtype=torch.int32)
+        q = torch.zeros(1029, 4, 64, dtype=torch.bfloat16, device=self.device)
+        k = torch.zeros(1029, 2, 64, dtype=torch.bfloat16, device=self.device)
+        v = torch.zeros_like(k)
+        v[-6:] = torch.tensor([2, 4, 6, 8, 12, 20], device=self.device)[:, None, None]
+        v.requires_grad_()
+        actual = varlen_attention(q, k, v, cu)
+        # Zero logits give uniform causal prefix averages within each document.
+        expected = torch.zeros_like(q)
+        expected[-6:] = torch.tensor([2, 3, 4, 8, 10, 20], device=self.device)[
+            :, None, None
+        ]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        actual.sum().backward()
+        # Each KV head serves two query heads; sum the causal averaging weights.
+        expected_gradient = torch.full_like(v, 2)
+        expected_gradient[-6:] = torch.tensor(
+            [11 / 3, 5 / 3, 2 / 3, 3, 1, 2], device=self.device
+        )[:, None, None]
+        torch.testing.assert_close(v.grad, expected_gradient, rtol=0.01, atol=0.01)
 
 
 if __name__ == "__main__":

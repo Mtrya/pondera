@@ -9,6 +9,8 @@ num_kv_heads = 4
 
 [training]
 seed = 640
+# all_tokens supervises every next token; final_decision supervises only the token after FINAL.
+objective = "all_tokens"
 # Recompute block activations during backward to fit long documents.
 activation_checkpointing = true
 muon_lr = 0.02
