@@ -1,6 +1,6 @@
 # Model inference
 
-`trace.py` loads the checkpoint's architecture, weights, and merge dictionary, then uses the common autoregressive `model(input_ids, cu_seqlens)` interface. Generation recomputes the full prefix at each step. Adding a model architecture requires registering its constructor in `MODEL_CLASSES`; generation and parsing have no architecture-specific implementation.
+`trace.py` loads the checkpoint's architecture, weights, and merge dictionary, then uses the common `model.forward_cached(input_ids, cu_seqlens, caches)` interface. Generation prefills the board and decodes one new token per step. Each request owns its caches; forcing FINAL after the reasoning budget or replacing an invalid reasoning prefix prefills the resulting context again. Adding a model architecture requires registering its constructor in `MODEL_CLASSES` and supplying the common forward and cached interfaces; generation and parsing have no architecture-specific implementation.
 
 A reasoning budget counts model calls before `FINAL`. Natural `FINAL` starts the answer early; reaching the reasoning limit inserts `FINAL` without a model call. A zero budget prefills `FINAL`. The separate answer allowance counts model tokens after that delimiter. Answer generation is greedy and unconstrained: no field, move, value, PV, or `END` is repaired or masked. A premature `END` or exhausted answer budget produces a failed answer.
 

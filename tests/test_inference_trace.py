@@ -1,10 +1,11 @@
-"""Expanded-answer contracts and generic generation on both real model variants."""
+"""Expanded-answer contracts and generic generation on real model variants."""
 
 import unittest
 
 import chess
 import torch
 
+from pondera.chess.codec import encode_board
 from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import (
     BACK,
@@ -18,9 +19,10 @@ from pondera.chess.vocabulary import (
     UCI_MOVE_TO_IDX,
     VALUE,
 )
-from pondera.inference.trace import Predictor, parse_answer
+from pondera.inference.trace import Predictor, _DecodeState, parse_answer
 from pondera.inference.vanilla_uci import pick_with_reasoning
 from pondera.models.linear import LinearVanillaModel
+from pondera.models.looped import LoopedModel
 from pondera.models.vanilla import VanillaModel
 
 
@@ -112,6 +114,33 @@ class AnswerTests(unittest.TestCase):
 class GenerationTests(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
+
+    def test_cached_predictions_equal_full_context_after_final_insertion(self):
+        torch.manual_seed(640)
+        prefix = encode_board(chess.STARTING_FEN).tolist()
+        tokens = [BACK, move("e2e4"), BACK, FINAL, VALUE, END]
+        for model_class in (VanillaModel, LinearVanillaModel, LoopedModel):
+            with self.subTest(architecture=model_class.architecture):
+                model = model_class(
+                    num_blocks=5,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_heads=2,
+                    num_kv_heads=1,
+                    vocab_size=CHESS_VOCAB_SIZE,
+                ).eval()
+                predictor = Predictor(model, MergeDictionary(), {})
+                state = _DecodeState()
+                with torch.inference_mode():
+                    # The jump to four tokens includes a generated token and
+                    # forced FINAL. Both must retain full causal context.
+                    for length in (0, 1, 2, 4, 5, 6):
+                        context = torch.tensor(prefix + tokens[:length])
+                        expected = model(context, [0, len(context)])[-1]
+                        actual = predictor._next_logits(prefix, tokens[:length], state)
+                        torch.testing.assert_close(
+                            actual, expected, rtol=1e-5, atol=1e-6
+                        )
 
     def model(self, model_class):
         model = model_class(
