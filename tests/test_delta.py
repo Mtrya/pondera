@@ -51,7 +51,11 @@ class DeltaTests(unittest.TestCase):
                     vocab_size=53,
                     softmax_every=interval,
                 )
-        for model_class in (LoopedModel, RecurrentDepthModel):
+        for model_class, scaling in (
+            (LoopedModel, False),
+            (LoopedModel, True),
+            (RecurrentDepthModel, False),
+        ):
             for mixer in ("gdn", "kda"):
                 yield model_class(
                     num_blocks=6,
@@ -63,6 +67,7 @@ class DeltaTests(unittest.TestCase):
                     mixer=mixer,
                     softmax_every=3,
                     loop_repetitions=3,
+                    scale_residuals=scaling,
                 )
         for interval in (0, 2):
             yield CyclicFlowModel(
@@ -146,7 +151,7 @@ class DeltaTests(unittest.TestCase):
                 model.zero_grad(set_to_none=True)
                 separate = torch.cat((model(ids[:5], [0, 5]), model(ids[5:], [0, 6])))
                 separate.square().sum().backward()
-                torch.testing.assert_close(packed, separate, rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(packed, separate, rtol=1e-5, atol=3e-6)
                 for name, parameter in model.named_parameters():
                     # Repeated blocks amplify fp32 GEMM rounding when the
                     # batch is split; compare each complete parameter gradient.

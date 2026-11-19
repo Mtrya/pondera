@@ -279,7 +279,7 @@ checkpoint_keep_last = 2
         cases = [(architecture, {}) for architecture in architectures] + [
             ("cyfa", {"num_slots": 4}),
             ("kdn", {}),
-            ("looped", {"mixer": "gdn", "softmax_every": 3}),
+            ("looped", {"mixer": "gdn", "softmax_every": 3, "scale_residuals": True}),
             ("recurrent", {"mixer": "kda", "softmax_every": 3}),
         ]
         for architecture, settings in cases:

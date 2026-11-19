@@ -56,6 +56,44 @@ class VanillaTests(unittest.TestCase):
             packed = looped(ids, cu)
             torch.testing.assert_close(packed[:5], full, rtol=1e-6, atol=1e-6)
 
+    def test_loop_scaling_can_be_folded_into_core_output_weights(self):
+        import copy
+
+        scaled = LoopedModel(
+            **{**MODEL, "num_blocks": 6}, loop_repetitions=3, scale_residuals=True
+        ).eval()
+        folded = copy.deepcopy(scaled)
+        folded.scale_residuals = False
+        # Linearity of the final projection lets its weights absorb the scale.
+        with torch.no_grad():
+            for block in folded.blocks[2:-2]:
+                block.attention.o.weight.div_(3)
+                block.down.weight.div_(3)
+        ids, cu = packed_ids()
+        expected = folded(ids, cu)
+        actual = scaled(ids, cu)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        for network in (scaled, folded):
+            network(ids, cu).square().sum().backward()
+        projected = {
+            f"blocks.{index}.{name}.weight"
+            for index in range(2, len(scaled.blocks) - 2)
+            for name in ("attention.o", "down")
+        }
+        for (name, parameter), (_, reference) in zip(
+            scaled.named_parameters(), folded.named_parameters(), strict=True
+        ):
+            gradient = reference.grad / 3 if name in projected else reference.grad
+            # Folding changes fp32 GEMM rounding, especially near zero entries.
+            relative = (parameter.grad - gradient).norm() / gradient.norm().clamp_min(
+                1e-12
+            )
+            self.assertLess(float(relative), 1e-5, name)
+        with torch.no_grad():
+            _, cache = scaled.forward_cached(ids[:4], torch.tensor([0, 4]))
+            final, _ = scaled.forward_cached(ids[4:5], torch.tensor([0, 5]), cache)
+        torch.testing.assert_close(final[-1], actual[4], rtol=1e-5, atol=1e-6)
+
     def test_later_documents_and_future_tokens_cannot_change_earlier_logits(self):
         ids, cu = packed_ids()
         with torch.no_grad():

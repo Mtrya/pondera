@@ -190,16 +190,20 @@ class Block(nn.Module):
     def _ffn(self, x):
         return self.down(situ_glu(self.gate(x), self.up(x)))
 
-    def forward(self, x, prepared):
-        x = x + self.attention(self.norm_attention(x), prepared)
-        return x + self._ffn(self.norm_ffn(x))
+    def forward(self, x, prepared, residual_scale=1.0):
+        x = torch.add(
+            x, self.attention(self.norm_attention(x), prepared), alpha=residual_scale
+        )
+        return torch.add(x, self._ffn(self.norm_ffn(x)), alpha=residual_scale)
 
-    def forward_cached(self, x, cu_seqlens, cache=None):
+    def forward_cached(self, x, cu_seqlens, cache=None, residual_scale=1.0):
         attended, new_cache = self.attention.forward_cached(
             self.norm_attention(x), cu_seqlens, cache
         )
-        x = x + attended
-        return x + self._ffn(self.norm_ffn(x)), new_cache
+        x = torch.add(x, attended, alpha=residual_scale)
+        return torch.add(
+            x, self._ffn(self.norm_ffn(x)), alpha=residual_scale
+        ), new_cache
 
 
 class VanillaModel(nn.Module):
@@ -236,9 +240,6 @@ class VanillaModel(nn.Module):
         self.norm = RMSNorm(hidden_size)
         self.head = nn.Linear(hidden_size, vocab_size, bias=False)
 
-    def execution_blocks(self):
-        return iter(self.blocks)
-
     def attention_type(self, index):
         return self.attention_cls or CausalSelfAttention
 
@@ -253,7 +254,7 @@ class VanillaModel(nn.Module):
     def forward(self, input_ids, cu_seqlens):
         prepared = self.prepare(cu_seqlens, input_ids.device)
         x = self.token_embedding(input_ids)
-        for block in self.execution_blocks():
+        for block in self.blocks:
             metadata = prepared[type(block.attention)]
             if self.training and self.activation_checkpointing:
                 x = checkpoint(block, x, metadata, use_reentrant=False)
@@ -264,7 +265,7 @@ class VanillaModel(nn.Module):
     def forward_cached(self, input_ids, cu_seqlens, caches=None):
         x = self.token_embedding(input_ids)
         new_caches = []
-        for index, block in enumerate(self.execution_blocks()):
+        for index, block in enumerate(self.blocks):
             cache = None if caches is None else caches[index]
             x, new_cache = block.forward_cached(x, cu_seqlens, cache)
             new_caches.append(new_cache)

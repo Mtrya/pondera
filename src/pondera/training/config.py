@@ -131,6 +131,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         {
             "architecture",
             "loop_repetitions",
+            "scale_residuals",
             "mixer",
             "softmax_every",
             "num_slots",
@@ -160,6 +161,12 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             raise ValueError("[model] mixer requires a recurrent-depth architecture")
         if model["mixer"] not in {"softmax", "gdn", "kda"}:
             raise ValueError("[model] mixer must be softmax, gdn, or kda")
+    if "scale_residuals" in model:
+        if (
+            model["architecture"] != "looped"
+            or type(model["scale_residuals"]) is not bool
+        ):
+            raise ValueError("[model] scale_residuals requires a boolean for looped")
     if "softmax_every" in model:
         if model["architecture"] not in {
             "gdn",
