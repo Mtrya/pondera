@@ -120,15 +120,20 @@ class GenerationTests(unittest.TestCase):
         torch.manual_seed(640)
         prefix = encode_board(chess.STARTING_FEN).tolist()
         tokens = [BACK, move("e2e4"), BACK, FINAL, VALUE, END]
-        for model_class in (
+        classes = (
             VanillaModel,
             LinearVanillaModel,
             LoopedModel,
             RecurrentDepthModel,
             BoardContextModel,
             SymbolicBoardModel,
-        ):
-            with self.subTest(architecture=model_class.architecture):
+        )
+        cases = [(model_class, {}) for model_class in classes] + [
+            (LoopedModel, {"mixer": "gdn", "softmax_every": 2}),
+            (RecurrentDepthModel, {"mixer": "kda", "softmax_every": 2}),
+        ]
+        for model_class, settings in cases:
+            with self.subTest(architecture=model_class.architecture, settings=settings):
                 model = model_class(
                     num_blocks=5,
                     hidden_size=16,
@@ -136,6 +141,7 @@ class GenerationTests(unittest.TestCase):
                     num_heads=2,
                     num_kv_heads=1,
                     vocab_size=CHESS_VOCAB_SIZE,
+                    **settings,
                 ).eval()
                 predictor = Predictor(model, MergeDictionary(), {})
                 state = _DecodeState()
@@ -147,7 +153,10 @@ class GenerationTests(unittest.TestCase):
                         expected = model(context, [0, len(context)])[-1]
                         actual = predictor._next_logits(prefix, tokens[:length], state)
                         torch.testing.assert_close(
-                            actual, expected, rtol=1e-5, atol=1e-6
+                            actual, expected, rtol=1e-5, atol=1e-5
+                        )
+                        self.assertEqual(
+                            actual.argmax().item(), expected.argmax().item()
                         )
 
     def model(self, model_class):

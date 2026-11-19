@@ -242,14 +242,16 @@ class VanillaModel(nn.Module):
     def attention_type(self, index):
         return self.attention_cls or CausalSelfAttention
 
-    def forward(self, input_ids, cu_seqlens):
+    def prepare(self, cu_seqlens, device):
         prepared = {}
         for block in self.blocks:
             attention_type = type(block.attention)
             if attention_type not in prepared:
-                prepared[attention_type] = attention_type.prepare(
-                    cu_seqlens, input_ids.device
-                )
+                prepared[attention_type] = attention_type.prepare(cu_seqlens, device)
+        return prepared
+
+    def forward(self, input_ids, cu_seqlens):
+        prepared = self.prepare(cu_seqlens, input_ids.device)
         x = self.token_embedding(input_ids)
         for block in self.execution_blocks():
             metadata = prepared[type(block.attention)]

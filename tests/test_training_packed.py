@@ -266,7 +266,7 @@ checkpoint_keep_last = 2
         )
 
     def test_toml_training_and_resume_match_uninterrupted_training(self):
-        for architecture in (
+        architectures = (
             "vanilla",
             "linear",
             "gdn",
@@ -275,12 +275,24 @@ checkpoint_keep_last = 2
             "recurrent",
             "board_context",
             "symbolic_board",
-        ):
-            with self.subTest(architecture=architecture):
-                recipe = self.root / f"{architecture}.toml"
-                full = self.root / f"{architecture}-full"
-                partial = self.root / f"{architecture}-partial"
+        )
+        cases = [(architecture, {}) for architecture in architectures] + [
+            ("looped", {"mixer": "gdn", "softmax_every": 3}),
+            ("recurrent", {"mixer": "kda", "softmax_every": 3}),
+        ]
+        for architecture, settings in cases:
+            with self.subTest(architecture=architecture, settings=settings):
+                name = f"{architecture}-{settings.get('mixer', 'default')}"
+                recipe = self.root / f"{name}.toml"
+                full = self.root / f"{name}-full"
+                partial = self.root / f"{name}-partial"
                 self.write_training_recipe(recipe, architecture)
+                fields = "\n".join(
+                    f"{key} = {json.dumps(value)}" for key, value in settings.items()
+                )
+                recipe.write_text(
+                    recipe.read_text().replace("[training]", f"{fields}\n[training]")
+                )
                 result = self.run_training_command(recipe, full)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 result = self.run_training_command(
@@ -295,6 +307,7 @@ checkpoint_keep_last = 2
                     model_config["num_kv_heads"] = 4
                 if architecture in {"looped", "recurrent"}:
                     model_config["num_blocks"] = 6
+                model_config.update(settings)
                 self.assertEqual(actual["model_config"], model_config)
                 self.assertEqual(actual["presented_documents"], 6)
                 self.assertEqual(

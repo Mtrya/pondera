@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from pondera.models.delta import GatedDeltaModel, KimiDeltaModel, delta_recurrent
+from pondera.models.looped import LoopedModel, RecurrentDepthModel
 
 
 class DeltaTests(unittest.TestCase):
@@ -48,6 +49,65 @@ class DeltaTests(unittest.TestCase):
                     vocab_size=53,
                     softmax_every=interval,
                 )
+        for model_class in (LoopedModel, RecurrentDepthModel):
+            for mixer in ("gdn", "kda"):
+                yield model_class(
+                    num_blocks=6,
+                    hidden_size=32,
+                    intermediate_size=48,
+                    num_heads=4,
+                    num_kv_heads=2,
+                    vocab_size=53,
+                    mixer=mixer,
+                    softmax_every=3,
+                    loop_repetitions=3,
+                )
+
+    def test_one_loop_matches_the_untied_delta_model(self):
+        config = dict(
+            num_blocks=8,
+            hidden_size=32,
+            intermediate_size=48,
+            num_heads=4,
+            num_kv_heads=2,
+            vocab_size=53,
+            softmax_every=4,
+        )
+        ids = torch.randint(0, 53, (11,))
+        for mixer, model_class in (("gdn", GatedDeltaModel), ("kda", KimiDeltaModel)):
+            with self.subTest(mixer=mixer):
+                torch.manual_seed(640)
+                ordinary = model_class(**config).eval()
+                torch.manual_seed(640)
+                looped = LoopedModel(**config, mixer=mixer, loop_repetitions=1).eval()
+                with torch.no_grad():
+                    torch.testing.assert_close(
+                        looped(ids, [0, 5, 11]),
+                        ordinary(ids, [0, 5, 11]),
+                        rtol=0,
+                        atol=0,
+                    )
+                looped.loop_repetitions = 6
+                self.assertEqual(
+                    sum(p.numel() for p in looped.parameters()),
+                    sum(p.numel() for p in ordinary.parameters()),
+                )
+
+    def test_loop_recomputation_preserves_all_gradients(self):
+        import copy
+
+        ids = torch.randint(0, 53, (11,))
+        for model in self.models():
+            if not isinstance(model, LoopedModel):
+                continue
+            recomputed = copy.deepcopy(model)
+            recomputed.activation_checkpointing = True
+            for network in (model, recomputed):
+                network(ids, [0, 5, 11]).square().mean().backward()
+            for actual, expected in zip(
+                recomputed.parameters(), model.parameters(), strict=True
+            ):
+                torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
 
     def test_packed_documents_match_separate_outputs_and_gradients(self):
         ids = torch.randint(0, 53, (11,))
@@ -65,11 +125,11 @@ class DeltaTests(unittest.TestCase):
                 separate.square().sum().backward()
                 torch.testing.assert_close(packed, separate, rtol=1e-5, atol=1e-6)
                 for name, parameter in model.named_parameters():
-                    # Splitting GEMMs changes fp32 cancellation in individual
-                    # entries; compare each parameter's complete gradient.
+                    # Repeated blocks amplify fp32 GEMM rounding when the
+                    # batch is split; compare each complete parameter gradient.
                     difference = (parameter.grad - gradients[name]).norm()
                     scale = gradients[name].norm().clamp_min(1e-12)
-                    self.assertLess(float(difference / scale), 1e-5, name)
+                    self.assertLess(float(difference / scale), 2e-5, name)
 
     def test_future_and_other_document_tokens_do_not_change_the_prefix(self):
         ids = torch.randint(0, 53, (13,))

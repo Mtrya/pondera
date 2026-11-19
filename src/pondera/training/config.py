@@ -128,7 +128,13 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     model = _table(
         values["model"],
         "model",
-        {"architecture", "loop_repetitions", "softmax_every", *_MODEL_DIMENSIONS},
+        {
+            "architecture",
+            "loop_repetitions",
+            "mixer",
+            "softmax_every",
+            *_MODEL_DIMENSIONS,
+        },
     )
     missing = {"architecture", *_MODEL_DIMENSIONS} - set(model)
     if missing:
@@ -148,8 +154,13 @@ def load_config(path=DEFAULT_CONFIG_PATH):
                 "[model] loop_repetitions requires a recurrent-depth architecture"
             )
         _integer("model", "loop_repetitions", model["loop_repetitions"], 1)
+    if "mixer" in model:
+        if model["architecture"] not in {"looped", "recurrent"}:
+            raise ValueError("[model] mixer requires a recurrent-depth architecture")
+        if model["mixer"] not in {"softmax", "gdn", "kda"}:
+            raise ValueError("[model] mixer must be softmax, gdn, or kda")
     if "softmax_every" in model:
-        if model["architecture"] not in {"gdn", "kda"}:
+        if model["architecture"] not in {"gdn", "kda", "looped", "recurrent"}:
             raise ValueError("[model] softmax_every requires a delta architecture")
         _integer("model", "softmax_every", model["softmax_every"], 0)
     if (
