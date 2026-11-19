@@ -89,10 +89,21 @@ class Muon(torch.optim.Optimizer):
 
 
 def split_parameters(model: nn.Module):
-    """Return (muon_params, adamw_params) under the frozen split rule."""
+    """Separate trainable hidden matrices from embeddings, head and gains."""
     muon, adamw = [], []
+    embeddings = {
+        id(module.weight)
+        for module in model.modules()
+        if isinstance(module, nn.Embedding)
+    }
     for name, param in model.named_parameters():
-        if param.ndim == 2 and not name.startswith(("token_embedding.", "head.")):
+        if not param.requires_grad:
+            continue
+        if (
+            param.ndim == 2
+            and id(param) not in embeddings
+            and not name.startswith("head.")
+        ):
             muon.append(param)
         else:
             adamw.append(param)

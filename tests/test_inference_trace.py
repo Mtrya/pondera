@@ -21,6 +21,7 @@ from pondera.chess.vocabulary import (
 )
 from pondera.inference.trace import Predictor, _DecodeState, parse_answer
 from pondera.inference.vanilla_uci import pick_with_reasoning
+from pondera.models.board_context import BoardContextModel, SymbolicBoardModel
 from pondera.models.linear import LinearVanillaModel
 from pondera.models.looped import LoopedModel, RecurrentDepthModel
 from pondera.models.vanilla import VanillaModel
@@ -124,6 +125,8 @@ class GenerationTests(unittest.TestCase):
             LinearVanillaModel,
             LoopedModel,
             RecurrentDepthModel,
+            BoardContextModel,
+            SymbolicBoardModel,
         ):
             with self.subTest(architecture=model_class.architecture):
                 model = model_class(

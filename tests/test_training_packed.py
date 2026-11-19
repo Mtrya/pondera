@@ -266,7 +266,16 @@ checkpoint_keep_last = 2
         )
 
     def test_toml_training_and_resume_match_uninterrupted_training(self):
-        for architecture in ("vanilla", "linear", "gdn", "kda", "looped", "recurrent"):
+        for architecture in (
+            "vanilla",
+            "linear",
+            "gdn",
+            "kda",
+            "looped",
+            "recurrent",
+            "board_context",
+            "symbolic_board",
+        ):
             with self.subTest(architecture=architecture):
                 recipe = self.root / f"{architecture}.toml"
                 full = self.root / f"{architecture}-full"
