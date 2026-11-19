@@ -161,7 +161,14 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         if model["mixer"] not in {"softmax", "gdn", "kda"}:
             raise ValueError("[model] mixer must be softmax, gdn, or kda")
     if "softmax_every" in model:
-        if model["architecture"] not in {"gdn", "kda", "cyfa", "looped", "recurrent"}:
+        if model["architecture"] not in {
+            "gdn",
+            "kda",
+            "kdn",
+            "cyfa",
+            "looped",
+            "recurrent",
+        }:
             raise ValueError("[model] softmax_every requires a hybrid architecture")
         _integer("model", "softmax_every", model["softmax_every"], 0)
     if "num_slots" in model:

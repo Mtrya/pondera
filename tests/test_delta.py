@@ -6,6 +6,7 @@ import torch
 
 from pondera.models.cyfa import CyclicFlowModel
 from pondera.models.delta import GatedDeltaModel, KimiDeltaModel, delta_recurrent
+from pondera.models.kalman import KalmanDeltaModel
 from pondera.models.looped import LoopedModel, RecurrentDepthModel
 
 
@@ -65,6 +66,17 @@ class DeltaTests(unittest.TestCase):
                 )
         for interval in (0, 2):
             yield CyclicFlowModel(
+                num_blocks=2,
+                hidden_size=32,
+                intermediate_size=48,
+                num_heads=4,
+                num_kv_heads=2 if interval else 4,
+                vocab_size=53,
+                softmax_every=interval,
+            )
+
+        for interval in (0, 2):
+            yield KalmanDeltaModel(
                 num_blocks=2,
                 hidden_size=32,
                 intermediate_size=48,

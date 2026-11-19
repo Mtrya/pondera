@@ -39,6 +39,80 @@ def delta_recurrent(q, k, v, g, beta, initial_state=None):
     return torch.stack(outputs), state
 
 
+def delta_attention(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    prepared,
+    cache=None,
+    output_final_state=False,
+    *,
+    channel_decay=False,
+    normalize=True,
+):
+    """Packed delta-rule memory with scalar or key-channel decay."""
+    cu_cpu, cu_device = prepared
+    if q.device.type in ("cuda", "npu"):
+        if channel_decay:
+            from fla.ops.kda import chunk_kda, fused_recurrent_kda
+
+            chunk, recurrent = chunk_kda, fused_recurrent_kda
+        else:
+            from fla.ops.gated_delta_rule import (
+                chunk_gated_delta_rule,
+                fused_recurrent_gated_delta_rule,
+            )
+
+            chunk, recurrent = (
+                chunk_gated_delta_rule,
+                fused_recurrent_gated_delta_rule,
+            )
+        incremental = not torch.is_grad_enabled() and (
+            cache is not None or q.dtype == torch.float32
+        )
+        options = {} if incremental else {"cu_seqlens_cpu": cu_cpu}
+        output, state = (recurrent if incremental else chunk)(
+            q=q.unsqueeze(0),
+            k=k.unsqueeze(0),
+            v=v.unsqueeze(0),
+            g=g.unsqueeze(0),
+            beta=beta.unsqueeze(0),
+            initial_state=cache,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_device,
+            use_qk_l2norm_in_kernel=normalize,
+            **options,
+        )
+        return output.squeeze(0), state
+    if normalize:
+        q, k = (
+            (
+                tensor.float()
+                * torch.rsqrt(tensor.float().square().sum(-1, keepdim=True) + 1e-6)
+            ).to(tensor.dtype)
+            for tensor in (q, k)
+        )
+    outputs, states = [], []
+    for index, (start, stop) in enumerate(
+        zip(cu_cpu[:-1].tolist(), cu_cpu[1:].tolist())
+    ):
+        output, state = delta_recurrent(
+            q[start:stop],
+            k[start:stop],
+            v[start:stop],
+            g[start:stop],
+            beta[start:stop],
+            None if cache is None else cache[index],
+        )
+        outputs.append(output)
+        states.append(state)
+    return torch.cat(outputs).to(v.dtype), torch.stack(
+        states
+    ) if output_final_state else None
+
+
 class GatedDeltaAttention(RecurrentAttention):
     channel_decay = False
 
@@ -80,63 +154,17 @@ class GatedDeltaAttention(RecurrentAttention):
     def _memory(self, vectors, x, prepared, cache=None, output_final_state=False):
         q, k, v = (tensor.view(-1, self.num_heads, self.head_dim) for tensor in vectors)
         g, beta = self._gates(x)
-        cu_cpu, cu_device = prepared
-        if x.device.type in ("cuda", "npu"):
-            if self.channel_decay:
-                from fla.ops.kda import chunk_kda, fused_recurrent_kda
-
-                chunk, recurrent = chunk_kda, fused_recurrent_kda
-            else:
-                from fla.ops.gated_delta_rule import (
-                    chunk_gated_delta_rule,
-                    fused_recurrent_gated_delta_rule,
-                )
-
-                chunk, recurrent = (
-                    chunk_gated_delta_rule,
-                    fused_recurrent_gated_delta_rule,
-                )
-            incremental = cache is not None or (
-                not torch.is_grad_enabled() and q.dtype == torch.float32
-            )
-            options = {} if incremental else {"cu_seqlens_cpu": cu_cpu}
-            output, state = (recurrent if incremental else chunk)(
-                q=q.unsqueeze(0),
-                k=k.unsqueeze(0),
-                v=v.unsqueeze(0),
-                g=g.unsqueeze(0),
-                beta=beta.unsqueeze(0),
-                initial_state=cache,
-                output_final_state=output_final_state,
-                cu_seqlens=cu_device,
-                use_qk_l2norm_in_kernel=True,
-                **options,
-            )
-            return output.squeeze(0), state
-        q, k = (
-            (
-                tensor.float()
-                * torch.rsqrt(tensor.float().square().sum(-1, keepdim=True) + 1e-6)
-            ).to(tensor.dtype)
-            for tensor in (q, k)
+        return delta_attention(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            prepared,
+            cache,
+            output_final_state,
+            channel_decay=self.channel_decay,
         )
-        outputs, states = [], []
-        for index, (start, stop) in enumerate(
-            zip(cu_cpu[:-1].tolist(), cu_cpu[1:].tolist())
-        ):
-            output, state = delta_recurrent(
-                q[start:stop],
-                k[start:stop],
-                v[start:stop],
-                g[start:stop],
-                beta[start:stop],
-                None if cache is None else cache[index],
-            )
-            outputs.append(output)
-            states.append(state)
-        return torch.cat(outputs).to(v.dtype), torch.stack(
-            states
-        ) if output_final_state else None
 
     def _output(self, x, memory):
         gate = self.gate(x).view_as(memory)
