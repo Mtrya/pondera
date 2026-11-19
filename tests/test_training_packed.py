@@ -221,7 +221,7 @@ num_blocks = {6 if architecture in {"looped", "recurrent"} else 1}
 hidden_size = 32
 intermediate_size = 48
 num_heads = 4
-num_kv_heads = {4 if architecture in {"gdn", "kda"} else 2}
+num_kv_heads = {4 if architecture in {"gdn", "kda", "cyfa"} else 2}
 
 [training]
 seed = 11
@@ -277,6 +277,7 @@ checkpoint_keep_last = 2
             "symbolic_board",
         )
         cases = [(architecture, {}) for architecture in architectures] + [
+            ("cyfa", {"num_slots": 4}),
             ("looped", {"mixer": "gdn", "softmax_every": 3}),
             ("recurrent", {"mixer": "kda", "softmax_every": 3}),
         ]
@@ -303,7 +304,7 @@ checkpoint_keep_last = 2
                 actual = torch.load(partial / "checkpoint.pth", weights_only=True)
                 self.assertEqual(actual["arch"], architecture)
                 model_config = dict(self.model_config)
-                if architecture in {"gdn", "kda"}:
+                if architecture in {"gdn", "kda", "cyfa"}:
                     model_config["num_kv_heads"] = 4
                 if architecture in {"looped", "recurrent"}:
                     model_config["num_blocks"] = 6

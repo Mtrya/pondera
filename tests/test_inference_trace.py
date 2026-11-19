@@ -22,6 +22,7 @@ from pondera.chess.vocabulary import (
 from pondera.inference.trace import Predictor, _DecodeState, parse_answer
 from pondera.inference.vanilla_uci import pick_with_reasoning
 from pondera.models.board_context import BoardContextModel, SymbolicBoardModel
+from pondera.models.cyfa import CyclicFlowModel
 from pondera.models.linear import LinearVanillaModel
 from pondera.models.looped import LoopedModel, RecurrentDepthModel
 from pondera.models.vanilla import VanillaModel
@@ -129,6 +130,7 @@ class GenerationTests(unittest.TestCase):
             SymbolicBoardModel,
         )
         cases = [(model_class, {}) for model_class in classes] + [
+            (CyclicFlowModel, {"num_slots": 4, "softmax_every": 2}),
             (LoopedModel, {"mixer": "gdn", "softmax_every": 2}),
             (RecurrentDepthModel, {"mixer": "kda", "softmax_every": 2}),
         ]

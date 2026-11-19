@@ -133,6 +133,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "loop_repetitions",
             "mixer",
             "softmax_every",
+            "num_slots",
             *_MODEL_DIMENSIONS,
         },
     )
@@ -160,9 +161,15 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         if model["mixer"] not in {"softmax", "gdn", "kda"}:
             raise ValueError("[model] mixer must be softmax, gdn, or kda")
     if "softmax_every" in model:
-        if model["architecture"] not in {"gdn", "kda", "looped", "recurrent"}:
-            raise ValueError("[model] softmax_every requires a delta architecture")
+        if model["architecture"] not in {"gdn", "kda", "cyfa", "looped", "recurrent"}:
+            raise ValueError("[model] softmax_every requires a hybrid architecture")
         _integer("model", "softmax_every", model["softmax_every"], 0)
+    if "num_slots" in model:
+        if model["architecture"] != "cyfa":
+            raise ValueError("[model] num_slots requires CyFA")
+        _integer("model", "num_slots", model["num_slots"], 2)
+        if model["num_slots"] % 2:
+            raise ValueError("[model] num_slots must be even")
     if (
         model["hidden_size"] % model["num_heads"]
         or model["num_heads"] % model["num_kv_heads"]

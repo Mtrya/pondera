@@ -1,0 +1,117 @@
+"""Packed short convolutions and incremental state for recurrent attention."""
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from pondera.models.vanilla import CausalSelfAttention, VanillaModel
+
+
+class CausalConvolution(nn.Conv1d):
+    """Four-token depthwise convolution, reset at each document."""
+
+    def __init__(self, width, activation="silu"):
+        super().__init__(width, width, kernel_size=4, groups=width, bias=False)
+        self.activation = activation
+
+    def activate(self, x):
+        return F.silu(x) if self.activation == "silu" else x
+
+    def forward(self, x, prepared):
+        cu_cpu, cu_device = prepared
+        if x.device.type in ("cuda", "npu"):
+            from fla.modules.causal_conv1d import causal_conv1d
+
+            output, _ = causal_conv1d(
+                x.unsqueeze(0),
+                self.weight.squeeze(1),
+                activation=self.activation,
+                cu_seqlens=cu_device,
+                cu_seqlens_cpu=cu_cpu,
+            )
+            return output.squeeze(0)
+        pieces = []
+        for start, stop in zip(cu_cpu[:-1].tolist(), cu_cpu[1:].tolist()):
+            doc = F.pad(x[start:stop].T.unsqueeze(0), (3, 0))
+            pieces.append(self.activate(super().forward(doc)).squeeze(0).T)
+        return torch.cat(pieces)
+
+    def forward_cached(self, x, prepared, cache=None):
+        if cache is None:
+            result = self(x, prepared)
+            history = F.pad(x, (0, 0, max(0, 3 - x.shape[0]), 0))[-3:]
+        else:
+            window = torch.cat((cache, x), dim=0)
+            result = self.activate(
+                (window.T * self.weight.squeeze(1)).sum(-1)
+            ).unsqueeze(0)
+            history = window[-3:]
+        return result, history
+
+
+class RecurrentAttention(nn.Module):
+    """Q/K/V convolutions with a subclass's memory update and output readout."""
+
+    @staticmethod
+    def prepare(cu_seqlens, device):
+        cu = torch.as_tensor(cu_seqlens, dtype=torch.int64, device="cpu")
+        return cu, cu.to(device, non_blocking=True)
+
+    def __init__(self, hidden_size, num_heads, *, activation="silu"):
+        super().__init__()
+        if hidden_size % num_heads:
+            raise ValueError("The head count must divide the hidden width")
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.q = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_conv = CausalConvolution(hidden_size, activation)
+        self.k_conv = CausalConvolution(hidden_size, activation)
+        self.v_conv = CausalConvolution(hidden_size, activation)
+
+    def forward(self, x, prepared):
+        vectors = (
+            conv(projection(x), prepared)
+            for projection, conv in (
+                (self.q, self.q_conv),
+                (self.k, self.k_conv),
+                (self.v, self.v_conv),
+            )
+        )
+        output, _ = self._memory(vectors, x, prepared)
+        return self._output(x, output)
+
+    def forward_cached(self, x, cu_seqlens, cache=None):
+        if cache is not None and x.shape[0] != 1:
+            raise ValueError("Cached memory decoding consumes one new token")
+        if len(cu_seqlens) != 2:
+            raise ValueError("Cached decoding requires one document")
+        prepared = self.prepare([0, x.shape[0]], x.device)
+        memory, histories = (None, (None, None, None)) if cache is None else cache
+        vectors, new_histories = [], []
+        for projection, conv, history in zip(
+            (self.q, self.k, self.v), (self.q_conv, self.k_conv, self.v_conv), histories
+        ):
+            vector, tail = conv.forward_cached(projection(x), prepared, history)
+            vectors.append(vector)
+            new_histories.append(tail)
+        output, state = self._memory(vectors, x, prepared, memory, True)
+        return self._output(x, output), (state, tuple(new_histories))
+
+
+class HybridModel(VanillaModel):
+    """Recurrent attention with optional periodic softmax layers."""
+
+    def __init__(self, *, softmax_every=0, **kwargs):
+        if not 0 <= softmax_every <= kwargs["num_blocks"]:
+            raise ValueError("softmax_every must be zero or a valid layer interval")
+        if not softmax_every and kwargs["num_kv_heads"] != kwargs["num_heads"]:
+            raise ValueError("Pure memory models require num_kv_heads = num_heads")
+        self.softmax_every = softmax_every
+        super().__init__(**kwargs)
+
+    def attention_type(self, index):
+        if self.softmax_every and (index + 1) % self.softmax_every == 0:
+            return CausalSelfAttention
+        return self.attention_cls
