@@ -37,7 +37,7 @@ class CompiledBoardTests(unittest.TestCase):
             if ply % 8 == 0:
                 positions.append(board.copy())
         # Pins, friendly ray endpoints and blocked sliders remain geometric attacks.
-        positions.append(chess.Board("4r1k1/8/8/8/8/4R3/4P3/4K3 w - - 0 1"))
+        positions.append(chess.Board("4r1k1/8/8/8/8/8/4R3/4K3 w - - 0 1"))
         for position in positions:
             ids = board_ids(position)
             for length in (2, len(ids) // 2, len(ids)):
