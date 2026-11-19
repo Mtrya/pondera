@@ -135,6 +135,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "mixer",
             "softmax_every",
             "num_slots",
+            "context_rank",
             *_MODEL_DIMENSIONS,
         },
     )
@@ -157,8 +158,13 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             )
         _integer("model", "loop_repetitions", model["loop_repetitions"], 1)
     if "mixer" in model:
-        if model["architecture"] not in {"looped", "recurrent"}:
-            raise ValueError("[model] mixer requires a recurrent-depth architecture")
+        if model["architecture"] not in {
+            "looped",
+            "recurrent",
+            "board_context",
+            "symbolic_board",
+        }:
+            raise ValueError("[model] mixer requires recurrent depth or board context")
         if model["mixer"] not in {"softmax", "gdn", "kda"}:
             raise ValueError("[model] mixer must be softmax, gdn, or kda")
     if "scale_residuals" in model:
@@ -175,9 +181,15 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "cyfa",
             "looped",
             "recurrent",
+            "board_context",
+            "symbolic_board",
         }:
             raise ValueError("[model] softmax_every requires a hybrid architecture")
         _integer("model", "softmax_every", model["softmax_every"], 0)
+    if "context_rank" in model:
+        if model["architecture"] not in {"board_context", "symbolic_board"}:
+            raise ValueError("[model] context_rank requires board context")
+        _integer("model", "context_rank", model["context_rank"], 1)
     if "num_slots" in model:
         if model["architecture"] != "cyfa":
             raise ValueError("[model] num_slots requires CyFA")

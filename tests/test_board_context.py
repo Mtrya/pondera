@@ -2,6 +2,7 @@
 
 import random
 import unittest
+from itertools import product
 
 import chess
 import torch
@@ -13,6 +14,8 @@ from pondera.models.board_context import (
     CompiledBoardFeatures,
     SymbolicBoardModel,
 )
+from pondera.models.delta import GatedDeltaModel, KimiDeltaModel
+from pondera.models.vanilla import VanillaModel
 from pondera.training.muon import build_optimizers
 
 
@@ -82,9 +85,18 @@ class BoardContextTests(unittest.TestCase):
         )
 
     def test_packed_causality_and_cached_decoding_through_prefix_boundary(self):
-        for cls in (BoardContextModel, SymbolicBoardModel):
-            with self.subTest(architecture=cls.architecture), torch.no_grad():
-                model = cls(**self.config).eval()
+        for cls, mixer in product(
+            (BoardContextModel, SymbolicBoardModel), ("softmax", "gdn", "kda")
+        ):
+            with (
+                self.subTest(architecture=cls.architecture, mixer=mixer),
+                torch.no_grad(),
+            ):
+                model = cls(
+                    **self.config,
+                    mixer=mixer,
+                    softmax_every=0 if mixer == "softmax" else 2,
+                ).eval()
                 ids = torch.cat((self.first, self.second))
                 cu = [0, len(self.first), len(ids)]
                 actual = model(ids, cu)
@@ -111,16 +123,24 @@ class BoardContextTests(unittest.TestCase):
                         cache,
                     )
                     parts.append(out)
-                torch.testing.assert_close(
-                    torch.cat(parts), actual[: len(self.first)], rtol=1e-5, atol=1e-6
+                cached, expected = torch.cat(parts), actual[: len(self.first)]
+                # Incremental convolution/GEMM changes fp32 reduction order.
+                torch.testing.assert_close(cached, expected, rtol=1e-5, atol=1e-5)
+                self.assertLess(
+                    float((cached - expected).norm() / expected.norm()), 2e-6
                 )
 
     def test_recomputation_gradients_and_frozen_circuit_during_training(self):
-        for cls in (BoardContextModel, SymbolicBoardModel):
-            with self.subTest(architecture=cls.architecture):
+        for cls, mixer in product(
+            (BoardContextModel, SymbolicBoardModel), ("softmax", "gdn", "kda")
+        ):
+            with self.subTest(architecture=cls.architecture, mixer=mixer):
+                options = dict(
+                    mixer=mixer, softmax_every=0 if mixer == "softmax" else 2
+                )
                 model, recomputed = (
-                    cls(**self.config).train(),
-                    cls(**self.config).train(),
+                    cls(**self.config, **options).train(),
+                    cls(**self.config, **options).train(),
                 )
                 recomputed.load_state_dict(model.state_dict())
                 recomputed.activation_checkpointing = True
@@ -152,6 +172,45 @@ class BoardContextTests(unittest.TestCase):
                 for name, p in model.named_parameters():
                     if name in frozen:
                         torch.testing.assert_close(p, frozen[name], rtol=0, atol=0)
+
+    def test_zero_modulation_preserves_backbone_initialization_outputs_and_gradients(
+        self,
+    ):
+        for cls, (mixer, backbone_cls) in product(
+            (BoardContextModel, SymbolicBoardModel),
+            (
+                ("softmax", VanillaModel),
+                ("gdn", GatedDeltaModel),
+                ("kda", KimiDeltaModel),
+            ),
+        ):
+            with self.subTest(architecture=cls.architecture, mixer=mixer):
+                options = {} if mixer == "softmax" else {"softmax_every": 2}
+                torch.manual_seed(640)
+                backbone = backbone_cls(**self.config, **options)
+                torch.manual_seed(640)
+                conditioned = cls(**self.config, mixer=mixer, **options)
+                parameters = {
+                    name.replace(".attention.attention.", ".attention."): p
+                    for name, p in conditioned.named_parameters()
+                    if not name.startswith("features.") and ".context_" not in name
+                }
+                for name, p in backbone.named_parameters():
+                    torch.testing.assert_close(parameters[name], p, rtol=0, atol=0)
+                with torch.no_grad():
+                    for block in conditioned.blocks:
+                        block.attention.context_up.weight.zero_()
+                expected = backbone(self.first, [0, len(self.first)])
+                actual = conditioned(self.first, [0, len(self.first)])
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                for logits in (actual, expected):
+                    torch.nn.functional.cross_entropy(
+                        logits, self.first.roll(-1)
+                    ).backward()
+                for name, p in backbone.named_parameters():
+                    torch.testing.assert_close(
+                        parameters[name].grad, p.grad, rtol=0, atol=0
+                    )
 
     def test_summary_ignores_later_trace_boards(self):
         for cls in (BoardContextModel, SymbolicBoardModel):

@@ -5,6 +5,8 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from pondera.chess.vocabulary import BOARD_PIECES, BOARD_TOKENS, MOVE
+from pondera.models.delta import GatedDeltaAttention, KimiDeltaAttention
+from pondera.models.memory import RecurrentAttention
 from pondera.models.vanilla import (
     CausalSelfAttention,
     RMSNorm,
@@ -106,33 +108,38 @@ def _prefix_totals(features, ids, open_before=None, totals_before=None):
     return totals, valid[..., -1:]
 
 
-class BoardContextAttention(CausalSelfAttention):
-    def __init__(self, hidden_size, num_heads, num_kv_heads):
-        super().__init__(hidden_size, num_heads, num_kv_heads)
-        rank = min(64, hidden_size)
+class BoardContextAttention(nn.Module):
+    """Modulate projected Q/K, preserving the wrapped attention's memory rule."""
+
+    def __init__(self, attention, rank):
+        super().__init__()
+        self.attention = attention
+        self.widths = attention.q.out_features, attention.k.out_features
         self.context_norm = RMSNorm(CONTEXT_DIM)
         self.context_down = nn.Linear(CONTEXT_DIM, rank, bias=False)
-        self.context_up = nn.Linear(
-            rank, hidden_size + num_kv_heads * self.head_dim, bias=False
-        )
+        self.context_up = nn.Linear(rank, sum(self.widths), bias=False)
         nn.init.normal_(self.context_up.weight, std=0.001)
 
-    def _condition(self, x, context, indices):
-        q, k, v = self._project(x)
+    def _condition(self, vectors, context, indices):
+        q, k, v = vectors
         scales = self.context_up(
             nn.functional.silu(self.context_down(self.context_norm(context)))
         )[indices]
-        q_scale, k_scale = scales.split(
-            (q.shape[1] * q.shape[2], k.shape[1] * k.shape[2]), -1
-        )
+        q_scale, k_scale = scales.split(self.widths, -1)
         q = q * (1 + q_scale.reshape_as(q).to(q.dtype))
         k = k * (1 + k_scale.reshape_as(k).to(k.dtype))
         return q, k, v
 
     def forward(self, x, prepared):
-        (cu, maximum, ends), context, indices = prepared
-        q, k, v = self._condition(x, context, indices)
-        return self.o(
+        metadata, context, indices = prepared
+        attention = self.attention
+        if isinstance(attention, RecurrentAttention):
+            vectors = self._condition(attention._project(x, metadata), context, indices)
+            output, _ = attention._memory(vectors, x, metadata)
+            return attention._output(x, output)
+        cu, maximum, ends = metadata
+        q, k, v = self._condition(attention._project(x), context, indices)
+        return attention.o(
             varlen_attention(
                 q, k, v, cu, max_seqlen=maximum, sequence_ends=ends
             ).reshape(x.shape)
@@ -140,24 +147,62 @@ class BoardContextAttention(CausalSelfAttention):
 
     def forward_cached(self, x, prepared, cache=None):
         cu, context, indices = prepared
-        q, k, v = self._condition(x, context, indices)
+        if len(cu) != 2 or (cache is not None and x.shape[0] != 1):
+            raise ValueError(
+                "Cached board conditioning requires one document and one new token"
+            )
+        attention = self.attention
+        if isinstance(attention, RecurrentAttention):
+            metadata = attention.prepare([0, x.shape[0]], x.device)
+            memory, histories = (None, (None, None, None)) if cache is None else cache
+            vectors, new_histories = attention._project_cached(x, metadata, histories)
+            vectors = self._condition(vectors, context, indices)
+            output, state = attention._memory(vectors, x, metadata, memory, True)
+            return attention._output(x, output), (state, new_histories)
+        q, k, v = self._condition(attention._project(x), context, indices)
         if cache is not None:
             k = torch.cat((cache[0], k))
             v = torch.cat((cache[1], v))
         result = varlen_attention(q, k, v, cu, q.shape[0] == k.shape[0])
-        return self.o(result.reshape(x.shape)), (k, v)
+        return attention.o(result.reshape(x.shape)), (k, v)
 
 
 class BoardContextModel(VanillaModel):
     """Condition Q/K scales on a learned sum of observed root-prefix atoms."""
 
     architecture = "board_context"
-    attention_cls = BoardContextAttention
     features_cls = LearnedBoardFeatures
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, mixer="softmax", softmax_every=0, context_rank=64, **kwargs):
+        if mixer not in {"softmax", "gdn", "kda"}:
+            raise ValueError("Board context mixer must be softmax, gdn, or kda")
+        if not 0 <= softmax_every <= kwargs["num_blocks"]:
+            raise ValueError("softmax_every must be zero or a valid layer interval")
+        if mixer == "softmax" and softmax_every:
+            raise ValueError("softmax_every requires a delta mixer")
+        if (
+            mixer != "softmax"
+            and not softmax_every
+            and kwargs["num_kv_heads"] != kwargs["num_heads"]
+        ):
+            raise ValueError("Pure memory models require num_kv_heads = num_heads")
+        if type(context_rank) is not int or context_rank < 1:
+            raise ValueError("context_rank must be a positive integer")
+        self.mixer, self.softmax_every = mixer, softmax_every
         super().__init__(**kwargs)
+        # Build the complete backbone before drawing any conditioning weights.
+        for block in self.blocks:
+            block.attention = BoardContextAttention(
+                block.attention, min(context_rank, kwargs["hidden_size"])
+            )
         self.features = self.features_cls()
+
+    def attention_type(self, index):
+        if self.mixer == "softmax" or (
+            self.softmax_every and (index + 1) % self.softmax_every == 0
+        ):
+            return CausalSelfAttention
+        return {"gdn": GatedDeltaAttention, "kda": KimiDeltaAttention}[self.mixer]
 
     def _prepare_context(self, input_ids, cu_seqlens):
         cu = torch.as_tensor(cu_seqlens, dtype=torch.long, device="cpu")
@@ -176,17 +221,17 @@ class BoardContextModel(VanillaModel):
 
     def forward(self, input_ids, cu_seqlens):
         context, indices = self._prepare_context(input_ids, cu_seqlens)
-        prepared = (
-            CausalSelfAttention.prepare(cu_seqlens, input_ids.device),
-            context,
-            indices,
-        )
+        prepared = {
+            kind: (kind.prepare(cu_seqlens, input_ids.device), context, indices)
+            for kind in {type(block.attention.attention) for block in self.blocks}
+        }
         x = self.token_embedding(input_ids)
         for block in self.blocks:
+            metadata = prepared[type(block.attention.attention)]
             if self.training and self.activation_checkpointing:
-                x = checkpoint(block, x, prepared, use_reentrant=False)
+                x = checkpoint(block, x, metadata, use_reentrant=False)
             else:
-                x = block(x, prepared)
+                x = block(x, metadata)
         return self.head(self.norm(x))
 
     def forward_cached(self, input_ids, cu_seqlens, caches=None):

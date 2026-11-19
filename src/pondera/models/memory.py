@@ -70,8 +70,8 @@ class RecurrentAttention(nn.Module):
         self.k_conv = CausalConvolution(hidden_size, activation)
         self.v_conv = CausalConvolution(hidden_size, activation)
 
-    def forward(self, x, prepared):
-        vectors = (
+    def _project(self, x, prepared):
+        return tuple(
             conv(projection(x), prepared)
             for projection, conv in (
                 (self.q, self.q_conv),
@@ -79,7 +79,19 @@ class RecurrentAttention(nn.Module):
                 (self.v, self.v_conv),
             )
         )
-        output, _ = self._memory(vectors, x, prepared)
+
+    def _project_cached(self, x, prepared, histories):
+        vectors, new_histories = [], []
+        for projection, conv, history in zip(
+            (self.q, self.k, self.v), (self.q_conv, self.k_conv, self.v_conv), histories
+        ):
+            vector, tail = conv.forward_cached(projection(x), prepared, history)
+            vectors.append(vector)
+            new_histories.append(tail)
+        return vectors, tuple(new_histories)
+
+    def forward(self, x, prepared):
+        output, _ = self._memory(self._project(x, prepared), x, prepared)
         return self._output(x, output)
 
     def forward_cached(self, x, cu_seqlens, cache=None):
@@ -89,15 +101,9 @@ class RecurrentAttention(nn.Module):
             raise ValueError("Cached decoding requires one document")
         prepared = self.prepare([0, x.shape[0]], x.device)
         memory, histories = (None, (None, None, None)) if cache is None else cache
-        vectors, new_histories = [], []
-        for projection, conv, history in zip(
-            (self.q, self.k, self.v), (self.q_conv, self.k_conv, self.v_conv), histories
-        ):
-            vector, tail = conv.forward_cached(projection(x), prepared, history)
-            vectors.append(vector)
-            new_histories.append(tail)
+        vectors, new_histories = self._project_cached(x, prepared, histories)
         output, state = self._memory(vectors, x, prepared, memory, True)
-        return self._output(x, output), (state, tuple(new_histories))
+        return self._output(x, output), (state, new_histories)
 
 
 class HybridModel(VanillaModel):

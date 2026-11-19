@@ -281,6 +281,11 @@ checkpoint_keep_last = 2
             ("kdn", {}),
             ("looped", {"mixer": "gdn", "softmax_every": 3, "scale_residuals": True}),
             ("recurrent", {"mixer": "kda", "softmax_every": 3}),
+            ("board_context", {"mixer": "kda", "softmax_every": 2, "context_rank": 16}),
+            (
+                "symbolic_board",
+                {"mixer": "kda", "softmax_every": 2, "context_rank": 16},
+            ),
         ]
         for architecture, settings in cases:
             with self.subTest(architecture=architecture, settings=settings):
@@ -289,6 +294,13 @@ checkpoint_keep_last = 2
                 full = self.root / f"{name}-full"
                 partial = self.root / f"{name}-partial"
                 self.write_training_recipe(recipe, architecture)
+                if (
+                    architecture in {"board_context", "symbolic_board"}
+                    and "mixer" in settings
+                ):
+                    recipe.write_text(
+                        recipe.read_text().replace("num_blocks = 1", "num_blocks = 2")
+                    )
                 fields = "\n".join(
                     f"{key} = {json.dumps(value)}" for key, value in settings.items()
                 )
@@ -309,6 +321,11 @@ checkpoint_keep_last = 2
                     model_config["num_kv_heads"] = 4
                 if architecture in {"looped", "recurrent"}:
                     model_config["num_blocks"] = 6
+                if (
+                    architecture in {"board_context", "symbolic_board"}
+                    and "mixer" in settings
+                ):
+                    model_config["num_blocks"] = 2
                 model_config.update(settings)
                 self.assertEqual(actual["model_config"], model_config)
                 self.assertEqual(actual["presented_documents"], 6)
