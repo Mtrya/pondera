@@ -228,9 +228,9 @@ class VanillaModel(nn.Module):
                 intermediate_size,
                 num_heads,
                 num_kv_heads,
-                self.attention_cls,
+                self.attention_type(index),
             )
-            for _ in range(num_blocks)
+            for index in range(num_blocks)
         )
         self.norm = RMSNorm(hidden_size)
         self.head = nn.Linear(hidden_size, vocab_size, bias=False)
@@ -238,15 +238,24 @@ class VanillaModel(nn.Module):
     def execution_blocks(self):
         return iter(self.blocks)
 
+    def attention_type(self, index):
+        return self.attention_cls or CausalSelfAttention
+
     def forward(self, input_ids, cu_seqlens):
-        attention_cls = self.attention_cls or CausalSelfAttention
-        prepared = attention_cls.prepare(cu_seqlens, input_ids.device)
+        prepared = {}
+        for block in self.blocks:
+            attention_type = type(block.attention)
+            if attention_type not in prepared:
+                prepared[attention_type] = attention_type.prepare(
+                    cu_seqlens, input_ids.device
+                )
         x = self.token_embedding(input_ids)
         for block in self.execution_blocks():
+            metadata = prepared[type(block.attention)]
             if self.training and self.activation_checkpointing:
-                x = checkpoint(block, x, prepared, use_reentrant=False)
+                x = checkpoint(block, x, metadata, use_reentrant=False)
             else:
-                x = block(x, prepared)
+                x = block(x, metadata)
         return self.head(self.norm(x))
 
     def forward_cached(self, input_ids, cu_seqlens, caches=None):

@@ -21,6 +21,7 @@ _MODEL_DIMENSIONS = (
 class TrainConfig:
     objective: str = "all_tokens"
     decision_loss_weight: float = 0.0
+    hyperball: bool = False
     muon_lr: float = 0.02
     adamw_lr: float = 3e-4
     warmup_fraction: float = 0.05
@@ -53,6 +54,8 @@ class TrainConfig:
             raise ValueError("[training] decision_loss_weight requires all_tokens")
         if type(self.activation_checkpointing) is not bool:
             raise ValueError("[training] activation_checkpointing must be a boolean")
+        if type(self.hyperball) is not bool:
+            raise ValueError("[training] hyperball must be a boolean")
         for name in ("warmup_fraction", "min_lr_ratio"):
             value = getattr(self, name)
             if (
@@ -125,7 +128,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     model = _table(
         values["model"],
         "model",
-        {"architecture", "loop_repetitions", *_MODEL_DIMENSIONS},
+        {"architecture", "loop_repetitions", "softmax_every", *_MODEL_DIMENSIONS},
     )
     missing = {"architecture", *_MODEL_DIMENSIONS} - set(model)
     if missing:
@@ -145,6 +148,10 @@ def load_config(path=DEFAULT_CONFIG_PATH):
                 "[model] loop_repetitions requires the looped architecture"
             )
         _integer("model", "loop_repetitions", model["loop_repetitions"], 1)
+    if "softmax_every" in model:
+        if model["architecture"] not in {"gdn", "kda"}:
+            raise ValueError("[model] softmax_every requires a delta architecture")
+        _integer("model", "softmax_every", model["softmax_every"], 0)
     if (
         model["hidden_size"] % model["num_heads"]
         or model["num_heads"] % model["num_kv_heads"]

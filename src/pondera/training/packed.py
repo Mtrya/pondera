@@ -313,6 +313,7 @@ def train(
         muon_lr=config.muon_lr,
         adamw_lr=config.adamw_lr,
         weight_decay=config.weight_decay,
+        hyperball=config.hyperball,
     )
     micro_step = update = presented_documents = 0
     if resume is not None:
@@ -329,16 +330,22 @@ def train(
                 raise ValueError(f"Resume {key} differs from checkpoint")
         if state["train_config"].get("objective") != config.objective:
             raise ValueError("Resume objective differs from checkpoint")
+        if state["train_config"].get("hyperball", False) != config.hyperball:
+            raise ValueError("Resume hyperball differs from checkpoint")
         if (
             state["train_config"].get("decision_loss_weight", 0.0)
             != config.decision_loss_weight
         ):
             raise ValueError("Resume decision_loss_weight differs from checkpoint")
         model.load_state_dict(state["model_state_dict"])
-        for optimizer, saved in zip(optimizers, state["optimizer_state_dicts"]):
+        for index, (optimizer, saved) in enumerate(
+            zip(optimizers, state["optimizer_state_dicts"])
+        ):
             optimizer.load_state_dict(saved)
             for group in optimizer.param_groups:
-                group["weight_decay"] = config.weight_decay
+                group["weight_decay"] = (
+                    0.0 if index == 0 and config.hyperball else config.weight_decay
+                )
         micro_step, update = state["micro_step"], state["update"]
         presented_documents = state["presented_documents"]
     swanlab_run_id = state.get("swanlab_run_id") if resume is not None else None

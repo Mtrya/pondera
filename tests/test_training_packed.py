@@ -76,6 +76,31 @@ def _ddp_worker(rank, store, packed, model_config, output, config, runs, model_c
 
 
 class MuonTests(unittest.TestCase):
+    def test_hyperball_perpendicular_update(self):
+        parameter = torch.nn.Parameter(torch.tensor([[3.0, 0.0], [0.0, 4.0]]))
+        optimizer = Muon([parameter], lr=0.1, hyperball=True)
+        parameter.grad = torch.tensor([[0.0, 1.0], [-1.0, 0.0]])
+        optimizer.step()
+        # Equal singular values preserve this direction. The unit update is
+        # perpendicular to W, so projection divides by sqrt(1 + 0.1**2).
+        expected = torch.tensor([[2.98511157, -0.35179877], [0.35179877, 3.98014876]])
+        torch.testing.assert_close(parameter, expected)
+
+    def test_hyperball_preserves_initial_matrix_norms(self):
+        torch.manual_seed(640)
+        parameters = [
+            torch.nn.Parameter(torch.randn(shape))
+            for shape in ((8, 8), (8, 32), (32, 8))
+        ]
+        radii = [parameter.norm().detach().clone() for parameter in parameters]
+        optimizer = Muon(parameters, lr=0.1, hyperball=True)
+        for _ in range(4):
+            for parameter in parameters:
+                parameter.grad = torch.randn_like(parameter)
+            optimizer.step()
+            for parameter, radius in zip(parameters, radii, strict=True):
+                torch.testing.assert_close(parameter.norm(), radius)
+
     def test_newton_schulz_orthogonalizes(self):
         torch.manual_seed(0)
         matrix = torch.randn(8, 8)
@@ -196,7 +221,7 @@ num_blocks = 1
 hidden_size = 32
 intermediate_size = 48
 num_heads = 4
-num_kv_heads = 2
+num_kv_heads = {4 if architecture in {"gdn", "kda"} else 2}
 
 [training]
 seed = 11
@@ -241,7 +266,7 @@ checkpoint_keep_last = 2
         )
 
     def test_toml_training_and_resume_match_uninterrupted_training(self):
-        for architecture in ("vanilla", "linear"):
+        for architecture in ("vanilla", "linear", "gdn", "kda"):
             with self.subTest(architecture=architecture):
                 recipe = self.root / f"{architecture}.toml"
                 full = self.root / f"{architecture}-full"
@@ -256,7 +281,10 @@ checkpoint_keep_last = 2
                 expected = torch.load(full / "checkpoint.pth", weights_only=True)
                 actual = torch.load(partial / "checkpoint.pth", weights_only=True)
                 self.assertEqual(actual["arch"], architecture)
-                self.assertEqual(actual["model_config"], self.model_config)
+                model_config = dict(self.model_config)
+                if architecture in {"gdn", "kda"}:
+                    model_config["num_kv_heads"] = 4
+                self.assertEqual(actual["model_config"], model_config)
                 self.assertEqual(actual["presented_documents"], 6)
                 self.assertEqual(
                     actual["selection"],
@@ -740,8 +768,9 @@ checkpoint_keep_last = 2
         self.assertTrue(artifacts)
         self.assertGreater(artifacts[0].stat().st_size, 0)
 
-    def check_resume_replays_the_same_losses(self, device):
+    def check_resume_replays_the_same_losses(self, device, hyperball=False):
         config = self.config(4)
+        config.hyperball = hyperball
         config.warmup_fraction = 0.5
         config.checkpoint_every = 1
         config.checkpoint_keep_last = 4
@@ -790,6 +819,9 @@ checkpoint_keep_last = 2
 
     def test_resume_replays_the_same_losses(self):
         self.check_resume_replays_the_same_losses("cpu")
+
+    def test_hyperball_resume_replays_the_same_losses(self):
+        self.check_resume_replays_the_same_losses("cpu", hyperball=True)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA resume requires a GPU")
     def test_cuda_resume_replays_the_same_losses(self):

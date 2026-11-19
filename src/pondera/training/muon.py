@@ -5,6 +5,9 @@ norms, biases, and scalars. The split is identical for every architecture.
 The update follows Keller Jordan's original Muon: the orthogonalized
 update is scaled by sqrt(max(1, fan_out / fan_in)), and the Newton–Schulz
 iteration uses the standard five steps.
+
+Hyperball optionally fixes hidden-matrix and update Frobenius norms using
+the initial matrix radius (https://arxiv.org/abs/2606.16899).
 """
 
 import torch
@@ -34,7 +37,10 @@ class Muon(torch.optim.Optimizer):
         momentum=0.95,
         nesterov=True,
         ns_steps=5,
+        hyperball=False,
     ):
+        if hyperball and weight_decay:
+            raise ValueError("Hyperball replaces weight decay for hidden matrices")
         super().__init__(
             params,
             dict(
@@ -43,6 +49,7 @@ class Muon(torch.optim.Optimizer):
                 momentum=momentum,
                 nesterov=nesterov,
                 ns_steps=ns_steps,
+                hyperball=hyperball,
             ),
         )
 
@@ -64,9 +71,20 @@ class Muon(torch.optim.Optimizer):
                     else buffer
                 )
                 update = newton_schulz5(gradient, group["ns_steps"])
-                scale = max(1, param.shape[-2] / param.shape[-1]) ** 0.5
-                param.mul_(1 - group["lr"] * group["weight_decay"])
-                param.add_(update.to(param.dtype), alpha=-group["lr"] * scale)
+                if group["hyperball"]:
+                    if "radius" not in state:
+                        state["radius"] = param.norm().detach().clone()
+                    radius = state["radius"]
+                    update = update.to(param.dtype)
+                    # Hyperball Eq. (1): normalize the update, then project the
+                    # resulting weight back to its initial Frobenius radius.
+                    update.mul_(radius / update.norm().clamp_min(1e-30))
+                    param.add_(update, alpha=-group["lr"])
+                    param.mul_(radius / param.norm().clamp_min(1e-30))
+                else:
+                    scale = max(1, param.shape[-2] / param.shape[-1]) ** 0.5
+                    param.mul_(1 - group["lr"] * group["weight_decay"])
+                    param.add_(update.to(param.dtype), alpha=-group["lr"] * scale)
         return loss
 
 
@@ -81,10 +99,17 @@ def split_parameters(model: nn.Module):
     return muon, adamw
 
 
-def build_optimizers(model, *, muon_lr=0.02, adamw_lr=3e-4, weight_decay=0.0):
+def build_optimizers(
+    model, *, muon_lr=0.02, adamw_lr=3e-4, weight_decay=0.0, hyperball=False
+):
     muon_params, adamw_params = split_parameters(model)
     return [
-        Muon(muon_params, lr=muon_lr, weight_decay=weight_decay),
+        Muon(
+            muon_params,
+            lr=muon_lr,
+            weight_decay=0.0 if hyperball else weight_decay,
+            hyperball=hyperball,
+        ),
         torch.optim.AdamW(
             adamw_params,
             lr=adamw_lr,
