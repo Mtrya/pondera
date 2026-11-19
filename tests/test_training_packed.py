@@ -217,7 +217,7 @@ class TrainerTests(unittest.TestCase):
         path.write_text(f"""
 [model]
 architecture = "{architecture}"
-num_blocks = 1
+num_blocks = {6 if architecture in {"looped", "recurrent"} else 1}
 hidden_size = 32
 intermediate_size = 48
 num_heads = 4
@@ -266,7 +266,7 @@ checkpoint_keep_last = 2
         )
 
     def test_toml_training_and_resume_match_uninterrupted_training(self):
-        for architecture in ("vanilla", "linear", "gdn", "kda"):
+        for architecture in ("vanilla", "linear", "gdn", "kda", "looped", "recurrent"):
             with self.subTest(architecture=architecture):
                 recipe = self.root / f"{architecture}.toml"
                 full = self.root / f"{architecture}-full"
@@ -284,6 +284,8 @@ checkpoint_keep_last = 2
                 model_config = dict(self.model_config)
                 if architecture in {"gdn", "kda"}:
                     model_config["num_kv_heads"] = 4
+                if architecture in {"looped", "recurrent"}:
+                    model_config["num_blocks"] = 6
                 self.assertEqual(actual["model_config"], model_config)
                 self.assertEqual(actual["presented_documents"], 6)
                 self.assertEqual(

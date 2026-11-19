@@ -3,7 +3,10 @@
 import random
 from itertools import chain, repeat
 
-from pondera.models.vanilla import VanillaModel
+import torch
+from torch.utils.checkpoint import checkpoint
+
+from pondera.models.vanilla import Block, CausalSelfAttention, RMSNorm, VanillaModel
 
 
 class LoopedModel(VanillaModel):
@@ -34,3 +37,80 @@ class LoopedModel(VanillaModel):
             chain.from_iterable(repeat(core, repetitions)),
             self.blocks[-2:],
         )
+
+
+class SandwichBlock(Block):
+    """Normalize both residual outputs, following recurrent-depth Section 3.2."""
+
+    def __init__(self, hidden_size, *args, **kwargs):
+        super().__init__(hidden_size, *args, **kwargs)
+        self.norm_after_attention = RMSNorm(hidden_size)
+        self.norm_after_ffn = RMSNorm(hidden_size)
+
+    def forward(self, x, prepared):
+        x = self.norm_after_attention(
+            x + self.attention(self.norm_attention(x), prepared)
+        )
+        return self.norm_after_ffn(x + self._ffn(self.norm_ffn(x)))
+
+    def forward_cached(self, x, cu_seqlens, cache=None):
+        attended, new_cache = self.attention.forward_cached(
+            self.norm_attention(x), cu_seqlens, cache
+        )
+        x = self.norm_after_attention(x + attended)
+        return self.norm_after_ffn(x + self._ffn(self.norm_ffn(x))), new_cache
+
+
+class RecurrentDepthModel(LoopedModel):
+    """Inject the prelude at every normalized core iteration.
+
+    Uses additive input injection and a zero initial state. This deterministic
+    small-model variant preserves packed and incremental causal execution;
+    it does not reproduce the paper's random initialization or depth sampler.
+    """
+
+    architecture = "recurrent"
+    block_cls = SandwichBlock
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.norm_core = RMSNorm(kwargs["hidden_size"])
+
+    def _iterate(self, x, apply):
+        for block in self.blocks[:2]:
+            x = apply(block, x)
+        embedded = x
+        state = torch.zeros_like(embedded)
+        repetitions = (
+            self.training_repetitions if self.training else self.loop_repetitions
+        )
+        for _ in range(repetitions):
+            state = state + embedded
+            for block in self.blocks[2:-2]:
+                state = apply(block, state)
+            state = self.norm_core(state)
+        for block in self.blocks[-2:]:
+            state = apply(block, state)
+        return self.head(self.norm(state))
+
+    def forward(self, input_ids, cu_seqlens):
+        prepared = CausalSelfAttention.prepare(cu_seqlens, input_ids.device)
+
+        def apply(block, x):
+            if self.training and self.activation_checkpointing:
+                return checkpoint(block, x, prepared, use_reentrant=False)
+            return block(x, prepared)
+
+        return self._iterate(self.token_embedding(input_ids), apply)
+
+    def forward_cached(self, input_ids, cu_seqlens, caches=None):
+        new_caches = []
+
+        def apply(block, x):
+            cache = None if caches is None else caches[len(new_caches)]
+            x, new_cache = block.forward_cached(x, cu_seqlens, cache)
+            new_caches.append(new_cache)
+            return x
+
+        logits = self._iterate(self.token_embedding(input_ids), apply)
+        return logits, new_caches

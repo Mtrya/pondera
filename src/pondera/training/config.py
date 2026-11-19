@@ -143,9 +143,9 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     for name in _MODEL_DIMENSIONS:
         _integer("model", name, model[name], 1)
     if "loop_repetitions" in model:
-        if model["architecture"] != "looped":
+        if model["architecture"] not in {"looped", "recurrent"}:
             raise ValueError(
-                "[model] loop_repetitions requires the looped architecture"
+                "[model] loop_repetitions requires a recurrent-depth architecture"
             )
         _integer("model", "loop_repetitions", model["loop_repetitions"], 1)
     if "softmax_every" in model:

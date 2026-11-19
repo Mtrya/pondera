@@ -2,7 +2,7 @@
 
 from pondera.models.delta import GatedDeltaModel, KimiDeltaModel
 from pondera.models.linear import LinearVanillaModel
-from pondera.models.looped import LoopedModel
+from pondera.models.looped import LoopedModel, RecurrentDepthModel
 from pondera.models.vanilla import VanillaModel
 
 MODEL_CLASSES = {
@@ -11,6 +11,7 @@ MODEL_CLASSES = {
         VanillaModel,
         LinearVanillaModel,
         LoopedModel,
+        RecurrentDepthModel,
         GatedDeltaModel,
         KimiDeltaModel,
     )

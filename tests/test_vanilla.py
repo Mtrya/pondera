@@ -6,7 +6,7 @@ from importlib.util import find_spec
 import torch
 
 from pondera.models.linear import LinearVanillaModel
-from pondera.models.looped import LoopedModel
+from pondera.models.looped import LoopedModel, RecurrentDepthModel
 from pondera.models.vanilla import (
     VanillaModel,
     eager_varlen_attention,
@@ -69,6 +69,52 @@ class VanillaTests(unittest.TestCase):
         with torch.no_grad():
             altered = self.model(changed, cu)
         torch.testing.assert_close(base[:7], altered[:7], rtol=0, atol=0)
+
+    def test_injected_recurrence_preserves_causality_and_incremental_generation(self):
+        model = RecurrentDepthModel(**{**MODEL, "num_blocks": 6}).eval()
+        ids, cu = packed_ids()
+        parameter_count = sum(p.numel() for p in model.parameters())
+        with torch.no_grad():
+            for depth in (1, 3, 6):
+                with self.subTest(depth=depth):
+                    model.loop_repetitions = depth
+                    packed = model(ids, cu)
+                    separate = torch.cat(
+                        (model(ids[:5], [0, 5]), model(ids[5:], [0, 6]))
+                    )
+                    torch.testing.assert_close(packed, separate, rtol=1e-5, atol=1e-6)
+                    changed = ids.clone()
+                    changed[3:] = (changed[3:] + 1) % MODEL["vocab_size"]
+                    torch.testing.assert_close(
+                        model(changed, cu)[:3], packed[:3], rtol=0, atol=0
+                    )
+                    parts = []
+                    cache = None
+                    for index in range(5):
+                        logits, cache = model.forward_cached(
+                            ids[index : index + 1], torch.tensor([0, index + 1]), cache
+                        )
+                        parts.append(logits)
+                    torch.testing.assert_close(
+                        torch.cat(parts), packed[:5], rtol=1e-5, atol=1e-6
+                    )
+                    self.assertEqual(
+                        sum(p.numel() for p in model.parameters()), parameter_count
+                    )
+
+    def test_injected_recurrence_recomputation_preserves_all_gradients(self):
+        model = RecurrentDepthModel(**{**MODEL, "num_blocks": 6}).train()
+        recomputed = RecurrentDepthModel(**{**MODEL, "num_blocks": 6}).train()
+        recomputed.load_state_dict(model.state_dict())
+        recomputed.activation_checkpointing = True
+        ids, cu = packed_ids()
+        labels = torch.randint(0, MODEL["vocab_size"], ids.shape)
+        for network in (model, recomputed):
+            torch.nn.functional.cross_entropy(network(ids, cu), labels).backward()
+        for actual, expected in zip(
+            recomputed.parameters(), model.parameters(), strict=True
+        ):
+            torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
 
     def test_packed_forward_equals_per_document_forward(self):
         ids, cu = packed_ids()

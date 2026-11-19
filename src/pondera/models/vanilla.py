@@ -206,6 +206,7 @@ class VanillaModel(nn.Module):
     """Vanilla transformer with a replaceable attention core."""
 
     attention_cls = None
+    block_cls = Block
     architecture = "vanilla"
 
     def __init__(
@@ -223,7 +224,7 @@ class VanillaModel(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, hidden_size)
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         self.blocks = nn.ModuleList(
-            Block(
+            self.block_cls(
                 hidden_size,
                 intermediate_size,
                 num_heads,

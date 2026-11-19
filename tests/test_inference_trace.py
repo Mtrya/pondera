@@ -22,7 +22,7 @@ from pondera.chess.vocabulary import (
 from pondera.inference.trace import Predictor, _DecodeState, parse_answer
 from pondera.inference.vanilla_uci import pick_with_reasoning
 from pondera.models.linear import LinearVanillaModel
-from pondera.models.looped import LoopedModel
+from pondera.models.looped import LoopedModel, RecurrentDepthModel
 from pondera.models.vanilla import VanillaModel
 
 
@@ -119,7 +119,12 @@ class GenerationTests(unittest.TestCase):
         torch.manual_seed(640)
         prefix = encode_board(chess.STARTING_FEN).tolist()
         tokens = [BACK, move("e2e4"), BACK, FINAL, VALUE, END]
-        for model_class in (VanillaModel, LinearVanillaModel, LoopedModel):
+        for model_class in (
+            VanillaModel,
+            LinearVanillaModel,
+            LoopedModel,
+            RecurrentDepthModel,
+        ):
             with self.subTest(architecture=model_class.architecture):
                 model = model_class(
                     num_blocks=5,
