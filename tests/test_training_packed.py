@@ -1,6 +1,7 @@
 """Trainer smoke: loss decreases, resume replays the same loss sequence."""
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ from pondera.data.packing import (
 )
 from pondera.data.pipeline import produce_shards
 from pondera.data.tokenize import encode_dataset
+from pondera.evaluation.loss import evaluate_loss
 from pondera.models.linear import LinearVanillaModel
 from pondera.models.vanilla import VanillaModel
 from pondera.training.config import TrainConfig
@@ -481,6 +483,116 @@ checkpoint_keep_last = 2
                         track=False,
                     )
                 self.assertFalse(output.exists())
+
+    def test_absolute_presentation_cap_and_resume_accounting(self):
+        config = self.config(8)
+        config.max_presented_documents = 7
+        output = self.root / "capped"
+        first = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            track=False,
+        )
+        self.assertEqual(first["presented_documents"], 7)
+        self.assertEqual(
+            json.loads((output / "progress.json").read_text())["presented_documents"], 7
+        )
+        config.max_presented_documents = 10
+        second = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            resume=output / "checkpoint.pth",
+            track=False,
+        )
+        self.assertEqual(second["presented_documents"], 10)
+        self.assertEqual(second["history"][-1]["presented_documents"], 10)
+        config.max_presented_documents = 9
+        with self.assertRaises(ValueError):
+            train(
+                self.make_model(),
+                self.model_config,
+                self.root / "packed",
+                config,
+                self.root / "exhausted",
+                resume=output / "checkpoint.pth",
+                track=False,
+            )
+
+    def test_validation_includes_documents_above_training_length_filter(self):
+        documents = PackedDocuments(self.root / "packed")
+        longest = int(np.argmax(documents.lengths))
+        splits = np.memmap(self.root / "packed" / "split.u8", np.uint8, mode="r+")
+        splits[longest] = 1
+        splits.flush()
+        documents = PackedDocuments(self.root / "packed")
+        config = self.config(1)
+        config.objective = "final_decision"
+        config.max_document_tokens = int(documents.lengths[documents.split == 0].min())
+        config.val_every = 1
+        output = self.root / "all-validation"
+        result = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            track=False,
+        )
+        state = torch.load(output / "checkpoint.pth", weights_only=True)
+        self.assertEqual(
+            state["selection"]["validation_documents"], int((splits == 1).sum())
+        )
+        # Every document supplies length minus one within-document next-token targets.
+        expected_labels = int((documents.lengths[documents.split == 1] - 1).sum())
+        self.assertEqual(result["history"][-1]["val_labeled_tokens"], expected_labels)
+        model = self.make_model()
+        model.load_state_dict(state["model_state_dict"])
+        model.eval()
+        loss, _ = validation_loss(
+            model, documents, 65536, "cpu", np.flatnonzero(splits == 1)
+        )
+        self.assertFalse(model.training)
+        self.assertAlmostEqual(loss, result["history"][-1]["val_loss"], places=6)
+
+    def test_checkpoint_loss_matches_uniform_distribution_and_training_evaluation(self):
+        output = self.root / "loss-reference"
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            self.config(1),
+            output,
+            track=False,
+        )
+        checkpoint = output / "checkpoint.pth"
+        model = self.make_model()
+        state = torch.load(checkpoint, weights_only=True)
+        model.load_state_dict(state["model_state_dict"])
+        documents = PackedDocuments(self.root / "packed")
+        expected, labels = validation_loss(
+            model, documents, 65536, "cpu", np.flatnonzero(documents.split == 1)
+        )
+        result = evaluate_loss(checkpoint, self.root / "packed", batch_tokens=32)
+        self.assertAlmostEqual(result["loss"], expected, delta=1e-6)
+        self.assertEqual(result["labeled_tokens"], labels)
+        self.assertEqual(
+            sum(row["tokens"] for row in result["document_losses"]), labels
+        )
+        for value in state["model_state_dict"].values():
+            value.zero_()
+        constant = self.root / "uniform.pth"
+        torch.save(state, constant)
+        # A zero-logit model assigns 1/vocabulary probability to every next token.
+        result = evaluate_loss(constant, self.root / "packed")
+        self.assertAlmostEqual(
+            result["loss"], math.log(self.model_config["vocab_size"]), places=6
+        )
 
     def test_loss_decreases(self):
         model = self.make_model()
@@ -1077,7 +1189,9 @@ checkpoint_keep_last = 2
                         sum(record["labeled_tokens"] for record in observed),
                         len(indices),
                     )
-                    self.assertEqual(observed[-1]["val_labeled_tokens"], 1)
+                    # The fixture's validation document has 46 tokens, regardless
+                    # of which targets the training objective supervises.
+                    self.assertEqual(observed[-1]["val_labeled_tokens"], 45)
                 for record, wanted in zip(observed, reference["history"]):
                     for field in (
                         "micro_step",

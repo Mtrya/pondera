@@ -5,6 +5,8 @@ import tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+from pondera.models import MODEL_CLASSES
+
 DEFAULT_CONFIG_PATH = Path("configs/train.toml")
 _MODEL_DIMENSIONS = (
     "num_blocks",
@@ -18,6 +20,7 @@ _MODEL_DIMENSIONS = (
 @dataclass
 class TrainConfig:
     objective: str = "all_tokens"
+    decision_loss_weight: float = 0.0
     muon_lr: float = 0.02
     adamw_lr: float = 3e-4
     warmup_fraction: float = 0.05
@@ -26,6 +29,7 @@ class TrainConfig:
     microbatch_tokens: int = 131_072
     update_tokens: int = 524_288
     presentations: float = 1.0
+    max_presented_documents: int | None = None
     documents: int | None = None
     max_document_tokens: int | None = None
     updates: int | None = None
@@ -40,6 +44,13 @@ class TrainConfig:
             raise ValueError(
                 "[training] objective must be all_tokens or final_decision"
             )
+        weight = self.decision_loss_weight
+        if type(weight) not in (int, float) or not math.isfinite(weight) or weight < 0:
+            raise ValueError(
+                "[training] decision_loss_weight must be finite and nonnegative"
+            )
+        if weight and self.objective != "all_tokens":
+            raise ValueError("[training] decision_loss_weight requires all_tokens")
         if type(self.activation_checkpointing) is not bool:
             raise ValueError("[training] activation_checkpointing must be a boolean")
         for name in ("warmup_fraction", "min_lr_ratio"):
@@ -56,6 +67,7 @@ class TrainConfig:
             "microbatch_tokens",
             "update_tokens",
             "documents",
+            "max_presented_documents",
             "max_document_tokens",
             "updates",
             "val_every",
@@ -110,14 +122,29 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     for section in ("model", "training"):
         if section not in values:
             raise ValueError(f"Missing config section: [{section}]")
-    model = _table(values["model"], "model", {"architecture", *_MODEL_DIMENSIONS})
+    model = _table(
+        values["model"],
+        "model",
+        {"architecture", "loop_repetitions", *_MODEL_DIMENSIONS},
+    )
     missing = {"architecture", *_MODEL_DIMENSIONS} - set(model)
     if missing:
         raise ValueError(f"Missing config key in [model]: {sorted(missing)[0]}")
-    if model["architecture"] not in ("vanilla", "linear"):
-        raise ValueError("[model] architecture must be vanilla or linear")
+    if (
+        not isinstance(model["architecture"], str)
+        or model["architecture"] not in MODEL_CLASSES
+    ):
+        raise ValueError(
+            f"[model] architecture must be one of {', '.join(MODEL_CLASSES)}"
+        )
     for name in _MODEL_DIMENSIONS:
         _integer("model", name, model[name], 1)
+    if "loop_repetitions" in model:
+        if model["architecture"] != "looped":
+            raise ValueError(
+                "[model] loop_repetitions requires the looped architecture"
+            )
+        _integer("model", "loop_repetitions", model["loop_repetitions"], 1)
     if (
         model["hidden_size"] % model["num_heads"]
         or model["num_heads"] % model["num_kv_heads"]

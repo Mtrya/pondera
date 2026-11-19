@@ -16,16 +16,14 @@ from pondera.chess.vocabulary import FINAL, MOVE, UCI_MOVE_TO_IDX
 from pondera.inference.trace import load_checkpoint
 
 
-def load_vanilla_checkpoint(path, device="cpu"):
-    """Load either packed-trainer model into eval mode."""
-    return load_checkpoint(path, device).model
+def load_vanilla_checkpoint(path, device="cpu", *, loop_repetitions=None):
+    """Load the packed-trainer model into eval mode."""
+    return load_checkpoint(path, device, loop_repetitions=loop_repetitions).model
 
 
 @torch.no_grad()
 def choose_move(model, fen, repetition=1, legal_moves=None):
     """Return the argmax legal UCI decision for one root position."""
-    import chess
-
     board = encode_board(fen, repetition)
     device = model.token_embedding.weight.device
     prefill = torch.as_tensor(
@@ -36,7 +34,13 @@ def choose_move(model, fen, repetition=1, legal_moves=None):
     )
     cu_seqlens = torch.tensor([0, prefill.numel()], dtype=torch.int32, device=device)
     logits, _ = model.forward_cached(prefill, cu_seqlens)
-    scores = logits[-1].float()
+    return choose_legal_move(logits[-1], fen, legal_moves)
+
+
+def choose_legal_move(logits, fen, legal_moves=None):
+    """Select a legal action from one vocabulary-wide root decision."""
+    import chess
+
     position = chess.Board(fen)
     if legal_moves is None:
         legal_moves = [move.uci() for move in position.legal_moves]
@@ -47,5 +51,5 @@ def choose_move(model, fen, repetition=1, legal_moves=None):
     ]
     if not candidates:
         raise ValueError("No legal move has a vocabulary token")
-    tokens = torch.tensor([token for token, _ in candidates], device=device)
-    return candidates[int(scores[tokens].argmax())][1]
+    tokens = torch.tensor([token for token, _ in candidates], device=logits.device)
+    return candidates[int(logits[tokens].float().argmax())][1]

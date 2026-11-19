@@ -19,6 +19,7 @@ from pondera.chess.vocabulary import (
     VALUE,
 )
 from pondera.inference.trace import Predictor, parse_answer
+from pondera.inference.vanilla_uci import pick_with_reasoning
 from pondera.models.linear import LinearVanillaModel
 from pondera.models.vanilla import VanillaModel
 
@@ -170,6 +171,29 @@ class GenerationTests(unittest.TestCase):
             result = predictor.generate(chess.STARTING_FEN, answer_tokens=4)
             self.assertEqual(result.tokens, [FINAL, END])
             self.assertFalse(result.answer.valid)
+
+    def test_uci_move_can_depend_on_generated_reasoning(self):
+        model = self.model(VanillaModel)
+        with torch.no_grad():
+            model.token_embedding.weight[:, 3] = 1
+            model.token_embedding.weight[FINAL, 3] = 0
+            model.token_embedding.weight[FINAL, 0] = 1
+            model.token_embedding.weight[BACK, 1] = 1
+            model.blocks[0].attention.v.weight[1, 1] = 1
+            model.blocks[0].attention.o.weight[1, 1] = 1
+            model.head.weight[BACK, 3] = 1
+            model.head.weight[move("d2d4"), 0] = 0.01
+            model.head.weight[move("e2e4"), 1] = 1
+
+        # Uniform causal attention gives e4 its only signal from the emitted BACK.
+        predictor = Predictor(model, MergeDictionary(), {})
+        board = chess.Board()
+        self.assertEqual(
+            pick_with_reasoning(predictor, board, "cpu", reasoning_tokens=0), "d2d4"
+        )
+        self.assertEqual(
+            pick_with_reasoning(predictor, board, "cpu", reasoning_tokens=1), "e2e4"
+        )
 
 
 if __name__ == "__main__":

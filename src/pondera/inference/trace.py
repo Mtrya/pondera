@@ -21,10 +21,7 @@ from pondera.chess.vocabulary import (
     VALUE,
     VALUE_BINS,
 )
-from pondera.models.linear import LinearVanillaModel
-from pondera.models.vanilla import VanillaModel
-
-MODEL_CLASSES = {"vanilla": VanillaModel, "linear": LinearVanillaModel}
+from pondera.models import MODEL_CLASSES, LoopedModel
 
 
 @dataclass
@@ -158,6 +155,41 @@ class Predictor:
     dictionary: MergeDictionary
     metadata: dict
 
+    def _next_logits(self, prefix, tokens):
+        device = next(self.model.parameters()).device
+        ids = torch.tensor(prefix + tokens, dtype=torch.long, device=device)
+        return self.model(ids, [0, len(ids)])[-1]
+
+    def _step(self, prefix, tokens):
+        token = int(self._next_logits(prefix, tokens).argmax())
+        tokens.append(token)
+        if token >= CHESS_VOCAB_SIZE:
+            return self.dictionary.expansion(token)
+        return (token,)
+
+    def _reason(self, prefix, tokens, budget):
+        for count in range(1, budget + 1):
+            expanded = self._step(prefix, tokens)
+            if FINAL in expanded:
+                return count, False, "end" if END in expanded else "answer_budget"
+            if END in expanded:
+                return count, False, "end_before_final"
+        tokens.append(FINAL)
+        return budget, True, "answer_budget"
+
+    @torch.inference_mode()
+    def decision_logits(self, fen, repetition=1, *, reasoning_tokens=0):
+        """Return the root-decision logits after generating a reasoning prefix."""
+        if reasoning_tokens < 0:
+            raise ValueError("Require nonnegative reasoning tokens")
+        self.model.eval()
+        prefix = encode_board(fen, repetition).tolist()
+        tokens = []
+        _, _, stop = self._reason(prefix, tokens, reasoning_tokens)
+        if stop != "answer_budget":
+            tokens = [FINAL]
+        return self._next_logits(prefix, tokens)
+
     @torch.inference_mode()
     def generate(self, fen, repetition=1, *, reasoning_tokens=0, answer_tokens=128):
         """Greedy full-prefix forwards, with no masking or answer repair.
@@ -170,46 +202,17 @@ class Predictor:
             raise ValueError(
                 "Require nonnegative reasoning and positive answer budgets"
             )
-        device = next(self.model.parameters()).device
         prefix = encode_board(fen, repetition).tolist()
         tokens = []
-        reasoning_count = answer_count = generated = 0
-        forced = False
-        stop = "answer_budget"
+        answer_count = 0
         self.model.eval()
         started = time.monotonic()
 
-        def step():
-            ids = torch.tensor(prefix + tokens, dtype=torch.long, device=device)
-            logits = self.model(ids, [0, len(ids)])
-            token = int(logits[-1].argmax())
-            tokens.append(token)
-            expanded = (
-                self.dictionary.expansion(token)
-                if token >= CHESS_VOCAB_SIZE
-                else (token,)
-            )
-            return expanded
-
-        for _ in range(reasoning_tokens):
-            expanded = step()
-            reasoning_count += 1
-            generated += 1
-            if FINAL in expanded:
-                if END in expanded:
-                    stop = "end"
-                break
-            if END in expanded:
-                stop = "end_before_final"
-                break
-        else:
-            tokens.append(FINAL)
-            forced = True
-        if stop not in {"end", "end_before_final"}:
+        reasoning_count, forced, stop = self._reason(prefix, tokens, reasoning_tokens)
+        if stop == "answer_budget":
             for _ in range(answer_tokens):
-                expanded = step()
+                expanded = self._step(prefix, tokens)
                 answer_count += 1
-                generated += 1
                 if END in expanded:
                     stop = "end"
                     break
@@ -218,7 +221,7 @@ class Predictor:
             answer=parse_answer(tokens, self.dictionary, fen, repetition),
             reasoning_tokens=reasoning_count,
             answer_tokens=answer_count,
-            generated_tokens=generated,
+            generated_tokens=reasoning_count + answer_count,
             forced_final=forced,
             stop=stop,
             seconds=time.monotonic() - started,
@@ -226,10 +229,16 @@ class Predictor:
         )
 
 
-def load_checkpoint(path, device="cpu"):
+def load_checkpoint(path, device="cpu", *, loop_repetitions=None):
     state = torch.load(path, map_location="cpu", weights_only=True)
     model = MODEL_CLASSES[state["arch"]](**state["model_config"])
     model.load_state_dict(state["model_state_dict"])
+    if loop_repetitions is not None:
+        if not isinstance(model, LoopedModel) or loop_repetitions < 1:
+            raise ValueError(
+                "A positive repetition override requires a looped checkpoint"
+            )
+        model.loop_repetitions = loop_repetitions
     identity = state.get("tokenizer_identity", {})
     dictionary = MergeDictionary(identity.get("merge_entries", ()))
     if state["model_config"]["vocab_size"] != CHESS_VOCAB_SIZE + len(dictionary):
@@ -240,4 +249,6 @@ def load_checkpoint(path, device="cpu"):
         if key in state
     }
     metadata["tokenizer_identity"] = identity
+    if isinstance(model, LoopedModel):
+        metadata["loop_repetitions"] = model.loop_repetitions
     return Predictor(model.to(device).eval(), dictionary, metadata)

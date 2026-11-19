@@ -1,4 +1,14 @@
-# Playing-strength evaluation
+# Checkpoint evaluation
+
+Compute full-document next-token loss with:
+
+```bash
+uv run python -m pondera.evaluation.loss --checkpoint RUN/checkpoint.pth --packed ENCODED --output LOSS --device cpu
+```
+
+`loss.py` evaluates every validation document with its complete causal context and the checkpoint's vocabulary. The reported loss is total next-token negative log likelihood divided by the number of labels, excluding only each document's terminal input position. Training selection limits and training-loss weights do not change this metric. `summary.json` records token counts, runtime, precision, and model settings; `documents.jsonl` retains each document's label count and summed negative log likelihood for paired comparisons. `--batch-tokens` controls packing, and a longer document receives a batch large enough to keep it intact. `--loop-repetitions` overrides inference depth for a looped checkpoint.
+
+Evaluate playing behavior with:
 
 ```bash
 uv run python -m pondera.evaluation --config configs/eval.toml --checkpoint RUN/checkpoint.pth --roots HELD_OUT_ROOTS --puzzles PUZZLES --cache REFERENCE.sqlite --output EVALUATION --engine STOCKFISH --device cpu

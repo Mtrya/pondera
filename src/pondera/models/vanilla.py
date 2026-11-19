@@ -235,11 +235,14 @@ class VanillaModel(nn.Module):
         self.norm = RMSNorm(hidden_size)
         self.head = nn.Linear(hidden_size, vocab_size, bias=False)
 
+    def execution_blocks(self):
+        return iter(self.blocks)
+
     def forward(self, input_ids, cu_seqlens):
         attention_cls = self.attention_cls or CausalSelfAttention
         prepared = attention_cls.prepare(cu_seqlens, input_ids.device)
         x = self.token_embedding(input_ids)
-        for block in self.blocks:
+        for block in self.execution_blocks():
             if self.training and self.activation_checkpointing:
                 x = checkpoint(block, x, prepared, use_reentrant=False)
             else:
@@ -249,7 +252,7 @@ class VanillaModel(nn.Module):
     def forward_cached(self, input_ids, cu_seqlens, caches=None):
         x = self.token_embedding(input_ids)
         new_caches = []
-        for index, block in enumerate(self.blocks):
+        for index, block in enumerate(self.execution_blocks()):
             cache = None if caches is None else caches[index]
             x, new_cache = block.forward_cached(x, cu_seqlens, cache)
             new_caches.append(new_cache)

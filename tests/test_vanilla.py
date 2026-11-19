@@ -6,6 +6,7 @@ from importlib.util import find_spec
 import torch
 
 from pondera.models.linear import LinearVanillaModel
+from pondera.models.looped import LoopedModel
 from pondera.models.vanilla import (
     VanillaModel,
     eager_varlen_attention,
@@ -32,6 +33,28 @@ class VanillaTests(unittest.TestCase):
         torch.set_num_threads(1)
         torch.manual_seed(7)
         self.model = VanillaModel(**MODEL).eval()
+
+    def test_looped_depth_shares_weights_and_cached_generation_matches(self):
+        config = {**MODEL, "num_blocks": 6}
+        ordinary = VanillaModel(**config).eval()
+        looped = LoopedModel(**config, loop_repetitions=1).eval()
+        looped.load_state_dict(ordinary.state_dict())
+        ids, cu = packed_ids()
+        with torch.no_grad():
+            torch.testing.assert_close(
+                looped(ids, cu), ordinary(ids, cu), rtol=0, atol=0
+            )
+            looped.loop_repetitions = 3
+            self.assertEqual(
+                sum(p.numel() for p in looped.parameters()),
+                sum(p.numel() for p in ordinary.parameters()),
+            )
+            full = looped(ids[:5], [0, 5])
+            _, caches = looped.forward_cached(ids[:4], torch.tensor([0, 4]))
+            last, _ = looped.forward_cached(ids[4:5], torch.tensor([0, 5]), caches)
+            torch.testing.assert_close(last[-1], full[-1], rtol=1e-5, atol=1e-6)
+            packed = looped(ids, cu)
+            torch.testing.assert_close(packed[:5], full, rtol=1e-6, atol=1e-6)
 
     def test_later_documents_and_future_tokens_cannot_change_earlier_logits(self):
         ids, cu = packed_ids()
