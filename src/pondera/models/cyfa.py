@@ -101,36 +101,93 @@ def _rotate(x, cosine, sine):
     ).flatten(-2)
 
 
+def _batched_scalar_memory(q, k, v, g, scale, cpu_boundaries, initial, output_final):
+    """Bound Ascend compilation and batch independent, zero-padded segments."""
+    from fla.ops.simple_gla import chunk_simple_gla, fused_recurrent_simple_gla
+
+    cu = cpu_boundaries.tolist()
+    lengths = [end - start for start, end in zip(cu[:-1], cu[1:])]
+    states = [
+        None if initial is None else initial[i : i + 1] for i in range(len(lengths))
+    ]
+    outputs = [[] for _ in lengths]
+    function = (
+        fused_recurrent_simple_gla
+        if not torch.is_grad_enabled() and q.dtype == torch.float32
+        else chunk_simple_gla
+    )
+    for offset in range(0, max(lengths), 4096):
+        groups = {}
+        for doc, length in enumerate(lengths):
+            if offset < length:
+                size = min(4096, length - offset)
+                padded = 64 * (1 << (((size + 63) // 64) - 1).bit_length())
+                groups.setdefault(padded, []).append((doc, cu[doc] + offset, size))
+        for padded, documents in groups.items():
+            vectors = []
+            for x in (q, k, v, g):
+                padding = (0, 0) * (x.ndim - 1)
+                vectors.append(
+                    torch.stack(
+                        [
+                            F.pad(x[start : start + size], (*padding, 0, padded - size))
+                            for _, start, size in documents
+                        ]
+                    )
+                )
+            carry = (
+                None
+                if states[documents[0][0]] is None
+                else torch.cat([states[doc] for doc, _, _ in documents])
+            )
+            keep = output_final or any(
+                offset + size < lengths[doc] for doc, _, size in documents
+            )
+            separate_state = function is chunk_simple_gla
+            separate_initial = carry is not None and separate_state
+            result, final = function(
+                *vectors,
+                scale=scale,
+                initial_state=None if separate_initial else carry,
+                output_final_state=keep and not separate_state,
+            )
+            if separate_state and keep:
+                # The terminal state is a weighted sum of writes. Reverse
+                # cumsum avoids subtracting two large negative prefixes.
+                gate = vectors[3].float()
+                suffix = F.pad(gate[:, 1:].flip(1).cumsum(1).flip(1), (0, 0, 0, 1))
+                final = torch.einsum(
+                    "bthk,bthv->bhkv",
+                    vectors[1].float(),
+                    vectors[2].float() * suffix.exp()[..., None],
+                )
+            if separate_initial:
+                # Scalar decay is linear in the initial memory. Keep this term
+                # in fp32, independently of the batched chunk state kernel.
+                survival = vectors[3].float().cumsum(1).exp()
+                inherited = torch.einsum(
+                    "bthk,bhkv->bthv", vectors[0].float(), carry.float()
+                )
+                result = (
+                    result.float() + inherited * survival[..., None] * scale
+                ).to(result.dtype)
+                if final is not None:
+                    final = final + carry * survival[:, -1, :, None, None]
+            for row, (doc, _, size) in enumerate(documents):
+                outputs[doc].append(result[row, :size])
+                if final is not None:
+                    states[doc] = final[row : row + 1]
+    return torch.cat([torch.cat(parts) for parts in outputs]), (
+        torch.cat(states) if output_final else None
+    )
+
+
 def _scalar_memory(q, k, v, g, scale, prepared, initial, output_final):
     cpu_boundaries, device_boundaries = prepared
-    if (
-        q.device.type == "npu"
-        and int((cpu_boundaries[1:] - cpu_boundaries[:-1]).max()) > 4096
-    ):
-        # Ascend's GLA state kernel statically unrolls each document's chunks.
-        # Bound compilation while carrying both state and its gradient across
-        # segments. This preserves the complete document's causal context.
-        pieces, states = [], []
-        for doc, (start, end) in enumerate(
-            zip(cpu_boundaries[:-1].tolist(), cpu_boundaries[1:].tolist())
-        ):
-            state = None if initial is None else initial[doc : doc + 1]
-            for offset in range(start, end, 4096):
-                stop = min(offset + 4096, end)
-                bounds = RecurrentAttention.prepare([0, stop - offset], q.device)
-                part, state = _scalar_memory(
-                    q[offset:stop],
-                    k[offset:stop],
-                    v[offset:stop],
-                    g[offset:stop],
-                    scale,
-                    bounds,
-                    state,
-                    True,
-                )
-                pieces.append(part)
-            states.append(state)
-        return torch.cat(pieces), torch.cat(states) if output_final else None
+    if q.device.type == "npu" and q.shape[0] > 1:
+        return _batched_scalar_memory(
+            q, k, v, g, scale, cpu_boundaries, initial, output_final
+        )
     if q.device.type in {"cuda", "npu"}:
         from fla.ops.simple_gla import (
             chunk_simple_gla,
@@ -140,7 +197,11 @@ def _scalar_memory(q, k, v, g, scale, prepared, initial, output_final):
         incremental = q.shape[0] == 1 or (
             not torch.is_grad_enabled() and q.dtype == torch.float32
         )
-        function = fused_recurrent_simple_gla if incremental else chunk_simple_gla
+        function = (
+            fused_recurrent_simple_gla
+            if incremental
+            else partial(chunk_simple_gla, cu_seqlens_cpu=cpu_boundaries)
+        )
         output, state = function(
             q=q.unsqueeze(0),
             k=k.unsqueeze(0),
