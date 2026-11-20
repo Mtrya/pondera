@@ -115,11 +115,14 @@ def delta_attention(
 
 class GatedDeltaAttention(RecurrentAttention):
     channel_decay = False
+    channel_erase = False
 
     def __init__(self, hidden_size, num_heads, num_kv_heads):
         # Recurrent layers use full memory heads; num_kv_heads applies to softmax.
         super().__init__(hidden_size, num_heads)
-        self.beta = nn.Linear(hidden_size, num_heads, bias=False)
+        self.beta = nn.Linear(
+            hidden_size, hidden_size if self.channel_erase else num_heads, bias=False
+        )
         if self.channel_decay:
             self.decay = nn.Sequential(
                 nn.Linear(hidden_size, self.head_dim, bias=False),

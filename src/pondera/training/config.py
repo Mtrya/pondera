@@ -176,6 +176,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     if "softmax_every" in model:
         if model["architecture"] not in {
             "gdn",
+            "gdn2",
             "kda",
             "kdn",
             "cyfa",
