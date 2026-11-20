@@ -2,11 +2,13 @@
 
 import importlib
 import json
+import os
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from pondera.data.packing import PackedDocuments, assemble_batch, pack_batches
@@ -19,6 +21,15 @@ def evaluate_loss(
 ):
     if device.startswith("npu"):
         importlib.import_module("torch_npu")
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    target = torch.device(device)
+    if world_size > 1 and target.type in {"cuda", "npu"}:
+        index = target.index
+        if index is None:
+            index = int(os.environ.get("LOCAL_RANK", str(rank)))
+        device = f"{target.type}:{index}"
+        getattr(torch, target.type).set_device(device)
     started = time.monotonic()
     predictor = load_checkpoint(checkpoint, device, loop_repetitions=loop_repetitions)
     documents = PackedDocuments(packed)
@@ -37,7 +48,8 @@ def evaluate_loss(
     budget = max(batch_tokens, int(documents.lengths[indices].max()))
     device_type = torch.device(device).type
     results = []
-    for batch_indices in pack_batches(documents.lengths, indices, budget):
+    batches = pack_batches(documents.lengths, indices, budget)
+    for batch_indices in batches[rank::world_size]:
         batch = assemble_batch(documents, batch_indices)
         inputs = torch.as_tensor(batch["input_ids"], dtype=torch.long, device=device)
         labels = torch.as_tensor(batch["labels"], dtype=torch.long, device=device)
@@ -66,6 +78,13 @@ def evaluate_loss(
                     "nll_sum": float(losses[start:stop].sum(dtype=np.float64)),
                 }
             )
+    if world_size > 1:
+        gathered = [None] * world_size
+        with torch.inference_mode(False):
+            dist.all_gather_object(gathered, results)
+        results = sorted(
+            (row for rows in gathered for row in rows), key=lambda row: row["document"]
+        )
     tokens = sum(row["tokens"] for row in results)
     return {
         "loss": sum(row["nll_sum"] for row in results) / tokens,
@@ -73,6 +92,7 @@ def evaluate_loss(
         "labeled_tokens": tokens,
         "seconds": time.monotonic() - started,
         "device": device,
+        "world_size": world_size,
         "precision": "bfloat16" if device_type in {"cuda", "npu"} else "float32",
         "checkpoint": str(Path(checkpoint).resolve()),
         "data_identity": documents.manifest["source_dataset_id"],
@@ -94,13 +114,24 @@ def main():
     args = parser.parse_args()
     if args.output.exists():
         parser.error("Use a new output directory")
-    result = evaluate_loss(
-        args.checkpoint,
-        args.packed,
-        device=args.device,
-        batch_tokens=args.batch_tokens,
-        loop_repetitions=args.loop_repetitions,
-    )
+    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if distributed:
+        # Only small CPU result records are exchanged; model execution is independent.
+        dist.init_process_group("gloo")
+    rank = dist.get_rank() if distributed else 0
+    try:
+        result = evaluate_loss(
+            args.checkpoint,
+            args.packed,
+            device=args.device,
+            batch_tokens=args.batch_tokens,
+            loop_repetitions=args.loop_repetitions,
+        )
+    finally:
+        if distributed:
+            dist.destroy_process_group()
+    if rank:
+        return
     args.output.mkdir(parents=True)
     rows = result.pop("document_losses")
     (args.output / "documents.jsonl").write_text(

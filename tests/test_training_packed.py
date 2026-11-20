@@ -675,6 +675,62 @@ checkpoint_keep_last = 2
             result["loss"], math.log(self.model_config["vocab_size"]), places=6
         )
 
+    def test_distributed_checkpoint_loss_preserves_all_document_results(self):
+        output = self.root / "distributed-loss"
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            self.config(1),
+            output,
+            track=False,
+        )
+        packed = self.root / "packed"
+        split = np.memmap(packed / "split.u8", np.uint8, mode="r+")
+        split[:] = 1
+        split.flush()
+        checkpoint = output / "checkpoint.pth"
+        # Uneven batches and a single batch exercise sharding and a rank with no work.
+        for budget in (32, 65536):
+            with self.subTest(batch_tokens=budget):
+                expected = evaluate_loss(checkpoint, packed, batch_tokens=budget)
+                destination = self.root / f"loss-{budget}"
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "torch.distributed.run",
+                        "--standalone",
+                        "--nproc-per-node=2",
+                        "-m",
+                        "pondera.evaluation.loss",
+                        "--checkpoint",
+                        str(checkpoint),
+                        "--packed",
+                        str(packed),
+                        "--output",
+                        str(destination),
+                        "--batch-tokens",
+                        str(budget),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                )
+                actual = json.loads((destination / "summary.json").read_text())
+                rows = [
+                    json.loads(line)
+                    for line in (destination / "documents.jsonl")
+                    .read_text()
+                    .splitlines()
+                ]
+                self.assertEqual(rows, expected["document_losses"])
+                self.assertEqual(actual["loss"], expected["loss"])
+                self.assertEqual(actual["labeled_tokens"], expected["labeled_tokens"])
+                self.assertEqual(actual["documents"], len(split))
+                self.assertEqual(actual["world_size"], 2)
+
     def test_loss_decreases(self):
         model = self.make_model()
         result = train(

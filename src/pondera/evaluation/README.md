@@ -8,6 +8,8 @@ uv run python -m pondera.evaluation.loss --checkpoint RUN/checkpoint.pth --packe
 
 `loss.py` evaluates every validation document with its complete causal context and the checkpoint's vocabulary. The reported loss is total next-token negative log likelihood divided by the number of labels, excluding only each document's terminal input position. Training selection limits and training-loss weights do not change this metric. `summary.json` records token counts, runtime, precision, and model settings; `documents.jsonl` retains each document's label count and summed negative log likelihood for paired comparisons. `--batch-tokens` controls packing, and a longer document receives a batch large enough to keep it intact. `--loop-repetitions` overrides inference depth for a looped checkpoint.
 
+Launch with `torchrun --standalone --nproc-per-node=4 -m pondera.evaluation.loss ... --device npu` (or `cuda`) to divide complete packed batches across devices. Each process selects its local device; Gloo exchanges only per-document CPU results, and rank zero writes the combined output. Packing, document order, and token weighting match single-process evaluation. The summary records `world_size` and elapsed evaluation time. Programmatic callers can initialize a process group before calling `evaluate_loss` on every rank.
+
 Evaluate playing behavior with:
 
 ```bash
