@@ -137,6 +137,10 @@ class GenerationTests(unittest.TestCase):
             (GatedDeltaNet2Model, {"softmax_every": 2}),
             (LoopedModel, {"mixer": "gdn", "softmax_every": 2}),
             (RecurrentDepthModel, {"mixer": "kda", "softmax_every": 2}),
+            (
+                LoopedModel,
+                {"mixer": "kda", "softmax_every": 2, "input_injection": "orthogonal"},
+            ),
         ]
         for model_class, settings in cases:
             with self.subTest(architecture=model_class.architecture, settings=settings):

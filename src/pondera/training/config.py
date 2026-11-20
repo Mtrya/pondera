@@ -132,6 +132,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "architecture",
             "loop_repetitions",
             "scale_residuals",
+            "input_injection",
             "mixer",
             "softmax_every",
             "num_slots",
@@ -173,6 +174,13 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             or type(model["scale_residuals"]) is not bool
         ):
             raise ValueError("[model] scale_residuals requires a boolean for looped")
+    if "input_injection" in model:
+        if model["architecture"] != "looped" or model["input_injection"] not in {
+            "none",
+            "decay",
+            "orthogonal",
+        }:
+            raise ValueError("[model] input_injection requires a looped injection mode")
     if "softmax_every" in model:
         if model["architecture"] not in {
             "gdn",

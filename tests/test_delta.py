@@ -70,6 +70,19 @@ class DeltaTests(unittest.TestCase):
                     loop_repetitions=3,
                     scale_residuals=scaling,
                 )
+        for injection in ("decay", "orthogonal"):
+            yield LoopedModel(
+                num_blocks=6,
+                hidden_size=32,
+                intermediate_size=48,
+                num_heads=4,
+                num_kv_heads=2,
+                vocab_size=53,
+                mixer="kda",
+                softmax_every=3,
+                loop_repetitions=3,
+                input_injection=injection,
+            )
         for interval in (0, 2):
             yield CyclicFlowModel(
                 num_blocks=2,
