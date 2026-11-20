@@ -133,6 +133,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "loop_repetitions",
             "scale_residuals",
             "input_injection",
+            "kv_replay",
             "mixer",
             "softmax_every",
             "num_slots",
@@ -181,6 +182,10 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "orthogonal",
         }:
             raise ValueError("[model] input_injection requires a looped injection mode")
+    if "kv_replay" in model and (
+        model["architecture"] != "looped" or type(model["kv_replay"]) is not bool
+    ):
+        raise ValueError("[model] kv_replay requires a boolean for looped")
     if "softmax_every" in model:
         if model["architecture"] not in {
             "gdn",

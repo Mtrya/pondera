@@ -113,6 +113,34 @@ def delta_attention(
     ) if output_final_state else None
 
 
+def replay_delta_attention(q, k, v, g, beta, previous, prepared, **options):
+    """Write this token's current and earlier-loop K/V, newest loop first.
+
+    Decay is applied once, before the first write. Each write retains its
+    originating beta; the current query reads after the oldest loop's write.
+    Expanding each token into consecutive writes reuses the packed delta kernel.
+    """
+    if not previous:
+        return delta_attention(q, k, v, g, beta, prepared, **options)
+    writes = ((k, v, beta), *reversed(previous))
+    count = len(writes)
+    keys, values, strengths = (
+        torch.stack(tensors, dim=1).flatten(0, 1) for tensors in zip(*writes)
+    )
+    queries = q.unsqueeze(1).expand(-1, count, -1, -1).flatten(0, 1)
+    decay = torch.stack((g, *(torch.zeros_like(g) for _ in previous)), dim=1)
+    output, state = delta_attention(
+        queries,
+        keys,
+        values,
+        decay.flatten(0, 1),
+        strengths,
+        tuple(cu * count for cu in prepared),
+        **options,
+    )
+    return output[count - 1 :: count], state
+
+
 class GatedDeltaAttention(RecurrentAttention):
     channel_decay = False
     channel_erase = False
@@ -173,6 +201,36 @@ class GatedDeltaAttention(RecurrentAttention):
         gate = self.gate(x).view_as(memory)
         gate = gate.sigmoid() if self.channel_decay else F.silu(gate)
         return self.o((self.norm_output(memory) * gate).reshape_as(x))
+
+    def forward_replay(
+        self, x, prepared, previous, cache=None, output_final_state=False
+    ):
+        """Return the output, reusable K/V/beta, and this loop's temporal cache."""
+        memory, histories = (None, (None, None, None)) if cache is None else cache
+        if output_final_state:
+            if len(prepared[0]) != 2 or (cache is not None and len(x) != 1):
+                raise ValueError(
+                    "Cached replay requires one document and one new token"
+                )
+            vectors, new_histories = self._project_cached(x, prepared, histories)
+        else:
+            vectors = self._project(x, prepared)
+        q, k, v = (tensor.view(-1, self.num_heads, self.head_dim) for tensor in vectors)
+        g, beta = self._gates(x)
+        output, state = replay_delta_attention(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            previous,
+            prepared,
+            cache=memory,
+            output_final_state=output_final_state,
+            channel_decay=self.channel_decay,
+        )
+        new_cache = (state, new_histories) if output_final_state else None
+        return self._output(x, output), (k, v, beta), new_cache
 
 
 class KimiDeltaAttention(GatedDeltaAttention):

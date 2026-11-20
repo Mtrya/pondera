@@ -282,6 +282,7 @@ checkpoint_keep_last = 2
             ("kdn", {}),
             ("looped", {"mixer": "gdn", "softmax_every": 3, "scale_residuals": True}),
             ("recurrent", {"mixer": "kda", "softmax_every": 3}),
+            ("looped", {"mixer": "kda", "softmax_every": 3, "kv_replay": True}),
             (
                 "looped",
                 {"mixer": "kda", "softmax_every": 3, "input_injection": "orthogonal"},
@@ -292,9 +293,9 @@ checkpoint_keep_last = 2
                 {"mixer": "kda", "softmax_every": 2, "context_rank": 16},
             ),
         ]
-        for architecture, settings in cases:
+        for case_index, (architecture, settings) in enumerate(cases):
             with self.subTest(architecture=architecture, settings=settings):
-                name = f"{architecture}-{settings.get('mixer', 'default')}"
+                name = f"{case_index}-{architecture}"
                 recipe = self.root / f"{name}.toml"
                 full = self.root / f"{name}-full"
                 partial = self.root / f"{name}-partial"

@@ -45,6 +45,16 @@ class InputInjection(nn.Module):
         return retained + injected
 
 
+class ReplayBlock(Block):
+    def forward_replay(self, x, prepared, previous, residual_scale=1.0, **options):
+        attended, current, cache = self.attention.forward_replay(
+            self.norm_attention(x), prepared, previous, **options
+        )
+        x = torch.add(x, attended, alpha=residual_scale)
+        x = torch.add(x, self._ffn(self.norm_ffn(x)), alpha=residual_scale)
+        return x, current, cache
+
+
 class LoopedModel(VanillaModel):
     architecture = "looped"
 
@@ -56,6 +66,7 @@ class LoopedModel(VanillaModel):
         softmax_every=0,
         scale_residuals=False,
         input_injection="none",
+        kv_replay=False,
         **kwargs,
     ):
         if kwargs["num_blocks"] < 5:
@@ -83,9 +94,21 @@ class LoopedModel(VanillaModel):
             raise ValueError("softmax_every must be zero or a valid layer interval")
         if mixer == "softmax" and softmax_every:
             raise ValueError("softmax_every requires a linear mixer")
+        if type(kv_replay) is not bool or (
+            kv_replay and (mixer == "softmax" or self.architecture != "looped")
+        ):
+            raise ValueError("KV replay requires a plain looped delta model")
+        self.kv_replay = kv_replay
+        if kv_replay:
+            self.block_cls = ReplayBlock
         self.attention_cls = mixers[mixer]
         self.softmax_every = softmax_every
         super().__init__(**kwargs)
+        if kv_replay and not any(
+            isinstance(block.attention, GatedDeltaAttention)
+            for block in self.blocks[2:-2]
+        ):
+            raise ValueError("KV replay requires a delta layer in the loop core")
         self.loop_repetitions = loop_repetitions
         self.training_repetitions = loop_repetitions
         self.scale_residuals = scale_residuals
@@ -122,17 +145,31 @@ class LoopedModel(VanillaModel):
             if self.injection is not None:
                 x = self.injection(x, injected)
             for block in self.blocks[2:-2]:
-                x = apply(block, x, scale)
+                x = apply(block, x, scale, replay=self.kv_replay)
         for block in self.blocks[-2:]:
             x = apply(block, x)
         return self.head(self.norm(x))
 
     def forward(self, input_ids, cu_seqlens):
         prepared = self.prepare(cu_seqlens, input_ids.device)
+        histories = {}
 
-        def apply(block, x, scale=1.0):
+        def apply(block, x, scale=1.0, replay=False):
             metadata = prepared[type(block.attention)]
             options = {} if scale == 1.0 else {"residual_scale": scale}
+            if replay and isinstance(block.attention, GatedDeltaAttention):
+                previous = histories.get(block, ())
+                args = (x, metadata, previous)
+                if self.training and self.activation_checkpointing:
+                    x, current, _ = checkpoint(
+                        block.forward_replay, *args, use_reentrant=False, **options
+                    )
+                else:
+                    x, current, _ = block.forward_replay(*args, **options)
+                # Each checkpoint receives its own immutable history. Recomputing
+                # an earlier loop must not observe later loops' projections.
+                histories[block] = (*previous, current)
+                return x
             if self.training and self.activation_checkpointing:
                 return checkpoint(block, x, metadata, use_reentrant=False, **options)
             return block(x, metadata, **options)
@@ -141,11 +178,29 @@ class LoopedModel(VanillaModel):
 
     def forward_cached(self, input_ids, cu_seqlens, caches=None):
         new_caches = []
+        histories = {}
+        prepared = (
+            self.prepare([0, len(input_ids)], input_ids.device)
+            if self.kv_replay
+            else None
+        )
 
-        def apply(block, x, scale=1.0):
+        def apply(block, x, scale=1.0, replay=False):
             cache = None if caches is None else caches[len(new_caches)]
             options = {} if scale == 1.0 else {"residual_scale": scale}
-            x, new_cache = block.forward_cached(x, cu_seqlens, cache, **options)
+            if replay and isinstance(block.attention, GatedDeltaAttention):
+                previous = histories.get(block, ())
+                x, current, new_cache = block.forward_replay(
+                    x,
+                    prepared[type(block.attention)],
+                    previous,
+                    cache=cache,
+                    output_final_state=True,
+                    **options,
+                )
+                histories[block] = (*previous, current)
+            else:
+                x, new_cache = block.forward_cached(x, cu_seqlens, cache, **options)
             new_caches.append(new_cache)
             return x
 

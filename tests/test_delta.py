@@ -5,7 +5,12 @@ import unittest
 import torch
 
 from pondera.models.cyfa import CyclicFlowModel
-from pondera.models.delta import GatedDeltaModel, KimiDeltaModel, delta_recurrent
+from pondera.models.delta import (
+    GatedDeltaModel,
+    KimiDeltaModel,
+    delta_recurrent,
+    replay_delta_attention,
+)
 from pondera.models.gdn2 import GatedDeltaNet2Model
 from pondera.models.kalman import KalmanDeltaModel
 from pondera.models.looped import LoopedModel, RecurrentDepthModel
@@ -39,6 +44,54 @@ class DeltaTests(unittest.TestCase):
         # The first association halves while the orthogonal key writes four.
         torch.testing.assert_close(output.flatten(), torch.tensor([1.0, 4.0]))
         torch.testing.assert_close(state, torch.tensor([[[0.5], [4.0]]]))
+
+    def test_replay_order_single_decay_and_cross_loop_gradients(self):
+        # With S=8, decay=1/2 and writes (v,beta)=(10,3/4),(6,1/2),(2,1/4),
+        # the two-token recurrence is S' = 3*S/64 + 89/16.
+        for channel_decay in (False, True):
+            q = k = torch.ones(2, 1, 1)
+            values = [
+                torch.full((2, 1, 1), v, requires_grad=True) for v in (2.0, 6.0, 10.0)
+            ]
+            keys = [torch.ones(2, 1, 1, requires_grad=True) for _ in range(2)]
+            strengths = [torch.full((2, 1), b, requires_grad=True) for b in (0.25, 0.5)]
+            decay = torch.full(
+                (2, 1, 1) if channel_decay else (2, 1), -0.6931471805599453
+            )
+            output, state = replay_delta_attention(
+                q,
+                k,
+                values[2],
+                decay,
+                torch.full((2, 1), 0.75),
+                tuple(zip(keys, values[:2], strengths)),
+                (torch.tensor([0, 2]), torch.tensor([0, 2])),
+                cache=torch.tensor([[[[8.0]]]]),
+                output_final_state=True,
+                normalize=False,
+                channel_decay=channel_decay,
+            )
+            torch.testing.assert_close(
+                output.flatten(), torch.tensor([5.9375, 5.8408203125])
+            )
+            torch.testing.assert_close(state.flatten(), torch.tensor([5.8408203125]))
+            output.sum().backward()
+            for value, expected in zip(
+                values,
+                (
+                    [0.26171875, 0.25],
+                    [0.392578125, 0.375],
+                    [0.29443359375, 0.28125],
+                ),
+            ):
+                torch.testing.assert_close(value.grad.flatten(), torch.tensor(expected))
+            # For the oldest write: dS/dbeta=v-k*S; dS/dk=beta*(v-2*k*S).
+            torch.testing.assert_close(
+                strengths[0].grad.flatten(), torch.tensor([-5.49609375, -5.12109375])
+            )
+            torch.testing.assert_close(
+                keys[0].grad.flatten(), torch.tensor([-3.271484375, -3.060546875])
+            )
 
     def models(self):
         for model_class in (GatedDeltaModel, KimiDeltaModel):
@@ -82,6 +135,20 @@ class DeltaTests(unittest.TestCase):
                 softmax_every=3,
                 loop_repetitions=3,
                 input_injection=injection,
+            )
+        for mixer in ("gdn", "kda"):
+            yield LoopedModel(
+                num_blocks=6,
+                hidden_size=32,
+                intermediate_size=48,
+                num_heads=4,
+                num_kv_heads=2,
+                vocab_size=53,
+                mixer=mixer,
+                softmax_every=3,
+                loop_repetitions=3,
+                kv_replay=True,
+                input_injection="decay",
             )
         for interval in (0, 2):
             yield CyclicFlowModel(
@@ -132,7 +199,9 @@ class DeltaTests(unittest.TestCase):
                 torch.manual_seed(640)
                 ordinary = model_class(**config).eval()
                 torch.manual_seed(640)
-                looped = LoopedModel(**config, mixer=mixer, loop_repetitions=1).eval()
+                looped = LoopedModel(
+                    **config, mixer=mixer, loop_repetitions=1, kv_replay=True
+                ).eval()
                 with torch.no_grad():
                     torch.testing.assert_close(
                         looped(ids, [0, 5, 11]),
