@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from pondera.models.cyfa import _Clock, _rotation, cyclic_flow_attention
+from pondera.models.cyfa import _Clock, _pack_segments, _rotation, cyclic_flow_attention
 from pondera.models.delta import GatedDeltaAttention
 
 
@@ -12,6 +12,29 @@ class CyFATests(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
         torch.manual_seed(640)
+
+    def test_segment_padding_and_gradients_exclude_unselected_tokens(self):
+        # Noncontiguous rows 1--3 and 7--8; padding must not read or train row 0.
+        vector = torch.arange(36.0).view(9, 4)[:, ::2].requires_grad_()
+        gate = torch.arange(9.0).requires_grad_()
+        packed, packed_gate = _pack_segments((vector, gate), [(0, 1, 3), (1, 7, 2)], 4)
+        torch.testing.assert_close(
+            packed,
+            torch.tensor(
+                [
+                    [[4, 6], [8, 10], [12, 14], [0, 0]],
+                    [[28, 30], [32, 34], [0, 0], [0, 0]],
+                ],
+                dtype=torch.float32,
+            ),
+        )
+        torch.testing.assert_close(
+            packed_gate, torch.tensor([[1, 2, 3, 0], [7, 8, 0, 0.0]])
+        )
+        (packed.sum() + packed_gate.sum()).backward()
+        selected = torch.tensor([0, 1, 1, 1, 0, 0, 0, 1, 1.0])
+        torch.testing.assert_close(vector.grad, selected[:, None].expand(9, 2))
+        torch.testing.assert_close(gate.grad, selected)
 
     def inputs(self, length=13):
         return [

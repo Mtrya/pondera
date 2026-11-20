@@ -101,6 +101,24 @@ def _rotate(x, cosine, sine):
     ).flatten(-2)
 
 
+def _pack_segments(vectors, documents, padded):
+    device = vectors[0].device
+    starts = torch.tensor([start for _, start, _ in documents], device=device)
+    lengths = torch.tensor([size for _, _, size in documents], device=device)
+    offsets = torch.arange(padded, device=device)
+    valid = offsets[None, :] < lengths[:, None]
+    indices = (starts[:, None] + offsets[None, :]).masked_fill(~valid, 0).flatten()
+    # One gather per group avoids a full-input SliceBackward for every document.
+    result = []
+    for vector in vectors:
+        grouped = vector.index_select(0, indices).view(
+            len(documents), padded, *vector.shape[1:]
+        )
+        mask = valid.view(len(documents), padded, *([1] * (vector.ndim - 1)))
+        result.append(grouped.masked_fill(~mask, 0))
+    return result
+
+
 def _batched_scalar_memory(q, k, v, g, scale, cpu_boundaries, initial, output_final):
     """Bound Ascend compilation and batch independent, zero-padded segments."""
     from fla.ops.simple_gla import chunk_simple_gla, fused_recurrent_simple_gla
@@ -124,17 +142,7 @@ def _batched_scalar_memory(q, k, v, g, scale, cpu_boundaries, initial, output_fi
                 padded = 64 * (1 << (((size + 63) // 64) - 1).bit_length())
                 groups.setdefault(padded, []).append((doc, cu[doc] + offset, size))
         for padded, documents in groups.items():
-            vectors = []
-            for x in (q, k, v, g):
-                padding = (0, 0) * (x.ndim - 1)
-                vectors.append(
-                    torch.stack(
-                        [
-                            F.pad(x[start : start + size], (*padding, 0, padded - size))
-                            for _, start, size in documents
-                        ]
-                    )
-                )
+            vectors = _pack_segments((q, k, v, g), documents, padded)
             carry = (
                 None
                 if states[documents[0][0]] is None
@@ -168,9 +176,9 @@ def _batched_scalar_memory(q, k, v, g, scale, cpu_boundaries, initial, output_fi
                 inherited = torch.einsum(
                     "bthk,bhkv->bthv", vectors[0].float(), carry.float()
                 )
-                result = (
-                    result.float() + inherited * survival[..., None] * scale
-                ).to(result.dtype)
+                result = (result.float() + inherited * survival[..., None] * scale).to(
+                    result.dtype
+                )
                 if final is not None:
                     final = final + carry * survival[:, -1, :, None, None]
             for row, (doc, _, size) in enumerate(documents):
