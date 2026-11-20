@@ -150,6 +150,19 @@ class DeltaTests(unittest.TestCase):
                 kv_replay=True,
                 input_injection="decay",
             )
+        yield LoopedModel(
+            num_blocks=6,
+            hidden_size=32,
+            intermediate_size=48,
+            num_heads=4,
+            num_kv_heads=2,
+            vocab_size=53,
+            mixer="kda",
+            softmax_every=3,
+            loop_repetitions=8,
+            input_injection="decay",
+            attention_residual_decay=0.55,
+        )
         for interval in (0, 2):
             yield CyclicFlowModel(
                 num_blocks=2,

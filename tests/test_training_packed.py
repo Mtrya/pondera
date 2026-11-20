@@ -285,6 +285,10 @@ checkpoint_keep_last = 2
             ("looped", {"mixer": "kda", "softmax_every": 3, "kv_replay": True}),
             (
                 "looped",
+                {"mixer": "kda", "softmax_every": 3, "attention_residual_decay": 0.55},
+            ),
+            (
+                "looped",
                 {"mixer": "kda", "softmax_every": 3, "input_injection": "orthogonal"},
             ),
             ("board_context", {"mixer": "kda", "softmax_every": 2, "context_rank": 16}),

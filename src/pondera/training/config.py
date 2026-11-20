@@ -134,6 +134,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "scale_residuals",
             "input_injection",
             "kv_replay",
+            "attention_residual_decay",
             "mixer",
             "softmax_every",
             "num_slots",
@@ -186,6 +187,14 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         model["architecture"] != "looped" or type(model["kv_replay"]) is not bool
     ):
         raise ValueError("[model] kv_replay requires a boolean for looped")
+    if "attention_residual_decay" in model and (
+        model["architecture"] != "looped"
+        or type(model["attention_residual_decay"]) not in {int, float}
+        or not 0 < model["attention_residual_decay"] < 1
+    ):
+        raise ValueError(
+            "[model] attention_residual_decay must be between 0 and 1 for looped"
+        )
     if "softmax_every" in model:
         if model["architecture"] not in {
             "gdn",

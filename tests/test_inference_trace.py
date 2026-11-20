@@ -137,6 +137,10 @@ class GenerationTests(unittest.TestCase):
             (GatedDeltaNet2Model, {"softmax_every": 2}),
             (LoopedModel, {"mixer": "gdn", "softmax_every": 2}),
             (LoopedModel, {"mixer": "kda", "softmax_every": 2, "kv_replay": True}),
+            (
+                LoopedModel,
+                {"mixer": "kda", "softmax_every": 2, "attention_residual_decay": 0.55},
+            ),
             (RecurrentDepthModel, {"mixer": "kda", "softmax_every": 2}),
             (
                 LoopedModel,

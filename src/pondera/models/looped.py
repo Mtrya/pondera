@@ -55,6 +55,31 @@ class ReplayBlock(Block):
         return x, current, cache
 
 
+class LoopAttentionResidual(nn.Module):
+    """InfiLoop's token-local attention over exponentially decayed loop states."""
+
+    def __init__(self, hidden_size, decay):
+        super().__init__()
+        self.query = nn.Parameter(torch.zeros(hidden_size))
+        self.decay_logit = nn.Parameter(torch.tensor(math.log(decay / (1 - decay))))
+
+    def start(self, x):
+        dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+        value = x.to(dtype)
+        normalized = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+        score = (normalized * self.query.to(dtype)).sum(-1, keepdim=True)
+        weight = score.clamp(-8, 8).exp()
+        return weight * value, weight
+
+    def forward(self, x, memory):
+        numerator, denominator = memory
+        current, weight = self.start(x)
+        decay = self.decay_logit.to(numerator.dtype).sigmoid()
+        numerator = decay * numerator + current
+        denominator = decay * denominator + weight
+        return (numerator / denominator).to(x.dtype), (numerator, denominator)
+
+
 class LoopedModel(VanillaModel):
     architecture = "looped"
 
@@ -67,6 +92,7 @@ class LoopedModel(VanillaModel):
         scale_residuals=False,
         input_injection="none",
         kv_replay=False,
+        attention_residual_decay=None,
         **kwargs,
     ):
         if kwargs["num_blocks"] < 5:
@@ -98,6 +124,10 @@ class LoopedModel(VanillaModel):
             kv_replay and (mixer == "softmax" or self.architecture != "looped")
         ):
             raise ValueError("KV replay requires a plain looped delta model")
+        if attention_residual_decay is not None and (
+            self.architecture != "looped" or not 0 < attention_residual_decay < 1
+        ):
+            raise ValueError("Loop attention residuals require a decay between 0 and 1")
         self.kv_replay = kv_replay
         if kv_replay:
             self.block_cls = ReplayBlock
@@ -118,6 +148,11 @@ class LoopedModel(VanillaModel):
             else InputInjection(
                 kwargs["hidden_size"], orthogonal=input_injection == "orthogonal"
             )
+        )
+        self.attention_residual = (
+            None
+            if attention_residual_decay is None
+            else LoopAttentionResidual(kwargs["hidden_size"], attention_residual_decay)
         )
 
     def attention_type(self, index):
@@ -141,11 +176,15 @@ class LoopedModel(VanillaModel):
         if self.injection is not None:
             injected = self.injection.prepare(x)
             x = torch.zeros_like(x)
+        if self.attention_residual is not None:
+            memory = self.attention_residual.start(x)
         for _ in range(repetitions):
             if self.injection is not None:
                 x = self.injection(x, injected)
             for block in self.blocks[2:-2]:
                 x = apply(block, x, scale, replay=self.kv_replay)
+            if self.attention_residual is not None:
+                x, memory = self.attention_residual(x, memory)
         for block in self.blocks[-2:]:
             x = apply(block, x)
         return self.head(self.norm(x))
