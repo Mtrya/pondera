@@ -932,6 +932,39 @@ checkpoint_keep_last = 2
     def test_hyperball_resume_replays_the_same_losses(self):
         self.check_resume_replays_the_same_losses("cpu", hyperball=True)
 
+    def test_truncated_loop_recipe_resumes_identically(self):
+        recipe = self.root / "truncated.toml"
+        self.write_training_recipe(recipe, "looped", updates=4)
+        recipe.write_text(
+            recipe.read_text().replace(
+                "[training]",
+                'input_injection = "decay"\nloop_repetitions = 8\n'
+                "[training]\nbackprop_repetitions = 2",
+            )
+        )
+        full, resumed = self.root / "full", self.root / "resumed"
+        result = self.run_training_command(recipe, full)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_training_command(
+            recipe, resumed, full / "checkpoint-00000003.pth"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = torch.load(full / "checkpoint.pth", weights_only=True)
+        actual = torch.load(resumed / "checkpoint.pth", weights_only=True)
+        self.assertEqual(actual["train_config"]["backprop_repetitions"], 2)
+        for name, value in expected["model_state_dict"].items():
+            torch.testing.assert_close(
+                actual["model_state_dict"][name], value, rtol=0, atol=0
+            )
+        reference = [
+            json.loads(row) for row in (full / "history.jsonl").read_text().splitlines()
+        ]
+        continuation = [
+            json.loads(row)
+            for row in (resumed / "history.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(continuation[0]["loss"], reference[3]["loss"])
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA resume requires a GPU")
     def test_cuda_resume_replays_the_same_losses(self):
         # Exact weight replay requires deterministic FlashAttention backward.

@@ -2,6 +2,7 @@
 
 import math
 import random
+from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -141,6 +142,7 @@ class LoopedModel(VanillaModel):
             raise ValueError("KV replay requires a delta layer in the loop core")
         self.loop_repetitions = loop_repetitions
         self.training_repetitions = loop_repetitions
+        self.backprop_repetitions = None
         self.scale_residuals = scale_residuals
         self.injection = (
             None
@@ -166,6 +168,28 @@ class LoopedModel(VanillaModel):
         )
         return self.training_repetitions
 
+    @contextmanager
+    def iteration_context(self, iteration, repetitions, device_type):
+        if (
+            self.training
+            and self.backprop_repetitions is not None
+            and iteration < repetitions - self.backprop_repetitions
+        ):
+            # Casts made without gradients must not be reused in the suffix
+            # that learns through the same shared parameters.
+            with (
+                torch.no_grad(),
+                torch.autocast(
+                    device_type,
+                    enabled=torch.is_autocast_enabled(device_type),
+                    dtype=torch.get_autocast_dtype(device_type),
+                    cache_enabled=False,
+                ),
+            ):
+                yield
+        else:
+            yield
+
     def _iterate(self, x, apply):
         for block in self.blocks[:2]:
             x = apply(block, x)
@@ -178,13 +202,14 @@ class LoopedModel(VanillaModel):
             x = torch.zeros_like(x)
         if self.attention_residual is not None:
             memory = self.attention_residual.start(x)
-        for _ in range(repetitions):
-            if self.injection is not None:
-                x = self.injection(x, injected)
-            for block in self.blocks[2:-2]:
-                x = apply(block, x, scale, replay=self.kv_replay)
-            if self.attention_residual is not None:
-                x, memory = self.attention_residual(x, memory)
+        for iteration in range(repetitions):
+            with self.iteration_context(iteration, repetitions, x.device.type):
+                if self.injection is not None:
+                    x = self.injection(x, injected)
+                for block in self.blocks[2:-2]:
+                    x = apply(block, x, scale, replay=self.kv_replay)
+                if self.attention_residual is not None:
+                    x, memory = self.attention_residual(x, memory)
         for block in self.blocks[-2:]:
             x = apply(block, x)
         return self.head(self.norm(x))
@@ -199,7 +224,11 @@ class LoopedModel(VanillaModel):
             if replay and isinstance(block.attention, GatedDeltaAttention):
                 previous = histories.get(block, ())
                 args = (x, metadata, previous)
-                if self.training and self.activation_checkpointing:
+                if (
+                    self.training
+                    and self.activation_checkpointing
+                    and torch.is_grad_enabled()
+                ):
                     x, current, _ = checkpoint(
                         block.forward_replay, *args, use_reentrant=False, **options
                     )
@@ -209,7 +238,11 @@ class LoopedModel(VanillaModel):
                 # an earlier loop must not observe later loops' projections.
                 histories[block] = (*previous, current)
                 return x
-            if self.training and self.activation_checkpointing:
+            if (
+                self.training
+                and self.activation_checkpointing
+                and torch.is_grad_enabled()
+            ):
                 return checkpoint(block, x, metadata, use_reentrant=False, **options)
             return block(x, metadata, **options)
 
@@ -292,11 +325,12 @@ class RecurrentDepthModel(LoopedModel):
         repetitions = (
             self.training_repetitions if self.training else self.loop_repetitions
         )
-        for _ in range(repetitions):
-            state = state + embedded
-            for block in self.blocks[2:-2]:
-                state = apply(block, state)
-            state = self.norm_core(state)
+        for iteration in range(repetitions):
+            with self.iteration_context(iteration, repetitions, state.device.type):
+                state = state + embedded
+                for block in self.blocks[2:-2]:
+                    state = apply(block, state)
+                state = self.norm_core(state)
         for block in self.blocks[-2:]:
             state = apply(block, state)
         return self.head(self.norm(state))

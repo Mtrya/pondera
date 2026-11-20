@@ -39,6 +39,7 @@ class TrainConfig:
     checkpoint_keep_last: int = 3
     seed: int = 640
     activation_checkpointing: bool = True
+    backprop_repetitions: int | None = None
 
     def validate(self):
         if self.objective not in ("all_tokens", "final_decision"):
@@ -77,6 +78,7 @@ class TrainConfig:
             "checkpoint_every",
             "checkpoint_keep_last",
             "seed",
+            "backprop_repetitions",
         ):
             value = getattr(self, name)
             if value is not None:

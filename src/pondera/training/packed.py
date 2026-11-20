@@ -308,6 +308,15 @@ def train(
         raise ValueError("Packed training data needs a dataset_id from encoding")
     model.to(device)
     model.activation_checkpointing = config.activation_checkpointing
+    if config.backprop_repetitions is not None:
+        if not hasattr(model, "backprop_repetitions") or (
+            model.architecture == "looped" and model.injection is None
+        ):
+            raise ValueError(
+                "Truncated backpropagation requires recurrent input injection"
+            )
+    if hasattr(model, "backprop_repetitions"):
+        model.backprop_repetitions = config.backprop_repetitions
     optimizers = build_optimizers(
         model,
         muon_lr=config.muon_lr,
