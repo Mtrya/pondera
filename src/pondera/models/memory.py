@@ -4,18 +4,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from pondera.models.vanilla import CausalSelfAttention, VanillaModel
-
 
 class CausalConvolution(nn.Conv1d):
     """Four-token depthwise convolution, reset at each document."""
 
-    def __init__(self, width, activation="silu"):
+    def __init__(self, width):
         super().__init__(width, width, kernel_size=4, groups=width, bias=False)
-        self.activation = activation
-
-    def activate(self, x):
-        return F.silu(x) if self.activation == "silu" else x
 
     def forward(self, x, prepared):
         cu_cpu, cu_device = prepared
@@ -25,7 +19,7 @@ class CausalConvolution(nn.Conv1d):
             output, _ = causal_conv1d(
                 x.unsqueeze(0),
                 self.weight.squeeze(1),
-                activation=self.activation,
+                activation="silu",
                 cu_seqlens=cu_device,
                 cu_seqlens_cpu=cu_cpu,
             )
@@ -33,7 +27,7 @@ class CausalConvolution(nn.Conv1d):
         pieces = []
         for start, stop in zip(cu_cpu[:-1].tolist(), cu_cpu[1:].tolist()):
             doc = F.pad(x[start:stop].T.unsqueeze(0), (3, 0))
-            pieces.append(self.activate(super().forward(doc)).squeeze(0).T)
+            pieces.append(F.silu(super().forward(doc)).squeeze(0).T)
         return torch.cat(pieces)
 
     def forward_cached(self, x, prepared, cache=None):
@@ -48,9 +42,7 @@ class CausalConvolution(nn.Conv1d):
             )
         else:
             window = torch.cat((cache, x), dim=0)
-            result = self.activate(
-                (window.T * self.weight.squeeze(1)).sum(-1)
-            ).unsqueeze(0)
+            result = F.silu((window.T * self.weight.squeeze(1)).sum(-1)).unsqueeze(0)
             history = window[-3:]
         return result, history
 
@@ -63,7 +55,7 @@ class RecurrentAttention(nn.Module):
         cu = torch.as_tensor(cu_seqlens, dtype=torch.int64, device="cpu")
         return cu, cu.to(device, non_blocking=True)
 
-    def __init__(self, hidden_size, num_heads, *, activation="silu"):
+    def __init__(self, hidden_size, num_heads):
         super().__init__()
         if hidden_size % num_heads:
             raise ValueError("The head count must divide the hidden width")
@@ -72,9 +64,9 @@ class RecurrentAttention(nn.Module):
         self.q = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.q_conv = CausalConvolution(hidden_size, activation)
-        self.k_conv = CausalConvolution(hidden_size, activation)
-        self.v_conv = CausalConvolution(hidden_size, activation)
+        self.q_conv = CausalConvolution(hidden_size)
+        self.k_conv = CausalConvolution(hidden_size)
+        self.v_conv = CausalConvolution(hidden_size)
 
     def _project(self, x, prepared):
         return tuple(
@@ -117,20 +109,3 @@ class RecurrentAttention(nn.Module):
         vectors, new_histories = self._project_cached(x, prepared, histories)
         output, state = self._memory(vectors, x, prepared, memory, True)
         return self._output(x, output), (state, new_histories)
-
-
-class HybridModel(VanillaModel):
-    """Recurrent attention with optional periodic softmax layers."""
-
-    def __init__(self, *, softmax_every=0, **kwargs):
-        if not 0 <= softmax_every <= kwargs["num_blocks"]:
-            raise ValueError("softmax_every must be zero or a valid layer interval")
-        if not softmax_every and kwargs["num_kv_heads"] != kwargs["num_heads"]:
-            raise ValueError("Pure memory models require num_kv_heads = num_heads")
-        self.softmax_every = softmax_every
-        super().__init__(**kwargs)
-
-    def attention_type(self, index):
-        if self.softmax_every and (index + 1) % self.softmax_every == 0:
-            return CausalSelfAttention
-        return self.attention_cls

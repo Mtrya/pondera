@@ -12,11 +12,13 @@ def _forward(
     v2,
     v3,
     v4,
+    v5,
     r0,
     r1,
     r2,
     r3,
     r4,
+    r5,
     weight,
     output,
     lse,
@@ -26,8 +28,8 @@ def _forward(
     BLOCK_ROWS: tl.constexpr,
     SOURCE_COUNT: tl.constexpr,
 ):
-    values = (v0, v1, v2, v3, v4)
-    inverse_rms = (r0, r1, r2, r3, r4)
+    values = (v0, v1, v2, v3, v4, v5)
+    inverse_rms = (r0, r1, r2, r3, r4, r5)
     row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     col = tl.arange(0, BLOCK_WIDTH)
     offset = row[:, None] * WIDTH + col[None, :]
@@ -59,11 +61,13 @@ def _backward(
     v2,
     v3,
     v4,
+    v5,
     r0,
     r1,
     r2,
     r3,
     r4,
+    r5,
     weight,
     output,
     lse,
@@ -73,6 +77,7 @@ def _backward(
     g2,
     g3,
     g4,
+    g5,
     grad_weight_tiles,
     rows,
     WIDTH: tl.constexpr,
@@ -81,9 +86,9 @@ def _backward(
     TILES_PER_PROGRAM: tl.constexpr,
     SOURCE_COUNT: tl.constexpr,
 ):
-    values = (v0, v1, v2, v3, v4)
-    inverse_rms = (r0, r1, r2, r3, r4)
-    grad_values = (g0, g1, g2, g3, g4)
+    values = (v0, v1, v2, v3, v4, v5)
+    inverse_rms = (r0, r1, r2, r3, r4, r5)
+    grad_values = (g0, g1, g2, g3, g4, g5)
     program = tl.program_id(0)
     col = tl.arange(0, BLOCK_WIDTH)
     query = tl.load(weight + col, col < WIDTH, 0)
@@ -121,7 +126,7 @@ def _backward(
 
 def _pointers(tensors):
     # The Ascend launcher accepts individual tensor arguments.
-    return (*tensors, *((tensors[0],) * (5 - len(tensors))))
+    return (*tensors, *((tensors[0],) * (6 - len(tensors))))
 
 
 class _DepthRead(torch.autograd.Function):
@@ -185,7 +190,7 @@ class _DepthRead(torch.autograd.Function):
 
 def depth_read(sources, weight):
     """Read contiguous FP32 source values paired with their tokenwise inverse RMS."""
-    if not 1 <= len(sources) <= 5:
-        raise ValueError("Fused depth read supports one to five sources")
+    if not 1 <= len(sources) <= 6:
+        raise ValueError("Fused depth read supports one to six sources")
     values, inverse_rms = zip(*sources, strict=True)
     return _DepthRead.apply(weight, *values, *inverse_rms)

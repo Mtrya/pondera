@@ -8,6 +8,4 @@ A reasoning budget counts model calls before `FINAL`. Natural `FINAL` starts the
 
 `vanilla_uci.py` defaults to the legal-masked, zero-presentation policy. With `--reasoning-tokens`, it uses the same greedy reasoning prefix as the checkpoint evaluator and masks the decision after FINAL to legal root moves. If generation ends before a decision context is available, it plays from the board followed by FINAL. `uci.py` owns the UCI protocol.
 
-`load_checkpoint` and the UCI entry accept a positive `loop_repetitions` / `--loop-repetitions` override for looped checkpoints. Recurrent depth changes forward computation while preserving shared weights; checkpoint metadata records the chosen depth.
-
-The UCI option `--acl-graph` enables FP32 Ascend graph replay for an eight-layer KDA checkpoint with a softmax layer every four blocks. Each request captures its two fixed-shape KDA segments at the first cached step and resets their state on another prefill. The growing softmax caches use the regular decode path. The UCI engine selects the requested device before graph creation and waits for the final decode before releasing the request’s graph buffers. Ascend graph capture requires a compatible `torch_npu` runtime.
+`load_checkpoint` and the UCI entry accept a positive `loop_repetitions` / `--loop-repetitions` override when the model specifies exactly one segment with an explicit `repeat`. This changes the number of executions while retaining the same weights. Evaluation metadata records the executed repetitions for each segment.

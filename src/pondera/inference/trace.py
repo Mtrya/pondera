@@ -2,7 +2,6 @@
 
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import chess
 import torch
@@ -22,11 +21,7 @@ from pondera.chess.vocabulary import (
     VALUE,
     VALUE_BINS,
 )
-from pondera.models import MODEL_CLASSES, LoopedModel
-from pondera.models.temporal_navigation import TokenValueNavigationModel
-
-if TYPE_CHECKING:
-    from pondera.inference.acl_graph import KdaDecodeGraph
+from pondera.models import PonderaModel
 
 
 @dataclass
@@ -156,9 +151,8 @@ class Generation:
 
 @dataclass
 class _DecodeState:
-    caches: list | None = None
+    caches: tuple | None = None
     consumed: int = 0
-    graph: "KdaDecodeGraph | None" = None
 
 
 @dataclass
@@ -166,7 +160,6 @@ class Predictor:
     model: torch.nn.Module
     dictionary: MergeDictionary
     metadata: dict
-    acl_graph: bool = False
 
     def _next_logits(self, prefix, tokens, state):
         device = next(self.model.parameters()).device
@@ -179,24 +172,9 @@ class Predictor:
         unseen = context if state.caches is None else context[state.consumed :]
         ids = torch.tensor(unseen, dtype=torch.long, device=device)
         offsets = torch.tensor([0, len(context)], dtype=torch.int32)
-        use_graph = self.acl_graph and not torch.is_autocast_enabled("npu")
-        if use_graph and state.caches is not None:
-            if state.graph is None:
-                from pondera.inference.acl_graph import KdaDecodeGraph
-
-                state.graph = KdaDecodeGraph(self.model, ids, state.caches)
-            logits, state.caches = state.graph.step(ids, offsets, state.caches)
-        else:
-            options = {}
-            if isinstance(self.model, TokenValueNavigationModel):
-                options["host_tokens"] = unseen
-            logits, state.caches = self.model.forward_cached(
-                ids, offsets, state.caches, **options
-            )
-            if not use_graph:
-                state.graph = None
-            elif state.graph is not None:
-                state.graph.reset(state.caches)
+        logits, state.caches = self.model.forward_cached(
+            ids, offsets, state.caches, host_tokens=unseen
+        )
         state.consumed = len(context)
         return logits[-1]
 
@@ -230,11 +208,7 @@ class Predictor:
         if stop != "answer_budget":
             tokens = [FINAL]
             state = _DecodeState()
-        logits = self._next_logits(prefix, tokens, state)
-        if state.graph is not None:
-            # Retain graph-owned buffers until the asynchronous final decode finishes.
-            torch.npu.current_stream(logits.device).synchronize()
-        return logits
+        return self._next_logits(prefix, tokens, state)
 
     @torch.inference_mode()
     def generate(self, fen, repetition=1, *, reasoning_tokens=0, answer_tokens=128):
@@ -278,35 +252,25 @@ class Predictor:
         )
 
 
-def load_checkpoint(path, device="cpu", *, loop_repetitions=None, acl_graph=False):
+def load_checkpoint(path, device="cpu", *, loop_repetitions=None):
     state = torch.load(path, map_location="cpu", weights_only=True)
-    model = MODEL_CLASSES[state["arch"]](**state["model_config"])
+    if state["arch"] != PonderaModel.architecture:
+        raise ValueError(f"Unsupported checkpoint architecture: {state['arch']}")
+    model = PonderaModel(**state["model_config"])
     model.load_state_dict(state["model_state_dict"])
     if loop_repetitions is not None:
-        if not isinstance(model, LoopedModel) or loop_repetitions < 1:
-            raise ValueError(
-                "A positive repetition override requires a looped checkpoint"
-            )
-        model.loop_repetitions = loop_repetitions
-    if acl_graph and (
-        str(device).split(":", 1)[0] != "npu"
-        or state["arch"] != "kda"
-        or len(model.blocks) != 8
-        or model.softmax_every != 4
-    ):
-        raise ValueError("ACLGraph decode requires the eight-layer 3:1 KDA on Ascend")
+        model.override_repetitions(loop_repetitions)
     identity = state.get("tokenizer_identity", {})
     dictionary = MergeDictionary(identity.get("merge_entries", ()))
-    if state["model_config"]["vocab_size"] != CHESS_VOCAB_SIZE + len(dictionary):
+    if model.vocab_size != CHESS_VOCAB_SIZE + len(dictionary):
         raise ValueError("Checkpoint vocabulary and merge entries disagree")
-    if isinstance(model, TokenValueNavigationModel):
-        model.bind_tokenizer(dictionary)
+    model.bind_tokenizer(dictionary)
     metadata = {
         key: state[key]
         for key in ("arch", "model_config", "update", "presented_documents")
         if key in state
     }
     metadata["tokenizer_identity"] = identity
-    if isinstance(model, LoopedModel):
-        metadata["loop_repetitions"] = model.loop_repetitions
-    return Predictor(model.to(device).eval(), dictionary, metadata, acl_graph=acl_graph)
+    if model.loop_segments:
+        metadata["segment_repetitions"] = model.repetitions
+    return Predictor(model.to(device).eval(), dictionary, metadata)

@@ -4,7 +4,7 @@ Pondera studies search-free chess policies and whether a neural model can intern
 
 **Status.** Pondera is a research work in progress. The package is experiment infrastructure, not a usable product: there is no stable user-facing API or command set, the data formats and model interfaces still change, and nothing here promises backward compatibility. The code is published so experiments can be inspected and reproduced, not as a turnkey chess engine.
 
-The current implementation includes lossless sparse board atoms, causal softmax and linear-attention Transformer baselines over one packed token stream, a trace grammar with a shared visit state machine and replay validator, supervised training with resumable checkpoints, a deterministic UCI adapter, graded puzzles, and fastchess match evaluation. ChessFormer-era checkpoints remain published on Hugging Face as provenance for the historical baselines recorded in the [leaderboard](results/leaderboard.md); the current codebase implements only the versioned lossless board format.
+The current implementation includes lossless sparse board atoms, a causal Transformer with Kimi Delta Attention, softmax attention, and repeated layers over one packed token stream, a trace grammar with a shared visit state machine and replay validator, supervised training with resumable checkpoints, a deterministic UCI adapter, graded puzzles, and fastchess match evaluation. ChessFormer-era checkpoints remain published on Hugging Face as provenance for the historical baselines recorded in the [leaderboard](results/leaderboard.md); the current codebase implements only the versioned lossless board format.
 
 ## Setup
 

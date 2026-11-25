@@ -28,7 +28,7 @@ from pondera.evaluation.config import EvalConfig
 from pondera.evaluation.puzzles import solve_puzzle
 from pondera.evaluation.reference import Reference
 from pondera.inference.trace import parse_answer
-from pondera.models.vanilla import VanillaModel
+from pondera.models import PonderaModel
 
 FEN = "7k/5K2/6Q1/8/8/8/8/8 w - - 0 1"
 PUZZLE = {
@@ -41,14 +41,14 @@ PUZZLE = {
 
 def save_constant_model(path, decision=None):
     config = dict(
-        num_blocks=1,
+        segments=[{"blocks": ["softmax"]}],
         hidden_size=16,
         intermediate_size=32,
         num_heads=2,
         num_kv_heads=1,
         vocab_size=CHESS_VOCAB_SIZE,
     )
-    model = VanillaModel(**config)
+    model = PonderaModel(**config)
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.zero_()
@@ -59,7 +59,7 @@ def save_constant_model(path, decision=None):
             model.head.weight[MOVE + UCI_MOVE_TO_IDX[decision], 0] = 1
     torch.save(
         {
-            "arch": "vanilla",
+            "arch": "pondera",
             "model_config": config,
             "model_state_dict": model.state_dict(),
             "tokenizer_identity": {"merge_entries": []},

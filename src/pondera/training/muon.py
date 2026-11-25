@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 
-def newton_schulz5(gradient, steps=5):
+def newton_schulz5(gradient):
     """Orthogonalize a matrix with the quintic Newton–Schulz iteration."""
     a, b, c = 3.4445, -4.7750, 2.0315
     x = gradient.bfloat16()
@@ -22,36 +22,15 @@ def newton_schulz5(gradient, steps=5):
     if transposed:
         x = x.mT
     x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    for _ in range(steps):
+    for _ in range(5):
         gram = x @ x.mT
         x = a * x + (b * gram + c * gram @ gram) @ x
     return x.mT if transposed else x
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr=0.02,
-        weight_decay=0.0,
-        momentum=0.95,
-        nesterov=True,
-        ns_steps=5,
-        hyperball=False,
-    ):
-        if hyperball and weight_decay:
-            raise ValueError("Hyperball replaces weight decay for hidden matrices")
-        super().__init__(
-            params,
-            dict(
-                lr=lr,
-                weight_decay=weight_decay,
-                momentum=momentum,
-                nesterov=nesterov,
-                ns_steps=ns_steps,
-                hyperball=hyperball,
-            ),
-        )
+    def __init__(self, params, lr, *, hyperball=False):
+        super().__init__(params, dict(lr=lr, hyperball=hyperball))
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -64,13 +43,8 @@ class Muon(torch.optim.Optimizer):
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(param.grad)
                 buffer = state["momentum_buffer"]
-                buffer.lerp_(param.grad, 1 - group["momentum"])
-                gradient = (
-                    param.grad.lerp(buffer, group["momentum"])
-                    if group["nesterov"]
-                    else buffer
-                )
-                update = newton_schulz5(gradient, group["ns_steps"])
+                buffer.lerp_(param.grad, 1 - 0.95)
+                update = newton_schulz5(param.grad.lerp(buffer, 0.95))
                 if group["hyperball"]:
                     if "radius" not in state:
                         state["radius"] = param.norm().detach().clone()
@@ -83,7 +57,6 @@ class Muon(torch.optim.Optimizer):
                     param.mul_(radius / param.norm().clamp_min(1e-30))
                 else:
                     scale = max(1, param.shape[-2] / param.shape[-1]) ** 0.5
-                    param.mul_(1 - group["lr"] * group["weight_decay"])
                     param.add_(update.to(param.dtype), alpha=-group["lr"] * scale)
         return loss
 
@@ -110,22 +83,15 @@ def split_parameters(model: nn.Module):
     return muon, adamw
 
 
-def build_optimizers(
-    model, *, muon_lr=0.02, adamw_lr=3e-4, weight_decay=0.0, hyperball=False
-):
+def build_optimizers(model, *, optimizer, muon_lr, adamw_lr, adamw_weight_decay):
     muon_params, adamw_params = split_parameters(model)
     return [
-        Muon(
-            muon_params,
-            lr=muon_lr,
-            weight_decay=0.0 if hyperball else weight_decay,
-            hyperball=hyperball,
-        ),
+        Muon(muon_params, lr=muon_lr, hyperball=optimizer == "hyperball"),
         torch.optim.AdamW(
             adamw_params,
             lr=adamw_lr,
             betas=(0.9, 0.95),
             eps=1e-10,
-            weight_decay=weight_decay,
+            weight_decay=adamw_weight_decay,
         ),
     ]

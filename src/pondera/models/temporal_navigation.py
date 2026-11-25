@@ -3,18 +3,10 @@
 from copy import copy
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 
-from pondera.models.navigation import (
-    BranchEntries,
-    navigation_sources,
-    navigation_table,
-)
-from pondera.models.token_value import KimiDeltaTokenValueModel
-from pondera.models.token_value_attn_res import TokenValueBlockAttnResModel
+from pondera.models.navigation import BranchEntries
 
 
 @dataclass(frozen=True)
@@ -29,12 +21,6 @@ class NavigationRead(nn.Module):
         super().__init__()
         self.query = nn.Parameter(torch.zeros(width))
         self.score_scale = width**-0.5
-        self.table = ()
-
-    def prepare(self, tokens, boundaries):
-        sources = navigation_sources(tokens, boundaries, self.table)
-        receivers = np.flatnonzero(sources[:, 0] >= 0)
-        return receivers, sources[receivers]
 
     def _mix(self, current, sources):
         states = torch.cat((current[:, None], sources), dim=1).float()
@@ -61,7 +47,7 @@ class NavigationRead(nn.Module):
             return hidden + self.query.sum().to(hidden.dtype) * 0
         return self._add(hidden, hidden, receivers, sources)
 
-    def forward_cached(self, hidden, tokens, cache=None):
+    def forward_cached(self, hidden, tokens, table, cache=None):
         if cache is None:
             cursor, start, prior = BranchEntries(), 0, {}
         else:
@@ -70,8 +56,7 @@ class NavigationRead(nn.Module):
         if len(hidden) != len(tokens):
             raise ValueError("Expected one layer output per input token")
         references = [
-            cursor.consume(start + i, self.table[token])
-            for i, token in enumerate(tokens)
+            cursor.consume(start + i, table[token]) for i, token in enumerate(tokens)
         ]
         receivers = [i for i, (branch, _) in enumerate(references) if branch >= 0]
         if not receivers:
@@ -106,61 +91,3 @@ class NavigationRead(nn.Module):
             for index in needed
         }
         return output, NavigationCache(start + len(tokens), cursor, saved)
-
-
-class TokenValueNavigationModel(KimiDeltaTokenValueModel):
-    architecture = "kda_token_value_navigation"
-
-    def __init__(self, *, hidden_size, **settings):
-        super().__init__(hidden_size=hidden_size, **settings)
-        if len(self.blocks) < 4:
-            raise ValueError("Chess-path reads require at least four blocks")
-        self.navigation = NavigationRead(hidden_size)
-
-    def bind_tokenizer(self, dictionary):
-        self.navigation.table = navigation_table(dictionary)
-        if len(self.navigation.table) != self.vocab_size:
-            raise ValueError("Navigation dictionary must match the model vocabulary")
-
-    def forward(self, input_ids, cu_seqlens, *, navigation_reads=None):
-        if navigation_reads is None:
-            navigation_reads = self.navigation.prepare(
-                input_ids.detach().cpu().numpy(), cu_seqlens
-            )
-
-        def read_after_fourth_block(index, residual):
-            if index != 3:
-                return residual
-            if self.training and self.activation_checkpointing:
-                return checkpoint(
-                    self.navigation, residual, navigation_reads, use_reentrant=False
-                )
-            return self.navigation(residual, navigation_reads)
-
-        return super().forward(
-            input_ids, cu_seqlens, after_block=read_after_fourth_block
-        )
-
-    def forward_cached(self, input_ids, cu_seqlens, caches=None, *, host_tokens=None):
-        block_caches, navigation_cache = (None, None) if caches is None else caches
-        if host_tokens is None:
-            host_tokens = input_ids.detach().cpu().tolist()
-
-        def read_after_fourth_block(index, residual):
-            nonlocal navigation_cache
-            if index == 3:
-                residual, navigation_cache = self.navigation.forward_cached(
-                    residual, host_tokens, navigation_cache
-                )
-            return residual
-
-        logits, block_caches = super().forward_cached(
-            input_ids, cu_seqlens, block_caches, after_block=read_after_fourth_block
-        )
-        return logits, (block_caches, navigation_cache)
-
-
-class TokenValueBlockAttnResNavigationModel(
-    TokenValueNavigationModel, TokenValueBlockAttnResModel
-):
-    architecture = "kda_token_value_block_attn_res_navigation"

@@ -5,28 +5,19 @@ import tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-from pondera.models import MODEL_CLASSES
+from pondera.models.config import validate_model_config
 
 DEFAULT_CONFIG_PATH = Path("configs/train.toml")
-_MODEL_DIMENSIONS = (
-    "num_blocks",
-    "hidden_size",
-    "intermediate_size",
-    "num_heads",
-    "num_kv_heads",
-)
 
 
 @dataclass
 class TrainConfig:
-    objective: str = "all_tokens"
-    decision_loss_weight: float = 0.0
-    hyperball: bool = False
-    muon_lr: float = 0.02
+    optimizer: str = "hyperball"
+    muon_lr: float = 0.0375
     adamw_lr: float = 3e-4
     warmup_fraction: float = 0.05
     min_lr_ratio: float = 0.1
-    weight_decay: float = 0.0
+    adamw_weight_decay: float = 0.0
     microbatch_tokens: int = 131_072
     update_tokens: int = 524_288
     presentations: float = 1.0
@@ -39,24 +30,12 @@ class TrainConfig:
     checkpoint_keep_last: int = 3
     seed: int = 640
     activation_checkpointing: bool = True
-    backprop_repetitions: int | None = None
 
     def validate(self):
-        if self.objective not in ("all_tokens", "final_decision"):
-            raise ValueError(
-                "[training] objective must be all_tokens or final_decision"
-            )
-        weight = self.decision_loss_weight
-        if type(weight) not in (int, float) or not math.isfinite(weight) or weight < 0:
-            raise ValueError(
-                "[training] decision_loss_weight must be finite and nonnegative"
-            )
-        if weight and self.objective != "all_tokens":
-            raise ValueError("[training] decision_loss_weight requires all_tokens")
         if type(self.activation_checkpointing) is not bool:
             raise ValueError("[training] activation_checkpointing must be a boolean")
-        if type(self.hyperball) is not bool:
-            raise ValueError("[training] hyperball must be a boolean")
+        if self.optimizer not in ("hyperball", "muon"):
+            raise ValueError("[training] optimizer must be hyperball or muon")
         for name in ("warmup_fraction", "min_lr_ratio"):
             value = getattr(self, name)
             if (
@@ -78,7 +57,6 @@ class TrainConfig:
             "checkpoint_every",
             "checkpoint_keep_last",
             "seed",
-            "backprop_repetitions",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -88,7 +66,7 @@ class TrainConfig:
                     value,
                     0 if name in {"val_every", "checkpoint_every", "seed"} else 1,
                 )
-        for name in ("muon_lr", "adamw_lr", "weight_decay", "presentations"):
+        for name in ("muon_lr", "adamw_lr", "adamw_weight_decay", "presentations"):
             value = getattr(self, name)
             if (
                 type(value) not in (int, float)
@@ -127,113 +105,8 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     for section in ("model", "training"):
         if section not in values:
             raise ValueError(f"Missing config section: [{section}]")
-    model = _table(
-        values["model"],
-        "model",
-        {
-            "architecture",
-            "loop_repetitions",
-            "scale_residuals",
-            "input_injection",
-            "kv_replay",
-            "attention_residual_decay",
-            "mixer",
-            "softmax_every",
-            "num_slots",
-            "context_rank",
-            "factorized_move_head",
-            *_MODEL_DIMENSIONS,
-        },
-    )
-    missing = {"architecture", *_MODEL_DIMENSIONS} - set(model)
-    if missing:
-        raise ValueError(f"Missing config key in [model]: {sorted(missing)[0]}")
-    if (
-        not isinstance(model["architecture"], str)
-        or model["architecture"] not in MODEL_CLASSES
-    ):
-        raise ValueError(
-            f"[model] architecture must be one of {', '.join(MODEL_CLASSES)}"
-        )
-    for name in _MODEL_DIMENSIONS:
-        _integer("model", name, model[name], 1)
-    if type(model.get("factorized_move_head", False)) is not bool:
-        raise ValueError("[model] factorized_move_head must be a boolean")
-    if "loop_repetitions" in model:
-        if model["architecture"] not in {"looped", "recurrent"}:
-            raise ValueError(
-                "[model] loop_repetitions requires a recurrent-depth architecture"
-            )
-        _integer("model", "loop_repetitions", model["loop_repetitions"], 1)
-    if "mixer" in model:
-        if model["architecture"] not in {
-            "looped",
-            "recurrent",
-            "board_context",
-            "symbolic_board",
-        }:
-            raise ValueError("[model] mixer requires recurrent depth or board context")
-        if model["mixer"] not in {"softmax", "gdn", "kda"}:
-            raise ValueError("[model] mixer must be softmax, gdn, or kda")
-    if "scale_residuals" in model:
-        if (
-            model["architecture"] != "looped"
-            or type(model["scale_residuals"]) is not bool
-        ):
-            raise ValueError("[model] scale_residuals requires a boolean for looped")
-    if "input_injection" in model:
-        if model["architecture"] != "looped" or model["input_injection"] not in {
-            "none",
-            "decay",
-            "orthogonal",
-        }:
-            raise ValueError("[model] input_injection requires a looped injection mode")
-    if "kv_replay" in model and (
-        model["architecture"] != "looped" or type(model["kv_replay"]) is not bool
-    ):
-        raise ValueError("[model] kv_replay requires a boolean for looped")
-    if "attention_residual_decay" in model and (
-        model["architecture"] != "looped"
-        or type(model["attention_residual_decay"]) not in {int, float}
-        or not 0 < model["attention_residual_decay"] < 1
-    ):
-        raise ValueError(
-            "[model] attention_residual_decay must be between 0 and 1 for looped"
-        )
-    if "softmax_every" in model:
-        if model["architecture"] not in {
-            "gdn",
-            "gdn2",
-            "kda",
-            "kda_token_value",
-            "kda_token_value_block_attn_res",
-            "kda_token_value_navigation",
-            "kda_token_value_block_attn_res_navigation",
-            "kdn",
-            "cyfa",
-            "looped",
-            "recurrent",
-            "board_context",
-            "symbolic_board",
-        }:
-            raise ValueError("[model] softmax_every requires a hybrid architecture")
-        _integer("model", "softmax_every", model["softmax_every"], 0)
-    if "context_rank" in model:
-        if model["architecture"] not in {"board_context", "symbolic_board"}:
-            raise ValueError("[model] context_rank requires board context")
-        _integer("model", "context_rank", model["context_rank"], 1)
-    if "num_slots" in model:
-        if model["architecture"] != "cyfa":
-            raise ValueError("[model] num_slots requires CyFA")
-        _integer("model", "num_slots", model["num_slots"], 2)
-        if model["num_slots"] % 2:
-            raise ValueError("[model] num_slots must be even")
-    if (
-        model["hidden_size"] % model["num_heads"]
-        or model["num_heads"] % model["num_kv_heads"]
-    ):
-        raise ValueError("[model] head counts must divide each other and hidden_size")
-
+    model = values["model"]
+    validate_model_config(model)
     training = _table(
         values["training"], "training", {field.name for field in fields(TrainConfig)}
     )

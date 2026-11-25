@@ -26,7 +26,6 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
 from pondera.chess.merge import MergeDictionary
-from pondera.chess.vocabulary import FINAL
 from pondera.data.packing import (
     PackedDocuments,
     assemble_batch,
@@ -34,8 +33,7 @@ from pondera.data.packing import (
     packed_batch_indices,
     select_documents,
 )
-from pondera.models import MODEL_CLASSES, LoopedModel
-from pondera.models.temporal_navigation import TokenValueNavigationModel
+from pondera.models import PonderaModel
 from pondera.training.config import DEFAULT_CONFIG_PATH, TrainConfig, load_config
 from pondera.training.muon import build_optimizers
 
@@ -84,19 +82,6 @@ def _lr_scale(progress, warmup_fraction, min_lr_ratio):
     return min_lr_ratio + (1 - min_lr_ratio) * (1 + math.cos(math.pi * decay)) / 2
 
 
-def _supervise(batch, objective):
-    if objective == "final_decision":
-        labels = batch["labels"].copy()
-        labels[batch["input_ids"] != FINAL] = -100
-        labeled = int(np.count_nonzero(labels != -100))
-    elif objective == "all_tokens":
-        labels = batch["labels"]
-        labeled = batch["tokens"] - batch["documents"]
-    else:
-        raise ValueError(f"Unknown training objective: {objective}")
-    return {**batch, "labels": labels, "labeled_tokens": labeled}
-
-
 def _move(batch, device):
     moved = {
         "host_input_ids": batch["input_ids"],
@@ -105,12 +90,8 @@ def _move(batch, device):
         ),
         "labels": torch.as_tensor(batch["labels"], dtype=torch.long, device=device),
         "cu_seqlens": batch["cu_seqlens"].tolist(),
-        "labeled_tokens": batch["labeled_tokens"],
+        "labeled_tokens": batch["tokens"] - batch["documents"],
     }
-    if "decision_indices" in batch:
-        moved["decision_indices"] = torch.as_tensor(
-            batch["decision_indices"], dtype=torch.long, device=device
-        )
     return moved
 
 
@@ -118,8 +99,8 @@ def _forward(model, batch):
     raw_model = _module(model)
     device_type = raw_model.token_embedding.weight.device.type
     options = {}
-    if isinstance(raw_model, TokenValueNavigationModel) and "host_input_ids" in batch:
-        options["navigation_reads"] = raw_model.navigation.prepare(
+    if raw_model.navigation and "host_input_ids" in batch:
+        options["navigation_reads"] = raw_model.prepare_navigation(
             batch["host_input_ids"], batch["cu_seqlens"]
         )
     with torch.autocast(
@@ -130,7 +111,7 @@ def _forward(model, batch):
         return model(batch["input_ids"], batch["cu_seqlens"], **options)
 
 
-def _loss(model, batch, decision_weight=0.0):
+def _loss(model, batch):
     if not batch["input_ids"].numel():
         # An idle rank participates in DDP with zero gradient and no presented tokens.
         moved = {
@@ -146,12 +127,6 @@ def _loss(model, batch, decision_weight=0.0):
     logits = logits.float().view(-1, logits.shape[-1])
     labels = batch["labels"].view(-1)
     loss = F.cross_entropy(logits, labels, ignore_index=-100)
-    if decision_weight and len(batch["decision_indices"]):
-        idx = batch["decision_indices"]
-        decision_total = F.cross_entropy(logits[idx], labels[idx], reduction="sum")
-        loss = (labeled * loss + decision_weight * decision_total) / (
-            labeled + decision_weight * len(idx)
-        )
     return loss, labeled
 
 
@@ -164,7 +139,6 @@ def validation_loss(
     indices,
     rank=0,
     world_size=1,
-    objective="all_tokens",
 ):
     model = _module(model)
     was_training = model.training
@@ -173,9 +147,7 @@ def validation_loss(
     total_loss = 0.0
     total_labeled = 0
     for batch in batches[rank::world_size]:
-        moved = _move(
-            _supervise(assemble_batch(documents, list(batch)), objective), device
-        )
+        moved = _move(assemble_batch(documents, list(batch)), device)
         loss, labeled = _loss(model, moved)
         total_loss += float(loss) * labeled
         total_labeled += labeled
@@ -183,7 +155,7 @@ def validation_loss(
     total_labeled = _reduce(total_labeled, device)
     model.train(was_training)
     if not total_labeled:
-        raise ValueError(f"No supervised validation labels for objective {objective}")
+        raise ValueError("No next-token labels in validation documents")
     return total_loss / total_labeled, total_labeled
 
 
@@ -268,7 +240,7 @@ def train(
     if world_size > 1:
         dist.barrier()
     documents = PackedDocuments(packed_dir)
-    if isinstance(model, TokenValueNavigationModel):
+    if model.navigation:
         model.bind_tokenizer(MergeDictionary(documents.manifest["merge_entries"]))
     cap = (
         documents.manifest["max_document_tokens"]
@@ -319,21 +291,12 @@ def train(
         raise ValueError("Packed training data needs a dataset_id from encoding")
     model.to(device)
     model.activation_checkpointing = config.activation_checkpointing
-    if config.backprop_repetitions is not None:
-        if not hasattr(model, "backprop_repetitions") or (
-            model.architecture == "looped" and model.injection is None
-        ):
-            raise ValueError(
-                "Truncated backpropagation requires recurrent input injection"
-            )
-    if hasattr(model, "backprop_repetitions"):
-        model.backprop_repetitions = config.backprop_repetitions
     optimizers = build_optimizers(
         model,
         muon_lr=config.muon_lr,
         adamw_lr=config.adamw_lr,
-        weight_decay=config.weight_decay,
-        hyperball=config.hyperball,
+        adamw_weight_decay=config.adamw_weight_decay,
+        optimizer=config.optimizer,
     )
     micro_step = update = presented_documents = 0
     if resume is not None:
@@ -348,24 +311,15 @@ def train(
         for key in ("seed", "microbatch_tokens"):
             if state["train_config"][key] != run_config["train_config"][key]:
                 raise ValueError(f"Resume {key} differs from checkpoint")
-        if state["train_config"].get("objective") != config.objective:
-            raise ValueError("Resume objective differs from checkpoint")
-        if state["train_config"].get("hyperball", False) != config.hyperball:
-            raise ValueError("Resume hyperball differs from checkpoint")
-        if (
-            state["train_config"].get("decision_loss_weight", 0.0)
-            != config.decision_loss_weight
-        ):
-            raise ValueError("Resume decision_loss_weight differs from checkpoint")
+        if state["train_config"]["optimizer"] != config.optimizer:
+            raise ValueError("Resume optimizer differs from checkpoint")
         model.load_state_dict(state["model_state_dict"])
-        for index, (optimizer, saved) in enumerate(
-            zip(optimizers, state["optimizer_state_dicts"])
+        for optimizer, saved in zip(
+            optimizers, state["optimizer_state_dicts"], strict=True
         ):
             optimizer.load_state_dict(saved)
-            for group in optimizer.param_groups:
-                group["weight_decay"] = (
-                    0.0 if index == 0 and config.hyperball else config.weight_decay
-                )
+        for group in optimizers[1].param_groups:
+            group["weight_decay"] = config.adamw_weight_decay
         micro_step, update = state["micro_step"], state["update"]
         presented_documents = state["presented_documents"]
     swanlab_run_id = state.get("swanlab_run_id") if resume is not None else None
@@ -418,7 +372,6 @@ def train(
         max_documents=target_documents,
     )
     started = time.monotonic()
-    looped = _module(model) if isinstance(_module(model), LoopedModel) else None
     try:
         while (config.updates is None or update < config.updates) and (
             target_documents is None or presented_documents < target_documents
@@ -426,7 +379,6 @@ def train(
             update_started = time.monotonic()
             batches = []
             total_labeled = 0
-            total_decisions = 0
             total_tokens = 0
             last_epoch = 0
             while total_tokens < config.update_tokens and (
@@ -446,14 +398,8 @@ def train(
                     micro_step += 1
                     if batch_rank == rank:
                         local_indices = document_indices
-                batch = _supervise(
-                    assemble_batch(documents, local_indices), config.objective
-                )
-                total_labeled += batch["labeled_tokens"]
-                if config.decision_loss_weight:
-                    final = (batch["input_ids"] == FINAL) & (batch["labels"] != -100)
-                    batch["decision_indices"] = np.flatnonzero(final)
-                    total_decisions += len(batch["decision_indices"])
+                batch = assemble_batch(documents, local_indices)
+                total_labeled += batch["tokens"] - batch["documents"]
                 batches.append(batch)
             total_labeled = _reduce(total_labeled, device)
             if rank == 0:
@@ -470,39 +416,21 @@ def train(
                 )
                 os.replace(temporary, progress_path)
             if not total_labeled:
-                raise ValueError(
-                    f"No supervised update labels for objective {config.objective}"
-                )
-            decision_weight = 0.0
-            if config.decision_loss_weight:
-                total_decisions = _reduce(total_decisions, device)
-                if not total_decisions:
-                    raise ValueError(
-                        "No final-decision targets for the weighted update"
-                    )
-                # Match the configured ratio of mean decision loss to mean token loss.
-                decision_weight = (
-                    config.decision_loss_weight * total_labeled / total_decisions
-                )
-            total_weight = total_labeled + decision_weight * total_decisions
+                raise ValueError("No next-token labels in the training update")
             for optimizer in optimizers:
                 optimizer.zero_grad()
-            if looped is not None:
-                repetitions = looped.select_training_depth(config.seed, update + 1)
             update_loss = torch.zeros((), device=device)
             for index, batch in enumerate(batches):
-                weight = batch["labeled_tokens"]
-                if decision_weight:
-                    weight += decision_weight * len(batch["decision_indices"])
                 moved = _move(batch, device)
+                weight = moved["labeled_tokens"]
                 context = (
                     model.no_sync()
                     if world_size > 1 and index + 1 < len(batches)
                     else nullcontext()
                 )
                 with context:
-                    loss, _ = _loss(model, moved, decision_weight)
-                    (loss * (weight * world_size / total_weight)).backward()
+                    loss, _ = _loss(model, moved)
+                    (loss * (weight * world_size / total_labeled)).backward()
                 update_loss += loss.detach() * weight
             # Use the budget fraction completed by this update, including a short final batch.
             progress = (
@@ -517,7 +445,7 @@ def train(
                 for group in optimizer.param_groups:
                     group["lr"] = peak_lr * lr_scale
                 optimizer.step()
-            update_loss = float(_reduce(update_loss, device)) / total_weight
+            update_loss = float(_reduce(update_loss, device)) / total_labeled
             if device.type in {"cuda", "npu"}:
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
@@ -540,10 +468,6 @@ def train(
                 "muon_lr": optimizers[0].param_groups[0]["lr"],
                 "adamw_lr": optimizers[1].param_groups[0]["lr"],
             }
-            if looped is not None:
-                record["repetitions"] = repetitions
-            if decision_weight:
-                record["decision_labels"] = total_decisions
             if config.val_every and (
                 update % config.val_every == 0
                 or presented_documents == target_documents
@@ -629,13 +553,12 @@ def main():
     model_settings, config = load_config(args.config)
     if args.max_presented_documents is not None:
         config.max_presented_documents = args.max_presented_documents
-    architecture = model_settings["architecture"]
     model_config = {
-        name: value for name, value in model_settings.items() if name != "architecture"
+        **model_settings,
+        "vocab_size": PackedDocuments(args.packed).manifest["vocabulary"],
     }
-    model_config["vocab_size"] = PackedDocuments(args.packed).manifest["vocabulary"]
     torch.manual_seed(config.seed)
-    model = MODEL_CLASSES[architecture](**model_config)
+    model = PonderaModel(**model_config)
     result = train(
         model,
         model_config,

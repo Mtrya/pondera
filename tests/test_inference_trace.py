@@ -29,17 +29,7 @@ from pondera.inference.trace import (
     parse_answer,
 )
 from pondera.inference.vanilla_uci import pick_with_reasoning
-from pondera.models.board_context import BoardContextModel, SymbolicBoardModel
-from pondera.models.cyfa import CyclicFlowModel
-from pondera.models.gdn2 import GatedDeltaNet2Model
-from pondera.models.kalman import KalmanDeltaModel
-from pondera.models.linear import LinearVanillaModel
-from pondera.models.looped import LoopedModel, RecurrentDepthModel
-from pondera.models.temporal_navigation import (
-    TokenValueBlockAttnResNavigationModel,
-    TokenValueNavigationModel,
-)
-from pondera.models.vanilla import VanillaModel
+from pondera.models import PonderaModel
 
 
 def move(uci):
@@ -135,56 +125,36 @@ class GenerationTests(unittest.TestCase):
         torch.manual_seed(640)
         prefix = encode_board(chess.STARTING_FEN).tolist()
         tokens = [BACK, move("e2e4"), BACK, FINAL, VALUE, END]
-        classes = (
-            VanillaModel,
-            LinearVanillaModel,
-            LoopedModel,
-            RecurrentDepthModel,
-            BoardContextModel,
-            SymbolicBoardModel,
-        )
-        cases = [(model_class, {}) for model_class in classes] + [
-            (CyclicFlowModel, {"num_slots": 4, "softmax_every": 2}),
-            (KalmanDeltaModel, {"softmax_every": 2}),
-            (GatedDeltaNet2Model, {"softmax_every": 2}),
-            (LoopedModel, {"mixer": "gdn", "softmax_every": 2}),
-            (LoopedModel, {"mixer": "kda", "softmax_every": 2, "kv_replay": True}),
-            (
-                LoopedModel,
-                {"mixer": "kda", "softmax_every": 2, "attention_residual_decay": 0.55},
-            ),
-            (RecurrentDepthModel, {"mixer": "kda", "softmax_every": 2}),
-            (
-                LoopedModel,
-                {"mixer": "kda", "softmax_every": 2, "input_injection": "orthogonal"},
-            ),
-        ]
-        for model_class, settings in cases:
-            with self.subTest(architecture=model_class.architecture, settings=settings):
-                model = model_class(
-                    num_blocks=5,
-                    hidden_size=16,
-                    intermediate_size=32,
-                    num_heads=2,
-                    num_kv_heads=1,
-                    vocab_size=CHESS_VOCAB_SIZE,
-                    **settings,
-                ).eval()
-                predictor = Predictor(model, MergeDictionary(), {})
-                state = _DecodeState()
-                with torch.inference_mode():
-                    # The jump to four tokens includes a generated token and
-                    # forced FINAL. Both must retain full causal context.
-                    for length in (0, 1, 2, 4, 5, 6):
-                        context = torch.tensor(prefix + tokens[:length])
-                        expected = model(context, [0, len(context)])[-1]
-                        actual = predictor._next_logits(prefix, tokens[:length], state)
-                        torch.testing.assert_close(
-                            actual, expected, rtol=1e-5, atol=1e-5
-                        )
-                        self.assertEqual(
-                            actual.argmax().item(), expected.argmax().item()
-                        )
+        model = PonderaModel(
+            segments=[
+                {"blocks": [{"attention": "kda", "group_end": True}]},
+                {
+                    "repeat": 2,
+                    "blocks": ["kda", {"attention": "softmax", "group_end": True}],
+                },
+                {
+                    "blocks": [
+                        {"attention": "softmax", "value_source": "token_embedding"}
+                    ]
+                },
+            ],
+            block_attn_res=True,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            num_kv_heads=1,
+            vocab_size=CHESS_VOCAB_SIZE,
+        ).eval()
+        predictor = Predictor(model, MergeDictionary(), {})
+        state = _DecodeState()
+        with torch.inference_mode():
+            # Inserting FINAL can leave two tokens to prefill together.
+            for length in (0, 1, 2, 4, 5, 6):
+                context = torch.tensor(prefix + tokens[:length])
+                expected = model(context, [0, len(context)])[-1]
+                actual = predictor._next_logits(prefix, tokens[:length], state)
+                torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+                self.assertEqual(actual.argmax().item(), expected.argmax().item())
 
     def test_chess_path_reads_are_causal_across_packing_and_cached_decode(self):
         torch.manual_seed(640)
@@ -196,63 +166,72 @@ class GenerationTests(unittest.TestCase):
         packed = document.repeat(2)
         first, length = len(prefix), len(document)
         config = dict(
-            num_blocks=4,
+            segments=[
+                {"blocks": [{"attention": "kda", "group_end": True}]},
+                {
+                    "repeat": 2,
+                    "blocks": [
+                        "kda",
+                        {"attention": "softmax", "navigation": True, "group_end": True},
+                    ],
+                },
+                {
+                    "blocks": [
+                        {"attention": "softmax", "value_source": "token_embedding"}
+                    ]
+                },
+            ],
+            block_attn_res=True,
             hidden_size=16,
             intermediate_size=32,
             num_heads=2,
             num_kv_heads=1,
-            softmax_every=4,
             vocab_size=CHESS_VOCAB_SIZE + 1,
         )
-        for model_class in (
-            TokenValueNavigationModel,
-            TokenValueBlockAttnResNavigationModel,
-        ):
-            with (
-                self.subTest(architecture=model_class.architecture),
-                torch.inference_mode(),
-            ):
-                model = model_class(**config)
-                model.navigation.query.normal_(std=0.25)
-                with TemporaryDirectory() as directory:
-                    path = Path(directory) / "checkpoint.pth"
-                    torch.save(
-                        dict(
-                            arch=model.architecture,
-                            model_config=config,
-                            model_state_dict=model.state_dict(),
-                            tokenizer_identity={"merge_entries": dictionary.entries},
-                        ),
-                        path,
-                    )
-                    predictor = load_checkpoint(path)
-                model = predictor.model
-                receivers, senders = model.navigation.prepare(
-                    packed.numpy(), [0, length, 2 * length]
+        with torch.inference_mode():
+            model = PonderaModel(**config)
+            for read in model.depth_reads:
+                read.query.normal_(std=0.15)
+            model.navigation["2"].query.normal_(std=0.25)
+            with TemporaryDirectory() as directory:
+                path = Path(directory) / "checkpoint.pth"
+                torch.save(
+                    dict(
+                        arch=model.architecture,
+                        model_config=config,
+                        model_state_dict=model.state_dict(),
+                        tokenizer_identity={"merge_entries": dictionary.entries},
+                    ),
+                    path,
                 )
-                # BACK returns to the first MOVE. The second MOVE was written last.
-                self.assertEqual(
-                    receivers.tolist(),
-                    [first + 2, first + 4, length + first + 2, length + first + 4],
-                )
-                self.assertEqual(
-                    senders[[0, 2]].tolist(),
-                    [[first, first + 1], [length + first, length + first + 1]],
-                )
-                full = model(document, [0, length])
+                predictor = load_checkpoint(path)
+            model = predictor.model
+            receivers, senders = model.prepare_navigation(
+                packed.numpy(), [0, length, 2 * length]
+            )
+            # BACK returns to the first MOVE. The second MOVE was written last.
+            self.assertEqual(
+                receivers.tolist(),
+                [first + 2, first + 4, length + first + 2, length + first + 4],
+            )
+            self.assertEqual(
+                senders[[0, 2]].tolist(),
+                [[first, first + 1], [length + first, length + first + 1]],
+            )
+            full = model(document, [0, length])
+            torch.testing.assert_close(
+                model(packed, [0, length, 2 * length])[length:], full
+            )
+            cache = _DecodeState()
+            for size in (0, 1, 2, 3, 4, 5, 7):
+                actual = predictor._next_logits(prefix, trace[:size], cache)
                 torch.testing.assert_close(
-                    model(packed, [0, length, 2 * length])[length:], full
+                    actual, full[first + size - 1], atol=1e-5, rtol=1e-5
                 )
-                cache = _DecodeState()
-                for size in (0, 1, 2, 3, 4, 5, 7):
-                    actual = predictor._next_logits(prefix, trace[:size], cache)
-                    torch.testing.assert_close(
-                        actual, full[first + size - 1], atol=1e-5, rtol=1e-5
-                    )
 
-    def model(self, model_class):
-        model = model_class(
-            num_blocks=1,
+    def model(self):
+        model = PonderaModel(
+            segments=[{"blocks": ["softmax"]}],
             hidden_size=16,
             intermediate_size=32,
             num_heads=2,
@@ -268,49 +247,46 @@ class GenerationTests(unittest.TestCase):
     def test_unconstrained_generation_budgets_count_model_steps(self):
         # Zero logits choose token 0, a board atom, at every step. An answer
         # mask or repair would change these analytically fixed outputs.
-        for model_class in (VanillaModel, LinearVanillaModel):
-            with self.subTest(architecture=model_class.architecture):
-                predictor = Predictor(self.model(model_class), MergeDictionary(), {})
-                result = predictor.generate(
-                    chess.STARTING_FEN, reasoning_tokens=3, answer_tokens=4
-                )
-                self.assertEqual(result.tokens, [0, 0, 0, FINAL, 0, 0, 0, 0])
-                self.assertEqual(
-                    (
-                        result.reasoning_tokens,
-                        result.answer_tokens,
-                        result.generated_tokens,
-                    ),
-                    (3, 4, 7),
-                )
-                self.assertTrue(result.forced_final)
-                self.assertFalse(result.answer.valid)
-                zero = predictor.generate(
-                    chess.STARTING_FEN, reasoning_tokens=0, answer_tokens=2
-                )
-                self.assertEqual(zero.tokens, [FINAL, 0, 0])
-                self.assertEqual(zero.generated_tokens, 2)
+        predictor = Predictor(self.model(), MergeDictionary(), {})
+        result = predictor.generate(
+            chess.STARTING_FEN, reasoning_tokens=3, answer_tokens=4
+        )
+        self.assertEqual(result.tokens, [0, 0, 0, FINAL, 0, 0, 0, 0])
+        self.assertEqual(
+            (
+                result.reasoning_tokens,
+                result.answer_tokens,
+                result.generated_tokens,
+            ),
+            (3, 4, 7),
+        )
+        self.assertTrue(result.forced_final)
+        self.assertFalse(result.answer.valid)
+        zero = predictor.generate(
+            chess.STARTING_FEN, reasoning_tokens=0, answer_tokens=2
+        )
+        self.assertEqual(zero.tokens, [FINAL, 0, 0])
+        self.assertEqual(zero.generated_tokens, 2)
 
     def test_natural_end_is_never_repaired(self):
-        for model_class in (VanillaModel, LinearVanillaModel):
-            model = self.model(model_class)
-            with torch.no_grad():
-                model.token_embedding.weight.fill_(1)
-                model.head.weight[END].fill_(1)
-            predictor = Predictor(model, MergeDictionary(), {})
-            result = predictor.generate(
-                chess.STARTING_FEN, reasoning_tokens=3, answer_tokens=4
-            )
-            self.assertEqual(result.tokens, [END])
-            self.assertEqual(result.stop, "end_before_final")
-            self.assertFalse(result.forced_final)
-            self.assertFalse(result.answer.valid)
-            result = predictor.generate(chess.STARTING_FEN, answer_tokens=4)
-            self.assertEqual(result.tokens, [FINAL, END])
-            self.assertFalse(result.answer.valid)
+        model = self.model()
+        with torch.no_grad():
+            model.token_embedding.weight.fill_(1)
+            model.head.weight[END].fill_(1)
+        predictor = Predictor(model, MergeDictionary(), {})
+        result = predictor.generate(
+            chess.STARTING_FEN, reasoning_tokens=3, answer_tokens=4
+        )
+        self.assertEqual(result.tokens, [END])
+        self.assertEqual(result.stop, "end_before_final")
+        self.assertFalse(result.forced_final)
+        self.assertFalse(result.answer.valid)
+        result = predictor.generate(chess.STARTING_FEN, answer_tokens=4)
+        self.assertEqual(result.tokens, [FINAL, END])
+        self.assertFalse(result.answer.valid)
 
     def test_uci_move_can_depend_on_generated_reasoning(self):
-        model = self.model(VanillaModel)
+        model = self.model()
         with torch.no_grad():
             model.token_embedding.weight[:, 3] = 1
             model.token_embedding.weight[FINAL, 3] = 0

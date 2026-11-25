@@ -13,7 +13,6 @@ import torch.nn.functional as F
 
 from pondera.data.packing import PackedDocuments, assemble_batch, pack_batches
 from pondera.inference.trace import load_checkpoint
-from pondera.models.temporal_navigation import TokenValueNavigationModel
 
 
 @torch.inference_mode()
@@ -56,8 +55,8 @@ def evaluate_loss(
         labels = torch.as_tensor(batch["labels"], dtype=torch.long, device=device)
         offsets = batch["cu_seqlens"].tolist()
         options = {}
-        if isinstance(predictor.model, TokenValueNavigationModel):
-            options["navigation_reads"] = predictor.model.navigation.prepare(
+        if predictor.model.navigation:
+            options["navigation_reads"] = predictor.model.prepare_navigation(
                 batch["input_ids"], offsets
             )
         with torch.autocast(

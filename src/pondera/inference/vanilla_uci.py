@@ -3,20 +3,30 @@
 import argparse
 from functools import partial
 
+import chess
+import torch
+
+from pondera.chess.symmetry import reflect_uci
 from pondera.chess.tracker import repetition_count
+from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
 from pondera.inference.trace import load_checkpoint
 from pondera.inference.uci import serve
-from pondera.inference.vanilla import (
-    choose_legal_move,
-    choose_move,
-    load_vanilla_checkpoint,
-)
 
 
-def pick(model, board, device):
-    if board.is_game_over():
-        return "0000"
-    return choose_move(model, board.fen(), repetition=repetition_count(board))
+def choose_legal_move(logits, fen, legal_moves=None):
+    """Select a legal action from one vocabulary-wide root decision."""
+    position = chess.Board(fen)
+    if legal_moves is None:
+        legal_moves = [move.uci() for move in position.legal_moves]
+    candidates = [
+        (MOVE + UCI_MOVE_TO_IDX[reflect_uci(uci) if not position.turn else uci], uci)
+        for uci in legal_moves
+        if uci in UCI_MOVE_TO_IDX
+    ]
+    if not candidates:
+        raise ValueError("No legal move has a vocabulary token")
+    tokens = torch.tensor([token for token, _ in candidates], device=logits.device)
+    return candidates[int(logits[tokens].float().argmax())][1]
 
 
 def pick_with_reasoning(predictor, board, device, *, reasoning_tokens):
@@ -35,24 +45,11 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--reasoning-tokens", type=int, default=0)
     parser.add_argument("--loop-repetitions", type=int)
-    parser.add_argument(
-        "--acl-graph",
-        action="store_true",
-        help="Replay fixed-shape KDA segments on Ascend",
-    )
     args = parser.parse_args()
     if args.reasoning_tokens < 0:
         parser.error("--reasoning-tokens must be nonnegative")
-    if args.reasoning_tokens or args.acl_graph:
-        picker = partial(pick_with_reasoning, reasoning_tokens=args.reasoning_tokens)
-        load = partial(
-            load_checkpoint,
-            loop_repetitions=args.loop_repetitions,
-            acl_graph=args.acl_graph,
-        )
-    else:
-        picker = pick
-        load = partial(load_vanilla_checkpoint, loop_repetitions=args.loop_repetitions)
+    picker = partial(pick_with_reasoning, reasoning_tokens=args.reasoning_tokens)
+    load = partial(load_checkpoint, loop_repetitions=args.loop_repetitions)
     if args.device.split(":", 1)[0] == "npu":
         import torch_npu
 

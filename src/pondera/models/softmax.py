@@ -1,18 +1,9 @@
-"""Vanilla causal transformer over one packed token stream.
-
-Full causal attention, NoPE, pre-norm RMSNorm, SiTU-GLU feed-forward, and
-grouped-query attention. No position encoding of any kind; the causal mask
-is the only positional signal. The forward path consumes packed documents
-through ``cu_seqlens`` and never materializes an L×L mask.
-"""
+"""Packed causal grouped-query softmax attention and block operations."""
 
 from functools import cache
 
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
-
-from pondera.models.move_head import FactorizedMoveHead
 
 
 class RMSNorm(nn.Module):
@@ -177,117 +168,3 @@ class CausalSelfAttention(nn.Module):
             varlen_attention(q, k, v, cu_seqlens, q.shape[0] == k.shape[0]).flatten(1)
         )
         return out, (k, v)
-
-
-class Block(nn.Module):
-    def __init__(
-        self,
-        hidden_size,
-        intermediate_size,
-        num_heads,
-        num_kv_heads,
-        attention_cls=None,
-    ):
-        super().__init__()
-        self.norm_attention = RMSNorm(hidden_size)
-        attention_cls = attention_cls or CausalSelfAttention
-        self.attention = attention_cls(hidden_size, num_heads, num_kv_heads)
-        self.norm_ffn = RMSNorm(hidden_size)
-        self.gate = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down = nn.Linear(intermediate_size, hidden_size, bias=False)
-
-    def _ffn(self, x):
-        return self.down(situ_glu(self.gate(x), self.up(x)))
-
-    def forward(self, x, prepared, residual_scale=1.0):
-        x = torch.add(
-            x, self.attention(self.norm_attention(x), prepared), alpha=residual_scale
-        )
-        return torch.add(x, self._ffn(self.norm_ffn(x)), alpha=residual_scale)
-
-    def forward_cached(self, x, cu_seqlens, cache=None, residual_scale=1.0):
-        attended, new_cache = self.attention.forward_cached(
-            self.norm_attention(x), cu_seqlens, cache
-        )
-        x = torch.add(x, attended, alpha=residual_scale)
-        return torch.add(
-            x, self._ffn(self.norm_ffn(x)), alpha=residual_scale
-        ), new_cache
-
-
-class VanillaModel(nn.Module):
-    """Vanilla transformer with a replaceable attention core."""
-
-    attention_cls = None
-    block_cls = Block
-    architecture = "vanilla"
-
-    def __init__(
-        self,
-        num_blocks,
-        hidden_size,
-        intermediate_size,
-        num_heads,
-        num_kv_heads,
-        vocab_size,
-        factorized_move_head=False,
-    ):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.activation_checkpointing = False
-        self.token_embedding = nn.Embedding(vocab_size, hidden_size)
-        nn.init.normal_(self.token_embedding.weight, std=0.02)
-        self.blocks = nn.ModuleList(
-            self.block_cls(
-                hidden_size,
-                intermediate_size,
-                num_heads,
-                num_kv_heads,
-                self.attention_type(index),
-            )
-            for index in range(num_blocks)
-        )
-        self.norm = RMSNorm(hidden_size)
-        self.head = (
-            FactorizedMoveHead(hidden_size, vocab_size)
-            if factorized_move_head
-            else nn.Linear(hidden_size, vocab_size, bias=False)
-        )
-
-    def attention_type(self, index):
-        return self.attention_cls or CausalSelfAttention
-
-    def prepare(self, cu_seqlens, device):
-        prepared = {}
-        for block in self.blocks:
-            attention_type = type(block.attention)
-            if attention_type not in prepared:
-                prepared[attention_type] = attention_type.prepare(cu_seqlens, device)
-        return prepared
-
-    def forward(self, input_ids, cu_seqlens):
-        prepared = self.prepare(cu_seqlens, input_ids.device)
-        x = self.token_embedding(input_ids)
-        for block in self.blocks:
-            metadata = prepared[type(block.attention)]
-            if self.training and self.activation_checkpointing:
-                x = checkpoint(block, x, metadata, use_reentrant=False)
-            else:
-                x = block(x, metadata)
-        return self.head(self.norm(x))
-
-    def forward_cached(self, input_ids, cu_seqlens, caches=None):
-        x = self.token_embedding(input_ids)
-        new_caches = []
-        for index, block in enumerate(self.blocks):
-            cache = None if caches is None else caches[index]
-            x, new_cache = block.forward_cached(x, cu_seqlens, cache)
-            new_caches.append(new_cache)
-        return self.head(self.norm(x)), new_caches
-
-    def non_embedding_parameters(self):
-        return (
-            sum(p.numel() for p in self.parameters())
-            - self.token_embedding.weight.numel()
-        )
