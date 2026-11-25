@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from pondera.data.packing import PackedDocuments, assemble_batch, pack_batches
 from pondera.inference.trace import load_checkpoint
+from pondera.models.temporal_navigation import TokenValueNavigationModel
 
 
 @torch.inference_mode()
@@ -53,12 +54,18 @@ def evaluate_loss(
         batch = assemble_batch(documents, batch_indices)
         inputs = torch.as_tensor(batch["input_ids"], dtype=torch.long, device=device)
         labels = torch.as_tensor(batch["labels"], dtype=torch.long, device=device)
+        offsets = batch["cu_seqlens"].tolist()
+        options = {}
+        if isinstance(predictor.model, TokenValueNavigationModel):
+            options["navigation_reads"] = predictor.model.navigation.prepare(
+                batch["input_ids"], offsets
+            )
         with torch.autocast(
             device_type=device_type,
             dtype=torch.bfloat16,
             enabled=device_type in {"cuda", "npu"},
         ):
-            logits = predictor.model(inputs, batch["cu_seqlens"].tolist())
+            logits = predictor.model(inputs, offsets, **options)
         losses = (
             F.cross_entropy(logits.float(), labels, reduction="none", ignore_index=-100)
             .cpu()

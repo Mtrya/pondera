@@ -7,6 +7,12 @@ from pondera.models.gdn2 import GatedDeltaNet2Model
 from pondera.models.kalman import KalmanDeltaModel
 from pondera.models.linear import LinearVanillaModel
 from pondera.models.looped import LoopedModel, RecurrentDepthModel
+from pondera.models.temporal_navigation import (
+    TokenValueBlockAttnResNavigationModel,
+    TokenValueNavigationModel,
+)
+from pondera.models.token_value import KimiDeltaTokenValueModel
+from pondera.models.token_value_attn_res import TokenValueBlockAttnResModel
 from pondera.models.vanilla import VanillaModel
 
 MODEL_CLASSES = {
@@ -18,6 +24,10 @@ MODEL_CLASSES = {
         RecurrentDepthModel,
         GatedDeltaModel,
         KimiDeltaModel,
+        KimiDeltaTokenValueModel,
+        TokenValueBlockAttnResModel,
+        TokenValueNavigationModel,
+        TokenValueBlockAttnResNavigationModel,
         GatedDeltaNet2Model,
         CyclicFlowModel,
         KalmanDeltaModel,

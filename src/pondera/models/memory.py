@@ -39,7 +39,13 @@ class CausalConvolution(nn.Conv1d):
     def forward_cached(self, x, prepared, cache=None):
         if cache is None:
             result = self(x, prepared)
-            history = F.pad(x, (0, 0, max(0, 3 - x.shape[0]), 0))[-3:]
+            tail = x[-3:]
+            # Keep the tail without retaining the full prefill projection.
+            history = (
+                F.pad(tail, (0, 0, 3 - tail.shape[0], 0))
+                if tail.shape[0] < 3
+                else tail.clone()
+            )
         else:
             window = torch.cat((cache, x), dim=0)
             result = self.activate(
@@ -81,11 +87,15 @@ class RecurrentAttention(nn.Module):
         )
 
     def _project_cached(self, x, prepared, histories):
+        projections = (projection(x) for projection in (self.q, self.k, self.v))
+        return self._convolve_cached(projections, prepared, histories)
+
+    def _convolve_cached(self, projections, prepared, histories):
         vectors, new_histories = [], []
-        for projection, conv, history in zip(
-            (self.q, self.k, self.v), (self.q_conv, self.k_conv, self.v_conv), histories
+        for projected, conv, history in zip(
+            projections, (self.q_conv, self.k_conv, self.v_conv), histories
         ):
-            vector, tail = conv.forward_cached(projection(x), prepared, history)
+            vector, tail = conv.forward_cached(projected, prepared, history)
             vectors.append(vector)
             new_histories.append(tail)
         return vectors, tuple(new_histories)
@@ -94,12 +104,15 @@ class RecurrentAttention(nn.Module):
         output, _ = self._memory(self._project(x, prepared), x, prepared)
         return self._output(x, output)
 
+    def _prepare_cached(self, x, cache):
+        return self.prepare([0, x.shape[0]], x.device)
+
     def forward_cached(self, x, cu_seqlens, cache=None):
         if cache is not None and x.shape[0] != 1:
             raise ValueError("Cached memory decoding consumes one new token")
         if len(cu_seqlens) != 2:
             raise ValueError("Cached decoding requires one document")
-        prepared = self.prepare([0, x.shape[0]], x.device)
+        prepared = self._prepare_cached(x, cache)
         memory, histories = (None, (None, None, None)) if cache is None else cache
         vectors, new_histories = self._project_cached(x, prepared, histories)
         output, state = self._memory(vectors, x, prepared, memory, True)

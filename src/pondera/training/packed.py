@@ -25,6 +25,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
+from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import FINAL
 from pondera.data.packing import (
     PackedDocuments,
@@ -34,6 +35,7 @@ from pondera.data.packing import (
     select_documents,
 )
 from pondera.models import MODEL_CLASSES, LoopedModel
+from pondera.models.temporal_navigation import TokenValueNavigationModel
 from pondera.training.config import DEFAULT_CONFIG_PATH, TrainConfig, load_config
 from pondera.training.muon import build_optimizers
 
@@ -97,6 +99,7 @@ def _supervise(batch, objective):
 
 def _move(batch, device):
     moved = {
+        "host_input_ids": batch["input_ids"],
         "input_ids": torch.as_tensor(
             batch["input_ids"], dtype=torch.long, device=device
         ),
@@ -112,13 +115,19 @@ def _move(batch, device):
 
 
 def _forward(model, batch):
-    device_type = _module(model).token_embedding.weight.device.type
+    raw_model = _module(model)
+    device_type = raw_model.token_embedding.weight.device.type
+    options = {}
+    if isinstance(raw_model, TokenValueNavigationModel) and "host_input_ids" in batch:
+        options["navigation_reads"] = raw_model.navigation.prepare(
+            batch["host_input_ids"], batch["cu_seqlens"]
+        )
     with torch.autocast(
         device_type=device_type,
         dtype=torch.bfloat16,
         enabled=device_type in {"cuda", "npu"},
     ):
-        return model(batch["input_ids"], batch["cu_seqlens"])
+        return model(batch["input_ids"], batch["cu_seqlens"], **options)
 
 
 def _loss(model, batch, decision_weight=0.0):
@@ -259,6 +268,8 @@ def train(
     if world_size > 1:
         dist.barrier()
     documents = PackedDocuments(packed_dir)
+    if isinstance(model, TokenValueNavigationModel):
+        model.bind_tokenizer(MergeDictionary(documents.manifest["merge_entries"]))
     cap = (
         documents.manifest["max_document_tokens"]
         if config.max_document_tokens is None

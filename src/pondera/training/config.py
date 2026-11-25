@@ -141,6 +141,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "softmax_every",
             "num_slots",
             "context_rank",
+            "factorized_move_head",
             *_MODEL_DIMENSIONS,
         },
     )
@@ -156,6 +157,8 @@ def load_config(path=DEFAULT_CONFIG_PATH):
         )
     for name in _MODEL_DIMENSIONS:
         _integer("model", name, model[name], 1)
+    if type(model.get("factorized_move_head", False)) is not bool:
+        raise ValueError("[model] factorized_move_head must be a boolean")
     if "loop_repetitions" in model:
         if model["architecture"] not in {"looped", "recurrent"}:
             raise ValueError(
@@ -202,6 +205,10 @@ def load_config(path=DEFAULT_CONFIG_PATH):
             "gdn",
             "gdn2",
             "kda",
+            "kda_token_value",
+            "kda_token_value_block_attn_res",
+            "kda_token_value_navigation",
+            "kda_token_value_block_attn_res_navigation",
             "kdn",
             "cyfa",
             "looped",

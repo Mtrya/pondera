@@ -12,6 +12,8 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from pondera.models.move_head import FactorizedMoveHead
+
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -20,6 +22,10 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        if x.device.type == "npu" and x.dtype == self.weight.dtype == torch.float32:
+            import torch_npu
+
+            return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
         variance = x.float().pow(2).mean(-1, keepdim=True)
         return (x * torch.rsqrt(variance + self.eps)).to(x.dtype) * self.weight
 
@@ -138,33 +144,37 @@ class CausalSelfAttention(nn.Module):
         self.v = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
         self.o = nn.Linear(hidden_size, hidden_size, bias=False)
 
-    def _project(self, x):
+    def _project(self, x, *, value_input=None):
         shape = (x.shape[0], self.num_kv_heads, self.head_dim)
         return (
             self.q(x).view(x.shape[0], self.num_heads, self.head_dim),
             self.k(x).view(shape),
-            self.v(x).view(shape),
+            self.v(x if value_input is None else value_input).view(shape),
         )
 
     def forward(self, x, prepared):
-        cu_seqlens, maximum, ends = prepared
         q, k, v = self._project(x)
+        return self.attend_projected(q, k, v, prepared)
+
+    def attend_projected(self, q, k, v, prepared):
+        cu_seqlens, maximum, ends = prepared
         return self.o(
             varlen_attention(
                 q, k, v, cu_seqlens, max_seqlen=maximum, sequence_ends=ends
-            ).reshape(x.shape)
+            ).flatten(1)
         )
 
     def forward_cached(self, x, cu_seqlens, cache=None):
         """One full sequence or an incremental step; cache is per-layer (k, v)."""
         q, k, v = self._project(x)
+        return self.attend_projected_cached(q, k, v, cu_seqlens, cache)
+
+    def attend_projected_cached(self, q, k, v, cu_seqlens, cache):
         if cache is not None:
             k = torch.cat([cache[0], k], dim=0)
             v = torch.cat([cache[1], v], dim=0)
         out = self.o(
-            varlen_attention(q, k, v, cu_seqlens, q.shape[0] == k.shape[0]).reshape(
-                x.shape
-            )
+            varlen_attention(q, k, v, cu_seqlens, q.shape[0] == k.shape[0]).flatten(1)
         )
         return out, (k, v)
 
@@ -221,6 +231,7 @@ class VanillaModel(nn.Module):
         num_heads,
         num_kv_heads,
         vocab_size,
+        factorized_move_head=False,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -238,7 +249,11 @@ class VanillaModel(nn.Module):
             for index in range(num_blocks)
         )
         self.norm = RMSNorm(hidden_size)
-        self.head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.head = (
+            FactorizedMoveHead(hidden_size, vocab_size)
+            if factorized_move_head
+            else nn.Linear(hidden_size, vocab_size, bias=False)
+        )
 
     def attention_type(self, index):
         return self.attention_cls or CausalSelfAttention

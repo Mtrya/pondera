@@ -35,15 +35,28 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--reasoning-tokens", type=int, default=0)
     parser.add_argument("--loop-repetitions", type=int)
+    parser.add_argument(
+        "--acl-graph",
+        action="store_true",
+        help="Replay fixed-shape KDA segments on Ascend",
+    )
     args = parser.parse_args()
     if args.reasoning_tokens < 0:
         parser.error("--reasoning-tokens must be nonnegative")
-    if args.reasoning_tokens:
+    if args.reasoning_tokens or args.acl_graph:
         picker = partial(pick_with_reasoning, reasoning_tokens=args.reasoning_tokens)
-        load = partial(load_checkpoint, loop_repetitions=args.loop_repetitions)
+        load = partial(
+            load_checkpoint,
+            loop_repetitions=args.loop_repetitions,
+            acl_graph=args.acl_graph,
+        )
     else:
         picker = pick
         load = partial(load_vanilla_checkpoint, loop_repetitions=args.loop_repetitions)
+    if args.device.split(":", 1)[0] == "npu":
+        import torch_npu
+
+        torch_npu.npu.set_device(args.device)
     serve(args.checkpoint, args.device, load=load, pick=picker)
 
 

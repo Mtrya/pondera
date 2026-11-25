@@ -1,6 +1,8 @@
 """Expanded-answer contracts and generic generation on real model variants."""
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import chess
 import torch
@@ -16,10 +18,16 @@ from pondera.chess.vocabulary import (
     MATE_LOSS,
     MATE_WIN,
     MOVE,
+    RESET,
     UCI_MOVE_TO_IDX,
     VALUE,
 )
-from pondera.inference.trace import Predictor, _DecodeState, parse_answer
+from pondera.inference.trace import (
+    Predictor,
+    _DecodeState,
+    load_checkpoint,
+    parse_answer,
+)
 from pondera.inference.vanilla_uci import pick_with_reasoning
 from pondera.models.board_context import BoardContextModel, SymbolicBoardModel
 from pondera.models.cyfa import CyclicFlowModel
@@ -27,6 +35,10 @@ from pondera.models.gdn2 import GatedDeltaNet2Model
 from pondera.models.kalman import KalmanDeltaModel
 from pondera.models.linear import LinearVanillaModel
 from pondera.models.looped import LoopedModel, RecurrentDepthModel
+from pondera.models.temporal_navigation import (
+    TokenValueBlockAttnResNavigationModel,
+    TokenValueNavigationModel,
+)
 from pondera.models.vanilla import VanillaModel
 
 
@@ -173,6 +185,70 @@ class GenerationTests(unittest.TestCase):
                         self.assertEqual(
                             actual.argmax().item(), expected.argmax().item()
                         )
+
+    def test_chess_path_reads_are_causal_across_packing_and_cached_decode(self):
+        torch.manual_seed(640)
+        dictionary = MergeDictionary([(BACK, VALUE + 10)])
+        prefix = encode_board(chess.STARTING_FEN).tolist()
+        e4, e5, back = move("e2e4"), move("e7e5"), CHESS_VOCAB_SIZE
+        trace = [e4, e5, back, move("c7c5"), RESET, FINAL, e4]
+        document = torch.tensor(prefix + trace)
+        packed = document.repeat(2)
+        first, length = len(prefix), len(document)
+        config = dict(
+            num_blocks=4,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            num_kv_heads=1,
+            softmax_every=4,
+            vocab_size=CHESS_VOCAB_SIZE + 1,
+        )
+        for model_class in (
+            TokenValueNavigationModel,
+            TokenValueBlockAttnResNavigationModel,
+        ):
+            with (
+                self.subTest(architecture=model_class.architecture),
+                torch.inference_mode(),
+            ):
+                model = model_class(**config)
+                model.navigation.query.normal_(std=0.25)
+                with TemporaryDirectory() as directory:
+                    path = Path(directory) / "checkpoint.pth"
+                    torch.save(
+                        dict(
+                            arch=model.architecture,
+                            model_config=config,
+                            model_state_dict=model.state_dict(),
+                            tokenizer_identity={"merge_entries": dictionary.entries},
+                        ),
+                        path,
+                    )
+                    predictor = load_checkpoint(path)
+                model = predictor.model
+                receivers, senders = model.navigation.prepare(
+                    packed.numpy(), [0, length, 2 * length]
+                )
+                # BACK returns to the first MOVE. The second MOVE was written last.
+                self.assertEqual(
+                    receivers.tolist(),
+                    [first + 2, first + 4, length + first + 2, length + first + 4],
+                )
+                self.assertEqual(
+                    senders[[0, 2]].tolist(),
+                    [[first, first + 1], [length + first, length + first + 1]],
+                )
+                full = model(document, [0, length])
+                torch.testing.assert_close(
+                    model(packed, [0, length, 2 * length])[length:], full
+                )
+                cache = _DecodeState()
+                for size in (0, 1, 2, 3, 4, 5, 7):
+                    actual = predictor._next_logits(prefix, trace[:size], cache)
+                    torch.testing.assert_close(
+                        actual, full[first + size - 1], atol=1e-5, rtol=1e-5
+                    )
 
     def model(self, model_class):
         model = model_class(

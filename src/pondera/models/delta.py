@@ -236,6 +236,29 @@ class GatedDeltaAttention(RecurrentAttention):
 class KimiDeltaAttention(GatedDeltaAttention):
     channel_decay = True
 
+    def _project_cached(self, x, prepared, histories):
+        if (
+            x.device.type != "npu"
+            or torch.is_grad_enabled()
+            or any(history is None for history in histories)
+        ):
+            return super()._project_cached(x, prepared, histories)
+
+        from pondera.models.short_conv_npu import short_convolution_step
+
+        projections = self.q(x), self.k(x), self.v(x)
+        weights = self.q_conv.weight, self.k_conv.weight, self.v_conv.weight
+        fused = short_convolution_step(projections, weights, histories)
+        if fused is not None:
+            return fused
+        return self._convolve_cached(projections, prepared, histories)
+
+    def _prepare_cached(self, x, cache):
+        if cache is not None and x.device.type == "npu" and not torch.is_grad_enabled():
+            # One sequence of one token uses the batched recurrent kernel.
+            return None, None
+        return super()._prepare_cached(x, cache)
+
 
 class GatedDeltaModel(HybridModel):
     architecture = "gdn"
