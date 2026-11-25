@@ -29,7 +29,12 @@ class TrainConfig:
     checkpoint_every: int = 50
     checkpoint_keep_last: int = 3
     seed: int = 640
+    init_seed: int | None = None
     activation_checkpointing: bool = True
+
+    @property
+    def initialization_seed(self):
+        return self.seed if self.init_seed is None else self.init_seed
 
     def validate(self):
         if type(self.activation_checkpointing) is not bool:
@@ -57,6 +62,7 @@ class TrainConfig:
             "checkpoint_every",
             "checkpoint_keep_last",
             "seed",
+            "init_seed",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -64,7 +70,9 @@ class TrainConfig:
                     "training",
                     name,
                     value,
-                    0 if name in {"val_every", "checkpoint_every", "seed"} else 1,
+                    0
+                    if name in {"val_every", "checkpoint_every", "seed", "init_seed"}
+                    else 1,
                 )
         for name in ("muon_lr", "adamw_lr", "adamw_weight_decay", "presentations"):
             value = getattr(self, name)

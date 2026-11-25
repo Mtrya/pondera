@@ -276,6 +276,28 @@ checkpoint_keep_last = 2
             env={**os.environ, "OMP_NUM_THREADS": "1"},
         )
 
+    def test_init_seed_changes_weights_without_changing_document_selection(self):
+        recipe = self.root / "model.toml"
+        self.write_training_recipe(recipe, updates=1)
+        recipe_text = recipe.read_text()
+        states = {}
+        for init_seed in (None, 11, 0):
+            if init_seed is not None:
+                recipe.write_text(f"{recipe_text}\ninit_seed = {init_seed}\n")
+            output = self.root / f"init-{init_seed}"
+            result = self.run_training_command(recipe, output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            states[init_seed] = torch.load(output / "checkpoint.pth", weights_only=True)
+            self.assertEqual(states[init_seed]["train_config"]["init_seed"], init_seed)
+
+        self.assertEqual(
+            states[None]["document_indices"], states[0]["document_indices"]
+        )
+        name = "token_embedding.weight"
+        reference = states[None]["model_state_dict"][name]
+        self.assertTrue(torch.equal(reference, states[11]["model_state_dict"][name]))
+        self.assertFalse(torch.equal(reference, states[0]["model_state_dict"][name]))
+
     def test_toml_training_and_resume_match_uninterrupted_training(self):
         recipe = self.root / "model.toml"
         full = self.root / "full"
@@ -863,6 +885,7 @@ checkpoint_keep_last = 2
         checkpoint = output / "checkpoint.pth"
         for field, value in (
             ("seed", self.config(2).seed + 1),
+            ("init_seed", self.config(2).seed + 1),
             ("microbatch_tokens", self.config(2).microbatch_tokens + 1),
             ("optimizer", "muon"),
         ):

@@ -26,6 +26,8 @@ blocks = [
 
 [training]
 seed = 640
+# Omit init_seed to initialize weights with seed. The document order uses seed.
+# init_seed = 641
 # Recompute block activations during backward to fit long documents.
 activation_checkpointing = true
 # Hidden matrices use Hyperball. Set optimizer = "muon" for the unconstrained update.

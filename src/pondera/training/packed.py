@@ -308,10 +308,16 @@ def train(
                 raise ValueError(f"Resume {key} differs from checkpoint")
         if state["document_indices"] != indices.tolist():
             raise ValueError("Resume document selection differs from checkpoint")
+        saved_config = state["train_config"]
         for key in ("seed", "microbatch_tokens"):
-            if state["train_config"][key] != run_config["train_config"][key]:
+            if saved_config[key] != run_config["train_config"][key]:
                 raise ValueError(f"Resume {key} differs from checkpoint")
-        if state["train_config"]["optimizer"] != config.optimizer:
+        saved_init_seed = saved_config.get("init_seed")
+        if saved_init_seed is None:
+            saved_init_seed = saved_config["seed"]
+        if saved_init_seed != config.initialization_seed:
+            raise ValueError("Resume init_seed differs from checkpoint")
+        if saved_config["optimizer"] != config.optimizer:
             raise ValueError("Resume optimizer differs from checkpoint")
         model.load_state_dict(state["model_state_dict"])
         for optimizer, saved in zip(
@@ -557,7 +563,7 @@ def main():
         **model_settings,
         "vocab_size": PackedDocuments(args.packed).manifest["vocabulary"],
     }
-    torch.manual_seed(config.seed)
+    torch.manual_seed(config.initialization_seed)
     model = PonderaModel(**model_config)
     result = train(
         model,
