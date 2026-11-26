@@ -1,13 +1,11 @@
 """Minimal trainer for the frozen packed batch contract.
 
-Muon owns hidden matrices, AdamW the rest (training/muon.py). One optimizer
-update consumes whole microbatches until its token target is met; each
-microbatch's next-token CE is normalized by that microbatch's supervised
-positions and weighted by its share of the update's actual labeled
-tokens. Resume starts at the saved number of consumed documents in a fixed
-selection and shuffled epoch order. With data parallelism the token target
-is global, ranks consume interleaved batches, and the DDP gradient average
-is rescaled to the global labeled-token count.
+Muon owns hidden matrices, AdamW the rest (training/muon.py). Each optimizer
+update has a global budget of whole-document packs. Each pack's next-token
+CE is weighted by its share of the update's labeled tokens. Resume starts
+at the saved number of consumed documents in a fixed selection and shuffled
+epoch order. Data-parallel ranks consume interleaved packs, and the DDP
+gradient average is rescaled to the global labeled-token count.
 """
 
 import importlib
@@ -333,7 +331,7 @@ def train(
     )
     validation_indices = np.flatnonzero(documents.split == 1)
     validation_budget = max(
-        config.microbatch_tokens,
+        config.max_pack_tokens,
         int(documents.lengths[validation_indices].max())
         if len(validation_indices)
         else 0,
@@ -341,9 +339,9 @@ def train(
     if not len(indices):
         raise ValueError("No eligible training documents selected")
     maximum = int(documents.lengths[indices].max())
-    if maximum > config.microbatch_tokens:
+    if maximum > config.max_pack_tokens:
         raise ValueError(
-            f"Selected document length {maximum} exceeds microbatch budget {config.microbatch_tokens}"
+            f"Selected document length {maximum} exceeds max_pack_tokens={config.max_pack_tokens}"
         )
     run_config = {
         "arch": model.architecture,
@@ -390,8 +388,8 @@ def train(
         if state["document_indices"] != indices.tolist():
             raise ValueError("Resume document selection differs from checkpoint")
         saved_config = state["train_config"]
-        for key in ("seed", "microbatch_tokens"):
-            if saved_config[key] != run_config["train_config"][key]:
+        for key in ("seed", "max_pack_tokens", "packs_per_update"):
+            if saved_config.get(key) != run_config["train_config"][key]:
                 raise ValueError(f"Resume {key} differs from checkpoint")
         saved_init_seed = saved_config.get("init_seed")
         if saved_init_seed is None:
@@ -459,7 +457,7 @@ def train(
         documents,
         indices,
         config.seed,
-        config.microbatch_tokens,
+        config.max_pack_tokens,
         start_document=presented_documents,
         presentations=config.presentations if schedule_documents is not None else None,
         max_documents=target_documents,
@@ -474,11 +472,12 @@ def train(
             total_labeled = 0
             total_tokens = 0
             last_epoch = 0
-            while total_tokens < config.update_tokens and (
+            packs_remaining = config.packs_per_update
+            while packs_remaining and (
                 target_documents is None or presented_documents < target_documents
             ):
                 local_indices = []
-                for batch_rank in range(world_size):
+                for batch_rank in range(min(world_size, packs_remaining)):
                     if (
                         target_documents is not None
                         and presented_documents >= target_documents
@@ -489,6 +488,7 @@ def train(
                     total_tokens += tokens
                     presented_documents += len(document_indices)
                     micro_step += 1
+                    packs_remaining -= 1
                     if batch_rank == rank:
                         local_indices = document_indices
                 batch = assemble_batch(documents, local_indices)

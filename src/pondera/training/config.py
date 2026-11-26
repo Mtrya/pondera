@@ -18,8 +18,8 @@ class TrainConfig:
     warmup_fraction: float = 0.05
     min_lr_ratio: float = 0.1
     adamw_weight_decay: float = 0.0
-    microbatch_tokens: int = 131_072
-    update_tokens: int = 524_288
+    max_pack_tokens: int = 131_072
+    packs_per_update: int = 8
     presentations: float = 1.0
     max_presented_documents: int | None = None
     documents: int | None = None
@@ -37,6 +37,8 @@ class TrainConfig:
         return self.seed if self.init_seed is None else self.init_seed
 
     def validate(self):
+        _integer("training", "max_pack_tokens", self.max_pack_tokens, 1)
+        _integer("training", "packs_per_update", self.packs_per_update, 1)
         if type(self.activation_checkpointing) is not bool:
             raise ValueError("[training] activation_checkpointing must be a boolean")
         if self.optimizer not in ("hyperball", "muon"):
@@ -52,8 +54,6 @@ class TrainConfig:
                 interval = "[0, 1)" if name == "warmup_fraction" else "[0, 1]"
                 raise ValueError(f"[training] {name} must be finite and in {interval}")
         for name in (
-            "microbatch_tokens",
-            "update_tokens",
             "documents",
             "max_presented_documents",
             "max_document_tokens",

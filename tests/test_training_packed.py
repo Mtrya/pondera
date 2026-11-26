@@ -203,13 +203,9 @@ class TrainerTests(unittest.TestCase):
         return PonderaModel(**self.model_config)
 
     def config(self, updates):
-        documents = PackedDocuments(self.root / "packed")
-        train_indices = select_documents(
-            PackedDocuments(self.root / "packed"), seed=640
-        )
         return TrainConfig(
-            microbatch_tokens=65_536,
-            update_tokens=2 * int(documents.lengths[train_indices].sum()),
+            max_pack_tokens=65_536,
+            packs_per_update=2,
             updates=updates,
             val_every=2,
             checkpoint_every=updates,
@@ -243,8 +239,8 @@ adamw_lr = 0.0007
 warmup_fraction = 0.5
 min_lr_ratio = 0.1
 adamw_weight_decay = 0.05
-microbatch_tokens = 1024
-update_tokens = 1
+max_pack_tokens = 1024
+packs_per_update = 1
 updates = {updates}
 documents = 3
 max_document_tokens = 65536
@@ -327,8 +323,8 @@ checkpoint_keep_last = 2
             },
         )
         self.assertEqual(actual["train_config"]["seed"], 11)
-        self.assertEqual(actual["train_config"]["microbatch_tokens"], 1024)
-        self.assertEqual(actual["train_config"]["update_tokens"], 1)
+        self.assertEqual(actual["train_config"]["max_pack_tokens"], 1024)
+        self.assertEqual(actual["train_config"]["packs_per_update"], 1)
         self.assertEqual(actual["train_config"]["checkpoint_keep_last"], 2)
         self.assertEqual(actual["train_config"]["warmup_fraction"], 0.5)
         self.assertEqual(actual["train_config"]["min_lr_ratio"], 0.1)
@@ -888,7 +884,8 @@ checkpoint_keep_last = 2
         for field, value in (
             ("seed", self.config(2).seed + 1),
             ("init_seed", self.config(2).seed + 1),
-            ("microbatch_tokens", self.config(2).microbatch_tokens + 1),
+            ("max_pack_tokens", self.config(2).max_pack_tokens + 1),
+            ("packs_per_update", self.config(2).packs_per_update + 1),
             ("optimizer", "muon"),
         ):
             with self.subTest(field=field):
@@ -1025,8 +1022,8 @@ checkpoint_keep_last = 2
             result = self.config(1)
             result.updates = None
             result.presentations = presentations
-            result.microbatch_tokens = int(documents.lengths.max())
-            result.update_tokens = 1
+            result.max_pack_tokens = int(documents.lengths.max())
+            result.packs_per_update = 1
             result.val_every = 0
             return result
 
@@ -1068,7 +1065,7 @@ checkpoint_keep_last = 2
                 documents,
                 select_documents(documents, seed=640),
                 640,
-                config(1.5).microbatch_tokens,
+                config(1.5).max_pack_tokens,
                 start_document=partial["presented_documents"],
                 presentations=1.5,
             )
@@ -1081,8 +1078,8 @@ checkpoint_keep_last = 2
         documents = PackedDocuments(self.root / "packed")
         config = self.config(1)
         config.updates = None
-        config.update_tokens = 1
-        config.microbatch_tokens = int(documents.lengths.max())
+        config.packs_per_update = 1
+        config.max_pack_tokens = int(documents.lengths.max())
         output = self.root / "stages"
         reference = train(
             self.make_model(),
@@ -1156,7 +1153,7 @@ checkpoint_keep_last = 2
 
     def test_distributed_matches_single_process_and_resume(self):
         config = self.config(2)
-        config.update_tokens *= 2
+        config.packs_per_update = 3
         config.val_every = 1
         reference = train(
             self.make_model(),
@@ -1192,6 +1189,7 @@ checkpoint_keep_last = 2
             actual.extend(rows[:1] if name == "partial" else rows)
         expected = reference["history"]
         self.assertEqual(len(actual), len(expected))
+        self.assertEqual([row["micro_step"] for row in actual], [3, 6])
         for observed, wanted in zip(actual, expected):
             for field in (
                 "update",
@@ -1229,7 +1227,8 @@ checkpoint_keep_last = 2
         indices = select_documents(PackedDocuments(self.root / "packed"), seed=640)
         config = self.config(1)
         config.updates = None
-        config.microbatch_tokens = int(documents.lengths.max())
+        config.max_pack_tokens = int(documents.lengths.max())
+        config.packs_per_update = 4
         config.val_every = 1
         batches = len(
             list(
@@ -1237,7 +1236,7 @@ checkpoint_keep_last = 2
                     documents,
                     indices,
                     config.seed,
-                    config.microbatch_tokens,
+                    config.max_pack_tokens,
                     presentations=1.0,
                 )
             )
