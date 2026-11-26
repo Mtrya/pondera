@@ -70,6 +70,8 @@ def _ddp_worker(rank, store, packed, model_config, output, config, runs):
                 resume=resume,
                 device="cpu",
                 track=False,
+                validation_internals=True,
+                validation_document_steps=(1, 2),
             )
     finally:
         dist.destroy_process_group()
@@ -605,7 +607,7 @@ checkpoint_keep_last = 2
         model = self.make_model()
         model.load_state_dict(state["model_state_dict"])
         model.eval()
-        loss, _ = validation_loss(
+        loss, _, _ = validation_loss(
             model, documents, 65536, "cpu", np.flatnonzero(splits == 1)
         )
         self.assertFalse(model.training)
@@ -626,7 +628,7 @@ checkpoint_keep_last = 2
         state = torch.load(checkpoint, weights_only=True)
         model.load_state_dict(state["model_state_dict"])
         documents = PackedDocuments(self.root / "packed")
-        expected, labels = validation_loss(
+        expected, labels, _ = validation_loss(
             model, documents, 65536, "cpu", np.flatnonzero(documents.split == 1)
         )
         result = evaluate_loss(checkpoint, self.root / "packed", batch_tokens=32)
@@ -1074,6 +1076,83 @@ checkpoint_keep_last = 2
         self.assertEqual(
             sum(record["tokens"] for record in resumed["history"]), expected_new_tokens
         )
+
+    def test_update_stop_keeps_schedule_and_paired_validation(self):
+        documents = PackedDocuments(self.root / "packed")
+        config = self.config(1)
+        config.updates = None
+        config.update_tokens = 1
+        config.microbatch_tokens = int(documents.lengths.max())
+        output = self.root / "stages"
+        reference = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            self.root / "reference",
+            track=False,
+        )
+        first = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            track=False,
+            stop_after_update=1,
+            validation_internals=True,
+            validation_document_steps=(1,),
+        )
+        self.assertEqual(first["updates"], 1)
+        self.assertEqual(
+            first["history"][0]["muon_lr"], reference["history"][0]["muon_lr"]
+        )
+        probe = first["history"][0]["internals"]
+        self.assertEqual(
+            probe["documents"], [int(np.flatnonzero(documents.split == 1)[0])]
+        )
+
+        checkpoint = output / "checkpoint.pth"
+        independently_scored = evaluate_loss(checkpoint, self.root / "packed")
+        evidence = output / "validation-00000001"
+        scores = [
+            json.loads(line)
+            for line in (evidence / "documents.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(len(scores), independently_scored["documents"])
+        for score, wanted in zip(
+            scores, independently_scored["document_losses"], strict=True
+        ):
+            self.assertEqual(score["document"], wanted["document"])
+            self.assertEqual(score["tokens"], wanted["tokens"])
+            self.assertAlmostEqual(
+                score["nll_sum"] / score["tokens"],
+                wanted["nll_sum"] / wanted["tokens"],
+                places=6,
+            )
+
+        resumed = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            track=False,
+            resume=checkpoint,
+        )
+        self.assertEqual(resumed["updates"], reference["updates"])
+        for actual, expected in zip(
+            resumed["history"], reference["history"][1:], strict=True
+        ):
+            for field in (
+                "loss",
+                "tokens",
+                "presented_documents",
+                "muon_lr",
+                "adamw_lr",
+            ):
+                self.assertEqual(actual[field], expected[field])
+        self.assertTrue((evidence / "summary.json").is_file())
 
     def test_distributed_matches_single_process_and_resume(self):
         config = self.config(2)

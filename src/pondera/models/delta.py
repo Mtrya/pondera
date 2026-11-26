@@ -107,18 +107,27 @@ class KimiDeltaAttention(RecurrentAttention):
         self.dt_bias = nn.Parameter(dt + (-torch.expm1(-dt)).log())
         self.norm_output = RMSNorm(self.head_dim, eps=1e-5)
         self.o = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.internals = None
+        self.internals_name = "lay?"
 
     def _memory(self, vectors, x, prepared, cache=None, output_final_state=False):
         q, k, v = (tensor.view(-1, self.num_heads, self.head_dim) for tensor in vectors)
         decay = F.softplus(self.decay(x).float() + self.dt_bias).view_as(q)
         decay = -self.A_log.exp()[None, :, None] * decay
         beta = self.beta(x).float().sigmoid()
+        if self.internals is not None:
+            name = f"kda/{self.internals_name}/pass{self.internals.pass_index}"
+            self.internals.mean(f"{name}/beta", beta)
+            self.internals.mean(f"{name}/retention", decay.exp())
         return delta_attention(
             q, k, v, decay, beta, prepared, cache, output_final_state
         )
 
     def _output(self, x, memory):
         gate = self.gate(x).view_as(memory).sigmoid()
+        if self.internals is not None:
+            name = f"kda/{self.internals_name}/pass{self.internals.pass_index}"
+            self.internals.mean(f"{name}/gate", gate)
         return self.o((self.norm_output(memory) * gate).reshape_as(x))
 
     def _project_cached(self, x, prepared, histories):

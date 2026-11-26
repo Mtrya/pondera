@@ -34,6 +34,7 @@ from pondera.data.packing import (
     select_documents,
 )
 from pondera.models import PonderaModel
+from pondera.models.internals import Internals, attach, detach
 from pondera.training.config import DEFAULT_CONFIG_PATH, TrainConfig, load_config
 from pondera.training.muon import build_optimizers
 
@@ -130,6 +131,16 @@ def _loss(model, batch):
     return loss, labeled
 
 
+def _validation_loss_sum(model, moved, boundaries):
+    logits = _forward(model, moved).float()
+    token_losses = F.cross_entropy(
+        logits, moved["labels"], ignore_index=-100, reduction="none"
+    )
+    return np.add.reduceat(
+        token_losses.cpu().numpy().astype(np.float64), boundaries[:-1]
+    )
+
+
 @torch.no_grad()
 def validation_loss(
     model,
@@ -139,24 +150,86 @@ def validation_loss(
     indices,
     rank=0,
     world_size=1,
+    *,
+    collect_internals=False,
+    document_losses=None,
 ):
     model = _module(model)
     was_training = model.training
     model.eval()
     batches = pack_batches(documents.lengths, indices, budget)
+    internals = Internals() if collect_internals and rank == 0 and batches else None
     total_loss = 0.0
     total_labeled = 0
-    for batch in batches[rank::world_size]:
-        moved = _move(assemble_batch(documents, list(batch)), device)
-        loss, labeled = _loss(model, moved)
-        total_loss += float(loss) * labeled
-        total_labeled += labeled
-    total_loss = _reduce(total_loss, device)
-    total_labeled = _reduce(total_labeled, device)
-    model.train(was_training)
+    report = {}
+    if document_losses is not None:
+        positions = {int(document): i for i, document in enumerate(indices)}
+        sums = np.zeros(len(indices), dtype=np.float32)
+    try:
+        for i, batch in enumerate(batches[rank::world_size]):
+            probe = i == 0 and internals is not None
+            packed = assemble_batch(documents, list(batch))
+            moved = _move(packed, device)
+            if probe:
+                attach(model, internals)
+            try:
+                if document_losses is None:
+                    loss, labeled = _loss(model, moved)
+                    total_loss += float(loss) * labeled
+                    total_labeled += labeled
+                else:
+                    losses = _validation_loss_sum(model, moved, packed["cu_seqlens"])
+                    sums[[positions[int(index)] for index in batch]] = losses
+            finally:
+                if probe:
+                    detach(model)
+            if probe:
+                report = {
+                    "documents": [int(index) for index in batch],
+                    "tokens": packed["tokens"],
+                    "metrics": internals.report(),
+                }
+        if document_losses is None:
+            total_loss = _reduce(total_loss, device)
+            total_labeled = _reduce(total_labeled, device)
+        else:
+            if world_size > 1:
+                sums = _reduce(sums, device)
+            total_loss = sum(float(value) for value in sums)
+            total_labeled = int((documents.lengths[indices] - 1).sum())
+            if rank == 0:
+                document_losses.extend(
+                    {
+                        "document": int(index),
+                        "tokens": int(documents.lengths[index] - 1),
+                        "nll_sum": float(loss),
+                    }
+                    for index, loss in zip(indices, sums, strict=True)
+                )
+    finally:
+        model.train(was_training)
     if not total_labeled:
         raise ValueError("No next-token labels in validation documents")
-    return total_loss / total_labeled, total_labeled
+    return total_loss / total_labeled, total_labeled, report
+
+
+def _write_validation(output_dir, record, rows, dataset_id):
+    destination = output_dir / f"validation-{record['update']:08d}"
+    destination.mkdir(exist_ok=True)
+    (destination / "documents.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows)
+    )
+    summary = {
+        "update": record["update"],
+        "presented_documents": record["presented_documents"],
+        "documents": len(rows),
+        "labeled_tokens": record["val_labeled_tokens"],
+        "loss": record["val_loss"],
+        "data_identity": dataset_id,
+    }
+    temporary = destination / "summary.tmp"
+    temporary.write_text(json.dumps(summary, indent=2) + "\n")
+    temporary.replace(destination / "summary.json")
 
 
 def save_training_checkpoint(
@@ -230,8 +303,16 @@ def train(
     resume=None,
     device="cpu",
     track=True,
+    *,
+    stop_after_update=None,
+    validation_internals=False,
+    validation_document_steps=(),
 ):
     config.validate()
+    if stop_after_update is not None and (
+        type(stop_after_update) is not int or stop_after_update < 1
+    ):
+        raise ValueError("stop_after_update must be a positive integer")
     device, rank, world_size = _distributed(device)
     output_dir = Path(output_dir)
     if output_dir.exists() and any(output_dir.iterdir()) and resume is None:
@@ -328,6 +409,12 @@ def train(
             group["weight_decay"] = config.adamw_weight_decay
         micro_step, update = state["micro_step"], state["update"]
         presented_documents = state["presented_documents"]
+    if stop_after_update is not None and update >= stop_after_update:
+        raise ValueError("Checkpoint already reached the requested optimizer step")
+    update_limit = min(
+        (limit for limit in (config.updates, stop_after_update) if limit is not None),
+        default=None,
+    )
     swanlab_run_id = state.get("swanlab_run_id") if resume is not None else None
     schedule_documents = (
         int(len(indices) * config.presentations) if config.updates is None else None
@@ -379,7 +466,7 @@ def train(
     )
     started = time.monotonic()
     try:
-        while (config.updates is None or update < config.updates) and (
+        while (update_limit is None or update < update_limit) and (
             target_documents is None or presented_documents < target_documents
         ):
             update_started = time.monotonic()
@@ -474,12 +561,21 @@ def train(
                 "muon_lr": optimizers[0].param_groups[0]["lr"],
                 "adamw_lr": optimizers[1].param_groups[0]["lr"],
             }
-            if config.val_every and (
-                update % config.val_every == 0
-                or presented_documents == target_documents
+            if update in validation_document_steps or (
+                config.val_every
+                and (
+                    update % config.val_every == 0
+                    or presented_documents == target_documents
+                    or update == stop_after_update
+                )
             ):
                 validation_started = time.monotonic()
-                record["val_loss"], record["val_labeled_tokens"] = validation_loss(
+                document_losses = [] if update in validation_document_steps else None
+                (
+                    record["val_loss"],
+                    record["val_labeled_tokens"],
+                    internals,
+                ) = validation_loss(
                     model,
                     documents,
                     validation_budget,
@@ -487,11 +583,25 @@ def train(
                     validation_indices,
                     rank,
                     world_size,
+                    collect_internals=validation_internals,
+                    document_losses=document_losses,
                 )
+                if internals:
+                    record["internals"] = internals
+                if rank == 0 and document_losses is not None:
+                    _write_validation(
+                        output_dir,
+                        record,
+                        document_losses,
+                        run_config["data_identity"]["source_dataset_id"],
+                    )
                 record["validation_seconds"] = time.monotonic() - validation_started
             history.append(record)
             if tracker is not None:
-                tracker.log(record, step=update)
+                tracker.log(
+                    {key: value for key, value in record.items() if key != "internals"},
+                    step=update,
+                )
             if history_log is not None:
                 history_log.write(json.dumps(record) + "\n")
                 print(json.dumps(record), flush=True)
@@ -553,6 +663,9 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--max-presented-documents", type=int)
+    parser.add_argument("--stop-after-update", type=int)
+    parser.add_argument("--validation-internals", action="store_true")
+    parser.add_argument("--validation-document-steps", nargs="+", type=int, default=())
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--track", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
@@ -574,6 +687,9 @@ def main():
         resume=args.resume,
         device=args.device,
         track=args.track,
+        stop_after_update=args.stop_after_update,
+        validation_internals=args.validation_internals,
+        validation_document_steps=args.validation_document_steps,
     )
     if result["rank"] == 0:
         print(

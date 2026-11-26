@@ -16,6 +16,8 @@ class DepthRead(nn.Module):
         super().__init__()
         self.query = nn.Parameter(torch.zeros(width))
         self.key_gain = nn.Parameter(torch.ones(width))
+        self.internals = None
+        self.internals_position = 0
 
     def forward(self, residual, sources):
         query = (self.query * self.key_gain).float().unsqueeze(0)
@@ -33,8 +35,15 @@ class DepthRead(nn.Module):
                 ],
                 dim=-1,
             )
-        weights = (len(sources) * scores.softmax(dim=-1) - 1).unbind(-1)
+        probs = scores.softmax(dim=-1)
+        if self.internals is not None:
+            key = f"read/pos{self.internals_position}/pass{self.internals.pass_index}"
+            # The read concentrates when one source's probability dominates;
+            # a uniform read of n sources reports n effective sources.
+            self.internals.mean(f"{key}/max_prob", probs.max(dim=-1).values)
+            self.internals.mean(f"{key}/effective", probs.square().sum(-1).reciprocal())
         # Unit weights reconstruct the trained residual with its original addition order.
+        weights = (len(sources) * probs - 1).unbind(-1)
         for (value, _), weight in zip(sources, weights, strict=True):
             residual = torch.addcmul(residual, value, weight.unsqueeze(-1))
         return residual

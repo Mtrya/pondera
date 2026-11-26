@@ -54,6 +54,7 @@ class PonderaModel(nn.Module):
         width = settings["hidden_size"]
         self.token_embedding = nn.Embedding(vocab_size, width)
         nn.init.normal_(self.token_embedding.weight, std=0.02)
+        self.internals = None
         self.blocks = nn.ModuleList(
             Block(
                 width,
@@ -233,13 +234,21 @@ class PonderaModel(nn.Module):
         token_values = self._token_values(embedding)
         residual = group_start = embedding
         sources = (summarize(embedding),) if self.depth_reads else ()
+        if self.internals is not None:
+            self.internals.rms("residual/embedding", residual)
         offset = 0
 
-        for size, count in zip(self.segment_sizes, self.repetitions, strict=True):
+        for segment, (size, count) in enumerate(
+            zip(self.segment_sizes, self.repetitions, strict=True)
+        ):
             entry = residual, group_start, sources
             previous = ()
             for pass_index in range(count):
                 residual, group_start, sources = entry
+                if self.internals is not None:
+                    self.internals.pass_index = pass_index + 1
+                    if segment in self.loop_segments and pass_index == 0:
+                        self.internals.rms(f"residual/seg{segment}/entry", residual)
                 export = pass_index + 1 < count
                 pass_group_start = residual
                 deltas = []
@@ -264,6 +273,12 @@ class PonderaModel(nn.Module):
                         )
                     else:
                         residual, cache = self._block(*args)
+                    if self.internals is not None:
+                        self.internals.rms(
+                            f"residual/seg{segment}/pass{pass_index + 1}"
+                            f"/lay{index + 1}",
+                            residual,
+                        )
                     if cached:
                         outgoing.append(cache)
                     if self.depth_reads and self.block_configs[index].group_end:
@@ -281,9 +296,22 @@ class PonderaModel(nn.Module):
                 # The outer residual keeps its original group start.
                 if export and pass_group_start is not residual:
                     deltas.append(summarize(residual - pass_group_start))
+                if self.internals is not None and segment in self.loop_segments:
+                    self.internals.rms(
+                        f"residual/seg{segment}/pass{pass_index + 1}/exit",
+                        residual,
+                        token_tail=True,
+                    )
+                    for group, (value, _) in enumerate(deltas, 1):
+                        self.internals.rms(
+                            f"delta/seg{segment}/pass{pass_index + 1}/grp{group}",
+                            value,
+                        )
                 previous = tuple(deltas)
             offset += size
 
+        if self.internals is not None:
+            self.internals.pass_index = 1
         partial_start = group_start if group_start is not residual else None
         x = self._read(2 * len(self.blocks), residual, sources, partial_start, ())
         return self.head(self.norm(x)), tuple(outgoing)

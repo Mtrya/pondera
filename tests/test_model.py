@@ -1,11 +1,13 @@
 """Model invariants for causality, shared execution, and packed/cached parity."""
 
+import math
 import unittest
 from importlib.util import find_spec
 
 import torch
 
 from pondera.models import PonderaModel
+from pondera.models.internals import Internals, attach, detach
 from pondera.models.softmax import eager_varlen_attention, situ_glu, varlen_attention
 
 MODEL = dict(
@@ -158,6 +160,53 @@ class ModelTests(unittest.TestCase):
         up = torch.randn(64, 8) * 100
         # |4·tanh(g/4)| ≤ 4, |σ(g)| ≤ 1, |25·tanh(u/25)| ≤ 25 → |out| ≤ 100.
         self.assertLessEqual(situ_glu(gate, up).abs().max().item(), 100.0)
+
+    def test_internals_collection_does_not_change_model_outputs(self):
+        ids, cu = packed_ids()
+        with torch.no_grad():
+            expected = self.model(ids, cu)
+        internals = Internals()
+        attach(self.model, internals)
+        try:
+            with torch.no_grad():
+                observed = self.model(ids, cu)
+        finally:
+            detach(self.model)
+        self.assertTrue(torch.equal(expected, observed))
+
+    def test_internals_report_distinguishes_repeated_passes(self):
+        ids, cu = packed_ids()
+        internals = Internals()
+        attach(self.model, internals)
+        try:
+            with torch.no_grad():
+                self.model(ids, cu)
+            report = internals.report()
+        finally:
+            detach(self.model)
+        # The key names are the contract consumed by the training history and
+        # the SwanLab monitor.
+        for key in (
+            "residual/embedding",
+            "residual/seg1/entry",
+            "residual/seg1/pass1/exit",
+            "residual/seg1/pass2/exit/token_rms_p99",
+            "delta/seg1/pass1/grp1",
+            "read/pos2/pass1/effective",
+            "read/pos2/pass2/max_prob",
+            "kda/lay02/pass1/beta",
+            "kda/lay02/pass2/retention",
+            "kda/lay02/pass2/gate",
+        ):
+            self.assertIn(key, report)
+            self.assertTrue(math.isfinite(report[key]))
+        self.assertFalse(any(key.startswith("delta/seg1/pass2/") for key in report))
+        # The reported embedding RMS must match a direct computation through
+        # the embedding module itself, an independent source.
+        direct = self.model.token_embedding(ids).double().square().mean().sqrt()
+        self.assertAlmostEqual(
+            report["residual/embedding"], float(direct.detach()), places=3
+        )
 
     def test_cached_incremental_decode_matches_full_forward(self):
         ids, _ = packed_ids()
