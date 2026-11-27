@@ -21,10 +21,7 @@ from pondera.chess.vocabulary import (
     VALUE,
     VALUE_BINS,
 )
-from pondera.models.linear import LinearVanillaModel
-from pondera.models.vanilla import VanillaModel
-
-MODEL_CLASSES = {"vanilla": VanillaModel, "linear": LinearVanillaModel}
+from pondera.models import PonderaModel
 
 
 @dataclass
@@ -153,14 +150,69 @@ class Generation:
 
 
 @dataclass
+class _DecodeState:
+    caches: tuple | None = None
+    consumed: int = 0
+
+
+@dataclass
 class Predictor:
     model: torch.nn.Module
     dictionary: MergeDictionary
     metadata: dict
 
+    def _next_logits(self, prefix, tokens, state):
+        device = next(self.model.parameters()).device
+        context = prefix + tokens
+        # Cached attention supports one new token at a time. Inserting FINAL
+        # can leave two unseen tokens; prefill that context together so neither
+        # token attends to its future. A replaced reasoning prefix also resets.
+        if len(context) != state.consumed + 1:
+            state.caches = None
+        unseen = context if state.caches is None else context[state.consumed :]
+        ids = torch.tensor(unseen, dtype=torch.long, device=device)
+        offsets = torch.tensor([0, len(context)], dtype=torch.int32)
+        logits, state.caches = self.model.forward_cached(
+            ids, offsets, state.caches, host_tokens=unseen
+        )
+        state.consumed = len(context)
+        return logits[-1]
+
+    def _step(self, prefix, tokens, state):
+        token = int(self._next_logits(prefix, tokens, state).argmax())
+        tokens.append(token)
+        if token >= CHESS_VOCAB_SIZE:
+            return self.dictionary.expansion(token)
+        return (token,)
+
+    def _reason(self, prefix, tokens, budget, state):
+        for count in range(1, budget + 1):
+            expanded = self._step(prefix, tokens, state)
+            if FINAL in expanded:
+                return count, False, "end" if END in expanded else "answer_budget"
+            if END in expanded:
+                return count, False, "end_before_final"
+        tokens.append(FINAL)
+        return budget, True, "answer_budget"
+
+    @torch.inference_mode()
+    def decision_logits(self, fen, repetition=1, *, reasoning_tokens=0):
+        """Return the root-decision logits after generating a reasoning prefix."""
+        if reasoning_tokens < 0:
+            raise ValueError("Require nonnegative reasoning tokens")
+        self.model.eval()
+        prefix = encode_board(fen, repetition).tolist()
+        tokens = []
+        state = _DecodeState()
+        _, _, stop = self._reason(prefix, tokens, reasoning_tokens, state)
+        if stop != "answer_budget":
+            tokens = [FINAL]
+            state = _DecodeState()
+        return self._next_logits(prefix, tokens, state)
+
     @torch.inference_mode()
     def generate(self, fen, repetition=1, *, reasoning_tokens=0, answer_tokens=128):
-        """Greedy full-prefix forwards, with no masking or answer repair.
+        """Greedy cached decoding, with no masking or answer repair.
 
         Budgets count model calls, not expanded atoms. The answer allowance
         counts tokens after FINAL. A model-emitted FINAL consumes a reasoning
@@ -170,46 +222,20 @@ class Predictor:
             raise ValueError(
                 "Require nonnegative reasoning and positive answer budgets"
             )
-        device = next(self.model.parameters()).device
         prefix = encode_board(fen, repetition).tolist()
         tokens = []
-        reasoning_count = answer_count = generated = 0
-        forced = False
-        stop = "answer_budget"
+        answer_count = 0
         self.model.eval()
         started = time.monotonic()
+        state = _DecodeState()
 
-        def step():
-            ids = torch.tensor(prefix + tokens, dtype=torch.long, device=device)
-            logits = self.model(ids, [0, len(ids)])
-            token = int(logits[-1].argmax())
-            tokens.append(token)
-            expanded = (
-                self.dictionary.expansion(token)
-                if token >= CHESS_VOCAB_SIZE
-                else (token,)
-            )
-            return expanded
-
-        for _ in range(reasoning_tokens):
-            expanded = step()
-            reasoning_count += 1
-            generated += 1
-            if FINAL in expanded:
-                if END in expanded:
-                    stop = "end"
-                break
-            if END in expanded:
-                stop = "end_before_final"
-                break
-        else:
-            tokens.append(FINAL)
-            forced = True
-        if stop not in {"end", "end_before_final"}:
+        reasoning_count, forced, stop = self._reason(
+            prefix, tokens, reasoning_tokens, state
+        )
+        if stop == "answer_budget":
             for _ in range(answer_tokens):
-                expanded = step()
+                expanded = self._step(prefix, tokens, state)
                 answer_count += 1
-                generated += 1
                 if END in expanded:
                     stop = "end"
                     break
@@ -218,7 +244,7 @@ class Predictor:
             answer=parse_answer(tokens, self.dictionary, fen, repetition),
             reasoning_tokens=reasoning_count,
             answer_tokens=answer_count,
-            generated_tokens=generated,
+            generated_tokens=reasoning_count + answer_count,
             forced_final=forced,
             stop=stop,
             seconds=time.monotonic() - started,
@@ -226,18 +252,25 @@ class Predictor:
         )
 
 
-def load_checkpoint(path, device="cpu"):
+def load_checkpoint(path, device="cpu", *, loop_repetitions=None):
     state = torch.load(path, map_location="cpu", weights_only=True)
-    model = MODEL_CLASSES[state["arch"]](**state["model_config"])
+    if state["arch"] != PonderaModel.architecture:
+        raise ValueError(f"Unsupported checkpoint architecture: {state['arch']}")
+    model = PonderaModel(**state["model_config"])
     model.load_state_dict(state["model_state_dict"])
+    if loop_repetitions is not None:
+        model.override_repetitions(loop_repetitions)
     identity = state.get("tokenizer_identity", {})
     dictionary = MergeDictionary(identity.get("merge_entries", ()))
-    if state["model_config"]["vocab_size"] != CHESS_VOCAB_SIZE + len(dictionary):
+    if model.vocab_size != CHESS_VOCAB_SIZE + len(dictionary):
         raise ValueError("Checkpoint vocabulary and merge entries disagree")
+    model.bind_tokenizer(dictionary)
     metadata = {
         key: state[key]
         for key in ("arch", "model_config", "update", "presented_documents")
         if key in state
     }
     metadata["tokenizer_identity"] = identity
+    if model.loop_segments:
+        metadata["segment_repetitions"] = model.repetitions
     return Predictor(model.to(device).eval(), dictionary, metadata)

@@ -3,7 +3,6 @@
 import hashlib
 import heapq
 import json
-import tempfile
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
@@ -89,6 +88,11 @@ def _generation(predictor, reference, fen, repetition, config, budget):
     )
     result = asdict(generated)
     result["answer"]["valid"] = generated.answer.valid
+    result["decision_quality"] = (
+        reference.grade_decision(fen, repetition, generated.answer.decision)
+        if generated.answer.move_legal
+        else None
+    )
     result["quality"] = (
         reference.grade(fen, repetition, generated.answer, pv_plies=config.pv_plies)
         if generated.answer.valid
@@ -109,7 +113,7 @@ def _puzzle(predictor, reference, row, config, budget):
         )
         turns.append({"fen": board.fen(), **generation})
         answer = generation["answer"]
-        if not answer["valid"] or answer["decision"] == "<claim_draw>":
+        if not answer["move_legal"] or answer["decision"] == "<claim_draw>":
             break
         candidate = chess.Move.from_uci(answer["decision"])
         board.push(candidate)
@@ -145,10 +149,17 @@ def _summary(records, *, puzzle=False):
         for generation in generations
         if generation["quality"] is not None
     ]
+    decisions = [
+        generation["decision_quality"]
+        for generation in generations
+        if generation["decision_quality"] is not None
+    ]
     count = len(records)
     result = {
         "count": count,
-        "quality_count": len(qualities),
+        "decision_quality_count": len(decisions),
+        "decision_failure_count": count - len(decisions),
+        "answer_quality_count": len(qualities),
         "errors": dict(
             Counter(error for answer in answers for error in answer["errors"])
         ),
@@ -168,10 +179,18 @@ def _summary(records, *, puzzle=False):
         "cp_loss",
         "expected_score_loss",
         "move_rank_fraction",
+        "best_move",
+    ):
+        values = [quality[name] for quality in decisions if quality[name] is not None]
+        result[name] = {
+            "count": len(values),
+            "mean": mean(values) if values else None,
+            "median": median(values) if values else None,
+        }
+    for name in (
         "value_absolute_error",
         "value_bin_correct",
         "mate_distance_correct",
-        "best_move",
     ):
         values = [quality[name] for quality in qualities if quality[name] is not None]
         result[name] = {
@@ -255,12 +274,22 @@ def evaluate_checkpoint(
     predictor = load_checkpoint(checkpoint, device)
     output.parent.mkdir(parents=True, exist_ok=True)
     budgets = sorted({0, config.reasoning_tokens})
-    with tempfile.TemporaryDirectory(
-        prefix=f".{output.name}-", dir=output.parent
-    ) as temporary:
-        work = Path(temporary) / "results"
-        work.mkdir()
-        reference_path = Path(cache) if cache is not None else work / "reference.sqlite"
+    output.mkdir()
+    reference_path = Path(cache) if cache is not None else output / "reference.sqlite"
+    report = {
+        "status": "running",
+        "checkpoint": str(Path(checkpoint).resolve()),
+        "checkpoint_metadata": predictor.metadata,
+        "config": asdict(config),
+        "sources": {
+            kind: str(Path(path).resolve())
+            for kind, path in (("root", roots), ("puzzle", puzzles))
+            if path is not None
+        },
+        "budgets": {},
+    }
+    reference = None
+    try:
         reference_path.parent.mkdir(parents=True, exist_ok=True)
         reference = Reference(
             engine,
@@ -269,84 +298,78 @@ def evaluate_checkpoint(
             threads=config.threads,
             hash_mb=config.hash_mb,
         )
-        report = {
-            "checkpoint": str(Path(checkpoint).resolve()),
-            "checkpoint_metadata": predictor.metadata,
-            "config": asdict(config),
-            "reference": reference.settings,
-            "sources": {
-                kind: str(Path(path).resolve())
-                for kind, path in (("root", roots), ("puzzle", puzzles))
-                if path is not None
-            },
-            "budgets": {},
-        }
-        try:
-            with (work / "positions.jsonl").open("w") as handle:
-                for budget in budgets:
-                    records = []
-                    for kind, rows in inputs.items():
-                        for key, row in rows:
-                            record = {
-                                "kind": kind,
-                                "id": key,
-                                "reasoning_tokens": budget,
-                            }
-                            if kind == "root":
-                                fen, repetition = row["fen"], row.get("repetition", 1)
-                                # Prepare all candidate scores even if this checkpoint's answer fails.
-                                reference.scores(chess.Board(fen))
-                                record.update(
-                                    fen=fen,
-                                    repetition=repetition,
-                                    generation=_generation(
-                                        predictor,
-                                        reference,
-                                        fen,
-                                        repetition,
-                                        config,
-                                        budget,
-                                    ),
-                                )
-                            else:
-                                root = chess.Board(row["FEN"])
-                                root.push_uci(row["Moves"].split()[0])
-                                reference.scores(chess.Board(root.fen()))
-                                record.update(
-                                    _puzzle(predictor, reference, row, config, budget)
-                                )
-                            records.append(record)
-                            handle.write(json.dumps(record, allow_nan=False) + "\n")
-                    summary = {"overall": _summary(records)}
-                    for kind in inputs:
-                        summary[kind] = _summary(
-                            [record for record in records if record["kind"] == kind],
-                            puzzle=kind == "puzzle",
-                        )
-                    if "puzzle" in inputs:
-                        bounds = config.rating_bounds
-                        summary["puzzle_buckets"] = {}
-                        for index, low in enumerate(bounds):
-                            high = (
-                                bounds[index + 1] if index + 1 < len(bounds) else None
+        report["reference"] = reference.settings
+        write_manifest(output / "summary.json", report)
+        with (output / "positions.jsonl").open("w", buffering=1) as handle:
+            for budget in budgets:
+                records = []
+                for kind, rows in inputs.items():
+                    for key, row in rows:
+                        record = {
+                            "kind": kind,
+                            "id": key,
+                            "reasoning_tokens": budget,
+                        }
+                        if kind == "root":
+                            fen, repetition = row["fen"], row.get("repetition", 1)
+                            # Prepare all candidate scores even if this checkpoint's answer fails.
+                            reference.scores(chess.Board(fen))
+                            record.update(
+                                fen=fen,
+                                repetition=repetition,
+                                generation=_generation(
+                                    predictor,
+                                    reference,
+                                    fen,
+                                    repetition,
+                                    config,
+                                    budget,
+                                ),
                             )
-                            subset = [
-                                record
-                                for record in records
-                                if record["kind"] == "puzzle"
-                                and low <= record["rating"]
-                                and (high is None or record["rating"] < high)
-                            ]
-                            summary["puzzle_buckets"][
-                                f"{low}-{high if high is not None else '+'}"
-                            ] = _summary(subset, puzzle=True)
-                    report["budgets"][str(budget)] = summary
-            report["reference_cache"] = {
-                "hits": reference.hits,
-                "searches": reference.searches,
-            }
-        finally:
+                        else:
+                            root = chess.Board(row["FEN"])
+                            root.push_uci(row["Moves"].split()[0])
+                            reference.scores(chess.Board(root.fen()))
+                            record.update(
+                                _puzzle(predictor, reference, row, config, budget)
+                            )
+                        records.append(record)
+                        handle.write(json.dumps(record, allow_nan=False) + "\n")
+                summary = {"overall": _summary(records)}
+                for kind in inputs:
+                    summary[kind] = _summary(
+                        [record for record in records if record["kind"] == kind],
+                        puzzle=kind == "puzzle",
+                    )
+                if "puzzle" in inputs:
+                    bounds = config.rating_bounds
+                    summary["puzzle_buckets"] = {}
+                    for index, low in enumerate(bounds):
+                        high = bounds[index + 1] if index + 1 < len(bounds) else None
+                        subset = [
+                            record
+                            for record in records
+                            if record["kind"] == "puzzle"
+                            and low <= record["rating"]
+                            and (high is None or record["rating"] < high)
+                        ]
+                        summary["puzzle_buckets"][
+                            f"{low}-{high if high is not None else '+'}"
+                        ] = _summary(subset, puzzle=True)
+                report["budgets"][str(budget)] = summary
+                write_manifest(output / "summary.json", report)
+        report["reference_cache"] = {
+            "hits": reference.hits,
+            "searches": reference.searches,
+        }
+    except BaseException as error:
+        report["status"] = "failed"
+        report["error"] = {"type": type(error).__name__, "message": str(error)}
+        write_manifest(output / "summary.json", report)
+        raise
+    finally:
+        if reference is not None:
             reference.close()
-        write_manifest(work / "summary.json", report)
-        work.rename(output)
+    report["status"] = "complete"
+    write_manifest(output / "summary.json", report)
     return report

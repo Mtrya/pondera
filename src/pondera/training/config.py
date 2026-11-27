@@ -5,26 +5,23 @@ import tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+from pondera.models.config import validate_model_config
+
 DEFAULT_CONFIG_PATH = Path("configs/train.toml")
-_MODEL_DIMENSIONS = (
-    "num_blocks",
-    "hidden_size",
-    "intermediate_size",
-    "num_heads",
-    "num_kv_heads",
-)
 
 
 @dataclass
 class TrainConfig:
-    muon_lr: float = 0.02
+    optimizer: str = "hyperball"
+    muon_lr: float = 0.0375
     adamw_lr: float = 3e-4
     warmup_fraction: float = 0.05
     min_lr_ratio: float = 0.1
-    weight_decay: float = 0.0
-    microbatch_tokens: int = 131_072
-    update_tokens: int = 524_288
+    adamw_weight_decay: float = 0.0
+    max_pack_tokens: int = 131_072
+    packs_per_update: int = 8
     presentations: float = 1.0
+    max_presented_documents: int | None = None
     documents: int | None = None
     max_document_tokens: int | None = None
     updates: int | None = None
@@ -32,11 +29,20 @@ class TrainConfig:
     checkpoint_every: int = 50
     checkpoint_keep_last: int = 3
     seed: int = 640
+    init_seed: int | None = None
     activation_checkpointing: bool = True
 
+    @property
+    def initialization_seed(self):
+        return self.seed if self.init_seed is None else self.init_seed
+
     def validate(self):
+        _integer("training", "max_pack_tokens", self.max_pack_tokens, 1)
+        _integer("training", "packs_per_update", self.packs_per_update, 1)
         if type(self.activation_checkpointing) is not bool:
             raise ValueError("[training] activation_checkpointing must be a boolean")
+        if self.optimizer not in ("hyperball", "muon"):
+            raise ValueError("[training] optimizer must be hyperball or muon")
         for name in ("warmup_fraction", "min_lr_ratio"):
             value = getattr(self, name)
             if (
@@ -48,15 +54,15 @@ class TrainConfig:
                 interval = "[0, 1)" if name == "warmup_fraction" else "[0, 1]"
                 raise ValueError(f"[training] {name} must be finite and in {interval}")
         for name in (
-            "microbatch_tokens",
-            "update_tokens",
             "documents",
+            "max_presented_documents",
             "max_document_tokens",
             "updates",
             "val_every",
             "checkpoint_every",
             "checkpoint_keep_last",
             "seed",
+            "init_seed",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -64,9 +70,11 @@ class TrainConfig:
                     "training",
                     name,
                     value,
-                    0 if name in {"val_every", "checkpoint_every", "seed"} else 1,
+                    0
+                    if name in {"val_every", "checkpoint_every", "seed", "init_seed"}
+                    else 1,
                 )
-        for name in ("muon_lr", "adamw_lr", "weight_decay", "presentations"):
+        for name in ("muon_lr", "adamw_lr", "adamw_weight_decay", "presentations"):
             value = getattr(self, name)
             if (
                 type(value) not in (int, float)
@@ -105,20 +113,8 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     for section in ("model", "training"):
         if section not in values:
             raise ValueError(f"Missing config section: [{section}]")
-    model = _table(values["model"], "model", {"architecture", *_MODEL_DIMENSIONS})
-    missing = {"architecture", *_MODEL_DIMENSIONS} - set(model)
-    if missing:
-        raise ValueError(f"Missing config key in [model]: {sorted(missing)[0]}")
-    if model["architecture"] not in ("vanilla", "linear"):
-        raise ValueError("[model] architecture must be vanilla or linear")
-    for name in _MODEL_DIMENSIONS:
-        _integer("model", name, model[name], 1)
-    if (
-        model["hidden_size"] % model["num_heads"]
-        or model["num_heads"] % model["num_kv_heads"]
-    ):
-        raise ValueError("[model] head counts must divide each other and hidden_size")
-
+    model = values["model"]
+    validate_model_config(model)
     training = _table(
         values["training"], "training", {field.name for field in fields(TrainConfig)}
     )

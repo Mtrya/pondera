@@ -23,11 +23,12 @@ from pondera.chess.vocabulary import (
     UCI_MOVE_TO_IDX,
     VALUE,
 )
-from pondera.evaluation.checkpoint import select_rows
+from pondera.evaluation.checkpoint import evaluate_checkpoint, select_rows
+from pondera.evaluation.config import EvalConfig
 from pondera.evaluation.puzzles import solve_puzzle
 from pondera.evaluation.reference import Reference
 from pondera.inference.trace import parse_answer
-from pondera.models.vanilla import VanillaModel
+from pondera.models import PonderaModel
 
 FEN = "7k/5K2/6Q1/8/8/8/8/8 w - - 0 1"
 PUZZLE = {
@@ -36,6 +37,36 @@ PUZZLE = {
     "Moves": "h7h8 g6g7",
     "Rating": 800,
 }
+
+
+def save_constant_model(path, decision=None):
+    config = dict(
+        segments=[{"blocks": ["softmax"]}],
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=2,
+        num_kv_heads=1,
+        vocab_size=CHESS_VOCAB_SIZE,
+    )
+    model = PonderaModel(**config)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+        if decision is not None:
+            # Zero residual branches preserve a constant embedding; one head row wins.
+            model.token_embedding.weight[:, 0] = 1
+            model.norm.weight.fill_(1)
+            model.head.weight[MOVE + UCI_MOVE_TO_IDX[decision], 0] = 1
+    torch.save(
+        {
+            "arch": "pondera",
+            "model_config": config,
+            "model_state_dict": model.state_dict(),
+            "tokenizer_identity": {"merge_entries": []},
+            "update": 7,
+        },
+        path,
+    )
 
 
 class PuzzleMateTests(unittest.TestCase):
@@ -51,6 +82,26 @@ class PuzzleMateTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_missing_reference_engine_writes_failed_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.pth"
+            save_constant_model(checkpoint)
+            roots = root / "roots.jsonl"
+            roots.write_text(json.dumps({"fen": FEN}) + "\n")
+            output = root / "evaluation"
+            with self.assertRaises(FileNotFoundError):
+                evaluate_checkpoint(
+                    checkpoint,
+                    output,
+                    EvalConfig(),
+                    roots=roots,
+                    engine=root / "missing-stockfish",
+                )
+            report = json.loads((output / "summary.json").read_text())
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["error"]["type"], "FileNotFoundError")
+
     def test_selection_is_invariant_to_input_order_duplicates_and_storage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -145,30 +196,93 @@ class ReferenceTests(unittest.TestCase):
         finally:
             reference.close()
 
-    def test_cli_records_failures_and_reuses_reference_across_checkpoints(self):
-        config = dict(
-            num_blocks=1,
-            hidden_size=16,
-            intermediate_size=32,
-            num_heads=2,
-            num_kv_heads=1,
-            vocab_size=CHESS_VOCAB_SIZE,
-        )
-        model = VanillaModel(**config)
-        with torch.no_grad():
-            for parameter in model.parameters():
-                parameter.zero_()
-        checkpoint = self.root / "model.pth"
-        torch.save(
-            {
-                "arch": "vanilla",
-                "model_config": config,
-                "model_state_dict": model.state_dict(),
-                "tokenizer_identity": {"merge_entries": []},
-                "update": 7,
-            },
+    def test_decision_grading_validates_moves_claims_and_terminal_roots(self):
+        reference = Reference("stockfish", self.root / "claims.sqlite", nodes=2000)
+        self.addCleanup(reference.close)
+        for decision in (None, "invalid", "a1a2", "0000", "<claim_draw>"):
+            with self.subTest(decision=decision), self.assertRaises(ValueError):
+                reference.grade_decision(FEN, 1, decision)
+        self.assertEqual(reference.searches, 0)
+        result = reference.grade_decision(FEN, 3, "<claim_draw>")
+        self.assertEqual(result["chosen"]["value"], 0)
+        self.assertEqual(result["root_value"], 1)
+        self.assertEqual(result["expected_score_loss"], 0.5)
+        board = chess.Board(FEN)
+        board.halfmove_clock = 100
+        result = reference.grade_decision(board.fen(), 1, "<claim_draw>")
+        self.assertEqual(result["chosen"]["value"], 0)
+        for repetition in (0, 5):
+            with self.subTest(repetition=repetition), self.assertRaises(ValueError):
+                reference.grade_decision(FEN, repetition, "g6g7")
+        board = chess.Board(FEN)
+        board.push_uci("g6g7")
+        self.assertTrue(board.is_checkmate())
+        with self.assertRaises(ValueError):
+            reference.grade_decision(board.fen(), 3, "<claim_draw>")
+
+    def test_legal_mating_decision_is_scored_despite_missing_answer_suffix(self):
+        checkpoint = self.root / "mate.pth"
+        save_constant_model(checkpoint, "g6g7")
+        roots, puzzles = self.root / "roots.jsonl", self.root / "puzzles.jsonl"
+        roots.write_text(json.dumps({"fen": FEN}) + "\n")
+        puzzles.write_text(json.dumps(PUZZLE) + "\n")
+        output = self.root / "evaluation"
+        report = evaluate_checkpoint(
             checkpoint,
+            output,
+            EvalConfig(reasoning_tokens=0, answer_tokens=1, nodes=2000, pv_plies=0),
+            roots=roots,
+            puzzles=puzzles,
         )
+        summary = report["budgets"]["0"]
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(summary["overall"]["decision_quality_count"], 2)
+        self.assertEqual(summary["overall"]["decision_failure_count"], 0)
+        self.assertEqual(summary["overall"]["answer_quality_count"], 0)
+        self.assertEqual(summary["overall"]["valid_rate"], 0)
+        self.assertEqual(summary["overall"]["expected_score_loss"]["mean"], 0)
+        self.assertEqual(summary["overall"]["value_absolute_error"]["count"], 0)
+        self.assertEqual(summary["puzzle"]["first_accuracy"], 1)
+        self.assertEqual(summary["puzzle"]["whole_accuracy"], 1)
+        records = list(
+            map(json.loads, (output / "positions.jsonl").read_text().splitlines())
+        )
+        generation = next(row["generation"] for row in records if row["kind"] == "root")
+        self.assertEqual(generation["answer"]["decision"], "g6g7")
+        self.assertIn("missing_value", generation["answer"]["errors"])
+        self.assertIsNone(generation["quality"])
+        self.assertTrue(generation["decision_quality"]["best_move"])
+
+    def test_failed_evaluation_preserves_completed_position_evidence(self):
+        checkpoint = self.root / "move.pth"
+        save_constant_model(checkpoint, "g6f6")
+        roots, puzzles = self.root / "roots.jsonl", self.root / "puzzles.jsonl"
+        roots.write_text(json.dumps({"fen": FEN}) + "\n")
+        # The setup and first answer are legal; the supplied opponent reply is not.
+        puzzles.write_text(
+            json.dumps({**PUZZLE, "Moves": "h7h8 g6f6 e2e4 f6f7"}) + "\n"
+        )
+        output = self.root / "failed"
+        with self.assertRaises(ValueError):
+            evaluate_checkpoint(
+                checkpoint,
+                output,
+                EvalConfig(reasoning_tokens=0, answer_tokens=1, nodes=1000, pv_plies=0),
+                roots=roots,
+                puzzles=puzzles,
+            )
+        report = json.loads((output / "summary.json").read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["error"]["type"], "IllegalMoveError")
+        records = list(
+            map(json.loads, (output / "positions.jsonl").read_text().splitlines())
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["generation"]["answer"]["decision"], "g6f6")
+
+    def test_cli_records_failures_and_reuses_reference_across_checkpoints(self):
+        checkpoint = self.root / "model.pth"
+        save_constant_model(checkpoint)
         roots = self.root / "roots.jsonl"
         roots.write_text(json.dumps({"fen": FEN, "repetition": 1}) + "\n")
         puzzles = self.root / "puzzles.jsonl"
@@ -210,7 +324,9 @@ class ReferenceTests(unittest.TestCase):
             for summary in report["budgets"].values():
                 self.assertEqual(summary["overall"]["count"], 2)
                 self.assertEqual(summary["overall"]["valid_rate"], 0)
-                self.assertEqual(summary["overall"]["quality_count"], 0)
+                self.assertEqual(summary["overall"]["decision_quality_count"], 0)
+                self.assertEqual(summary["overall"]["decision_failure_count"], 2)
+                self.assertEqual(summary["overall"]["answer_quality_count"], 0)
                 self.assertIsNone(summary["root"]["cp_loss"]["mean"])
                 self.assertEqual(summary["puzzle"]["first_accuracy"], 0)
                 self.assertEqual(summary["puzzle"]["whole_accuracy"], 0)

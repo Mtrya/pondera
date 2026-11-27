@@ -125,6 +125,7 @@ def packed_batch_indices(
     budget,
     start_document=0,
     presentations=None,
+    max_documents=None,
 ):
     """Yield (indices, epoch) from consumed-document progress without token IO.
 
@@ -144,6 +145,10 @@ def packed_batch_indices(
             f"Selected document length {maximum} exceeds microbatch budget {budget}"
         )
     target = None if presentations is None else int(len(indices) * presentations)
+    if max_documents is not None:
+        if max_documents < 0:
+            raise ValueError("max_documents must be nonnegative")
+        target = max_documents if target is None else min(target, max_documents)
     consumed = start_document
     while target is None or consumed < target:
         epoch, position = divmod(consumed, len(indices))

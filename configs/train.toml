@@ -1,25 +1,48 @@
 [model]
-architecture = "vanilla" # vanilla softmax attention, or linear attention
-num_blocks = 8
 hidden_size = 1024
-intermediate_size = 2816
-num_heads = 16
-num_kv_heads = 4
-# Vocabulary size comes from the encoded dataset.
+intermediate_size = 2240
+num_heads = 8
+num_kv_heads = 2
+factorized_move_head = true
+block_attn_res = true
+
+[[model.segments]]
+blocks = ["kda", { attention = "kda", group_end = true }]
+
+[[model.segments]]
+repeat = 2
+blocks = [
+  "kda",
+  { attention = "softmax", navigation = true, group_end = true },
+  "kda",
+  { attention = "kda", group_end = true },
+]
+
+[[model.segments]]
+blocks = [
+  "kda",
+  { attention = "softmax", value_source = "token_embedding", group_end = true },
+]
 
 [training]
 seed = 640
+# Omit init_seed to initialize weights with seed. The document order uses seed.
+# init_seed = 641
 # Recompute block activations during backward to fit long documents.
 activation_checkpointing = true
-muon_lr = 0.02
+# Hidden matrices use Hyperball. Set optimizer = "muon" for the unconstrained update.
+optimizer = "hyperball"
+muon_lr = 0.0375
 adamw_lr = 0.0003
 # Linear warmup over the first 5% of the training budget, then cosine decay.
 warmup_fraction = 0.05
 # Final learning rates as a fraction of the peaks above.
 min_lr_ratio = 0.1
-weight_decay = 0.0
-microbatch_tokens = 131072
-update_tokens = 524288
+adamw_weight_decay = 0.0
+# Maximum input tokens in one whole-document pack, processed by one rank.
+max_pack_tokens = 131072
+# Global pack count per optimizer update. At this pack size, 8 is about 1M tokens.
+packs_per_update = 8
 presentations = 1.0
 # Omit documents to use every eligible training document.
 # documents = 50000

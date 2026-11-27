@@ -21,6 +21,9 @@ dependencies = [
 [dependency-groups]
 dev = ["ruff>=0.15.0", "import-linter>=2.0"]
 
+[project.optional-dependencies]
+cuda = ["fla-core[cuda]>=0.6.0"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

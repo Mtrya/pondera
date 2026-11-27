@@ -1,15 +1,18 @@
 """Trainer smoke: loss decreases, resume replays the same loss sequence."""
 
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
 import swanlab
 import torch
 import torch.distributed as dist
@@ -27,14 +30,14 @@ from pondera.data.packing import (
 )
 from pondera.data.pipeline import produce_shards
 from pondera.data.tokenize import encode_dataset
-from pondera.models.linear import LinearVanillaModel
-from pondera.models.vanilla import VanillaModel
+from pondera.evaluation.loss import evaluate_loss
+from pondera.models import PonderaModel
 from pondera.training.config import TrainConfig
 from pondera.training.muon import Muon, newton_schulz5, split_parameters
-from pondera.training.packed import train
+from pondera.training.packed import train, validation_loss
 
 MODEL = dict(
-    num_blocks=1,
+    segments=[{"blocks": ["softmax"]}],
     hidden_size=32,
     intermediate_size=48,
     num_heads=4,
@@ -42,7 +45,7 @@ MODEL = dict(
 )
 
 
-def _ddp_worker(rank, store, packed, model_config, output, config, runs, model_class):
+def _ddp_worker(rank, store, packed, model_config, output, config, runs):
     dist.init_process_group(
         "gloo",
         init_method=f"file://{store}",
@@ -55,7 +58,7 @@ def _ddp_worker(rank, store, packed, model_config, output, config, runs, model_c
         output = Path(output)
         for name, updates, resume in runs:
             torch.manual_seed(11)
-            model = model_class(**model_config)
+            model = PonderaModel(**model_config)
             config.updates = updates
             config.checkpoint_every = 1
             train(
@@ -67,12 +70,46 @@ def _ddp_worker(rank, store, packed, model_config, output, config, runs, model_c
                 resume=resume,
                 device="cpu",
                 track=False,
+                validation_internals=True,
+                validation_document_steps=(1, 2),
             )
     finally:
         dist.destroy_process_group()
 
 
 class MuonTests(unittest.TestCase):
+    def test_hyperball_unit_step_preserves_radius_when_candidate_is_zero(self):
+        parameter = torch.nn.Parameter(torch.tensor([[2.0]]))
+        parameter.grad = torch.ones_like(parameter)
+        Muon([parameter], lr=1.0, hyperball=True).step()
+        # A scalar update in the same direction has length 2 and cancels the weight.
+        torch.testing.assert_close(parameter, torch.tensor([[2.0]]))
+
+    def test_hyperball_perpendicular_update(self):
+        parameter = torch.nn.Parameter(torch.tensor([[3.0, 0.0], [0.0, 4.0]]))
+        optimizer = Muon([parameter], lr=0.1, hyperball=True)
+        parameter.grad = torch.tensor([[0.0, 1.0], [-1.0, 0.0]])
+        optimizer.step()
+        # Equal singular values preserve this direction. The unit update is
+        # perpendicular to W, so projection divides by sqrt(1 + 0.1**2).
+        expected = torch.tensor([[2.98511157, -0.35179877], [0.35179877, 3.98014876]])
+        torch.testing.assert_close(parameter, expected)
+
+    def test_hyperball_preserves_initial_matrix_norms(self):
+        torch.manual_seed(640)
+        parameters = [
+            torch.nn.Parameter(torch.randn(shape))
+            for shape in ((8, 8), (8, 32), (32, 8))
+        ]
+        radii = [parameter.norm().detach().clone() for parameter in parameters]
+        optimizer = Muon(parameters, lr=0.1, hyperball=True)
+        for _ in range(4):
+            for parameter in parameters:
+                parameter.grad = torch.randn_like(parameter)
+            optimizer.step()
+            for parameter, radius in zip(parameters, radii, strict=True):
+                torch.testing.assert_close(parameter.norm(), radius)
+
     def test_newton_schulz_orthogonalizes(self):
         torch.manual_seed(0)
         matrix = torch.randn(8, 8)
@@ -90,7 +127,7 @@ class MuonTests(unittest.TestCase):
         reference_parameters = [
             torch.nn.Parameter(parameter.detach().clone()) for parameter in parameters
         ]
-        optimizer = Muon(parameters, lr=0.02, momentum=0.95)
+        optimizer = Muon(parameters, lr=0.02)
         reference = torch.optim.Muon(
             reference_parameters,
             lr=0.02,
@@ -115,7 +152,7 @@ class MuonTests(unittest.TestCase):
             torch.testing.assert_close(parameter, expected, rtol=0.01, atol=0.002)
 
     def test_split_rule(self):
-        model = VanillaModel(**MODEL, vocab_size=CHESS_VOCAB_SIZE)
+        model = PonderaModel(**MODEL, vocab_size=CHESS_VOCAB_SIZE)
         muon, adamw = split_parameters(model)
         muon_names = {
             name for name, p in model.named_parameters() if any(p is m for m in muon)
@@ -170,40 +207,47 @@ class TrainerTests(unittest.TestCase):
 
     def make_model(self):
         torch.manual_seed(11)
-        return VanillaModel(**self.model_config)
+        return PonderaModel(**self.model_config)
 
     def config(self, updates):
-        documents = PackedDocuments(self.root / "packed")
-        train_indices = select_documents(
-            PackedDocuments(self.root / "packed"), seed=640
-        )
         return TrainConfig(
-            microbatch_tokens=65_536,
-            update_tokens=2 * int(documents.lengths[train_indices].sum()),
+            max_pack_tokens=65_536,
+            packs_per_update=2,
             updates=updates,
             val_every=2,
             checkpoint_every=updates,
         )
 
-    def write_training_recipe(self, path, architecture="vanilla", updates=2):
+    def write_training_recipe(self, path, updates=2):
         path.write_text(f"""
 [model]
-architecture = "{architecture}"
-num_blocks = 1
 hidden_size = 32
 intermediate_size = 48
 num_heads = 4
 num_kv_heads = 2
+block_attn_res = true
+factorized_move_head = true
+
+[[model.segments]]
+blocks = [{{ attention = "kda", group_end = true }}]
+
+[[model.segments]]
+repeat = 2
+blocks = ["kda", {{ attention = "softmax", navigation = true, group_end = true }}]
+
+[[model.segments]]
+blocks = [{{ attention = "softmax", value_source = "token_embedding", group_end = true }}]
 
 [training]
 seed = 11
+optimizer = "hyperball"
 muon_lr = 0.01
 adamw_lr = 0.0007
 warmup_fraction = 0.5
 min_lr_ratio = 0.1
-weight_decay = 0.05
-microbatch_tokens = 1024
-update_tokens = 1
+adamw_weight_decay = 0.05
+max_pack_tokens = 1024
+packs_per_update = 1
 updates = {updates}
 documents = 3
 max_document_tokens = 65536
@@ -237,86 +281,101 @@ checkpoint_keep_last = 2
             env={**os.environ, "OMP_NUM_THREADS": "1"},
         )
 
+    def test_init_seed_changes_weights_without_changing_document_selection(self):
+        recipe = self.root / "model.toml"
+        self.write_training_recipe(recipe, updates=1)
+        recipe_text = recipe.read_text()
+        states = {}
+        for init_seed in (None, 11, 0):
+            if init_seed is not None:
+                recipe.write_text(f"{recipe_text}\ninit_seed = {init_seed}\n")
+            output = self.root / f"init-{init_seed}"
+            result = self.run_training_command(recipe, output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            states[init_seed] = torch.load(output / "checkpoint.pth", weights_only=True)
+            self.assertEqual(states[init_seed]["train_config"]["init_seed"], init_seed)
+
+        self.assertEqual(
+            states[None]["document_indices"], states[0]["document_indices"]
+        )
+        name = "token_embedding.weight"
+        reference = states[None]["model_state_dict"][name]
+        self.assertTrue(torch.equal(reference, states[11]["model_state_dict"][name]))
+        self.assertFalse(torch.equal(reference, states[0]["model_state_dict"][name]))
+
     def test_toml_training_and_resume_match_uninterrupted_training(self):
-        for architecture in ("vanilla", "linear"):
-            with self.subTest(architecture=architecture):
-                recipe = self.root / f"{architecture}.toml"
-                full = self.root / f"{architecture}-full"
-                partial = self.root / f"{architecture}-partial"
-                self.write_training_recipe(recipe, architecture)
-                result = self.run_training_command(recipe, full)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                result = self.run_training_command(
-                    recipe, partial, full / "checkpoint-00000001.pth"
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                expected = torch.load(full / "checkpoint.pth", weights_only=True)
-                actual = torch.load(partial / "checkpoint.pth", weights_only=True)
-                self.assertEqual(actual["arch"], architecture)
-                self.assertEqual(actual["model_config"], self.model_config)
-                self.assertEqual(actual["presented_documents"], 6)
-                self.assertEqual(
-                    actual["selection"],
-                    {
-                        "documents": 3,
-                        "max_document_tokens": 65536,
-                        "validation_documents": 1,
-                    },
-                )
-                self.assertEqual(actual["train_config"]["seed"], 11)
-                self.assertEqual(actual["train_config"]["microbatch_tokens"], 1024)
-                self.assertEqual(actual["train_config"]["update_tokens"], 1)
-                self.assertEqual(actual["train_config"]["checkpoint_keep_last"], 2)
-                self.assertEqual(actual["train_config"]["warmup_fraction"], 0.5)
-                self.assertEqual(actual["train_config"]["min_lr_ratio"], 0.1)
-                for optimizer, expected_lr in zip(
-                    actual["optimizer_state_dicts"], (0.001, 0.00007)
-                ):
-                    self.assertAlmostEqual(
-                        optimizer["param_groups"][0]["lr"], expected_lr
-                    )
-                self.assertTrue(
-                    all(
-                        optimizer["param_groups"][0]["weight_decay"] == 0.05
-                        for optimizer in actual["optimizer_state_dicts"]
-                    )
-                )
-                self.assertEqual(
-                    json.loads((partial / "config.json").read_text())["train_config"],
-                    actual["train_config"],
-                )
-                reference_history = [
-                    json.loads(line)
-                    for line in (full / "history.jsonl").read_text().splitlines()
-                ]
-                resumed_history = [
-                    json.loads(line)
-                    for line in (partial / "history.jsonl").read_text().splitlines()
-                ]
-                self.assertEqual(
-                    [record["loss"] for record in resumed_history],
-                    [record["loss"] for record in reference_history[1:]],
-                )
-                for name, weight in expected["model_state_dict"].items():
-                    torch.testing.assert_close(
-                        actual["model_state_dict"][name], weight, rtol=0, atol=0
-                    )
-                # The requested model in TOML must not be silently replaced
-                # with checkpoint settings during resume.
-                recipe.write_text(
-                    recipe.read_text().replace("hidden_size = 32", "hidden_size = 64")
-                )
-                result = self.run_training_command(
-                    recipe, partial, partial / "checkpoint.pth"
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(
-                    [
-                        json.loads(line)
-                        for line in (partial / "history.jsonl").read_text().splitlines()
-                    ],
-                    resumed_history,
-                )
+        recipe = self.root / "model.toml"
+        full = self.root / "full"
+        partial = self.root / "partial"
+        self.write_training_recipe(recipe)
+        result = self.run_training_command(recipe, full)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_training_command(
+            recipe, partial, full / "checkpoint-00000001.pth"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = torch.load(full / "checkpoint.pth", weights_only=True)
+        actual = torch.load(partial / "checkpoint.pth", weights_only=True)
+        self.assertEqual(actual["arch"], "pondera")
+        settings = tomllib.loads(recipe.read_text())["model"]
+        settings["vocab_size"] = self.model_config["vocab_size"]
+        self.assertEqual(actual["model_config"], settings)
+        self.assertEqual(actual["presented_documents"], 6)
+        self.assertEqual(
+            actual["selection"],
+            {
+                "documents": 3,
+                "max_document_tokens": 65536,
+                "validation_documents": 1,
+            },
+        )
+        self.assertEqual(actual["train_config"]["seed"], 11)
+        self.assertEqual(actual["train_config"]["max_pack_tokens"], 1024)
+        self.assertEqual(actual["train_config"]["packs_per_update"], 1)
+        self.assertEqual(actual["train_config"]["checkpoint_keep_last"], 2)
+        self.assertEqual(actual["train_config"]["warmup_fraction"], 0.5)
+        self.assertEqual(actual["train_config"]["min_lr_ratio"], 0.1)
+        for optimizer, expected_lr in zip(
+            actual["optimizer_state_dicts"], (0.001, 0.00007)
+        ):
+            self.assertAlmostEqual(optimizer["param_groups"][0]["lr"], expected_lr)
+        matrix, adamw = actual["optimizer_state_dicts"]
+        self.assertTrue(matrix["param_groups"][0]["hyperball"])
+        self.assertEqual(adamw["param_groups"][0]["weight_decay"], 0.05)
+        self.assertEqual(
+            json.loads((partial / "config.json").read_text())["train_config"],
+            actual["train_config"],
+        )
+        reference_history = [
+            json.loads(line)
+            for line in (full / "history.jsonl").read_text().splitlines()
+        ]
+        resumed_history = [
+            json.loads(line)
+            for line in (partial / "history.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(
+            [record["loss"] for record in resumed_history],
+            [record["loss"] for record in reference_history[1:]],
+        )
+        for name, weight in expected["model_state_dict"].items():
+            torch.testing.assert_close(
+                actual["model_state_dict"][name], weight, rtol=0, atol=0
+            )
+        # The requested model in TOML must not be silently replaced
+        # with checkpoint settings during resume.
+        recipe.write_text(
+            recipe.read_text().replace("hidden_size = 32", "hidden_size = 64")
+        )
+        result = self.run_training_command(recipe, partial, partial / "checkpoint.pth")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            [
+                json.loads(line)
+                for line in (partial / "history.jsonl").read_text().splitlines()
+            ],
+            resumed_history,
+        )
 
     def test_checkpoint_retention_and_resume_from_an_older_update(self):
         config = self.config(5)
@@ -394,6 +453,7 @@ checkpoint_keep_last = 2
         for budget in ("updates", "presentations"):
             with self.subTest(budget=budget):
                 config = self.config(4)
+                config.muon_lr = 0.02
                 config.warmup_fraction = 0.5
                 config.min_lr_ratio = 0.1
                 config.checkpoint_every = 1
@@ -481,6 +541,171 @@ checkpoint_keep_last = 2
                     )
                 self.assertFalse(output.exists())
 
+    def test_absolute_presentation_cap_and_resume_accounting(self):
+        config = self.config(8)
+        config.max_presented_documents = 7
+        output = self.root / "capped"
+        first = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            track=False,
+        )
+        self.assertEqual(first["presented_documents"], 7)
+        self.assertEqual(
+            json.loads((output / "progress.json").read_text())["presented_documents"], 7
+        )
+        config.max_presented_documents = 10
+        second = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            resume=output / "checkpoint.pth",
+            track=False,
+        )
+        self.assertEqual(second["presented_documents"], 10)
+        self.assertEqual(second["history"][-1]["presented_documents"], 10)
+        config.max_presented_documents = 9
+        with self.assertRaises(ValueError):
+            train(
+                self.make_model(),
+                self.model_config,
+                self.root / "packed",
+                config,
+                self.root / "exhausted",
+                resume=output / "checkpoint.pth",
+                track=False,
+            )
+
+    def test_validation_includes_documents_above_training_length_filter(self):
+        documents = PackedDocuments(self.root / "packed")
+        longest = int(np.argmax(documents.lengths))
+        splits = np.memmap(self.root / "packed" / "split.u8", np.uint8, mode="r+")
+        splits[longest] = 1
+        splits.flush()
+        documents = PackedDocuments(self.root / "packed")
+        config = self.config(1)
+        config.max_document_tokens = int(documents.lengths[documents.split == 0].min())
+        config.val_every = 1
+        output = self.root / "all-validation"
+        result = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            track=False,
+        )
+        state = torch.load(output / "checkpoint.pth", weights_only=True)
+        self.assertEqual(
+            state["selection"]["validation_documents"], int((splits == 1).sum())
+        )
+        # Every document supplies length minus one within-document next-token targets.
+        expected_labels = int((documents.lengths[documents.split == 1] - 1).sum())
+        self.assertEqual(result["history"][-1]["val_labeled_tokens"], expected_labels)
+        model = self.make_model()
+        model.load_state_dict(state["model_state_dict"])
+        model.eval()
+        loss, _, _ = validation_loss(
+            model, documents, 65536, "cpu", np.flatnonzero(splits == 1)
+        )
+        self.assertFalse(model.training)
+        self.assertAlmostEqual(loss, result["history"][-1]["val_loss"], places=6)
+
+    def test_checkpoint_loss_matches_uniform_distribution_and_training_evaluation(self):
+        output = self.root / "loss-reference"
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            self.config(1),
+            output,
+            track=False,
+        )
+        checkpoint = output / "checkpoint.pth"
+        model = self.make_model()
+        state = torch.load(checkpoint, weights_only=True)
+        model.load_state_dict(state["model_state_dict"])
+        documents = PackedDocuments(self.root / "packed")
+        expected, labels, _ = validation_loss(
+            model, documents, 65536, "cpu", np.flatnonzero(documents.split == 1)
+        )
+        result = evaluate_loss(checkpoint, self.root / "packed", batch_tokens=32)
+        self.assertAlmostEqual(result["loss"], expected, delta=1e-6)
+        self.assertEqual(result["labeled_tokens"], labels)
+        self.assertEqual(
+            sum(row["tokens"] for row in result["document_losses"]), labels
+        )
+        for value in state["model_state_dict"].values():
+            value.zero_()
+        constant = self.root / "uniform.pth"
+        torch.save(state, constant)
+        # A zero-logit model assigns 1/vocabulary probability to every next token.
+        result = evaluate_loss(constant, self.root / "packed")
+        self.assertAlmostEqual(
+            result["loss"], math.log(self.model_config["vocab_size"]), places=6
+        )
+
+    def test_distributed_checkpoint_loss_preserves_all_document_results(self):
+        output = self.root / "distributed-loss"
+        train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            self.config(1),
+            output,
+            track=False,
+        )
+        packed = self.root / "packed"
+        split = np.memmap(packed / "split.u8", np.uint8, mode="r+")
+        split[:] = 1
+        split.flush()
+        checkpoint = output / "checkpoint.pth"
+        # Uneven batches and a single batch exercise sharding and a rank with no work.
+        for budget in (32, 65536):
+            with self.subTest(batch_tokens=budget):
+                expected = evaluate_loss(checkpoint, packed, batch_tokens=budget)
+                destination = self.root / f"loss-{budget}"
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "torch.distributed.run",
+                        "--standalone",
+                        "--nproc-per-node=2",
+                        "-m",
+                        "pondera.evaluation.loss",
+                        "--checkpoint",
+                        str(checkpoint),
+                        "--packed",
+                        str(packed),
+                        "--output",
+                        str(destination),
+                        "--batch-tokens",
+                        str(budget),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                )
+                actual = json.loads((destination / "summary.json").read_text())
+                rows = [
+                    json.loads(line)
+                    for line in (destination / "documents.jsonl")
+                    .read_text()
+                    .splitlines()
+                ]
+                self.assertEqual(rows, expected["document_losses"])
+                self.assertEqual(actual["loss"], expected["loss"])
+                self.assertEqual(actual["labeled_tokens"], expected["labeled_tokens"])
+                self.assertEqual(actual["documents"], len(split))
+                self.assertEqual(actual["world_size"], 2)
+
     def test_loss_decreases(self):
         model = self.make_model()
         result = train(
@@ -521,7 +746,7 @@ checkpoint_keep_last = 2
         try:
             swanlab.register_callbacks([Recorder()])
             result = train(
-                LinearVanillaModel(**self.model_config),
+                PonderaModel(**self.model_config),
                 self.model_config,
                 self.root / "packed",
                 config,
@@ -535,9 +760,9 @@ checkpoint_keep_last = 2
                 os.environ["SWANLAB_MODE"] = previous_mode
         self.assertEqual([step for _, step in events], [1, 2])
         self.assertEqual([data for data, _ in events], result["history"])
-        self.assertEqual(architectures, ["linear", "linear"])
+        self.assertEqual(architectures, ["pondera", "pondera"])
         local_config = json.loads((output / "config.json").read_text())
-        self.assertEqual(local_config["arch"], "linear")
+        self.assertEqual(local_config["arch"], "pondera")
         state = torch.load(output / "checkpoint.pth", weights_only=True)
         self.assertIsInstance(state["swanlab_run_id"], str)
         self.assertTrue(state["swanlab_run_id"])
@@ -545,8 +770,9 @@ checkpoint_keep_last = 2
         self.assertTrue(artifacts)
         self.assertGreater(artifacts[0].stat().st_size, 0)
 
-    def check_resume_replays_the_same_losses(self, device):
+    def check_resume_replays_the_same_losses(self, device, hyperball=False):
         config = self.config(4)
+        config.optimizer = "hyperball" if hyperball else "muon"
         config.warmup_fraction = 0.5
         config.checkpoint_every = 1
         config.checkpoint_keep_last = 4
@@ -596,6 +822,9 @@ checkpoint_keep_last = 2
     def test_resume_replays_the_same_losses(self):
         self.check_resume_replays_the_same_losses("cpu")
 
+    def test_hyperball_resume_replays_the_same_losses(self):
+        self.check_resume_replays_the_same_losses("cpu", hyperball=True)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA resume requires a GPU")
     def test_cuda_resume_replays_the_same_losses(self):
         # Exact weight replay requires deterministic FlashAttention backward.
@@ -626,7 +855,7 @@ checkpoint_keep_last = 2
         config.muon_lr = 0.01
         config.adamw_lr = 0.00015
         config.min_lr_ratio = 0.25
-        config.weight_decay = 0.7
+        config.adamw_weight_decay = 0.7
         train(
             self.make_model(),
             self.model_config,
@@ -644,8 +873,9 @@ checkpoint_keep_last = 2
             for optimizer in state["optimizer_state_dicts"]
         ]
         self.assertEqual(rates, [[0.0025], [0.0000375]])
-        for optimizer in state["optimizer_state_dicts"]:
-            self.assertEqual(optimizer["param_groups"][0]["weight_decay"], 0.7)
+        self.assertEqual(
+            state["optimizer_state_dicts"][1]["param_groups"][0]["weight_decay"], 0.7
+        )
 
     def test_resume_rejects_changed_sampler_and_architecture(self):
         output = self.root / "sampler-partial"
@@ -658,10 +888,16 @@ checkpoint_keep_last = 2
             track=False,
         )
         checkpoint = output / "checkpoint.pth"
-        for field in ("seed", "microbatch_tokens"):
+        for field, value in (
+            ("seed", self.config(2).seed + 1),
+            ("init_seed", self.config(2).seed + 1),
+            ("max_pack_tokens", self.config(2).max_pack_tokens + 1),
+            ("packs_per_update", self.config(2).packs_per_update + 1),
+            ("optimizer", "muon"),
+        ):
             with self.subTest(field=field):
                 config = self.config(2)
-                setattr(config, field, getattr(config, field) + 1)
+                setattr(config, field, value)
                 with self.assertRaises(ValueError):
                     train(
                         self.make_model(),
@@ -684,10 +920,11 @@ checkpoint_keep_last = 2
                 resume=checkpoint,
                 track=False,
             )
+        changed = {**self.model_config, "segments": [{"blocks": ["kda"]}]}
         with self.assertRaises(ValueError):
             train(
-                LinearVanillaModel(**self.model_config),
-                self.model_config,
+                PonderaModel(**changed),
+                changed,
                 self.root / "packed",
                 self.config(2),
                 self.root / "changed-architecture",
@@ -741,7 +978,10 @@ checkpoint_keep_last = 2
             self.config(1),
             output,
             track=False,
+            validation_document_steps=(1,),
         )
+        first_report = output / "validation-00000001" / "summary.json"
+        initial_summary = first_report.read_text()
         old_checkpoint = self.root / "old-checkpoint.pth"
         shutil.copy2(output / "checkpoint.pth", old_checkpoint)
         train(
@@ -752,7 +992,9 @@ checkpoint_keep_last = 2
             output,
             resume=old_checkpoint,
             track=False,
+            validation_document_steps=(2, 3),
         )
+        self.assertTrue((output / "validation-00000003" / "summary.json").is_file())
         history_path = output / "history.jsonl"
         expected = [
             json.loads(line)["loss"] for line in history_path.read_text().splitlines()
@@ -765,7 +1007,11 @@ checkpoint_keep_last = 2
             output,
             resume=old_checkpoint,
             track=False,
+            validation_document_steps=(2,),
         )
+        self.assertEqual(first_report.read_text(), initial_summary)
+        self.assertTrue((output / "validation-00000002" / "documents.jsonl").is_file())
+        self.assertFalse((output / "validation-00000003").exists())
         records = [json.loads(line) for line in history_path.read_text().splitlines()]
         self.assertEqual([record["update"] for record in records], [1, 2, 3])
         self.assertEqual([record["loss"] for record in records], expected)
@@ -792,8 +1038,8 @@ checkpoint_keep_last = 2
             result = self.config(1)
             result.updates = None
             result.presentations = presentations
-            result.microbatch_tokens = int(documents.lengths.max())
-            result.update_tokens = 1
+            result.max_pack_tokens = int(documents.lengths.max())
+            result.packs_per_update = 1
             result.val_every = 0
             return result
 
@@ -829,24 +1075,123 @@ checkpoint_keep_last = 2
         # partial optimizer update need not match an originally longer run.
         self.assertEqual(partial["presented_documents"], int(count * 0.75))
         self.assertEqual(resumed["presented_documents"], expected_count)
-        expected_new_tokens = sum(
-            int(documents.lengths[batch].sum())
-            for batch, _ in packed_batch_indices(
-                documents,
-                select_documents(documents, seed=640),
-                640,
-                config(1.5).microbatch_tokens,
-                start_document=partial["presented_documents"],
-                presentations=1.5,
-            )
-        )
+        # Uninterrupted training sees the same document suffix without a resume cursor.
         self.assertEqual(
-            sum(record["tokens"] for record in resumed["history"]), expected_new_tokens
+            sum(record["tokens"] for record in partial["history"] + resumed["history"]),
+            sum(record["tokens"] for record in reference["history"]),
         )
+
+    def test_training_without_validation_skips_metrics_and_rejects_report_requests(
+        self,
+    ):
+        packed = self.root / "packed"
+        (packed / "split.u8").write_bytes(bytes(len(PackedDocuments(packed))))
+        output = self.root / "no-validation"
+        result = train(
+            self.make_model(),
+            self.model_config,
+            packed,
+            self.config(2),
+            output,
+            track=False,
+        )
+        self.assertEqual(result["updates"], 2)
+        self.assertNotIn("val_loss", result["history"][-1])
+        self.assertTrue((output / "checkpoint.pth").is_file())
+
+        rejected = self.root / "no-document-report"
+        with self.assertRaises(ValueError):
+            train(
+                self.make_model(),
+                self.model_config,
+                packed,
+                self.config(2),
+                rejected,
+                track=False,
+                validation_document_steps=(1,),
+            )
+        self.assertFalse((rejected / "history.jsonl").exists())
+
+    def test_update_stop_keeps_schedule_and_paired_validation(self):
+        documents = PackedDocuments(self.root / "packed")
+        config = self.config(1)
+        config.updates = None
+        config.packs_per_update = 1
+        config.max_pack_tokens = int(documents.lengths.max())
+        output = self.root / "stages"
+        reference = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            self.root / "reference",
+            track=False,
+        )
+        first = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            track=False,
+            stop_after_update=1,
+            validation_internals=True,
+            validation_document_steps=(1,),
+        )
+        self.assertEqual(first["updates"], 1)
+        self.assertEqual(
+            first["history"][0]["muon_lr"], reference["history"][0]["muon_lr"]
+        )
+        probe = first["history"][0]["internals"]
+        self.assertEqual(
+            probe["documents"], [int(np.flatnonzero(documents.split == 1)[0])]
+        )
+
+        checkpoint = output / "checkpoint.pth"
+        independently_scored = evaluate_loss(checkpoint, self.root / "packed")
+        evidence = output / "validation-00000001"
+        scores = [
+            json.loads(line)
+            for line in (evidence / "documents.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(len(scores), independently_scored["documents"])
+        for score, wanted in zip(
+            scores, independently_scored["document_losses"], strict=True
+        ):
+            self.assertEqual(score["document"], wanted["document"])
+            self.assertEqual(score["tokens"], wanted["tokens"])
+            self.assertAlmostEqual(
+                score["nll_sum"] / score["tokens"],
+                wanted["nll_sum"] / wanted["tokens"],
+                places=6,
+            )
+
+        resumed = train(
+            self.make_model(),
+            self.model_config,
+            self.root / "packed",
+            config,
+            output,
+            track=False,
+            resume=checkpoint,
+        )
+        self.assertEqual(resumed["updates"], reference["updates"])
+        for actual, expected in zip(
+            resumed["history"], reference["history"][1:], strict=True
+        ):
+            for field in (
+                "loss",
+                "tokens",
+                "presented_documents",
+                "muon_lr",
+                "adamw_lr",
+            ):
+                self.assertEqual(actual[field], expected[field])
+        self.assertTrue((evidence / "summary.json").is_file())
 
     def test_distributed_matches_single_process_and_resume(self):
         config = self.config(2)
-        config.update_tokens *= 2
+        config.packs_per_update = 3
         config.val_every = 1
         reference = train(
             self.make_model(),
@@ -869,7 +1214,6 @@ checkpoint_keep_last = 2
                     ("partial", 2, None),
                     ("resumed", 2, output / "partial" / "checkpoint-00000001.pth"),
                 ),
-                VanillaModel,
             ),
             nprocs=2,
             join=True,
@@ -883,8 +1227,16 @@ checkpoint_keep_last = 2
             actual.extend(rows[:1] if name == "partial" else rows)
         expected = reference["history"]
         self.assertEqual(len(actual), len(expected))
+        self.assertEqual([row["micro_step"] for row in actual], [3, 6])
         for observed, wanted in zip(actual, expected):
-            for field in ("update", "micro_step", "tokens", "labeled_tokens", "epoch"):
+            for field in (
+                "update",
+                "micro_step",
+                "tokens",
+                "labeled_tokens",
+                "val_labeled_tokens",
+                "epoch",
+            ):
                 self.assertEqual(observed[field], wanted[field])
             self.assertAlmostEqual(observed["loss"], wanted["loss"], places=4)
             self.assertAlmostEqual(observed["val_loss"], wanted["val_loss"], places=4)
@@ -913,7 +1265,8 @@ checkpoint_keep_last = 2
         indices = select_documents(PackedDocuments(self.root / "packed"), seed=640)
         config = self.config(1)
         config.updates = None
-        config.microbatch_tokens = int(documents.lengths.max())
+        config.max_pack_tokens = int(documents.lengths.max())
+        config.packs_per_update = 4
         config.val_every = 1
         batches = len(
             list(
@@ -921,69 +1274,72 @@ checkpoint_keep_last = 2
                     documents,
                     indices,
                     config.seed,
-                    config.microbatch_tokens,
+                    config.max_pack_tokens,
                     presentations=1.0,
                 )
             )
         )
         self.assertEqual(batches % 2, 1)
-        for model_class in (VanillaModel, LinearVanillaModel):
-            with self.subTest(architecture=model_class.architecture):
-                root = self.root / model_class.architecture
-                torch.manual_seed(11)
-                reference = train(
-                    model_class(**self.model_config),
-                    self.model_config,
-                    self.root / "packed",
-                    config,
-                    root / "reference",
-                    track=False,
-                )
-                output = root / "distributed"
-                torch.multiprocessing.spawn(
-                    _ddp_worker,
-                    args=(
-                        root / "store",
-                        self.root / "packed",
-                        self.model_config,
-                        output,
-                        config,
-                        (("full", None, None),),
-                        model_class,
-                    ),
-                    nprocs=2,
-                    join=True,
-                )
-                actual = torch.load(
-                    output / "full" / "checkpoint.pth", weights_only=True
-                )
-                expected = torch.load(
-                    root / "reference" / "checkpoint.pth", weights_only=True
-                )
-                self.assertEqual(actual["micro_step"], batches)
-                self.assertEqual(actual["presented_documents"], len(indices))
-                observed = [
-                    json.loads(line)
-                    for line in (output / "full" / "history.jsonl")
-                    .read_text()
-                    .splitlines()
-                ]
-                self.assertEqual(len(observed), reference["updates"])
-                for record, wanted in zip(observed, reference["history"]):
-                    for field in (
-                        "micro_step",
-                        "tokens",
-                        "labeled_tokens",
-                        "presentations",
-                    ):
-                        self.assertEqual(record[field], wanted[field])
-                    self.assertAlmostEqual(record["loss"], wanted["loss"], places=4)
-                    self.assertAlmostEqual(
-                        record["val_loss"], wanted["val_loss"], places=4
-                    )
-                for key, weight in expected["model_state_dict"].items():
+        root = self.root / "uneven"
+        root.mkdir()
+        torch.manual_seed(11)
+        reference = train(
+            PonderaModel(**self.model_config),
+            self.model_config,
+            self.root / "packed",
+            config,
+            root / "reference",
+            track=False,
+        )
+        output = root / "distributed"
+        torch.multiprocessing.spawn(
+            _ddp_worker,
+            args=(
+                root / "store",
+                self.root / "packed",
+                self.model_config,
+                output,
+                config,
+                (("full", None, None),),
+            ),
+            nprocs=2,
+            join=True,
+        )
+        actual = torch.load(output / "full" / "checkpoint.pth", weights_only=True)
+        expected = torch.load(root / "reference" / "checkpoint.pth", weights_only=True)
+        self.assertEqual(actual["micro_step"], batches)
+        self.assertEqual(actual["presented_documents"], len(indices))
+        observed = [
+            json.loads(line)
+            for line in (output / "full" / "history.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(len(observed), reference["updates"])
+        for record, wanted in zip(observed, reference["history"]):
+            for field in (
+                "micro_step",
+                "tokens",
+                "labeled_tokens",
+                "val_labeled_tokens",
+                "presentations",
+            ):
+                self.assertEqual(record[field], wanted[field])
+            self.assertAlmostEqual(record["loss"], wanted["loss"], places=4)
+            self.assertAlmostEqual(record["val_loss"], wanted["val_loss"], places=4)
+        # At the first update, momentum is proportional to the gradient.
+        # Compare before Muon's BF16 orthogonalization can amplify tiny
+        # differences from the distributed reduction order.
+        for observed_optimizer, expected_optimizer in zip(
+            actual["optimizer_state_dicts"],
+            expected["optimizer_state_dicts"],
+            strict=True,
+        ):
+            for parameter, state in expected_optimizer["state"].items():
+                for name, value in state.items():
                     torch.testing.assert_close(
-                        actual["model_state_dict"][key], weight, rtol=1e-4, atol=1e-5
+                        observed_optimizer["state"][parameter][name],
+                        value,
+                        rtol=1e-5,
+                        atol=1e-8,
                     )
 
 

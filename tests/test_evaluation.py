@@ -11,10 +11,10 @@ import torch
 
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
 from pondera.evaluation.match import parse_result, run_match
-from pondera.models.vanilla import VanillaModel
+from pondera.models import PonderaModel
 
 CONFIG = {
-    "num_blocks": 1,
+    "segments": [{"blocks": ["softmax"]}],
     "hidden_size": 16,
     "intermediate_size": 32,
     "num_heads": 2,
@@ -25,11 +25,11 @@ CONFIG = {
 def save_model(path):
     config = {**CONFIG, "vocab_size": CHESS_VOCAB_SIZE}
     torch.manual_seed(640)
-    model = VanillaModel(**config)
+    model = PonderaModel(**config)
     torch.save(
         {
             "format_version": 1,
-            "arch": "vanilla",
+            "arch": "pondera",
             "model_config": config,
             "model_state_dict": model.state_dict(),
         },
