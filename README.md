@@ -14,7 +14,7 @@ cd pondera
 uv sync --group dev
 ```
 
-Python 3.13 or later is required. Install Stockfish and fastchess separately and put them on `PATH`. For CPU inference, use `uv sync --no-dev`.
+Python 3.13 or later is required. Source and editable installs also require a Rust toolchain. The build uses Maturin to compile the chess extension. Install Stockfish and fastchess separately and put them on `PATH`. For CPU inference, use `uv sync --no-dev`.
 
 For CUDA training or inference, pass `--extra cuda` to `uv sync` or `uv run` to install the KDA kernels. Triton also needs a C compiler and the headers for your Python installation. On Ascend, use a compatible Torch NPU, Triton Ascend, and FLA environment. See the [FLA backend installation guide](https://github.com/fla-org/flash-linear-attention/blob/main/INSTALL.md).
 
@@ -46,6 +46,7 @@ The evaluator compares zero reasoning with the configured thinking budget, repor
 uv run ruff check .
 uv run ruff format --check .
 uv run lint-imports
+cargo fmt --manifest-path rust/chess/Cargo.toml --check
 uv run python -m unittest discover -s tests -v
 ```
 

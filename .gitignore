@@ -3,6 +3,9 @@
 /.venv/
 /build/
 /dist/
+/rust/chess/target/
+/src/pondera/chess/_rules*.so
+/src/pondera/chess/_rules*.pyd
 *.egg-info/
 __pycache__/
 *.py[cod]

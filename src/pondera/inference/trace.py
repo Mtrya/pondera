@@ -3,9 +3,9 @@
 import time
 from dataclasses import dataclass, field
 
-import chess
 import torch
 
+from pondera.chess import _rules as rules
 from pondera.chess.codec import decode_value_token, encode_board
 from pondera.chess.merge import MergeDictionary, MergeDictionaryError, decode
 from pondera.chess.symmetry import reflect_uci
@@ -75,8 +75,8 @@ def parse_answer(tokens, dictionary, fen, repetition=1):
     if not body or not MOVE <= body[0] < VALUE:
         answer.errors.append("missing_decision")
         return answer
-    board = chess.Board(fen)
-    mirrored = board.turn == chess.BLACK
+    board = rules.Board(fen)
+    mirrored = board.turn == rules.BLACK
 
     def move_name(atom):
         move = IDX_TO_UCI_MOVE[atom - MOVE]
@@ -90,7 +90,7 @@ def parse_answer(tokens, dictionary, fen, repetition=1):
         and (
             repetition >= 3 or board.halfmove_clock >= 100
             if claim
-            else chess.Move.from_uci(answer.decision) in board.legal_moves
+            else board.is_legal(rules.Move.from_uci(answer.decision))
         )
     )
     if not answer.move_legal:
@@ -126,8 +126,8 @@ def parse_answer(tokens, dictionary, fen, repetition=1):
         return answer
     board.push_uci(answer.decision)
     for move in answer.pv:
-        parsed = chess.Move.from_uci(move)
-        if board.is_game_over() or parsed not in board.legal_moves:
+        parsed = rules.Move.from_uci(move)
+        if board.is_game_over() or not board.is_legal(parsed):
             answer.errors.append("illegal_pv")
             return answer
         board.push(parsed)

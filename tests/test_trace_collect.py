@@ -10,10 +10,10 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
-import chess
 from trace_fixtures import read_release_rows
 from trace_fixtures import trace_config_text as config_text
 
+from pondera.chess import _rules as rules
 from pondera.data.config import load_config, parse_recipe
 from pondera.data.pipeline import (
     CollectionError,
@@ -70,7 +70,7 @@ class RecipeTests(unittest.TestCase):
 
     def test_root_settings_are_recomputed_from_the_active_recipe(self):
         roots = [
-            {"root_id": f"root-{index}", "fen": chess.STARTING_FEN}
+            {"root_id": f"root-{index}", "fen": rules.STARTING_FEN}
             for index in range(200)
         ]
         first = self.load(config_text())
@@ -93,7 +93,7 @@ class RecipeTests(unittest.TestCase):
         ]
         config = self.load(config_text(joint=joint))
         roots = [
-            {"root_id": f"root-{i}", "fen": chess.STARTING_FEN} for i in range(2000)
+            {"root_id": f"root-{i}", "fen": rules.STARTING_FEN} for i in range(2000)
         ]
         sampled = sample_root_settings(roots, config, 640)
         counts = Counter((r["teacher_width"], r["depth"]) for r in sampled)
@@ -131,7 +131,7 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual([r["teacher_width"] for r in sampled], [20, 2, 1])
         for root in sampled:
             self.assertEqual(
-                root["teacher_width"], chess.Board(root["fen"]).legal_moves.count()
+                root["teacher_width"], rules.Board(root["fen"]).legal_move_count()
             )
             self.assertEqual(root["effective_width"], root["teacher_width"])
         capped = sample_root_settings(roots, self.load(config_text(width=3)), 640)
@@ -586,7 +586,7 @@ class EngineTimeoutTests(unittest.TestCase):
             script.chmod(0o755)
             with _Engine(script, 256, timeout=1) as engine:
                 with self.assertRaises(EngineTimeoutError):
-                    engine.search(chess.STARTING_FEN, directory / "trace.jsonl", 1, 4)
+                    engine.search(rules.STARTING_FEN, directory / "trace.jsonl", 1, 4)
 
     def test_a_slow_engine_start_is_a_plain_collection_failure(self):
         with tempfile.TemporaryDirectory() as directory:

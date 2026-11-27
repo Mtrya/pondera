@@ -8,12 +8,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
-import chess
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from trace_fixtures import read_release_rows, tie_sidecar_lines, trace_config_text
 
+from pondera.chess import _rules as rules
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
 from pondera.data.config import load_config, parse_recipe
@@ -707,7 +707,7 @@ class WideReleaseTests(unittest.TestCase):
             capped = next(
                 root for root in roots if root["root_id"].startswith("6c9691")
             )
-            self.assertEqual(chess.Board(capped["fen"]).legal_moves.count(), 2)
+            self.assertEqual(rules.Board(capped["fen"]).legal_move_count(), 2)
             stored = records[capped["root_id"], capped["presentation"]]["row"]
             self.assertEqual(stored["teacher_width"], 3)
             self.assertNotIn("effective_width", stored)

@@ -1,7 +1,7 @@
 """Rule-only path state machine for trace thought traces.
 
 A tracker owns the ground truth of one thought path: a root position with its
-repetition count, a stack of absolute UCI moves, and the current python-chess
+repetition count, a stack of absolute UCI moves, and the current Rust-backed
 board. It never evaluates moves, never searches, and imports no data, model, or
 training code.
 
@@ -20,17 +20,13 @@ observation's count and includes the root's prior history, while
 written path and ignores that history.
 """
 
-import chess
-
+from pondera.chess import _rules as rules
 from pondera.chess.codec import encode_board
 
 
-def repetition_count(board: chess.Board) -> int:
+def repetition_count(board: rules.Board) -> int:
     """Occurrences of the current position in the board's move history, capped at five."""
-    for count in range(5, 1, -1):
-        if board.is_repetition(count):
-            return count
-    return 1
+    return board.repetition_count()
 
 
 class PathTracker:
@@ -41,22 +37,12 @@ class PathTracker:
             raise ValueError("Root repetition must be positive")
         self.root_fen = root_fen
         self.root_repetition = repetition
-        self._root = chess.Board(root_fen)
-        self._root_key = self._position_key(self._root)
+        self._root = rules.Board(root_fen)
+        self._root_key = self._root.position_key()
         self.board = self._root.copy(stack=False)
         self._path = []
         self._keys = [self._root_key]
         self._counts = {self._root_key: 1}
-
-    @staticmethod
-    def _position_key(board):
-        """Position identity used by repetition rules, without move counters.
-
-        python-chess writes the en-passant field only when an en-passant
-        capture is actually legal, which is exactly when it distinguishes
-        positions for repetition.
-        """
-        return board._transposition_key()
 
     @property
     def path(self) -> tuple[str, ...]:
@@ -78,23 +64,23 @@ class PathTracker:
     def push(self, move: str) -> None:
         """Enter the child reached by a legal absolute UCI move."""
         try:
-            parsed = chess.Move.from_uci(move)
+            parsed = rules.Move.from_uci(move)
         except ValueError as error:
             raise ValueError(f"Not a board move: {move}") from error
-        if parsed not in self.board.legal_moves:
+        if not self.board.is_legal(parsed):
             raise ValueError(f"Illegal move at this node: {move}")
         self.board.push(parsed)
         self._record_push(move)
 
     def push_legal(self, move: str) -> str:
         """Push a producer-qualified absolute UCI move and return its SAN."""
-        san = self.board.san_and_push(chess.Move.from_uci(move))
+        san = self.board.san_and_push(rules.Move.from_uci(move))
         self._record_push(move)
         return san
 
     def _record_push(self, move):
         self._path.append(move)
-        key = self._position_key(self.board)
+        key = self.board.position_key()
         self._keys.append(key)
         self._counts[key] = self._counts.get(key, 0) + 1
 

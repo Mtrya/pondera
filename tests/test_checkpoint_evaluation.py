@@ -9,11 +9,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import chess
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
+from pondera.chess import _rules as rules
 from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import (
     CHESS_VOCAB_SIZE,
@@ -71,7 +71,7 @@ def save_constant_model(path, decision=None):
 
 class PuzzleMateTests(unittest.TestCase):
     def test_any_legal_checkmate_solves_a_mate_in_one(self):
-        board = chess.Board(FEN)
+        board = rules.Board(FEN)
         for move in board.legal_moves:
             after = board.copy()
             after.push(move)
@@ -105,7 +105,7 @@ class SelectionTests(unittest.TestCase):
     def test_selection_is_invariant_to_input_order_duplicates_and_storage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            board = chess.Board()
+            board = rules.Board()
             rows = [{"fen": board.fen(), "repetition": 1}]
             for move in ("e2e4", "e7e5", "g1f3"):
                 board.push_uci(move)
@@ -131,8 +131,8 @@ class ReferenceTests(unittest.TestCase):
         reference = Reference("stockfish", self.root / "scores.sqlite", nodes=2000)
         try:
             for board, mate, draw in (
-                (chess.Board(FEN), "g6g7", "g6f5"),
-                (chess.Board(FEN).mirror(), "g3g2", "g3f4"),
+                (rules.Board(FEN), "g6g7", "g6f5"),
+                (rules.Board("8/8/8/8/8/6q1/5k2/7K b - - 0 1"), "g3g2", "g3f4"),
             ):
                 # Root-relative move tokens are the same in the mirrored position.
                 dictionary = MergeDictionary()
@@ -166,7 +166,7 @@ class ReferenceTests(unittest.TestCase):
             reference.close()
         reference = Reference("stockfish", self.root / "scores.sqlite", nodes=2000)
         try:
-            reference.scores(chess.Board(FEN))
+            reference.scores(rules.Board(FEN))
             self.assertEqual(reference.searches, 0)
             self.assertEqual(reference.hits, 1)
         finally:
@@ -185,9 +185,9 @@ class ReferenceTests(unittest.TestCase):
                     END,
                 ],
                 MergeDictionary(),
-                chess.STARTING_FEN,
+                rules.STARTING_FEN,
             )
-            result = reference.grade(chess.STARTING_FEN, 1, answer, pv_plies=2)
+            result = reference.grade(rules.STARTING_FEN, 1, answer, pv_plies=2)
             self.assertEqual([ply["move"] for ply in result["pv"]], ["e7e5", "g1f3"])
             self.assertEqual(
                 [ply["root_player"] for ply in result["pv"]], [False, True]
@@ -207,14 +207,13 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(result["chosen"]["value"], 0)
         self.assertEqual(result["root_value"], 1)
         self.assertEqual(result["expected_score_loss"], 0.5)
-        board = chess.Board(FEN)
-        board.halfmove_clock = 100
-        result = reference.grade_decision(board.fen(), 1, "<claim_draw>")
+        claim_fen = "7k/5K2/6Q1/8/8/8/8/8 w - - 100 1"
+        result = reference.grade_decision(claim_fen, 1, "<claim_draw>")
         self.assertEqual(result["chosen"]["value"], 0)
         for repetition in (0, 5):
             with self.subTest(repetition=repetition), self.assertRaises(ValueError):
                 reference.grade_decision(FEN, repetition, "g6g7")
-        board = chess.Board(FEN)
+        board = rules.Board(FEN)
         board.push_uci("g6g7")
         self.assertTrue(board.is_checkmate())
         with self.assertRaises(ValueError):

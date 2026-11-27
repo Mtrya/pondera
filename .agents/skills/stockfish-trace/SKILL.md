@@ -5,7 +5,7 @@ description: Implement, build, and verify the external instrumented Stockfish 17
 
 # Stockfish trace producer
 
-Pondera ships only the Python consumer under `src/pondera/data/`: root-pool construction, configuration, sidecar validation, trace synthesis and replay, release construction and validation, and dataset adapters. It does not ship Stockfish source, an instrumentation patch, engine binaries, sidecars, or releases.
+Pondera's trace consumer lives under `src/pondera/data/`: root-pool construction, configuration, sidecar validation, trace synthesis and replay, release construction and validation, and dataset adapters. It does not ship Stockfish source, an instrumentation patch, engine binaries, sidecars, or releases.
 
 When you start from a clean Pondera clone, build the producer outside the repository from upstream Stockfish 17.1 and this specification. `src/pondera/data/trace.py` is the consumer contract: if `parse_sidecar`, `synthesize_root`, or `replay` rejects your output, fix the producer. Do not copy Stockfish code into this skill or into the repository.
 
@@ -163,4 +163,4 @@ If any gate fails, stop and fix the C++ instrumentation.
    validate_release("/abs/path/to/release", workers=1)
    PY
    ```
-   Use bounded qualification releases during implementation and when investigating a concrete failure. Validation checks manifests, ragged array layout, stored states, and every trace replay against python-chess. Normal curation relies on the qualified producer and synthesizer. Parallel diagnostics use spawned workers and require an importable script with an `if __name__ == "__main__"` guard.
+   Use bounded qualification releases during implementation and when investigating a concrete failure. Validation checks manifests, ragged array layout, stored states, and every trace by replaying it through Pondera's chess rules. Normal curation relies on the qualified producer and synthesizer. Parallel diagnostics use spawned workers and require an importable script with an `if __name__ == "__main__"` guard.

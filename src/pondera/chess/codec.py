@@ -16,9 +16,9 @@ of the value segment, frozen on the pinned teacher release.
 import bisect
 from collections.abc import Sequence
 
-import chess
 import numpy as np
 
+from pondera.chess import _rules as rules
 from pondera.chess.domain import (
     EMPTY_SQ_IDX,
     IDX_TO_PIECE,
@@ -133,7 +133,7 @@ def decode_value_token(token: int) -> float:
     raise ValueError(f"Not a value token: {token}")
 
 
-def legal_move_indices(board: chess.Board) -> list[int]:
+def legal_move_indices(board: rules.Board) -> list[int]:
     """Board moves only; draw adjudication belongs to the game runner."""
     return sorted(UCI_MOVE_TO_IDX[move.uci()] for move in board.legal_moves)
 

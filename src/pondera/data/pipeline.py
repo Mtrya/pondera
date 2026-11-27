@@ -14,11 +14,9 @@ import json
 import os
 import pickle
 import random
-import select
 import shutil
 import signal
 import statistics
-import subprocess
 import time
 from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
@@ -28,9 +26,9 @@ from multiprocessing.util import Finalize
 from pathlib import Path
 from uuid import uuid4
 
-import chess
 import numpy as np
 
+from pondera.chess import _rules as rules
 from pondera.chess.codec import cap_mate_distance, value_bin
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import (
@@ -69,6 +67,7 @@ from pondera.data.trace import (
     synthesize_root,
     validate_root,
 )
+from pondera.uci_process import UciProcess
 
 
 def sample_distribution(rng, distribution):
@@ -364,8 +363,11 @@ def _check_sidecar(root, sidecar, config, engine_name, teacher=None):
     return repetition
 
 
-class _Engine:
+class _Engine(UciProcess):
     """One worker's UCI process, reset to fresh search state for each root."""
+
+    error_type = CollectionError
+    timeout_type = EngineTimeoutError
 
     def __init__(
         self, path, hash_mb, timeout=3600, syzygy_path=None, syzygy_probe_limit=7
@@ -376,12 +378,7 @@ class _Engine:
             # Probing must fail loudly here; an unusable directory would
             # silently produce ordinary searches under a probing identity.
             raise CollectionError(f"Syzygy tablebases are unusable: {syzygy_path}")
-        self.process = subprocess.Popen(
-            [str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
-        )
-        self.buffer = b""
-        self.timeout = timeout
-        self.closed = False
+        super().__init__(path, timeout)
         try:
             deadline = time.monotonic() + timeout
             self._send("uci")
@@ -399,42 +396,6 @@ class _Engine:
             self.close(force=True)
             raise
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-
-    def _send(self, line):
-        try:
-            self.process.stdin.write((line + "\n").encode())
-            self.process.stdin.flush()
-        except (BrokenPipeError, ValueError, OSError) as error:
-            raise CollectionError("engine process is gone") from error
-
-    def _read_line(self, deadline):
-        while b"\n" not in self.buffer:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise EngineTimeoutError("engine timed out")
-            ready, _, _ = select.select([self.process.stdout], [], [], remaining)
-            if not ready:
-                continue
-            chunk = self.process.stdout.read(65536)
-            if not chunk:
-                raise CollectionError("engine closed its output")
-            self.buffer += chunk
-        line, self.buffer = self.buffer.split(b"\n", 1)
-        return line.decode(errors="replace").strip()
-
-    def _read_until(self, prefix, deadline):
-        seen = []
-        while True:
-            line = self._read_line(deadline)
-            seen.append(line)
-            if line.startswith(prefix):
-                return line, seen
-
     def search(self, fen, trace_path, width, depth):
         deadline = time.monotonic() + self.timeout
         self._send("setoption name TraceLog value ")
@@ -451,26 +412,6 @@ class _Engine:
         if len(parts) < 2:
             raise CollectionError(f"engine returned no bestmove: {bestmove!r}")
         return parts[1]
-
-    def close(self, *, force=False):
-        if self.closed:
-            return
-        if force:
-            self.process.kill()
-            self.process.wait()
-        else:
-            try:
-                self._send("quit")
-            except CollectionError:
-                pass
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-        self.process.stdin.close()
-        self.process.stdout.close()
-        self.closed = True
 
 
 RELEASE_ONLY_METADATA = frozenset({"root_selection"})
@@ -1063,12 +1004,12 @@ def _check_champion_round(root_id, entry, board, value_mate, max_ply):
     if not _is_int(round_number, 1) or not _is_int(entry["depth"], 1):
         raise ValueError(f"Champion round is invalid: {root_id}")
     move = entry["move"]
-    if not isinstance(move, str) or chess.Move.from_uci(move) not in board.legal_moves:
+    if not isinstance(move, str) or not board.is_legal(rules.Move.from_uci(move)):
         raise ValueError(f"Champion move is illegal: {root_id}")
     pv = entry["pv"]
     if not isinstance(pv, list) or not pv or pv[0] != move:
         raise ValueError(f"Champion principal variation is invalid: {root_id}")
-    tracker = chess.Board(board.fen(en_passant="fen"))
+    tracker = rules.Board(board.fen(en_passant="fen"))
     for index, step in enumerate(pv):
         if not isinstance(step, str):
             raise ValueError(f"Champion principal variation has a bad move: {root_id}")
@@ -1079,7 +1020,7 @@ def _check_champion_round(root_id, entry, board, value_mate, max_ply):
                 f"Champion principal variation is illegal: {root_id}"
             ) from error
         if index + 1 < len(pv) and tracker.is_game_over():
-            # The search rule, not python-chess's material rule, defines the
+            # The search rule, not the material rule, defines the
             # trace's terminals; the writer re-checks the exact rule on replay.
             continue
     value_token = entry["value_token"]
@@ -1129,7 +1070,7 @@ def _check_champion_round(root_id, entry, board, value_mate, max_ply):
             raise ValueError(f"Champion candidate is incomplete: {root_id}")
         if (
             not isinstance(candidate["move"], str)
-            or chess.Move.from_uci(candidate["move"]) not in board.legal_moves
+            or not board.is_legal(rules.Move.from_uci(candidate["move"]))
             or not _is_int(candidate["order"], 1)
             or candidate["move"] in seen_moves
         ):
@@ -1284,8 +1225,8 @@ def _validate_shard_rows(
         depth = row.get("teacher_depth")
         if not _is_int(teacher_width, 1) or not _is_int(depth, 1):
             raise ValueError(f"Release teacher settings are invalid: {root_id}")
-        board = chess.Board(row["fen"])
-        legal_width = board.legal_moves.count()
+        board = rules.Board(row["fen"])
+        legal_width = board.legal_move_count()
         width, expected_depth = sample_search(recipe, seed, root_id)
         expected_width = legal_width if width == "full" else width
         if teacher_width != expected_width:
@@ -1388,7 +1329,7 @@ def _validate_shard_rows(
         if count != len(expected_boundaries):
             raise ValueError(f"Truncation-state count is invalid: {root_id}")
         expected_states = _expected_states(
-            program, tokens, champion, board.turn == chess.BLACK
+            program, tokens, champion, board.turn == rules.BLACK
         )
         if len(expected_states) != count:
             raise ValueError(f"Truncation-state count is invalid: {root_id}")
@@ -1433,7 +1374,7 @@ def _validate_shard_rows(
             )
         pv_start = final_index + (4 if mate_distance is not None else 3)
         pv_tokens = [int(token) for token in tokens[pv_start:-1]]
-        mirrored = board.turn == chess.BLACK
+        mirrored = board.turn == rules.BLACK
         actual_pv = [
             reflect_uci(IDX_TO_UCI_MOVE[token - MOVE])
             if mirrored
@@ -1609,7 +1550,7 @@ def sample_root_settings(roots, config, seed):
     for root in roots:
         result = dict(root)
         width, result["depth"] = sample_search(config.sampling, seed, root["root_id"])
-        legal_width = chess.Board(root["fen"]).legal_moves.count()
+        legal_width = rules.Board(root["fen"]).legal_move_count()
         result["teacher_width"] = legal_width if width == "full" else width
         result["effective_width"] = min(result["teacher_width"], legal_width)
         result["presentation"] = sample_presentation(

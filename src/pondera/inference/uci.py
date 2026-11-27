@@ -2,14 +2,14 @@
 
 import sys
 
-import chess
+from pondera.chess import _rules as rules
 
 
-def parse_position(parts: list[str]) -> chess.Board:
+def parse_position(parts: list[str]) -> rules.Board:
     if parts[0] == "startpos":
-        board, index = chess.Board(), 1
+        board, index = rules.Board(), 1
     elif parts[0] == "fen":
-        board, index = chess.Board(" ".join(parts[1:7])), 7
+        board, index = rules.Board(" ".join(parts[1:7])), 7
     else:
         raise ValueError(f"Unknown position type: {parts[0]}")
     if index < len(parts):
@@ -22,7 +22,7 @@ def parse_position(parts: list[str]) -> chess.Board:
 
 def serve(checkpoint: str, device: str, *, load, pick) -> None:
     model = None
-    board = chess.Board()
+    board = rules.Board()
     for line in sys.stdin:
         parts = line.split()
         if not parts:
@@ -33,7 +33,7 @@ def serve(checkpoint: str, device: str, *, load, pick) -> None:
         elif command == "isready":
             print("readyok", flush=True)
         elif command == "ucinewgame":
-            board = chess.Board()
+            board = rules.Board()
         elif command == "position":
             board = parse_position(parts[1:])
         elif command == "go":

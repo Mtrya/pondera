@@ -4,10 +4,10 @@ import time
 from collections import Counter
 from pathlib import Path
 
-import chess
 import pyarrow.parquet as pq
 from huggingface_hub import HfApi, hf_hub_download
 
+from pondera.chess import _rules as rules
 from pondera.data.roots.pool import _position_key, root_id_for, select_pool, split_for
 
 
@@ -41,7 +41,7 @@ def parquet_files(source, cache, *, local=None):
 
 def puzzle_root(row, source, *, local=False):
     """One fresh root after Moves[0]; retain the complete source row."""
-    board = chess.Board(row["FEN"])
+    board = rules.Board(row["FEN"])
     board.push_uci(row["Moves"].split()[0])
     if board.is_checkmate() or board.is_stalemate():
         return None
@@ -52,7 +52,7 @@ def puzzle_root(row, source, *, local=False):
         "split": split_for(key),
         "fen": fen,
         "repetition": 1,
-        "turn": "white" if board.turn == chess.WHITE else "black",
+        "turn": "white" if board.turn == rules.WHITE else "black",
         "position_key": key,
         "source": {
             "kind": "lichess_puzzles",

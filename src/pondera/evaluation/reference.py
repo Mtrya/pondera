@@ -4,13 +4,13 @@ import hashlib
 import json
 import shutil
 import sqlite3
+import time
 from contextlib import ExitStack
 from pathlib import Path
 
-import chess
-import chess.engine
-
+from pondera.chess import _rules as rules
 from pondera.chess.codec import cap_mate_distance, value_bin
+from pondera.uci_process import UciError, UciProcess
 
 
 def score_key(score):
@@ -22,19 +22,86 @@ def can_claim(board, repetition):
     return repetition >= 3 or board.halfmove_clock >= 100
 
 
+class _ReferenceEngine(UciProcess):
+    def __init__(self, path, threads, hash_mb, timeout=30):
+        super().__init__(path, timeout)
+        try:
+            deadline = time.monotonic() + timeout
+            self._send("uci")
+            _, banner = self._read_until("uciok", deadline)
+            self.id = {}
+            options = set()
+            for line in banner:
+                if line.startswith("id "):
+                    _, key, value = line.split(maxsplit=2)
+                    self.id[key] = value
+                elif line.startswith("option name "):
+                    name, _, _ = line.removeprefix("option name ").partition(" type ")
+                    options.add(name)
+            for name, value in (
+                ("Threads", threads),
+                ("Hash", hash_mb),
+                ("UCI_ShowWDL", "true"),
+            ):
+                if name not in options:
+                    raise UciError(f"Engine does not expose {name}")
+                self._send(f"setoption name {name} value {value}")
+        except BaseException:
+            self.close(force=True)
+            raise
+
+    def search(self, root_fen, history, nodes, move):
+        deadline = time.monotonic() + self.timeout
+        self._send("ucinewgame")
+        self._send("isready")
+        self._read_until("readyok", deadline)
+        position = f"position fen {root_fen}"
+        if history:
+            position += " moves " + " ".join(history)
+        self._send(position)
+        self._send(f"go nodes {nodes} searchmoves {move}")
+        bestmove, lines = self._read_until("bestmove", deadline)
+        if bestmove.split()[1:2] != [move]:
+            raise UciError(f"Expected bestmove {move}, received {bestmove!r}")
+        score = None
+        wdl = None
+        try:
+            for line in lines:
+                words = line.split()
+                if words[:1] != ["info"] or words[1:2] == ["string"]:
+                    continue
+                # PV contents are moves through the end of the line.
+                if "pv" in words:
+                    words = words[: words.index("pv")]
+                if "score" in words:
+                    index = words.index("score")
+                    kind, value = words[index + 1 : index + 3]
+                    if kind in {"cp", "mate"}:
+                        score = kind, int(value)
+                if "wdl" in words:
+                    index = words.index("wdl")
+                    wins, _, losses = map(int, words[index + 1 : index + 4])
+                    wdl = (wins - losses) / 1000
+        except ValueError as error:
+            raise UciError("Malformed UCI score or WDL") from error
+        if score is None:
+            raise UciError("Engine returned no score")
+        kind, value = score
+        if kind == "mate":
+            return {"cp": None, "mate": value, "value": 1.0 if value > 0 else -1.0}
+        if wdl is None:
+            raise UciError("Engine returned no WDL")
+        return {"cp": value, "mate": None, "value": wdl}
+
+
 class Reference:
     def __init__(self, executable, cache, *, nodes, threads=1, hash_mb=64):
         executable = Path(shutil.which(str(executable)) or executable).resolve()
         with executable.open("rb") as handle:
             binary = hashlib.file_digest(handle, "sha256").hexdigest()
         with ExitStack() as resources:
-            self.engine = chess.engine.SimpleEngine.popen_uci(
-                str(executable), timeout=30
-            )
-            resources.callback(self.engine.quit)
-            self.engine.configure(
-                {"Threads": threads, "Hash": hash_mb, "UCI_ShowWDL": True}
-            )
+            self.engine = _ReferenceEngine(executable, threads, hash_mb)
+            resources.callback(self.engine.close)
             self.settings = {
                 "engine": self.engine.id,
                 "nodes_per_move": nodes,
@@ -56,7 +123,7 @@ class Reference:
 
     def close(self):
         try:
-            self.engine.quit()
+            self.engine.close()
         finally:
             self.cache.close()
 
@@ -66,12 +133,9 @@ class Reference:
         History is part of the key. The root's prior repetition count is not
         fabricated as move history: this matches the corpus teacher's FEN input.
         """
-        position = json.dumps(
-            [
-                board.root().fen(en_passant="fen"),
-                [move.uci() for move in board.move_stack],
-            ]
-        )
+        root_fen = board.root().fen(en_passant="fen")
+        history = [move.uci() for move in board.move_stack]
+        position = json.dumps([root_fen, history])
         cached = self.cache.execute(
             "SELECT scores FROM reference WHERE engine=? AND position=?",
             (self.identity, position),
@@ -80,22 +144,8 @@ class Reference:
             self.hits += 1
             return json.loads(cached[0])
         result = {}
-        for move in sorted(board.legal_moves, key=lambda move: move.uci()):
-            info = self.engine.analyse(
-                board,
-                chess.engine.Limit(nodes=self.nodes),
-                root_moves=[move],
-                game=object(),
-                info=chess.engine.INFO_ALL,
-            )
-            score = info["score"].pov(board.turn)
-            mate = score.mate()
-            if mate is not None:
-                value = 1.0 if score > chess.engine.Cp(0) else -1.0
-            else:
-                wdl = info["wdl"].pov(board.turn)
-                value = (wdl.wins - wdl.losses) / 1000
-            result[move.uci()] = {"cp": score.score(), "mate": mate, "value": value}
+        for move in sorted(move.uci() for move in board.legal_moves):
+            result[move] = self.engine.search(root_fen, history, self.nodes, move)
             self.searches += 1
         if not result:
             raise ValueError("Engine reference needs a root with legal moves")
@@ -113,7 +163,7 @@ class Reference:
 
     def grade_decision(self, fen, repetition, decision):
         """Grade a legal move or draw claim independently of any answer suffix."""
-        board = chess.Board(fen)
+        board = rules.Board(fen)
         if (
             not board.is_valid()
             or board.is_game_over()
@@ -126,12 +176,12 @@ class Reference:
                 raise ValueError("The position does not permit a draw claim")
         else:
             try:
-                move = chess.Move.from_uci(decision)
+                move = rules.Move.from_uci(decision)
             except (TypeError, ValueError) as error:
                 raise ValueError(
                     "Decision must be a legal UCI move or draw claim"
                 ) from error
-            if move not in board.legal_moves:
+            if not board.is_legal(move):
                 raise ValueError("Decision is not legal in this position")
         scores = self.scores(board)
         searched_best = max(scores.values(), key=score_key)
@@ -175,7 +225,7 @@ class Reference:
             }
         )
         if answer.decision != "<claim_draw>":
-            board = chess.Board(fen)
+            board = rules.Board(fen)
             root_turn = board.turn
             board.push_uci(answer.decision)
             for move in answer.pv[:pv_plies]:

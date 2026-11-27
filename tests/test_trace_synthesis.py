@@ -2,9 +2,9 @@ import json
 import unittest
 from pathlib import Path
 
-import chess
 from trace_fixtures import tie_sidecar_lines
 
+from pondera.chess import _rules as rules
 from pondera.chess.codec import mate_token, value_bin
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.tracker import PathTracker
@@ -414,9 +414,9 @@ class SynthesisTests(unittest.TestCase):
 
     def test_wide_teacher_width_is_capped_by_the_legal_root_moves(self):
         sidecar, root, synthesized = synthesize_case("two_moves_w3", teacher_width=3)
-        board = chess.Board(root["fen"])
+        board = rules.Board(root["fen"])
         self.assertFalse(board.is_checkmate() or board.is_stalemate())
-        self.assertEqual(board.legal_moves.count(), 2)
+        self.assertEqual(board.legal_move_count(), 2)
         self.assertEqual(sidecar.events[0]["schema"], 4)
         self.assertEqual(sidecar.session["options"]["multipv"], 3)
         self.assertEqual(sidecar.search_start["multi_pv"], 2)

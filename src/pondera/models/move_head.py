@@ -1,10 +1,10 @@
 """Shared source and destination factors for the atomic move logits."""
 
-import chess
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from pondera.chess.domain import SQUARE_TO_IDX
 from pondera.chess.vocabulary import IDX_TO_UCI_MOVE, MOVE, VALUE
 
 
@@ -20,7 +20,7 @@ class FactorizedMoveHead(nn.Linear):
         self.source = nn.Parameter(torch.zeros(64, hidden_size))
         self.destination = nn.Parameter(torch.zeros(64, hidden_size))
         coordinates = [
-            (MOVE + index, chess.parse_square(move[:2]), chess.parse_square(move[2:4]))
+            (MOVE + index, SQUARE_TO_IDX[move[:2]], SQUARE_TO_IDX[move[2:4]])
             for index, move in IDX_TO_UCI_MOVE.items()
             if move != "<claim_draw>"
         ]

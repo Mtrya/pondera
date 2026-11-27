@@ -4,6 +4,7 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 
 | Location | Responsibility |
 |---|---|
+| `rust/chess/` | Standard chess and PGN replay compiled into the Pondera package by Maturin |
 | `chess/` | Action vocabulary, rule-only path tracking, lossless board token encoding, exact symmetry transforms, and min-cost merge dictionaries |
 | `models/` | Neural model definitions |
 | `data/` | Root preparation, trace curation and validation, vocabulary fitting and encoding from stored atoms, and packed training datasets |

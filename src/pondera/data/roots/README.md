@@ -6,7 +6,7 @@
 |---|---|
 | `__init__.py` | Prepare configured source quotas and publish the combined pool. |
 | `pool.py` | Root records, position keys, deterministic splits, sampling, and pool storage. |
-| `pgn.py` | Download/check the configured archive, replay PGNs with repetition history, and build a claim-stratified sample. |
+| `pgn.py` | Read and verify the configured archive, send complete PGN games to the Rust replay function, and build a claim-stratified sample from the returned positions. |
 | `puzzles.py` | Download a pinned HF Parquet revision, apply the first puzzle move, and sample the resulting roots. |
 
 Every puzzle contributes one candidate at the position after `Moves[0]`; the solution begins with `Moves[1]`. Complete original game history is unavailable, so puzzle roots use repetition one and declare that assumption in provenance. Their FEN clock is preserved, and no claimable-position quota is imposed. The full original puzzle row and HF revision are retained in the shared JSON `source` field.

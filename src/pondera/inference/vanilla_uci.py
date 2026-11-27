@@ -3,9 +3,9 @@
 import argparse
 from functools import partial
 
-import chess
 import torch
 
+from pondera.chess import _rules as rules
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.tracker import repetition_count
 from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
@@ -15,7 +15,7 @@ from pondera.inference.uci import serve
 
 def choose_legal_move(logits, fen, legal_moves=None):
     """Select a legal action from one vocabulary-wide root decision."""
-    position = chess.Board(fen)
+    position = rules.Board(fen)
     if legal_moves is None:
         legal_moves = [move.uci() for move in position.legal_moves]
     candidates = [

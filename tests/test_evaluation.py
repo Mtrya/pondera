@@ -6,9 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import chess
 import torch
 
+from pondera.chess import _rules as rules
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
 from pondera.evaluation.match import parse_result, run_match
 from pondera.models import PonderaModel
@@ -79,9 +79,9 @@ class EvaluationTests(unittest.TestCase):
             self.assertIn("uciok", lines)
             self.assertIn("readyok", lines)
             best = [line.split()[1] for line in lines if line.startswith("bestmove ")]
-            board = chess.Board()
+            board = rules.Board()
             board.push_uci("e2e4")
-            self.assertIn(chess.Move.from_uci(best[0]), board.legal_moves)
+            self.assertIn(rules.Move.from_uci(best[0]), board.legal_moves)
             self.assertEqual(best[1:], ["0000", "0000"])
             self.assertEqual(lines.count("readyok"), 3)
             self.assertTrue(

@@ -6,8 +6,7 @@ import random
 from collections import Counter
 from pathlib import Path
 
-import chess
-
+from pondera.chess import _rules as rules
 from pondera.data.dataset import write_manifest
 
 SPLIT_MODULUS = 65
@@ -41,14 +40,14 @@ def validate_record(record, index=0):
     if record.get("position_key", position_key) != position_key:
         raise CorpusError(f"Root {root_id} has an inconsistent position key")
     try:
-        board = chess.Board(fen)
+        board = rules.Board(fen)
     except ValueError as error:
         raise CorpusError(f"Root {root_id} has an invalid FEN") from error
     if not board.is_valid():
         raise CorpusError(f"Root {root_id} has an invalid position")
-    if board.is_checkmate() or board.is_stalemate() or not board.legal_moves:
+    if not board.has_legal_moves():
         raise CorpusError(f"Root {root_id} has no legal move")
-    turn = "white" if board.turn == chess.WHITE else "black"
+    turn = "white" if board.turn == rules.WHITE else "black"
     if record.get("turn") not in (None, turn):
         raise CorpusError(f"Root {root_id} has a turn inconsistent with its FEN")
     return {**record, "turn": turn, "position_key": position_key}

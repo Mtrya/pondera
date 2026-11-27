@@ -15,10 +15,10 @@ from functools import cached_property
 from pathlib import Path
 from typing import NamedTuple
 
-import chess
 import numpy as np
 import orjson
 
+from pondera.chess import _rules as rules
 from pondera.chess.codec import (
     decode_board,
     decode_value_token,
@@ -295,7 +295,7 @@ class TraceProgram:
 def _board_move(uci):
     """Parse an absolute UCI board move, rejecting the draw-claim pseudo-move."""
     try:
-        return chess.Move.from_uci(uci)
+        return rules.Move.from_uci(uci)
     except ValueError as error:
         raise ValueError(f"Not a board move: {uci}") from error
 
@@ -378,7 +378,7 @@ class _TraceState:
         self.teacher_width = teacher_width
         self.root_fen = root_fen
         self.root = self.tracker.board.copy()
-        self.mirrored = self.root.turn == chess.BLACK
+        self.mirrored = self.root.turn == rules.BLACK
         self.root_position = self.root.fen(en_passant="fen")
         self.root_terminal = self.tracker.search_terminal()
         self.tokens = []
@@ -537,7 +537,7 @@ class _TraceState:
             parsed = _board_move(uci)
         except ValueError as error:
             raise _Illegal("illegal_move", str(error)) from error
-        if parsed not in self.tracker.board.legal_moves:
+        if not self.tracker.board.is_legal(parsed):
             raise _Illegal("illegal_move", f"not legal at this node: {uci}")
         if not self.tracker.path:
             self.round_has_candidate = True
@@ -709,7 +709,7 @@ class _TraceState:
             move = _board_move(uci)
         except ValueError as error:
             raise _Illegal("final_illegal", str(error)) from error
-        if move not in self.root.legal_moves:
+        if not self.root.is_legal(move):
             raise _Illegal("final_illegal", f"not a legal root move: {uci}")
         if self.root_terminal is not None:
             raise _Illegal("final_illegal", "the root is a rule terminal")
@@ -812,7 +812,7 @@ class _TraceState:
             parsed = _board_move(uci)
         except ValueError as error:
             raise _Illegal("final_illegal", str(error)) from error
-        if parsed not in self.pv_tracker.board.legal_moves:
+        if not self.pv_tracker.board.is_legal(parsed):
             raise _Illegal("final_illegal", f"not legal in the final line: {uci}")
         start = len(self.tokens)
         san = self.pv_tracker.board.san(parsed)
@@ -1063,7 +1063,7 @@ class TraceWriter:
 def replay(tokens, root_fen, repetition=1, teacher_width=1):
     """Rebuild and validate a trace from its tokens and the root position.
 
-    The state is reconstructed with python-chess from the root FEN alone;
+    The state is reconstructed with the chess backend from the root FEN alone;
     writer intermediates are never consulted. Raises TraceError at the first
     broken rule, with a machine-readable tag and token index.
     """
@@ -1387,14 +1387,14 @@ def parse_sidecar(lines, teacher_width=1, source="<sidecar>"):
 
     fen = _text(position.get("fen"), "position.fen")
     try:
-        root_board = chess.Board(fen)
+        root_board = rules.Board(fen)
     except ValueError as error:
         raise SynthesisError("position.fen is not a valid FEN") from error
     if root_board.is_checkmate() or root_board.is_stalemate():
         raise SynthesisError("a terminal root is not a valid trace root")
     # The engine caps MultiPV at the number of legal root moves and records the
     # capped value as the effective width of the search.
-    effective_width = min(teacher_width, root_board.legal_moves.count())
+    effective_width = min(teacher_width, root_board.legal_move_count())
     depth = require_int(search_start.get("depth"), "search_start.depth", 1)
     require_int(search_start.get("multi_pv"), "search_start.multi_pv", 1)
     if search_start["multi_pv"] != effective_width:
@@ -1975,7 +1975,7 @@ class _TraceBuffer:
 
     def __init__(self, tracker):
         self.tracker = tracker
-        self.mirrored = tracker.board.turn == chess.BLACK
+        self.mirrored = tracker.board.turn == rules.BLACK
         self.tokens = []
         self.roles = []
         self.last_was_board = False
@@ -2056,11 +2056,11 @@ class _TraceBuffer:
             CLAIM_DRAW if uci == CLAIM_DRAW_UCI else _move_token(uci, self.mirrored),
             ROLE_FINAL_MOVE,
         )
-        self.pv_board = chess.Board(self.tracker.root_fen)
+        self.pv_board = rules.Board(self.tracker.root_fen)
         san = (
             "CLAIM_DRAW"
             if uci == CLAIM_DRAW_UCI
-            else self.pv_board.san_and_push(chess.Move.from_uci(uci))
+            else self.pv_board.san_and_push(rules.Move.from_uci(uci))
         )
         self._text("\nFINAL " + san)
 
@@ -2076,7 +2076,7 @@ class _TraceBuffer:
 
     def final_pv(self, uci):
         self._emit(_move_token(uci, self.mirrored), ROLE_FINAL_PV)
-        self._text(" " + self.pv_board.san_and_push(chess.Move.from_uci(uci)))
+        self._text(" " + self.pv_board.san_and_push(rules.Move.from_uci(uci)))
 
     def end(self):
         self._emit(END, ROLE_CONTROL)
@@ -2381,7 +2381,7 @@ class _Synthesis:
         top = self.sidecar.round_ends[-1]["rank"][0]
         claimable = (
             self.tracker.root_repetition >= 3
-            or chess.Board(self.sidecar.fen).halfmove_clock >= 100
+            or rules.Board(self.sidecar.fen).halfmove_clock >= 100
         )
         claim = (
             self.config.synthesis.claim_draw
@@ -2524,7 +2524,7 @@ class _Synthesis:
             "all_draw": all_draw,
             "claim_draw": self._claim,
             "claimable": self.tracker.root_repetition >= 3
-            or chess.Board(self.sidecar.fen).halfmove_clock >= 100,
+            or rules.Board(self.sidecar.fen).halfmove_clock >= 100,
             "thinking_tokens": self.writer.final_start,
             "total_tokens": len(self.writer.tokens),
             "board_descent": self.board_counts["descent"],
@@ -2547,8 +2547,8 @@ def validate_root(root, sidecar):
     if root.get("split") not in {"train", "val"}:
         raise SynthesisError("root split must be train or val")
     repetition = require_int(root.get("repetition"), "root.repetition", 1, 4)
-    board = chess.Board(sidecar.fen)
-    expected_turn = "white" if board.turn == chess.WHITE else "black"
+    board = rules.Board(sidecar.fen)
+    expected_turn = "white" if board.turn == rules.WHITE else "black"
     if root.get("turn") != expected_turn:
         raise SynthesisError("root turn differs from the sidecar FEN")
     if root.get("position_key") is not None:

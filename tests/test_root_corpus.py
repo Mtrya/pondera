@@ -10,8 +10,7 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
-import chess
-
+from pondera.chess import _rules as rules
 from pondera.data.config import load_config
 from pondera.data.dataset import load_manifest
 from pondera.data.roots.pgn import _Candidate, _profile, ensure_archive
@@ -266,7 +265,7 @@ class RootPoolTests(unittest.TestCase):
         self.assertEqual(manifest["positions"]["skipped_terminal"], 2)
         self.assertEqual(manifest["positions"]["pool_keys"], 24)
         for row in rows:
-            board = chess.Board(row["fen"])
+            board = rules.Board(row["fen"])
             self.assertFalse(board.is_checkmate())
             self.assertFalse(board.is_stalemate())
             self.assertTrue(board.legal_moves)

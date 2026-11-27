@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import re
 import shutil
 import subprocess
 import time
@@ -9,18 +10,16 @@ import urllib.parse
 import urllib.request
 import zipfile
 from collections import Counter
+from itertools import islice
 from pathlib import Path
 from statistics import median
 from typing import NamedTuple
 
-import chess
-import chess.pgn
-
+from pondera.chess import _rules as rules
 from pondera.data.roots.pool import (
     CLAIM_HALFMOVE,
     FIVEFOLD,
     CorpusError,
-    _position_key,
     root_id_for,
     select_pool,
     split_for,
@@ -150,43 +149,64 @@ class _PgnStream:
         return False
 
 
-def _replay_game(game, game_index):
-    """Return per-key candidates for one game, plus its ply count."""
-    board = game.board()
-    counts = {_position_key(board.fen()): 1}
+_PGN_DELIMITERS = re.compile(r"[{}();]")
+
+
+def _games(stream):
+    """Frame PGN games while keeping archive IO outside the chess backend."""
+    lines = []
+    in_movetext = in_comment = False
+    variations = 0
+    for line in stream:
+        stripped = line.strip().removeprefix("\ufeff")
+        if stripped.startswith("%"):
+            continue
+        if not in_comment and not variations:
+            if in_movetext and (not stripped or stripped.startswith("[")):
+                yield "".join(lines)
+                lines = []
+                in_movetext = False
+            if not stripped:
+                continue
+            if not in_movetext and stripped.startswith("["):
+                lines.append(stripped + "\n")
+                continue
+        lines.append(line.removeprefix("\ufeff"))
+        cursor = 0
+        for delimiter in _PGN_DELIMITERS.finditer(line):
+            if (
+                not in_comment
+                and not variations
+                and line[cursor : delimiter.start()].strip()
+            ):
+                in_movetext = True
+            cursor = delimiter.end()
+            char = delimiter[0]
+            if in_comment:
+                if char == "}":
+                    in_comment = False
+            elif char == ";":
+                break
+            elif char == "{":
+                in_comment = True
+            elif char == "(":
+                variations += 1
+            elif char == ")" and variations:
+                variations -= 1
+        else:
+            if not in_comment and not variations and line[cursor:].strip():
+                in_movetext = True
+    if lines:
+        yield "".join(lines)
+
+
+def _replay_game(rows, game_index, terminal):
     last = {}
-    plies = 0
-    try:
-        for ply, move in enumerate(game.mainline_moves(), 1):
-            board.push(move)
-            fen = board.fen()
-            key = _position_key(fen)
-            count = counts.get(key, 0) + 1
-            counts[key] = count
-            last[key] = _Candidate(
-                count,
-                board.halfmove_clock,
-                board.fullmove_number,
-                game_index,
-                ply,
-            )
-            plies = ply
-    except ValueError:
-        return None
-    if plies and not board.legal_moves:
-        del last[_position_key(board.fen())]
-        return last, plies, True
-    return last, plies, False
-
-
-def _game_is_replayable(game):
-    if game.errors:
-        return "illegal"
-    if game.headers.get("Variant", "Standard").lower() != "standard":
-        return "variant"
-    if "FEN" in game.headers or "SetUp" in game.headers:
-        return "setup"
-    return None
+    for ply, (key, repetition, halfmove, fullmove) in enumerate(rows, 1):
+        last[key] = _Candidate(repetition, halfmove, fullmove, game_index, ply)
+    if terminal:
+        del last[rows[-1][0]]
+    return last
 
 
 def _profile(pool, raw_repetitions, game_plies):
@@ -295,24 +315,17 @@ def build_pool(
     game_plies = []
     pool = {}
     with _PgnStream(archive) as reader:
-        stream = reader._text
-        while limit_games is None or games_read < limit_games:
-            game = chess.pgn.read_game(stream)
-            if game is None:
-                break
+        for game in islice(_games(reader._text), limit_games):
             games_read += 1
-            reason = _game_is_replayable(game)
+            reason, rows, terminal = rules.replay_mainline(game)
             if reason is not None:
                 skipped[reason] += 1
                 continue
-            replayed = _replay_game(game, games_read - 1)
-            if replayed is None:
-                skipped["replay"] += 1
-                continue
-            candidates, plies, terminal = replayed
+            plies = len(rows)
             if not plies:
                 skipped["empty"] += 1
                 continue
+            candidates = _replay_game(rows, games_read - 1, terminal)
             if terminal:
                 skipped_terminal += 1
             games_replayed += 1
