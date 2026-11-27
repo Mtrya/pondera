@@ -25,9 +25,9 @@ from pondera.chess.vocabulary import (
 )
 from pondera.data.dataset import (
     iter_atom_batches,
-    load_manifest,
     open_trace_shard,
     parquet_sources,
+    read_release,
 )
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 from pondera.data.trace_encoding import (
@@ -107,7 +107,7 @@ def load_rows(release, *, max_roots=None, workers=1, split=None):
     if max_roots is not None and max_roots < 1:
         raise ValueError("max_roots must be positive")
     release = Path(release)
-    manifest = load_manifest(release / "release.json") if release.is_dir() else {}
+    manifest = read_release(release)
     if manifest:
         for field, expected in (
             ("grammar_version", TRACE_GRAMMAR_VERSION),
@@ -117,7 +117,7 @@ def load_rows(release, *, max_roots=None, workers=1, split=None):
                 raise ValueError(f"Unsupported {field} in {release}")
     remaining = max_roots
     tasks = []
-    for path, expected, _ in parquet_sources(release):
+    for path, expected, _ in parquet_sources(release, manifest):
         limit = None
         if remaining is not None:
             # Count the selected split before scheduling atom reads.

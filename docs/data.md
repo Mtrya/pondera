@@ -44,11 +44,11 @@ Synthesis writes two representations of the same trace in each release row.
 - `trace_text` is the portable grammar-v2 transcription. It uses absolute SAN and records the navigation operations, board observations, evaluations, and final answer.
 - `trace_atom_ids` is the unmerged base atom sequence for that presentation. It includes the final answer and starts after the initial board prefix. Move and board observation atoms use the root player's frame. The local release also carries the atom count and per-state diagnostics used to validate the trace.
 
-Checkpoint completed roots and publish completed shards atomically. Record search timeouts as drops and allow up to three attempts across runs for other collection failures. Resume from the recorded root results. A complete release reconciles each root to either a published document or a recorded drop. Bounded qualification replays the stored atoms and verifies split counts and provenance.
+Each curation job reads its assigned half-open shard range. Jobs targeting the same release can work on disjoint ranges with the same pool, shard size, teacher, and recipe. Completed roots and published shards are reused on restart. Search timeouts are recorded as drops, and other collection failures receive up to three attempts across runs. The ordered release manifest is published once every root has a document or a recorded drop. Bounded qualification replays the stored atoms and verifies split counts and provenance.
 
 ## 3. Export to Hugging Face Parquet
 
-The exporter projects each accepted row into the eleven-column shared schema. It writes `data/train-*.parquet` and `data/validation-*.parquet` and preserves the trace text, values, and source JSON. The Parquet part name carries split membership. [Exporter](../tools/export_hf.py) · [Shared schema](../src/pondera/data/dataset.py)
+The exporter projects each accepted row into the eleven-column shared schema. It writes `data/train-*.parquet` and `data/validation-*.parquet` and preserves the trace text, values, and source JSON. The Parquet part name carries split membership. Parts preserve the order within each split and roll over at a 256 MiB maximum by default. The exporter checks the size of the closed file and splits oversized parts, with a single-row part allowed to exceed the limit. The complete projection appears atomically. [Exporter](../tools/export_hf.py) · [Shared schema](../src/pondera/data/dataset.py)
 
 | Arrow type | Fields |
 | --- | --- |
@@ -67,6 +67,8 @@ Fitting and encoding share the same merge boundaries. `BACK`, `RESET`, `BOARD`, 
 ## 5. Encode every document
 
 Read the stored base atoms in bounded batches. Apply the saved dictionary to each trace segment, choosing an encoding with the fewest tokens in that segment. Prepend the base board tokens derived from the document's FEN and repetition. Keep the document's split and presentation. Atom IDs name the fixed vocabulary, while encoded model token IDs can also name learned composites.
+
+Encoding stages complete shards for reuse with the same source and dictionary. Final assembly streams those shards in release order and rebases their local offsets. If interrupted, assembly restarts from the staged shards. Disk space must accommodate both staged streams and the final output until publication.
 
 The encoded document store contains these files.
 

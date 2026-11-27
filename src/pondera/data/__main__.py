@@ -56,7 +56,6 @@ def main():
         from pondera.data.pipeline import run_pipeline
 
         result = run_pipeline(config, args.input, args.output, engine=args.engine)
-        result = {key: value for key, value in result.items() if key != "statistics"}
     else:
         from pondera.data.tokenize import merge_and_encode
 

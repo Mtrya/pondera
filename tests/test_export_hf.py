@@ -96,6 +96,34 @@ class ExportTests(unittest.TestCase):
                     (run / "export-again" / "data" / name).read_bytes(),
                 )
 
+            for cap in (1, 2500):
+                parts = run / f"parts-{cap}"
+                result = export_hf(release, parts, batch_size=2, max_part_bytes=cap)
+                self.assertGreater(len(result["files"]), 2)
+                for item in result["files"]:
+                    self.assertTrue(item["rows"] == 1 or item["bytes"] <= cap)
+                for split, label in (("train", "train"), ("validation", "val")):
+                    found = [
+                        row
+                        for path in sorted((parts / "data").glob(f"{split}-*.parquet"))
+                        for row in pq.read_table(path).to_pylist()
+                    ]
+                    self.assertEqual(
+                        found,
+                        [
+                            {name: row[name] for name in HF_COLUMNS}
+                            for row in local
+                            if row["split"] == label
+                        ],
+                    )
+                repeated = run / f"parts-again-{cap}"
+                export_hf(release, repeated, batch_size=3, max_part_bytes=cap)
+                for item in result["files"]:
+                    self.assertEqual(
+                        (parts / item["path"]).read_bytes(),
+                        (repeated / item["path"]).read_bytes(),
+                    )
+
             manifest_path = release / "release.json"
             original = load_manifest(manifest_path)
             for field in ("format_version", "grammar_version", "tokenizer_version"):

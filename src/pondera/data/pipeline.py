@@ -33,7 +33,6 @@ from pondera.chess.codec import cap_mate_distance, value_bin
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import (
     CHESS_TOKENIZER_VERSION,
-    FINAL,
     IDX_TO_UCI_MOVE,
     MATE_LOSS,
     MATE_WIN,
@@ -47,11 +46,14 @@ from pondera.data.dataset import (
     DATA_FORMAT_VERSION,
     load_manifest,
     load_trace_arrays,
+    read_release,
     read_root_rows,
     validate_trace_arrays,
     write_manifest,
     write_trace_rows,
 )
+from pondera.data.progress import ReleaseProgress
+from pondera.data.roots.pool import RootPool, pool_path, read_roots
 from pondera.data.trace import (
     CLAIM_DRAW_UCI,
     DRAW_CLAIM_BOUND,
@@ -158,14 +160,6 @@ class RootProfile:
             for name in self.presentations[root_id]
         ]
         self._add(root_id, root.root["split"], root.stats, rows)
-
-    def add_stored(self, row, stats, token_count, thinking_tokens):
-        self._add(
-            row["root_id"],
-            row["split"],
-            stats,
-            [(row["presentation"], token_count, thinking_tokens)],
-        )
 
     def _add(self, root_id, split, stats, rows):
         self.roots += 1
@@ -493,7 +487,7 @@ def _champion_row(root, synthesized):
     }
 
 
-def _write_shard(directory, records, metadata, presentations):
+def _write_shard(directory, records, metadata, presentations, dropped):
     rows, champion_rows = [], []
     for synthesized in records:
         root = synthesized.root
@@ -511,29 +505,28 @@ def _write_shard(directory, records, metadata, presentations):
     # (rows == selected minus dropped) catch a wrongly empty one.
     write_trace_rows(directory, rows)
     _write_jsonl(directory / "champions.jsonl", champion_rows)
-    payload = {**metadata, "rows": len(rows)}
+    payload = {**metadata, "rows": len(rows), "dropped": dropped}
     write_manifest(directory / "manifest.json", payload)
     return payload
 
 
-def _expected_root_rows(roots, presentations):
-    return {
-        (root["root_id"], presentation)
-        for root in roots
-        for presentation in presentations[root["root_id"]]
-    }
-
-
-def _recover_shard(output, index, roots, metadata, presentations):
+def _recover_shard(output, index, group, metadata):
     final = output / f"shard-{index:06d}"
     manifest = load_manifest(final / "manifest.json")
     if not isinstance(manifest.get("rows"), int):
         raise FileExistsError(f"Unregistered shard has no valid row count: {final}")
+    dropped = manifest["dropped"]
+    drop_ids = set(dropped)
+    if len(drop_ids) != len(dropped) or not drop_ids <= {
+        root["root_id"] for root in group
+    }:
+        raise ValueError(f"Unregistered shard has different dropped roots: {final}")
+    roots = [root for root in group if root["root_id"] not in drop_ids]
     published = {"path": final.name, "rows": manifest["rows"]}
     _, rows = _read_shard_metadata(output, published, metadata)
-    if {(row["root_id"], row["presentation"]) for row in rows} != _expected_root_rows(
-        roots, presentations
-    ):
+    if [(row["root_id"], row["presentation"]) for row in rows] != [
+        (root["root_id"], root["presentation"]) for root in roots
+    ]:
         raise FileExistsError(f"Unregistered shard has different roots: {final}")
     expected = {root["root_id"]: root for root in roots}
     for row in rows:
@@ -548,62 +541,25 @@ def _recover_shard(output, index, roots, metadata, presentations):
                 raise FileExistsError(
                     f"Unregistered shard root {name} differs: {final}"
                 )
-    return published
+    return published["rows"], dropped
 
 
-def _check_shard_layout(output, shard, roots):
-    """Reject a registered shard that no longer matches the current layout."""
-    stored = read_root_rows(Path(output) / shard["path"])
-    if {row["root_id"] for row in stored} != {root["root_id"] for root in roots}:
-        raise ValueError(
-            f"Registered shard {shard['path']} covers different roots; "
-            "the release was produced with a different shard layout"
-        )
-    expected = {root["root_id"]: root for root in roots}
-    for row in stored:
-        root = expected[row["root_id"]]
-        for name in ROOT_ROW_FIELDS:
-            if name in root and row.get(name) != root[name]:
-                raise ValueError(f"Registered root {name} differs: {row['root_id']}")
-
-
-def _profile_shard(output, shard, profile):
-    directory = Path(output) / shard["path"]
-    rows = read_root_rows(directory)
-    tokens = load_trace_arrays(directory, ("trace_atom_ids",))["trace_atom_ids"]
-    champions = {row["root_id"]: row for row in _read_champions(directory)}
-    for index, row in enumerate(rows):
-        final = np.flatnonzero(tokens[index] == FINAL)
-        if len(final) != 1:
-            raise ValueError(f"Stored trace has no unique FINAL: {row['root_id']}")
-        profile.add_stored(
-            row,
-            champions[row["root_id"]]["stats"],
-            row["trace_atom_count"],
-            int(final[0]),
-        )
-
-
-def _publish_shard(output, index, records, metadata, presentations):
+def _publish_shard(output, index, group, records, metadata):
     final = output / f"shard-{index:06d}"
-    # A unique staging directory: two producers erroneously targeting the
-    # same shard (the contract is disjoint ranges) cannot wreck each other's
-    # staging area.
     temporary = output / f".shard-{index:06d}.{uuid4().hex}.tmp"
-    # Dropped roots (engine timeouts) leave no record behind; a shard whose
-    # roots all timed out publishes with zero rows.
+    dropped = [
+        root["root_id"]
+        for root, record in zip(group, records, strict=True)
+        if record is None
+    ]
+    presentations = {root["root_id"]: (root["presentation"],) for root in group}
     records = [record for record in records if record is not None]
     try:
-        payload = _write_shard(temporary, records, metadata, presentations)
-    except BaseException:
+        payload = _write_shard(temporary, records, metadata, presentations, dropped)
+        temporary.rename(final)
+    finally:
         shutil.rmtree(temporary, ignore_errors=True)
-        raise
-    if final.exists():
-        shutil.rmtree(temporary)
-        roots = [record.root for record in records]
-        return _recover_shard(output, index, roots, metadata, presentations)
-    os.replace(temporary, final)
-    return {"path": final.name, "rows": payload["rows"]}
+    return payload["rows"], dropped
 
 
 class _RootCache:
@@ -864,7 +820,11 @@ def _release_identity_contract(release, root_count):
     engine = metadata["engine"]
     if (
         not isinstance(engine, dict)
-        or set(engine) != ENGINE_FIELDS
+        or set(engine) not in (ENGINE_FIELDS, ENGINE_FIELDS | {"sha256"})
+        or (
+            "sha256" in engine
+            and (not isinstance(engine["sha256"], str) or len(engine["sha256"]) != 64)
+        )
         or not isinstance(engine["name"], str)
         or not engine["name"]
     ):
@@ -1428,7 +1388,7 @@ def validate_release(directory, roots=None, workers=8):
     if workers < 1:
         raise ValueError("Validation workers must be positive")
     directory = Path(directory)
-    release = load_manifest(directory / "release.json")
+    release = read_release(directory)
     if not release:
         raise FileNotFoundError(directory / "release.json")
     dropped = release.get("dropped", [])
@@ -1716,8 +1676,6 @@ def _synthesize_groups(
     group with failures is not publishable; its collected roots are
     checkpointed, so retrying it recollects only the missing roots.
     """
-    if not groups:
-        return
     if provider is not None or workers == 1:
         engine = None
         try:
@@ -1761,7 +1719,6 @@ def _synthesize_groups(
             if engine is not None:
                 engine.close(force=True)
         return
-    workers = min(workers, sum(len(group) for _, group in groups))
     pending = {}
     active = {}
     completed = deque()
@@ -1784,6 +1741,9 @@ def _synthesize_groups(
                     finished(index)
                 else:
                     yield index, position, root
+            # Let the coordinator publish a fully cached shard before opening
+            # another group.
+            yield None
 
     missing = missing_roots()
     context = get_context("spawn")
@@ -1804,11 +1764,15 @@ def _synthesize_groups(
         ),
     )
     try:
+        exhausted = object()
         while True:
-            while len(pending) < 2 * workers:
-                item = next(missing, None)
-                if item is None:
+            item = None
+            while len(pending) < 2 * workers and not completed:
+                item = next(missing, exhausted)
+                if item is exhausted:
                     break
+                if item is None:
+                    continue
                 index, position, root = item
                 pending[pool.submit(_direct_worker, index, root)] = (index, position)
             while completed:
@@ -1826,7 +1790,9 @@ def _synthesize_groups(
                         records.append(record)
                 yield index, group, records, failures
             if not pending:
-                break
+                if item is exhausted:
+                    break
+                continue
             done, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in done:
                 index, position = pending.pop(future)
@@ -1889,18 +1855,21 @@ def _search_identity(config):
     return identity
 
 
-def _identity_for(config, roots, engine_name="stockfish", root_source=None):
+def _identity_for(config, counts, engine_name, engine_path, root_source):
+    wide = any(
+        probability and width != 1 for (width, _), probability in config.sampling.joint
+    )
+    producer = {"name": engine_name}
+    if engine_path is not None:
+        with engine_path.open("rb") as handle:
+            producer["sha256"] = hashlib.file_digest(handle, "sha256").hexdigest()
     return {
         "teacher": {
-            "schema_version": (
-                SIDECAR_SCHEMA_WIDE
-                if any(root["teacher_width"] > 1 for root in roots)
-                else SIDECAR_SCHEMA
-            ),
+            "schema_version": SIDECAR_SCHEMA_WIDE if wide else SIDECAR_SCHEMA,
             "value_mate": 32000,
             "max_ply": 246,
         },
-        "engine": {"name": engine_name},
+        "engine": producer,
         "search": _search_identity(config),
         "board": config.board_dict(),
         "presentation": config.presentation_dict(),
@@ -1909,15 +1878,9 @@ def _identity_for(config, roots, engine_name="stockfish", root_source=None):
             "source": str(root_source) if root_source is not None else "in-memory",
             "algorithm": "stratified",
             "seed": config.seed,
-            "requested": len(roots),
-            "counts": {
-                split: sum(root["split"] == split for root in roots)
-                for split in ("train", "val")
-            },
-            "source_counts": {
-                split: sum(root["split"] == split for root in roots)
-                for split in ("train", "val")
-            },
+            "requested": sum(counts.values()),
+            "counts": counts,
+            "source_counts": counts,
         },
         "recipe": config.sampling.identity(),
     }
@@ -1962,222 +1925,152 @@ def produce_shards(
     one summary error and keeps the checkpoints. The cache directory is
     removed once the release is complete.
     """
-    roots = sample_root_settings(list(roots), config, config.seed)
-    if not roots:
+    if isinstance(roots, RootPool):
+        pool_id = roots.pool_id
+        counts = roots.manifest["counts"]
+        read_range = roots.iter_range
+    else:
+        roots = list(roots)
+        if len({root["root_id"] for root in roots}) != len(roots):
+            raise ValueError("A trace release cannot contain duplicate root ids")
+        digest = hashlib.sha256()
+        for root in roots:
+            digest.update(json.dumps(root, sort_keys=True).encode())
+        pool_id = digest.hexdigest()
+        counts = {
+            split: sum(root["split"] == split for root in roots)
+            for split in ("train", "val")
+        }
+
+        def read_range(start, stop):
+            return roots[start:stop]
+
+    if not len(roots):
         raise ValueError("A trace release needs at least one root")
-    if len({root["root_id"] for root in roots}) != len(roots):
-        raise ValueError("A trace release cannot contain duplicate root ids")
     shard_size = config.release.shard_size if shard_size is None else shard_size
     workers = config.release.workers if workers is None else workers
     if shard_size < 1 or workers < 1:
         raise ValueError("Shard size and workers must be positive")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    engine_path = None
-    engine_name = "stockfish"
-    teacher = None
-    if sidecar_for_root is None:
-        engine_path = _engine_path(engine)
-        engine_name = "Stockfish 17.1"
-        teacher = (32000, 246)
-    identity = identity or _identity_for(
-        config, roots, engine_name=engine_name, root_source=root_source
-    )
+    engine_path = _engine_path(engine) if sidecar_for_root is None else None
+    engine_name = "Stockfish 17.1" if engine_path is not None else "stockfish"
+    teacher = (32000, 246) if engine_path is not None else None
+    if identity is None:
+        identity = _identity_for(config, counts, engine_name, engine_path, root_source)
     release_metadata = _release_metadata(identity)
-    shard_metadata = {
-        key: value
-        for key, value in release_metadata.items()
-        if key not in RELEASE_ONLY_METADATA
-    }
-    presentations = {root["root_id"]: (root["presentation"],) for root in roots}
-    release_path = output_dir / "release.json"
-    previous = load_manifest(release_path)
-    if previous and previous.get("metadata") != identity:
-        raise ValueError("The existing release belongs to a different configuration")
-    shards_by_index = {
-        int(shard["path"].split("-")[-1]): shard for shard in previous.get("shards", [])
-    }
-    groups = [
-        (index, roots[start : start + shard_size])
-        for index, start in enumerate(range(0, len(roots), shard_size))
-    ]
-    cache = _RootCache(output_dir, identity)
-    ready, pending = [], []
-    dropped_by_shard = {}
-    for entry in (previous or {}).get("dropped", []):
-        dropped_by_shard.setdefault(entry["shard"], set()).add(entry["root_id"])
-    for index, group in groups:
-        if index < start_shard or (end_shard is not None and index >= end_shard):
-            continue
-        if index in shards_by_index:
-            dropped = dropped_by_shard.get(index, set())
-            _check_shard_layout(
-                output_dir,
-                shards_by_index[index],
-                [root for root in group if root["root_id"] not in dropped],
-            )
-            cache.clear_shard(index)
-            continue
-        final = output_dir / f"shard-{index:06d}"
-        if final.exists():
-            dropped = [
-                root["root_id"]
-                for root in group
-                if cache.dropped(index, root) is not None
-            ]
-            shard = _recover_shard(
-                output_dir,
-                index,
-                [root for root in group if root["root_id"] not in set(dropped)],
-                shard_metadata,
-                presentations,
-            )
-            ready.append((index, group, shard, dropped))
-        else:
-            pending.append((index, group))
-
-    run = {"failures": 0}
-    failed = []
-
-    def publishable():
-        for index, group, shard, dropped in ready:
-            yield index, group, shard, dropped
-        deferred = []
-        for index, group, records, failures in _synthesize_groups(
-            pending,
-            config,
-            engine_path,
-            engine_name,
-            teacher,
-            sidecar_for_root,
-            workers,
-            cache,
-            run,
-        ):
-            if failures:
-                deferred.append((index, group))
-                continue
-            dropped = [
-                group[position]["root_id"]
-                for position, record in enumerate(records)
-                if record is None
-            ]
-            yield (
-                index,
-                group,
-                _publish_shard(
-                    output_dir, index, records, shard_metadata, presentations
-                ),
-                dropped,
-            )
-        # A deferred group's collected roots are checkpoint hits here; only
-        # the failed roots are recollected in this second pass.
-        for index, group, records, failures in _synthesize_groups(
-            deferred,
-            config,
-            engine_path,
-            engine_name,
-            teacher,
-            sidecar_for_root,
-            workers,
-            cache,
-            run,
-        ):
-            if failures:
-                failed.extend(
-                    (index, group[position]["root_id"], error)
-                    for position, error in failures.items()
-                )
-                continue
-            dropped = [
-                group[position]["root_id"]
-                for position, record in enumerate(records)
-                if record is None
-            ]
-            yield (
-                index,
-                group,
-                _publish_shard(
-                    output_dir, index, records, shard_metadata, presentations
-                ),
-                dropped,
+    shard_metadata = shard_configuration(release_metadata)
+    with ReleaseProgress(
+        output_dir,
+        {**release_metadata, "metadata": identity},
+        roots=len(roots),
+        shard_size=shard_size,
+        pool_id=pool_id,
+    ) as progress:
+        stop = progress.shards if end_shard is None else end_shard
+        if not 0 <= start_shard <= stop <= progress.shards:
+            raise ValueError(
+                f"Shard range [{start_shard}, {stop}) is outside [0, {progress.shards})"
             )
 
-    for index, group, shard, dropped_ids in publishable():
         with _release_lock(output_dir):
-            current = load_manifest(release_path)
-            if current and current.get("metadata") != identity:
-                raise ValueError(
-                    "The existing release belongs to a different configuration"
-                )
-            shards_by_index = {
-                int(item["path"].split("-")[-1]): item
-                for item in current.get("shards", [])
-            }
-            if index in shards_by_index:
-                # Shard ranges are disjoint by contract; a second producer
-                # targeting the same shard must fail loudly, not mix data.
-                raise FileExistsError(f"Shard is already registered: {index:06d}")
-            shards_by_index[index] = shard
-            dropped = (current or {}).get("dropped", []) + [
-                {"root_id": root_id, "shard": index} for root_id in dropped_ids
-            ]
-            write_manifest(
-                release_path,
-                {
-                    **release_metadata,
-                    "dataset_id": current.get("dataset_id") or uuid4().hex,
-                    "metadata": identity,
-                    "dropped": dropped,
-                    "shards": [shards_by_index[key] for key in sorted(shards_by_index)],
-                },
+            cache = _RootCache(output_dir, identity)
+
+        def group_for(index):
+            start, end = progress.bounds(index)
+            return sample_root_settings(read_range(start, end), config, config.seed)
+
+        def register(index, rows, dropped):
+            progress.register(index, rows, dropped)
+            cache.clear_shard(index)
+
+        def pending():
+            for index in range(start_shard, stop):
+                if progress.contains(index):
+                    cache.clear_shard(index)
+                    continue
+                group = group_for(index)
+                if (output_dir / f"shard-{index:06d}").is_dir():
+                    register(
+                        index, *_recover_shard(output_dir, index, group, shard_metadata)
+                    )
+                    continue
+                yield index, group
+
+        run = {"failures": 0}
+        failed_count = 0
+        examples = []
+        deferred = []
+
+        def synthesize(groups):
+            return _synthesize_groups(
+                groups,
+                config,
+                engine_path,
+                engine_name,
+                teacher,
+                sidecar_for_root,
+                min(workers, (stop - start_shard) * shard_size),
+                cache,
+                run,
             )
-        cache.clear_shard(index)
-    with _release_lock(output_dir):
-        current = load_manifest(release_path)
-        complete = sum(shard["rows"] for shard in current.get("shards", []))
-        dropped = current.get("dropped", [])
-        profile = RootProfile(presentations)
-        for shard in current.get("shards", []):
-            _profile_shard(output_dir, shard, profile)
-        statistics = profile.result() if profile.roots else None
-        if statistics is not None:
-            statistics["complete"] = complete + len(dropped) == len(roots)
-            write_manifest(output_dir / "statistics.json", statistics)
-    if failed:
-        summary = "; ".join(
-            f"shard {index:06d} root {root_id} ({error})"
-            for index, root_id, error in failed[:10]
-        )
-        raise CollectionError(
-            f"{len(failed)} roots failed permanently; their shards stay "
-            "unpublished and every collected root stays checkpointed for the "
-            f"next run: {summary}"
-        )
-    if complete + len(dropped) == len(roots):
-        # A partial-range run keeps the cache for shards it never touched.
-        shutil.rmtree(cache.directory, ignore_errors=True)
-    return {
-        "shards": current.get("shards", []),
-        "roots": complete,
-        "dropped": len(dropped),
-        "pending": len(roots) - complete - len(dropped),
-        "release": str(release_path),
-        "statistics": statistics,
-    }
+
+        if start_shard < stop:
+            for index, group, records, failures in synthesize(pending()):
+                if failures:
+                    deferred.append(index)
+                else:
+                    register(
+                        index,
+                        *_publish_shard(
+                            output_dir, index, group, records, shard_metadata
+                        ),
+                    )
+            if deferred:
+                for index, group, records, failures in synthesize(
+                    (index, group_for(index)) for index in deferred
+                ):
+                    if not failures:
+                        register(
+                            index,
+                            *_publish_shard(
+                                output_dir, index, group, records, shard_metadata
+                            ),
+                        )
+                        continue
+                    failed_count += len(failures)
+                    for position, error in failures.items():
+                        if len(examples) < 10:
+                            examples.append(
+                                f"shard {index:06d} root {group[position]['root_id']} ({error})"
+                            )
+
+        with _release_lock(output_dir):
+            counts = progress.finalize()
+            if not counts["pending"]:
+                shutil.rmtree(cache.directory, ignore_errors=True)
+        if failed_count:
+            summary = "; ".join(examples)
+            raise CollectionError(
+                f"{failed_count} roots failed permanently; their shards stay "
+                "unpublished and every collected root stays checkpointed for the "
+                f"next run: {summary}"
+            )
+        return {
+            **counts,
+            "release": str(progress.release) if progress.release.exists() else None,
+        }
 
 
 def run_pipeline(config, roots, output, engine="stockfish"):
     """Curate traces from a prepared pool without modifying its records."""
-    from pondera.data.roots.pool import pool_path, read_roots
-
-    roots = pool_path(roots)
+    path = pool_path(roots).resolve()
     return produce_shards(
-        read_roots(roots),
+        RootPool(path) if path.suffix == ".parquet" else read_roots(path),
         output,
         config,
         start_shard=config.release.start_shard,
         end_shard=config.release.end_shard,
         engine=engine,
-        root_source=roots,
+        root_source=path,
     )

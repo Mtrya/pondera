@@ -107,9 +107,9 @@ class ReleaseTests(unittest.TestCase):
     def test_release_layout_identity_and_validation(self):
         self.assertEqual(self.result["roots"], len(CASES))
         # One presentation per root: five roots produce 2 + 2 + 1 rows.
-        self.assertEqual(len(self.result["shards"]), 3)
-        self.assertEqual([shard["rows"] for shard in self.result["shards"]], [2, 2, 1])
+        self.assertEqual(self.result["shards"], 3)
         release = load_manifest(self.release / "release.json")
+        self.assertEqual([shard["rows"] for shard in release["shards"]], [2, 2, 1])
         self.assertEqual(release["format_version"], 12)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
@@ -147,7 +147,7 @@ class ReleaseTests(unittest.TestCase):
             "mate_distance": pa.int16(),
             "source": pa.string(),
         }
-        for shard in self.result["shards"]:
+        for shard in load_manifest(self.release / "release.json")["shards"]:
             table = pq.read_table(self.release / shard["path"] / "data.parquet")
             self.assertEqual(len(table.schema), 17)
             for name, dtype in expected.items():
@@ -235,8 +235,9 @@ class ReleaseTests(unittest.TestCase):
             workers=1,
         )
         self.assertEqual(again["roots"], len(CASES))
-        self.assertEqual(len(again["shards"]), 3)
-        self.assertEqual(again["statistics"], self.result["statistics"])
+        self.assertEqual(again["shards"], 3)
+        self.assertEqual(again, self.result)
+        before = (self.release / "release.json").read_bytes()
         (self.release / "release.json").unlink()
         recovered = produce_shards(
             self.roots,
@@ -247,7 +248,8 @@ class ReleaseTests(unittest.TestCase):
             workers=1,
         )
         self.assertEqual(recovered["roots"], len(CASES))
-        self.assertEqual(recovered["statistics"], self.result["statistics"])
+        self.assertEqual(recovered, self.result)
+        self.assertEqual((self.release / "release.json").read_bytes(), before)
         self.assertTrue(validate_release(self.release, self.roots, workers=1)["ok"])
 
     def test_resume_rejects_changed_root_provenance(self):
@@ -409,9 +411,10 @@ class FailureIsolationTests(unittest.TestCase):
         provider, _ = self.flaky(fail_id, times=2)
         with self.assertRaises(CollectionError):
             self.produce(provider)
-        release = load_manifest(self.run / "release" / "release.json")
+        release = self.run / "release"
+        self.assertFalse((release / "release.json").exists())
         self.assertEqual(
-            [shard["path"] for shard in release["shards"]],
+            sorted(path.name for path in release.glob("shard-*")),
             ["shard-000001", "shard-000002"],
         )
 

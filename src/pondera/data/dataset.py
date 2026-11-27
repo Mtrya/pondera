@@ -69,31 +69,39 @@ def load_manifest(path):
         return json.load(handle)
 
 
-def parquet_sources(directory):
-    """List release shards or HF split files as (path, row count, split)."""
+def read_release(directory):
+    """Read the ordered completed snapshot, or return empty for standalone Parquet."""
+    from pondera.data.progress import PROGRESS_FILE
+
     directory = Path(directory)
-    manifest = load_manifest(directory / "release.json") if directory.is_dir() else {}
+    manifest = load_manifest(directory / "release.json")
+    if not manifest and (directory / PROGRESS_FILE).is_file():
+        raise ValueError(f"Curation is incomplete: {directory}")
+    return manifest
+
+
+def parquet_sources(directory, manifest=None):
+    """Yield (path, row count, split) in release or split-file order."""
+    directory = Path(directory)
+    manifest = read_release(directory) if manifest is None else manifest
     if manifest:
-        result = []
         for shard in manifest["shards"]:
             path = directory / shard["path"]
             if path.suffix != ".parquet":
                 path /= "data.parquet"
-            result.append((path, shard["rows"], shard.get("split")))
-        return result
+            yield path, shard["rows"], shard.get("split")
+        return
     root = directory / "data" if (directory / "data").is_dir() else directory
     paths = [root] if root.is_file() else sorted(root.glob("*.parquet"))
     if not paths:
         raise FileNotFoundError(f"No Parquet data in {directory}")
     splits = {"train": "train", "validation": "val", "val": "val"}
-    return [
-        (
+    for path in paths:
+        yield (
             path,
             pq.ParquetFile(path).metadata.num_rows,
             splits.get(path.stem.split("-")[0]),
         )
-        for path in paths
-    ]
 
 
 def write_trace_rows(directory, rows):

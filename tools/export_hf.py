@@ -2,13 +2,12 @@
 
 import argparse
 import json
-import os
-import shutil
-import tempfile
 from collections import Counter
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
@@ -17,22 +16,90 @@ from pondera.data.dataset import (
     HF_COLUMNS,
     HF_SCHEMA,
     TRACE_SCHEMA,
-    load_manifest,
+    parquet_sources,
+    read_release,
 )
 from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 SPLIT_NAMES = {"train": "train", "val": "validation"}
+MAX_PART_BYTES = 256 * 1024**2
+ROW_GROUP_ROWS = 1024
 
 
-def export_hf(release, output, batch_size=1024):
-    """Write deterministic train/validation Parquet files without machine arrays."""
-    if batch_size < 1:
-        raise ValueError("Export batch size must be positive")
-    release = Path(release)
-    output = Path(output)
+class _SplitParts:
+    def __init__(self, directory, split, max_bytes):
+        self.directory = directory
+        self.split = split
+        self.max_bytes = max_bytes
+        self.files = []
+        self.buffer = []
+        self.buffer_bytes = 0
+        self.group = []
+        self.group_rows = 0
+
+    def add(self, batch):
+        while batch.num_rows:
+            take = min(ROW_GROUP_ROWS - self.group_rows, batch.num_rows)
+            self.group.append(batch.slice(0, take))
+            self.group_rows += take
+            batch = batch.slice(take)
+            if self.group_rows == ROW_GROUP_ROWS:
+                self._buffer_group()
+
+    def _buffer_group(self):
+        group = pa.Table.from_batches(self.group, schema=HF_SCHEMA).combine_chunks()
+        self.group = []
+        self.group_rows = 0
+        if self.buffer and self.buffer_bytes + group.nbytes > self.max_bytes:
+            self._flush()
+        self.buffer.append(group)
+        self.buffer_bytes += group.nbytes
+        if self.buffer_bytes >= self.max_bytes:
+            self._flush()
+
+    def _flush(self):
+        self._write(pa.concat_tables(self.buffer))
+        self.buffer.clear()
+        self.buffer_bytes = 0
+
+    def _write(self, table):
+        name = f"{self.split}-{len(self.files):05d}.parquet"
+        destination = self.directory / name
+        pq.write_table(
+            table,
+            destination,
+            row_group_size=ROW_GROUP_ROWS,
+            compression="zstd",
+            compression_level=3,
+            use_dictionary=["presentation", "turn", "final_move"],
+        )
+        size = destination.stat().st_size
+        if size > self.max_bytes and table.num_rows > 1:
+            # Check the closed file, including its footer. An oversized document
+            # occupies a part on its own because rows are indivisible.
+            middle = table.num_rows // 2
+            self._write(table.slice(0, middle))
+            self._write(table.slice(middle))
+            return
+        self.files.append(
+            {"path": f"data/{name}", "rows": table.num_rows, "bytes": size}
+        )
+
+    def close(self):
+        if self.group:
+            self._buffer_group()
+        if self.buffer:
+            self._flush()
+
+
+def export_hf(release, output, batch_size=1024, *, max_part_bytes=MAX_PART_BYTES):
+    """Write ordered split parts, bounded by bytes except for single rows."""
+    if batch_size < 1 or max_part_bytes < 1:
+        raise ValueError("Export batch size and part size must be positive")
+    release, output = Path(release), Path(output)
     if output.exists():
         raise FileExistsError(output)
-    manifest = load_manifest(release / "release.json")
+    manifest = read_release(release)
     if not manifest or not manifest.get("shards"):
         raise ValueError(f"Release has no completed shards: {release}")
     for field, expected in (
@@ -43,63 +110,43 @@ def export_hf(release, output, batch_size=1024):
         if manifest.get(field) != expected:
             raise ValueError(f"Unsupported release {field}: {manifest.get(field)}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
-    (temporary / "data").mkdir(parents=True)
-    writers = {}
     counts = Counter()
-    try:
-        for shard in manifest["shards"]:
-            path = release / shard["path"] / "data.parquet"
+    with TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as work:
+        stage = Path(work) / "export"
+        directory = stage / "data"
+        directory.mkdir(parents=True)
+        splits = {
+            label: _SplitParts(directory, name, max_part_bytes)
+            for label, name in SPLIT_NAMES.items()
+        }
+        for path, expected, _ in parquet_sources(release, manifest):
             source = pq.ParquetFile(path)
             if source.schema_arrow != TRACE_SCHEMA:
                 raise ValueError(
                     f"Shard schema differs from the release contract: {path}"
                 )
-            if source.metadata.num_rows != shard["rows"]:
+            if source.metadata.num_rows != expected:
                 raise ValueError(f"Shard row count differs from its release: {path}")
             for batch in source.iter_batches(
                 batch_size=batch_size, columns=[*HF_COLUMNS, "split"], use_threads=False
             ):
-                rows = batch.to_pylist()
-                unknown = {row["split"] for row in rows} - set(SPLIT_NAMES)
-                if unknown:
-                    raise ValueError(f"Unknown release split: {sorted(unknown)[0]}")
-                for local_split, hf_split in SPLIT_NAMES.items():
-                    selected = [row for row in rows if row["split"] == local_split]
-                    if not selected:
-                        continue
-                    if hf_split not in writers:
-                        destination = temporary / "data" / f"{hf_split}-00000.parquet"
-                        writers[hf_split] = pq.ParquetWriter(
-                            destination,
-                            HF_SCHEMA,
-                            compression="zstd",
-                            compression_level=3,
-                            use_dictionary=["presentation", "turn", "final_move"],
-                        )
-                    writers[hf_split].write_table(
-                        pa.Table.from_pylist(selected, schema=HF_SCHEMA)
-                    )
-                    counts[hf_split] += len(selected)
+                labels = batch["split"]
+                projected = batch.select(HF_COLUMNS)
+                selected_rows = 0
+                for label, parts in splits.items():
+                    selected = projected.filter(pc.equal(labels, label))
+                    if selected.num_rows:
+                        parts.add(selected)
+                        counts[parts.split] += selected.num_rows
+                        selected_rows += selected.num_rows
+                if selected_rows != batch.num_rows:
+                    raise ValueError(f"Unknown release split in {path}")
         if not counts:
             raise ValueError("Release contains no rows")
-        for writer in writers.values():
-            writer.close()
-        files = [
-            {
-                "path": f"data/{split}-00000.parquet",
-                "rows": counts[split],
-                "bytes": (temporary / "data" / f"{split}-00000.parquet").stat().st_size,
-            }
-            for split in ("train", "validation")
-            if split in counts
-        ]
-        os.replace(temporary, output)
-    except BaseException:
-        for writer in writers.values():
-            writer.close()
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
+        for parts in splits.values():
+            parts.close()
+        stage.rename(output)
+    files = [file for parts in splits.values() for file in parts.files]
     return {"rows": dict(counts), "files": files, "columns": list(HF_COLUMNS)}
 
 
@@ -108,8 +155,19 @@ def main():
     parser.add_argument("--release", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--max-part-bytes", type=int, default=MAX_PART_BYTES)
     args = parser.parse_args()
-    print(json.dumps(export_hf(args.release, args.output, args.batch_size), indent=2))
+    print(
+        json.dumps(
+            export_hf(
+                args.release,
+                args.output,
+                args.batch_size,
+                max_part_bytes=args.max_part_bytes,
+            ),
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

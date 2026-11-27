@@ -807,8 +807,7 @@ class DirectPipelineIntegrationTests(unittest.TestCase):
                 end_shard=1,
             )
             self.assertEqual(partial["pending"], 4)
-            # Recover a real published shard whose registration was interrupted.
-            (directory / "resumed" / "release.json").unlink()
+            self.assertFalse((directory / "resumed" / "release.json").exists())
             produce_shards(
                 roots,
                 directory / "resumed",
