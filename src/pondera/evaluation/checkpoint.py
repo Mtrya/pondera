@@ -8,17 +8,27 @@ from dataclasses import asdict
 from pathlib import Path
 from statistics import mean, median
 
-import chess
 import pyarrow.parquet as pq
 
+from pondera.chess import _rules as rules
 from pondera.chess.tracker import repetition_count
 from pondera.data.dataset import parquet_sources, write_manifest
+from pondera.data.roots.pool import MANIFEST_FILE, POOL_FILE, RootPool
 from pondera.evaluation.reference import Reference
 from pondera.inference.trace import load_checkpoint
 
 
 def _rows(path, puzzle):
     path = Path(path)
+    candidate = path / POOL_FILE if path.is_dir() else path
+    if (
+        not puzzle
+        and candidate.name == POOL_FILE
+        and candidate.with_name(MANIFEST_FILE).is_file()
+        and candidate.is_file()
+    ):
+        yield from RootPool(candidate).iter_range()
+        return
     if path.is_dir() and (path / "roots.jsonl").exists():
         path /= "roots.jsonl"
     if path.suffix == ".jsonl":
@@ -49,7 +59,7 @@ def select_rows(path, *, puzzle, limit, seed):
     selected, heap = {}, []
     for row in _rows(path, puzzle):
         if puzzle:
-            board = chess.Board(row["FEN"])
+            board = rules.Board(row["FEN"])
             moves = row["Moves"].split()
             if len(moves) < 2:
                 raise ValueError("A puzzle needs a setup move and a solution")
@@ -59,7 +69,7 @@ def select_rows(path, *, puzzle, limit, seed):
             key = str(row.get("PuzzleId") or (row["FEN"] + "|" + row["Moves"]))
             int(row["Rating"])
         else:
-            board = chess.Board(row["fen"])
+            board = rules.Board(row["fen"])
             repetition = row.get("repetition", 1)
             if type(repetition) is not int or repetition < 1:
                 raise ValueError("Root repetition must be a positive integer")
@@ -102,7 +112,7 @@ def _generation(predictor, reference, fen, repetition, config, budget):
 
 
 def _puzzle(predictor, reference, row, config, budget):
-    board = chess.Board(row["FEN"])
+    board = rules.Board(row["FEN"])
     moves = row["Moves"].split()
     board.push_uci(moves[0])
     turns = []
@@ -115,7 +125,7 @@ def _puzzle(predictor, reference, row, config, budget):
         answer = generation["answer"]
         if not answer["move_legal"] or answer["decision"] == "<claim_draw>":
             break
-        candidate = chess.Move.from_uci(answer["decision"])
+        candidate = rules.Move.from_uci(answer["decision"])
         board.push(candidate)
         # Lichess accepts every checkmating alternative, including mate-in-one.
         correct = candidate.uci() == moves[position] or board.is_checkmate()
@@ -313,7 +323,7 @@ def evaluate_checkpoint(
                         if kind == "root":
                             fen, repetition = row["fen"], row.get("repetition", 1)
                             # Prepare all candidate scores even if this checkpoint's answer fails.
-                            reference.scores(chess.Board(fen))
+                            reference.scores(rules.Board(fen))
                             record.update(
                                 fen=fen,
                                 repetition=repetition,
@@ -327,9 +337,9 @@ def evaluate_checkpoint(
                                 ),
                             )
                         else:
-                            root = chess.Board(row["FEN"])
+                            root = rules.Board(row["FEN"])
                             root.push_uci(row["Moves"].split()[0])
-                            reference.scores(chess.Board(root.fen()))
+                            reference.scores(rules.Board(root.fen()))
                             record.update(
                                 _puzzle(predictor, reference, row, config, budget)
                             )

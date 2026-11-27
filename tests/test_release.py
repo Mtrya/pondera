@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import threading
 import tomllib
@@ -8,12 +9,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
-import chess
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from trace_fixtures import read_release_rows, tie_sidecar_lines, trace_config_text
 
+from pondera.chess import _rules as rules
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.vocabulary import MOVE, UCI_MOVE_TO_IDX
 from pondera.data.config import load_config, parse_recipe
@@ -107,9 +108,9 @@ class ReleaseTests(unittest.TestCase):
     def test_release_layout_identity_and_validation(self):
         self.assertEqual(self.result["roots"], len(CASES))
         # One presentation per root: five roots produce 2 + 2 + 1 rows.
-        self.assertEqual(len(self.result["shards"]), 3)
-        self.assertEqual([shard["rows"] for shard in self.result["shards"]], [2, 2, 1])
+        self.assertEqual(self.result["shards"], 3)
         release = load_manifest(self.release / "release.json")
+        self.assertEqual([shard["rows"] for shard in release["shards"]], [2, 2, 1])
         self.assertEqual(release["format_version"], 12)
         self.assertEqual(release["grammar_version"], 2)
         self.assertEqual(release["teacher"]["schema_version"], 3)
@@ -119,13 +120,15 @@ class ReleaseTests(unittest.TestCase):
                 "hash_mb": 256,
                 "timeout_seconds": 3600,
                 "syzygy_probe_limit": 0,
-                "syzygy_tables": None,
             },
         )
         self.assertEqual(release["recipe"], self.config.sampling.identity())
         self.assertEqual(release["engine"]["name"], "stockfish")
         self.assertEqual(release["presentation"], self.config.presentation_dict())
-        self.assertEqual(release["metadata"], validate_release_identity(release))
+        self.assertEqual(
+            validate_release_identity(release)["recipe"],
+            self.config.sampling.identity(),
+        )
         validation = validate_release(self.release, self.roots, workers=1)
         self.assertTrue(validation["ok"])
         self.assertEqual(validation["roots"], len(CASES))
@@ -147,7 +150,7 @@ class ReleaseTests(unittest.TestCase):
             "mate_distance": pa.int16(),
             "source": pa.string(),
         }
-        for shard in self.result["shards"]:
+        for shard in load_manifest(self.release / "release.json")["shards"]:
             table = pq.read_table(self.release / shard["path"] / "data.parquet")
             self.assertEqual(len(table.schema), 17)
             for name, dtype in expected.items():
@@ -162,25 +165,11 @@ class ReleaseTests(unittest.TestCase):
         parallel = validate_release(self.release, self.roots, workers=4)
         self.assertEqual(parallel, sequential)
 
-    def expected_shard_metadata(self, release):
-        expected = {
-            key: release[key]
-            for key in (
-                "format_version",
-                "grammar_version",
-                "tokenizer_version",
-                "role_count",
-            )
-        }
-        expected.update(release["metadata"])
-        return expected
-
     def test_shards_have_arrays_champions_and_identical_suffixes(self):
         release = load_manifest(self.release / "release.json")
-        expected = self.expected_shard_metadata(release)
         suffixes = {}
         for shard in release["shards"]:
-            manifest, rows, arrays = verify_shard_files(self.release, shard, expected)
+            manifest, rows, arrays = verify_shard_files(self.release, shard)
             self.assertEqual(manifest["rows"], shard["rows"])
             champions = {
                 row["root_id"]: row
@@ -235,8 +224,9 @@ class ReleaseTests(unittest.TestCase):
             workers=1,
         )
         self.assertEqual(again["roots"], len(CASES))
-        self.assertEqual(len(again["shards"]), 3)
-        self.assertEqual(again["statistics"], self.result["statistics"])
+        self.assertEqual(again["shards"], 3)
+        self.assertEqual(again, self.result)
+        before = (self.release / "release.json").read_bytes()
         (self.release / "release.json").unlink()
         recovered = produce_shards(
             self.roots,
@@ -247,8 +237,21 @@ class ReleaseTests(unittest.TestCase):
             workers=1,
         )
         self.assertEqual(recovered["roots"], len(CASES))
-        self.assertEqual(recovered["statistics"], self.result["statistics"])
+        self.assertEqual(recovered, self.result)
+        self.assertEqual((self.release / "release.json").read_bytes(), before)
         self.assertTrue(validate_release(self.release, self.roots, workers=1)["ok"])
+
+    def test_resume_detects_a_missing_registered_shard(self):
+        shutil.rmtree(self.release / "shard-000000")
+        with self.assertRaises(FileNotFoundError):
+            produce_shards(
+                self.roots,
+                self.release,
+                self.config,
+                sidecar_for_root=self.provider,
+                shard_size=2,
+                workers=1,
+            )
 
     def test_resume_rejects_changed_root_provenance(self):
         roots = [
@@ -342,9 +345,8 @@ class ReleaseTests(unittest.TestCase):
     def test_claim_root_is_materialized_without_a_variation(self):
         release = load_manifest(self.release / "release.json")
         claim_roots = set()
-        expected = self.expected_shard_metadata(release)
         for shard in release["shards"]:
-            _, rows, _ = verify_shard_files(self.release, shard, expected)
+            _, rows, _ = verify_shard_files(self.release, shard)
             for row in rows:
                 if row["final_move"] == "<claim_draw>":
                     claim_roots.add(row["root_id"])
@@ -409,9 +411,10 @@ class FailureIsolationTests(unittest.TestCase):
         provider, _ = self.flaky(fail_id, times=2)
         with self.assertRaises(CollectionError):
             self.produce(provider)
-        release = load_manifest(self.run / "release" / "release.json")
+        release = self.run / "release"
+        self.assertFalse((release / "release.json").exists())
         self.assertEqual(
-            [shard["path"] for shard in release["shards"]],
+            sorted(path.name for path in release.glob("shard-*")),
             ["shard-000001", "shard-000002"],
         )
 
@@ -457,6 +460,27 @@ class FailureIsolationTests(unittest.TestCase):
         }
         self.assertEqual(expected, read_release_rows(self.run / "release"))
         self.assertFalse((self.run / "release" / ".roots").exists())
+
+    def test_all_dropped_roots_remain_recorded_without_a_release(self):
+        roots = self.roots[:1]
+
+        def timed_out(root):
+            raise EngineTimeoutError("injected timeout")
+
+        output = self.run / "release"
+        with self.assertRaisesRegex(ValueError, "Every selected root was dropped"):
+            produce_shards(
+                roots, output, self.config, sidecar_for_root=timed_out, workers=1
+            )
+        self.assertFalse((output / "release.json").exists())
+        self.assertEqual(
+            load_manifest(output / "shard-000000" / "manifest.json"),
+            {"rows": 0, "dropped": [roots[0]["root_id"]]},
+        )
+        with self.assertRaisesRegex(ValueError, "Every selected root was dropped"):
+            produce_shards(
+                roots, output, self.config, sidecar_for_root=self.provider, workers=1
+            )
 
     def test_a_dropped_root_is_not_recollected_on_resume(self):
         drop_id = self.roots[1]["root_id"]
@@ -707,7 +731,7 @@ class WideReleaseTests(unittest.TestCase):
             capped = next(
                 root for root in roots if root["root_id"].startswith("6c9691")
             )
-            self.assertEqual(chess.Board(capped["fen"]).legal_moves.count(), 2)
+            self.assertEqual(rules.Board(capped["fen"]).legal_move_count(), 2)
             stored = records[capped["root_id"], capped["presentation"]]["row"]
             self.assertEqual(stored["teacher_width"], 3)
             self.assertNotIn("effective_width", stored)
@@ -756,13 +780,8 @@ joint = [{width = 1, depth = 4, probability = 1.0}]
                         {"width": width, "depth": depth, "probability": 1.0},
                     ],
                 }
-                release["recipe"] = release["metadata"]["recipe"] = recipe
+                release["recipe"] = recipe
                 release_path.write_text(json.dumps(release))
-                for shard in release["shards"]:
-                    path = release_dir / shard["path"] / "manifest.json"
-                    manifest = load_manifest(path)
-                    manifest["recipe"] = recipe
-                    path.write_text(json.dumps(manifest))
                 validate_release_identity(release)
                 with self.assertRaises(ValueError):
                     validate_release(release_dir, workers=1)

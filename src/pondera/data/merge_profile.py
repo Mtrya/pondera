@@ -1,9 +1,4 @@
-"""Fit and measure merge dictionaries on declared trace corpora.
-
-Full presentations supply candidate substrings. They are distinct sampled
-roots, rather than alternate full views of every random/zero row. Measurement
-includes every selected presentation; vocabulary holdout is optional.
-"""
+"""Fit and measure merge dictionaries on stored trace atom IDs."""
 
 import json
 import multiprocessing
@@ -16,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import pyarrow.parquet as pq
+import pyarrow.compute as pc
 
 from pondera.chess.merge import (
     count_candidates,
@@ -28,15 +23,19 @@ from pondera.chess.vocabulary import (
     CHESS_VOCAB_SIZE,
     LINES,
 )
-from pondera.data.dataset import load_manifest, parquet_sources
-from pondera.data.text import (
+from pondera.data.dataset import (
+    iter_atom_batches,
+    open_trace_shard,
+    parquet_sources,
+    read_release,
+)
+from pondera.data.trace import TRACE_GRAMMAR_VERSION
+from pondera.data.trace_encoding import (
     MERGE_BOUNDARIES,
     STANDALONE_ATOMS,
     encode_traces,
     merge_segments,
-    trace_atoms,
 )
-from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 
 @dataclass(frozen=True)
@@ -66,57 +65,49 @@ def peak_rss_bytes():
 
 
 def _load_shard(task):
-    """Parse one shard's profile rows from authoritative text, in order."""
-    path, expected, split, release_name, selected = task
-    file = pq.ParquetFile(path)
-    if file.metadata.num_rows != expected:
-        raise ValueError(f"Shard row count differs from its release: {path}")
+    path, expected, release_name, split, limit = task
     columns = [
         "fen",
-        "repetition",
+        "root_id",
+        "split",
         "presentation",
         "teacher_width",
         "teacher_depth",
     ]
-    columns.extend(
-        name for name in ("root_id", "split") if name in file.schema_arrow.names
-    )
-    columns.append("trace_text")
+    file = open_trace_shard(path, expected, columns)
     rows = []
-    for batch in file.iter_batches(columns=columns, batch_size=64, use_threads=False):
-        for row in batch.to_pylist():
-            position = " ".join(row["fen"].split()[:4])
-            if selected is not None and position not in selected:
-                continue
-            label = row.get("split", split)
+    for batch, atom_ids in iter_atom_batches(file, columns, batch_size=64):
+        for index, row in enumerate(batch):
+            label = row["split"]
             if label not in {"train", "val"}:
                 raise ValueError(f"Unknown dataset split: {label}")
+            if split is not None and label != split:
+                continue
             rows.append(
                 ProfileRow(
                     release_name,
-                    row.get("root_id") or f"{row['fen']}|{row['repetition']}",
-                    position,
+                    row["root_id"],
+                    " ".join(row["fen"].split()[:4]),
                     label,
                     row["presentation"],
                     row["teacher_width"],
                     row["teacher_depth"],
-                    trace_atoms(row["trace_text"]),
+                    atom_ids[index],
                 )
             )
+            if len(rows) == limit:
+                return rows
     return rows
 
 
-def load_rows(release, *, max_roots=None, workers=1):
-    """Project only profile columns, selecting root groups before token IO.
-
-    With ``workers`` above one, spawned worker processes parse shards in
-    parallel — spawned, not forked, so no Parquet IO state crosses a fork.
-    Rows keep shard order either way.
-    """
+def load_rows(release, *, max_roots=None, workers=1, split=None):
+    """Load profile rows in release order, capping the selected split prefix."""
     if workers < 1:
         raise ValueError("workers must be positive")
+    if max_roots is not None and max_roots < 1:
+        raise ValueError("max_roots must be positive")
     release = Path(release)
-    manifest = load_manifest(release / "release.json") if release.is_dir() else {}
+    manifest = read_release(release)
     if manifest:
         for field, expected in (
             ("grammar_version", TRACE_GRAMMAR_VERSION),
@@ -124,28 +115,24 @@ def load_rows(release, *, max_roots=None, workers=1):
         ):
             if manifest.get(field) != expected:
                 raise ValueError(f"Unsupported {field} in {release}")
-    sources = parquet_sources(release)
-    selected = None
-    if max_roots is not None:
-        if max_roots < 1:
-            raise ValueError("max_roots must be positive")
-        positions = set()
-        for path, _, _ in sources:
-            for batch in pq.ParquetFile(path).iter_batches(
-                columns=["fen"], batch_size=1024, use_threads=False
-            ):
-                positions.update(
-                    " ".join(fen.split()[:4]) for fen in batch.column(0).to_pylist()
-                )
-        selected = set(
-            sorted(
-                positions, key=lambda key: (random.Random(f"640:{key}").random(), key)
-            )[:max_roots]
-        )
-    tasks = [
-        (path, expected, split, str(release), selected)
-        for path, expected, split in sources
-    ]
+    remaining = max_roots
+    tasks = []
+    for path, expected, _ in parquet_sources(release, manifest):
+        limit = None
+        if remaining is not None:
+            # Count the selected split before scheduling atom reads.
+            available = expected
+            if split is not None and expected:
+                file = open_trace_shard(path, expected, ["split"])
+                labels = file.read(columns=["split"], use_threads=False)["split"]
+                available = pc.sum(pc.equal(labels, split)).as_py() or 0
+            limit = min(remaining, available)
+            if not limit:
+                continue
+            remaining -= limit
+        tasks.append((path, expected, str(release), split, limit))
+        if remaining == 0:
+            break
     if workers > 1 and len(tasks) > 1:
         context = multiprocessing.get_context("spawn")
         with context.Pool(workers) as pool:
@@ -153,11 +140,6 @@ def load_rows(release, *, max_roots=None, workers=1):
     else:
         groups = [_load_shard(task) for task in tasks]
     return [row for group in groups for row in group]
-
-
-def load_full_rows(release):
-    """Full rows from authoritative text, retaining split and identity."""
-    return [row for row in load_rows(release) if row.presentation == "full"]
 
 
 def _empty():
@@ -283,7 +265,7 @@ def build_profile(
     workers=1,
     on_tier=None,
 ):
-    """Count full rows, select dictionaries, and stream corpus measurements.
+    """Count candidates, select dictionaries, and stream corpus measurements.
 
     ``workers`` parallelizes loading, candidate counting, selection encoding,
     and measurement across processes without changing any result.
@@ -307,10 +289,13 @@ def build_profile(
         raise ValueError("Invalid fitting split or selection stride")
     if workers < 1:
         raise ValueError("workers must be positive")
+    sample_split = fit_split if max_roots is not None and fit_split != "all" else None
     loaded = [
         row
         for release in releases
-        for row in load_rows(release, max_roots=max_roots, workers=workers)
+        for row in load_rows(
+            release, max_roots=max_roots, workers=workers, split=sample_split
+        )
     ]
     heldout_positions = {
         row.position for row in loaded if is_held_out(row.position, holdout_fraction)
@@ -319,14 +304,9 @@ def build_profile(
         heldout_positions.update(
             row.position for row in loaded if row.split != fit_split
         )
-    fitting = [
-        row
-        for row in loaded
-        if row.presentation == "full" and row.position not in heldout_positions
-    ]
+    fitting = [row for row in loaded if row.position not in heldout_positions]
     if not fitting and any(size > CHESS_VOCAB_SIZE for size in vocab_sizes):
-        raise ValueError("The fitting corpus has no full-presentation rows")
-    measurement = [row for row in loaded if row.position not in heldout_positions]
+        raise ValueError("The fitting corpus has no eligible rows")
     heldout = [row for row in loaded if row.position in heldout_positions]
     positions = sorted({row.position for row in fitting})
     selection_positions = set(positions[::selection_stride])
@@ -364,7 +344,7 @@ def build_profile(
             "holdout_fraction": holdout_fraction,
             "loaded": _summary(loaded),
             "fitting": _summary(fitting),
-            "measurement": _summary(measurement),
+            "measurement": _summary(fitting),
             "heldout": _summary(heldout),
             "selection": {
                 "stride": selection_stride,
@@ -408,7 +388,7 @@ def build_profile(
             flush=True,
         )
         measure_start = time.monotonic()
-        measured, usage = _measure(measurement, dictionary, workers=workers)
+        measured, usage = _measure(fitting, dictionary, workers=workers)
         unseen, _ = _measure(heldout, dictionary, workers=workers)
         print(f"measured in {time.monotonic() - measure_start:.0f}s", flush=True)
         dictionaries[size] = dictionary
@@ -441,10 +421,8 @@ def render_report(document, title="Merge dictionary profile"):
     lines = [
         f"# {title}",
         "",
-        f"Candidate counting uses {corpus['fitting']['rows']:,} full rows; selection uses "
-        f"{corpus['selection']['rows']:,} rows. Measurement covers "
-        f"{corpus['measurement']['rows']:,} rows across their stored presentations. "
-        "Each root has its selected presentation; missing full views are not regenerated.",
+        f"Candidate counting and measurement use {corpus['fitting']['rows']:,} rows "
+        f"across their stored presentations. Selection uses {corpus['selection']['rows']:,} rows.",
         "",
         f"Fitting split: {corpus['fit_split']}; optional root holdout: "
         f"{corpus['holdout_fraction']:.3f}. Original dataset split labels are preserved.",

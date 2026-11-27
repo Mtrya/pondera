@@ -1,8 +1,8 @@
 import unittest
 
-import chess
 import numpy as np
 
+from pondera.chess import _rules as rules
 from pondera.chess.codec import decode_board, mate_token, value_bin
 from pondera.chess.symmetry import TOKEN_MIRROR
 from pondera.chess.tracker import PathTracker
@@ -36,7 +36,7 @@ from pondera.data.trace import (
 
 # A black-to-move root reached after 1.e4, and a castling position with both
 # sides holding all rights.
-BLACK_TO_MOVE = chess.Board()
+BLACK_TO_MOVE = rules.Board()
 BLACK_TO_MOVE.push_uci("e2e4")
 BLACK_TO_MOVE = BLACK_TO_MOVE.fen(en_passant="fen")
 CASTLING_FEN = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"
@@ -47,7 +47,7 @@ BIN_ZERO = 10
 BIN_HALF = 15
 BIN_MAX = 19
 
-# Frozen rule positions, each cross-checked against python-chess below.
+# Frozen positions for the trace search rule.
 FIFTY_MOVE_ROOT = "7k/8/8/8/8/8/8/K6R w - - 99 1"
 FIFTY_MOVE_DRAWN_ROOT = "7k/8/8/8/8/8/8/K6R w - - 100 1"
 MATE_IN_ONE_ROOT = "7k/5Q2/6K1/8/8/8/8/8 w - - 0 1"
@@ -86,7 +86,7 @@ class DesignExampleTests(unittest.TestCase):
             REFUTED,
             RESET,
         )
-        program = replay(tokens, chess.STARTING_FEN)
+        program = replay(tokens, rules.STARTING_FEN)
         self.assertEqual(
             [step.operation for step in program.steps[:8]],
             [
@@ -105,7 +105,7 @@ class DesignExampleTests(unittest.TestCase):
         # e2e4 BACK d2d4 <refuted>: the passed child is not a reference.
         tokens = [DEPTH, move_token("e2e4"), BACK, move_token("d2d4"), REFUTED]
         with self.assertRaises(TraceError) as context:
-            replay(tokens, chess.STARTING_FEN)
+            replay(tokens, rules.STARTING_FEN)
         self.assertEqual(context.exception.tag, "refuted_without_reference")
 
     def test_return_evaluation_makes_the_parent_candidate_exact(self):
@@ -123,7 +123,7 @@ class DesignExampleTests(unittest.TestCase):
             move_token("d2d4"),
             REFUTED,
         )
-        program = replay(tokens, chess.STARTING_FEN)
+        program = replay(tokens, rules.STARTING_FEN)
         self.assertEqual(
             [step.operation for step in program.steps[:12]],
             [
@@ -144,7 +144,7 @@ class DesignExampleTests(unittest.TestCase):
 
 
 class VisitStateTests(unittest.TestCase):
-    def assertIllegal(self, tokens, tag, fen=chess.STARTING_FEN, **kwargs):
+    def assertIllegal(self, tokens, tag, fen=rules.STARTING_FEN, **kwargs):
         with self.assertRaises(TraceError) as context:
             replay(tokens, fen, **kwargs)
         self.assertEqual(context.exception.tag, tag)
@@ -176,10 +176,10 @@ class VisitStateTests(unittest.TestCase):
             value_token(0.2),
             RESET,
         )
-        replay(tokens, chess.STARTING_FEN)
+        replay(tokens, rules.STARTING_FEN)
 
         # A BOARD request after the conclusion is the one extra operation.
-        writer = TraceWriter(chess.STARTING_FEN)
+        writer = TraceWriter(rules.STARTING_FEN)
         writer.depth()
         writer.move("e2e4")
         writer.evaluate(value=0.1)
@@ -191,12 +191,12 @@ class VisitStateTests(unittest.TestCase):
         writer.final("e2e4")
         writer.final_evaluate(value=0.1)
         writer.end()
-        program = replay(writer.tokens, chess.STARTING_FEN)
+        program = replay(writer.tokens, rules.STARTING_FEN)
         self.assertEqual(program.steps[3].operation, "board")
 
     def test_refutation_needs_a_fresh_visit(self):
         # The reference exists (e2e4 is exact) but d2d4 already observed.
-        writer = TraceWriter(chess.STARTING_FEN)
+        writer = TraceWriter(rules.STARTING_FEN)
         writer.depth()
         writer.move("e2e4")
         writer.evaluate(value=0.1)
@@ -205,7 +205,7 @@ class VisitStateTests(unittest.TestCase):
         writer.board()
         tokens = list(writer.tokens) + [REFUTED]
         with self.assertRaises(TraceError) as context:
-            replay(tokens, chess.STARTING_FEN)
+            replay(tokens, rules.STARTING_FEN)
         self.assertEqual(context.exception.tag, "refuted_after_content")
         self.assertIllegal(
             [
@@ -234,9 +234,9 @@ class VisitStateTests(unittest.TestCase):
             REFUTED,
         ]
         complete = two_exact + [FINAL, move_token("e2e4"), value_token(0.1), END]
-        replay(complete, chess.STARTING_FEN, teacher_width=2)
+        replay(complete, rules.STARTING_FEN, teacher_width=2)
         with self.assertRaises(TraceError) as context:
-            replay(complete, chess.STARTING_FEN, teacher_width=3)
+            replay(complete, rules.STARTING_FEN, teacher_width=3)
         self.assertEqual(context.exception.tag, "refuted_without_reference")
 
         # The current candidate's own earlier exact value is not a reference.
@@ -270,7 +270,7 @@ class VisitStateTests(unittest.TestCase):
         # <depth> and FINAL remain legal after the root evaluation.
         replay(
             counter_trace(move_token("e2e4"), BACK, value_token(0.2)),
-            chess.STARTING_FEN,
+            rules.STARTING_FEN,
         )
         replay(
             [
@@ -284,7 +284,7 @@ class VisitStateTests(unittest.TestCase):
                 value_token(0.2),
                 END,
             ],
-            chess.STARTING_FEN,
+            rules.STARTING_FEN,
         )
 
     def test_depth_rules(self):
@@ -310,12 +310,12 @@ class VisitStateTests(unittest.TestCase):
                 value_token(0.1),
                 END,
             ],
-            chess.STARTING_FEN,
+            rules.STARTING_FEN,
         )
         # FINAL may immediately follow <depth> at a round-start truncation.
         replay(
             [DEPTH, FINAL, move_token("e2e4"), value_token(0.1), END],
-            chess.STARTING_FEN,
+            rules.STARTING_FEN,
         )
         # <depth> after FINAL belongs to no grammar rule.
         self.assertIllegal(
@@ -376,7 +376,7 @@ class RuleTerminalTests(unittest.TestCase):
     def test_insufficient_material_does_not_stop_the_trace(self):
         # K vs K is game over by material but not by the search rule.
         fen = "8/8/8/4k3/8/8/8/4K3 w - - 0 1"
-        self.assertTrue(chess.Board(fen).is_game_over())
+        self.assertTrue(rules.Board(fen).is_game_over())
         self.assertIsNone(PathTracker(fen).search_terminal())
         writer = TraceWriter(fen)
         writer.depth()
@@ -390,7 +390,7 @@ class RuleTerminalTests(unittest.TestCase):
 
 
 class FinalSuffixTests(unittest.TestCase):
-    def assertIllegal(self, tokens, tag, fen=chess.STARTING_FEN, **kwargs):
+    def assertIllegal(self, tokens, tag, fen=rules.STARTING_FEN, **kwargs):
         with self.assertRaises(TraceError) as context:
             replay(tokens, fen, **kwargs)
         self.assertEqual(context.exception.tag, tag)
@@ -404,7 +404,7 @@ class FinalSuffixTests(unittest.TestCase):
             move_token("g1f3"),
             END,
         ]
-        program = replay(tokens, chess.STARTING_FEN)
+        program = replay(tokens, rules.STARTING_FEN)
         self.assertEqual(program.final_move, "e2e4")
         self.assertEqual(program.final_move_index, 1)
         self.assertNotEqual(program.final_move_index, len(program.tokens) - 1)
@@ -428,11 +428,11 @@ class FinalSuffixTests(unittest.TestCase):
     def test_mate_token_needs_the_matching_extreme_bin(self):
         replay(
             [FINAL, move_token("e2e4"), VALUE + BIN_MAX, mate_token(3, True), END],
-            chess.STARTING_FEN,
+            rules.STARTING_FEN,
         )
         replay(
             [FINAL, move_token("e2e4"), VALUE + 0, mate_token(4, False), END],
-            chess.STARTING_FEN,
+            rules.STARTING_FEN,
         )
         self.assertIllegal(
             [FINAL, move_token("e2e4"), VALUE + BIN_HALF, mate_token(3, True), END],
@@ -473,7 +473,7 @@ class FinalSuffixTests(unittest.TestCase):
                 move_token("e7e5"),
                 END,
             ],
-            chess.STARTING_FEN,
+            rules.STARTING_FEN,
         )
 
     def test_suffix_shapes_are_ordered(self):
@@ -543,7 +543,7 @@ class FinalSuffixTests(unittest.TestCase):
 
     def test_draw_claim_suffix(self):
         claim = [FINAL, move_token("<claim_draw>"), value_token(0.25), END]
-        program = replay(claim, chess.STARTING_FEN, repetition=3)
+        program = replay(claim, rules.STARTING_FEN, repetition=3)
         self.assertEqual(program.final_move, "<claim_draw>")
         self.assertEqual(program.roles[1], ROLE_FINAL_MOVE)
 
@@ -562,7 +562,7 @@ class FinalSuffixTests(unittest.TestCase):
         # A claim may carry the mate token that justifies it.
         replay(
             [FINAL, move_token("<claim_draw>"), VALUE + 0, mate_token(2, False), END],
-            chess.STARTING_FEN,
+            rules.STARTING_FEN,
             repetition=3,
         )
         self.assertIllegal(
@@ -631,7 +631,7 @@ class MaskParityTests(unittest.TestCase):
             move_token("g8f6"),
             END,
         ]
-        writer = TraceWriter(chess.STARTING_FEN)
+        writer = TraceWriter(rules.STARTING_FEN)
         for index, token in enumerate(hand):
             with self.subTest(index=index, token=token):
                 self.assertIn(token, writer.allowed_tokens(final_allowed=True))
@@ -657,7 +657,7 @@ class MaskParityTests(unittest.TestCase):
         )
 
     def test_mask_states_match_the_grammar(self):
-        writer = TraceWriter(chess.STARTING_FEN)
+        writer = TraceWriter(rules.STARTING_FEN)
         self.assertEqual(writer.allowed_tokens(False), (DEPTH,))
         self.assertEqual(writer.allowed_tokens(True), (DEPTH, FINAL))
         writer.depth()
@@ -683,7 +683,7 @@ class MaskParityTests(unittest.TestCase):
             allowed & {BACK, RESET, BOARD, FINAL}, {BACK, RESET, BOARD, FINAL}
         )
 
-        writer = TraceWriter(chess.STARTING_FEN)
+        writer = TraceWriter(rules.STARTING_FEN)
         writer.begin_final()
         allowed = set(writer.allowed_tokens(True))
         self.assertIn(move_token("d2d4"), allowed)
@@ -709,17 +709,14 @@ class BoardObservationTests(unittest.TestCase):
         writer.final_evaluate(value=0.0)
         writer.end()
         program = replay(writer.tokens, CASTLING_FEN)
-        board = chess.Board(CASTLING_FEN)
-        board.push_uci("e1g1")
         step = program.steps[2]
-        self.assertEqual(
-            step.observed.split()[:5], board.fen(en_passant="fen").split()[:5]
-        )
+        expected = "r3k2r/8/8/8/8/8/8/R4RK1 b kq - 1".split()
+        self.assertEqual(step.observed.split()[:5], expected)
         self.assertEqual(step.repetition, 1)
         decoded, repetition = decode_board(
             np.asarray(writer.tokens[step.start + 1 : step.end])
         )
-        self.assertEqual(decoded.split()[:5], board.fen(en_passant="fen").split()[:5])
+        self.assertEqual(decoded.split()[:5], expected)
         self.assertEqual(repetition, 1)
 
     def test_board_observation_saturates_large_halfmove_clock(self):
@@ -731,7 +728,7 @@ class BoardObservationTests(unittest.TestCase):
         writer.final("h1h2")
         writer.final_evaluate(value=0.0)
         writer.end()
-        board = chess.Board(root_fen)
+        board = rules.Board(root_fen)
         board.push_uci("h1h2")
         self.assertEqual(board.halfmove_clock, 100)
 
@@ -743,7 +740,7 @@ class BoardObservationTests(unittest.TestCase):
         self.assertEqual(writer.tokens[step.end - 2], HALFMOVE + 100)
 
     def test_board_observation_rejects_wrong_or_broken_content(self):
-        writer = TraceWriter(chess.STARTING_FEN)
+        writer = TraceWriter(rules.STARTING_FEN)
         writer.depth()
         writer.move("e2e4")
         writer.board()
@@ -756,18 +753,18 @@ class BoardObservationTests(unittest.TestCase):
         wrong = list(tokens)
         wrong[step.start + 1] = 0  # a1 pawn atom, not the observed position
         with self.assertRaises(TraceError) as context:
-            replay(wrong, chess.STARTING_FEN)
+            replay(wrong, rules.STARTING_FEN)
         self.assertEqual(context.exception.tag, "board_mismatch")
 
         truncated = tokens[: step.end - 1]
         with self.assertRaises(TraceError) as context:
-            replay(truncated, chess.STARTING_FEN)
+            replay(truncated, rules.STARTING_FEN)
         self.assertEqual(context.exception.tag, "board_truncated")
 
         invalid = list(tokens)
         invalid[step.end - 7] = SIDE  # duplicate side atom
         with self.assertRaises(TraceError) as context:
-            replay(invalid, chess.STARTING_FEN)
+            replay(invalid, rules.STARTING_FEN)
         self.assertEqual(context.exception.tag, "board_invalid")
 
         # The observation carries the true halfmove clock and repetition count.
@@ -779,13 +776,13 @@ class BoardObservationTests(unittest.TestCase):
                 wrong_counter = list(tokens)
                 wrong_counter[offset] = token
                 with self.assertRaises(TraceError) as context:
-                    replay(wrong_counter, chess.STARTING_FEN)
+                    replay(wrong_counter, rules.STARTING_FEN)
                 self.assertEqual(context.exception.tag, "board_mismatch")
 
     def test_board_atoms_are_a_set_not_a_byte_trace(self):
         # Replay validates by decoding the observation, so piece atoms may
         # arrive in any order and still describe the same position.
-        writer = TraceWriter(chess.STARTING_FEN)
+        writer = TraceWriter(rules.STARTING_FEN)
         writer.depth()
         writer.move("e2e4")
         writer.board()
@@ -799,26 +796,26 @@ class BoardObservationTests(unittest.TestCase):
             tokens[: step.start + 1] + list(reversed(pieces)) + tokens[step.end - 8 :]
         )
         self.assertNotEqual(reordered, tokens)
-        program = replay(reordered, chess.STARTING_FEN)
+        program = replay(reordered, rules.STARTING_FEN)
         self.assertEqual(program.steps[2].observed, writer.steps[2].observed)
 
     def test_board_at_the_root_is_illegal(self):
-        tracker = PathTracker(chess.STARTING_FEN)
+        tracker = PathTracker(rules.STARTING_FEN)
         tokens = [DEPTH, BOARD, *[int(token) for token in tracker.board_tokens()]]
         with self.assertRaises(TraceError) as context:
-            replay(tokens, chess.STARTING_FEN)
+            replay(tokens, rules.STARTING_FEN)
         self.assertEqual(context.exception.tag, "board_at_root")
-        writer = TraceWriter(chess.STARTING_FEN)
+        writer = TraceWriter(rules.STARTING_FEN)
         writer.depth()
         with self.assertRaises(ValueError):
             writer.board()
 
     def test_board_response_mirrors_pieces_but_not_side_or_counters(self):
-        root = chess.Board()
+        root = rules.Board()
         for move in ("e2e4", "e7e5", "g1f3"):
             root.push_uci(move)
         root_fen = root.fen(en_passant="fen")
-        self.assertEqual(root.turn, chess.BLACK)
+        self.assertEqual(root.turn, rules.BLACK)
         self.assertEqual(root.halfmove_clock, 1)
 
         writer = TraceWriter(root_fen)
@@ -831,9 +828,9 @@ class BoardObservationTests(unittest.TestCase):
         writer.end()
         program = replay(writer.tokens, root_fen)
 
-        true_board = chess.Board(root_fen)
+        true_board = rules.Board(root_fen)
         true_board.push_uci("b8c6")
-        self.assertEqual(true_board.turn, chess.WHITE)
+        self.assertEqual(true_board.turn, rules.WHITE)
         self.assertEqual(true_board.halfmove_clock, 2)
         step = program.steps[2]
         self.assertEqual(
@@ -850,25 +847,23 @@ class BoardObservationTests(unittest.TestCase):
         self.assertEqual(
             absolute.split()[:5], true_board.fen(en_passant="fen").split()[:5]
         )
-        # A naive Board.mirror() would flip the side to move; the response does not.
-        self.assertEqual(true_board.mirror().fen().split()[1], "b")
 
 
 class WriterBoundaryTests(unittest.TestCase):
     def test_final_uses_the_root_legal_set_not_the_current_node(self):
-        writer = TraceWriter(chess.STARTING_FEN)
+        writer = TraceWriter(rules.STARTING_FEN)
         writer.depth()
         writer.move("e2e4")
         writer.board()
         writer.final("d2d4")
         writer.final_evaluate(value=0.0)
         writer.end()
-        program = replay(writer.tokens, chess.STARTING_FEN)
+        program = replay(writer.tokens, rules.STARTING_FEN)
         self.assertEqual(program.final_move, "d2d4")
         self.assertEqual(program.steps[-3].path, ("e2e4",))
 
     def test_nothing_follows_end(self):
-        writer = TraceWriter(chess.STARTING_FEN)
+        writer = TraceWriter(rules.STARTING_FEN)
         writer.final("e2e4")
         writer.final_evaluate(value=0.0)
         writer.end()
@@ -891,24 +886,24 @@ class WriterBoundaryTests(unittest.TestCase):
                 operation()
 
     def test_claim_draw_is_not_a_thought_move(self):
-        writer = TraceWriter(chess.STARTING_FEN, repetition=3)
+        writer = TraceWriter(rules.STARTING_FEN, repetition=3)
         writer.depth()
         with self.assertRaises(ValueError):
             writer.move("<claim_draw>")
         with self.assertRaises(TraceError) as context:
             replay(
                 [DEPTH, move_token("<claim_draw>")],
-                chess.STARTING_FEN,
+                rules.STARTING_FEN,
                 repetition=3,
             )
         self.assertEqual(context.exception.tag, "illegal_move")
 
     def test_malformed_streams_report_padding_and_unexpected_tokens(self):
         with self.assertRaises(TraceError) as context:
-            replay([DEPTH, PAD, FINAL], chess.STARTING_FEN)
+            replay([DEPTH, PAD, FINAL], rules.STARTING_FEN)
         self.assertEqual(context.exception.tag, "pad_inside_trace")
         with self.assertRaises(TraceError) as context:
-            replay([SIDE], chess.STARTING_FEN)
+            replay([SIDE], rules.STARTING_FEN)
         self.assertEqual(context.exception.tag, "unexpected_token")
 
 

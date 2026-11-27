@@ -10,10 +10,10 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
-import chess
 from trace_fixtures import read_release_rows
 from trace_fixtures import trace_config_text as config_text
 
+from pondera.chess import _rules as rules
 from pondera.data.config import load_config, parse_recipe
 from pondera.data.pipeline import (
     CollectionError,
@@ -22,6 +22,7 @@ from pondera.data.pipeline import (
     _check_sidecar,
     _collect_root,
     _Engine,
+    _RootCache,
     _start_engine,
     produce_shards,
     run_pipeline,
@@ -70,7 +71,7 @@ class RecipeTests(unittest.TestCase):
 
     def test_root_settings_are_recomputed_from_the_active_recipe(self):
         roots = [
-            {"root_id": f"root-{index}", "fen": chess.STARTING_FEN}
+            {"root_id": f"root-{index}", "fen": rules.STARTING_FEN}
             for index in range(200)
         ]
         first = self.load(config_text())
@@ -93,7 +94,7 @@ class RecipeTests(unittest.TestCase):
         ]
         config = self.load(config_text(joint=joint))
         roots = [
-            {"root_id": f"root-{i}", "fen": chess.STARTING_FEN} for i in range(2000)
+            {"root_id": f"root-{i}", "fen": rules.STARTING_FEN} for i in range(2000)
         ]
         sampled = sample_root_settings(roots, config, 640)
         counts = Counter((r["teacher_width"], r["depth"]) for r in sampled)
@@ -131,7 +132,7 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual([r["teacher_width"] for r in sampled], [20, 2, 1])
         for root in sampled:
             self.assertEqual(
-                root["teacher_width"], chess.Board(root["fen"]).legal_moves.count()
+                root["teacher_width"], rules.Board(root["fen"]).legal_move_count()
             )
             self.assertEqual(root["effective_width"], root["teacher_width"])
         capped = sample_root_settings(roots, self.load(config_text(width=3)), 640)
@@ -405,6 +406,43 @@ class EngineFailureIntegrationTests(unittest.TestCase):
                     sorted(searches.values()), [1] * (len(roots) - 1) + [2]
                 )
 
+    def test_a_fully_cached_shard_does_not_block_the_search_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            config, roots, script, golog = fixture_engine(directory, timeout=5)
+            roots = roots[:3]
+            manifest_path = script.with_suffix(".json")
+            manifest = json.loads(manifest_path.read_text())
+            manifest.update(
+                fault="none",
+                blocked_fens=[roots[0]["fen"]],
+                unblock_fen=roots[2]["fen"],
+                gate=str(directory / "gate"),
+            )
+            manifest_path.write_text(json.dumps(manifest))
+
+            output = directory / "release"
+            output.mkdir()
+            cached = sample_root_settings(roots, config, config.seed)[1]
+            lines = (
+                Path(manifest["cases"][cached["fen"]]["sidecar"])
+                .read_text()
+                .splitlines()
+            )
+            record = _collect_root(
+                cached, config, None, None, None, {cached["root_id"]: lines}
+            )
+            _RootCache(output).store(1, cached, record)
+            result = produce_shards(
+                roots, output, config, shard_size=1, workers=2, engine=script
+            )
+
+            self.assertEqual(result["roots"], 3)
+            self.assertEqual(result["dropped"], 0)
+            self.assertCountEqual(
+                golog.read_text().splitlines(), [roots[0]["fen"], roots[2]["fen"]]
+            )
+
     def test_later_shards_unblock_slow_roots_in_both_active_shards(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
@@ -586,7 +624,7 @@ class EngineTimeoutTests(unittest.TestCase):
             script.chmod(0o755)
             with _Engine(script, 256, timeout=1) as engine:
                 with self.assertRaises(EngineTimeoutError):
-                    engine.search(chess.STARTING_FEN, directory / "trace.jsonl", 1, 4)
+                    engine.search(rules.STARTING_FEN, directory / "trace.jsonl", 1, 4)
 
     def test_a_slow_engine_start_is_a_plain_collection_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -807,8 +845,7 @@ class DirectPipelineIntegrationTests(unittest.TestCase):
                 end_shard=1,
             )
             self.assertEqual(partial["pending"], 4)
-            # Recover a real published shard whose registration was interrupted.
-            (directory / "resumed" / "release.json").unlink()
+            self.assertFalse((directory / "resumed" / "release.json").exists())
             produce_shards(
                 roots,
                 directory / "resumed",

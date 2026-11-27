@@ -1,13 +1,14 @@
 seed = 640
 max_document_tokens = 131072
 
+[roots]
+validation_count = 2000
+workers = 4
+
 [sources.elite]
 kind = "pgn"
 url = "https://database.nikonoel.fr/lichess_elite_2025-11.zip"
 sha256 = "1ffa577aa0a1352fa04c9a890a6706049a3a79edc52810b136758d1e2a1a2eab"
-train = 500000
-val = 2000
-claimable_share = 0.03
 # Omit limit_games to preprocess the complete archive.
 # limit_games = 100
 
@@ -15,8 +16,7 @@ claimable_share = 0.03
 kind = "lichess_puzzles"
 repo_id = "Lichess/chess-puzzles"
 revision = "461725966ea46898ec6481372a6326de3281bfbd"
-train = 0
-val = 0
+prefix_fraction = 1.0
 batch_size = 1024
 
 [search]
@@ -63,8 +63,9 @@ max_rounds = 100000
 top = 20
 # Fitting/encoding worker processes; results are identical at any count.
 workers = 8
-# Omit max_roots to use all input roots; block defaults to max(8, composites // 32).
-# max_roots = 128
+# Fit on the first 500,000 published training documents in release order.
+max_roots = 500000
+# block defaults to max(8, composites // 32).
 # block = 32
 
 batch_size = 128

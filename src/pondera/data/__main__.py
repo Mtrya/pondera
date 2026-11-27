@@ -25,7 +25,12 @@ def main():
     encode = commands.add_parser(
         "encode", help="Fit a merge vocabulary and encode traces"
     )
-    encode.add_argument("--input", required=True, type=Path)
+    encode.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        help="Curated release with stored trace atoms",
+    )
     for command in (prepare, curate, encode):
         command.add_argument("--config", default=DEFAULT_CONFIG_PATH, type=Path)
         command.add_argument("--output", required=True, type=Path)
@@ -33,6 +38,7 @@ def main():
     config = load_config(args.config)
     if args.command == "prepare":
         from pondera.data.roots import prepare_pool
+        from pondera.data.roots.pool import POOL_FILE
 
         inputs = {}
         for value in args.input:
@@ -42,14 +48,14 @@ def main():
             inputs[name] = Path(path)
         manifest = prepare_pool(config, args.output, inputs=inputs, cache=args.cache)
         result = {
-            "root_pool": str(args.output / "roots.jsonl"),
+            "root_pool": str(args.output / POOL_FILE),
             "roots": sum(manifest["counts"].values()),
+            "pool_id": manifest["pool_id"],
         }
     elif args.command == "curate":
         from pondera.data.pipeline import run_pipeline
 
         result = run_pipeline(config, args.input, args.output, engine=args.engine)
-        result = {key: value for key, value in result.items() if key != "statistics"}
     else:
         from pondera.data.tokenize import merge_and_encode
 

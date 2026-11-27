@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
       - name: Install CPU dependencies
         run: |
           uv venv
@@ -43,7 +45,9 @@ jobs:
           echo "$RUNNER_TEMP/fastchess-bin" >> "$GITHUB_PATH"
       - name: Validate package and imports
         run: |
+          cargo +stable fmt --manifest-path rust/chess/Cargo.toml --check
           uv lock --check
+          uv run --no-sync python -c 'from importlib.util import find_spec; assert find_spec("chess") is None'
           uv run --no-sync ruff check .
           uv run --no-sync ruff format --check .
           uv run --no-sync lint-imports
@@ -54,4 +58,9 @@ jobs:
           ulimit -c 0
           timeout --signal=ABRT --kill-after=10s 5m uv run --no-sync python -X faulthandler -m unittest discover -s tests -v
       - name: Build distributions
-        run: uv build
+        run: |
+          uv build
+          uv venv "$RUNNER_TEMP/pondera-wheel"
+          uv pip install --python "$RUNNER_TEMP/pondera-wheel/bin/python" --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          pondera-wheel/bin/python -c 'from importlib.util import find_spec; from pondera.chess._rules import Board; assert find_spec("chess") is None; assert Board().legal_move_count() == 20'

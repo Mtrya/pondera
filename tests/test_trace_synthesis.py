@@ -2,9 +2,9 @@ import json
 import unittest
 from pathlib import Path
 
-import chess
 from trace_fixtures import tie_sidecar_lines
 
+from pondera.chess import _rules as rules
 from pondera.chess.codec import mate_token, value_bin
 from pondera.chess.symmetry import reflect_uci
 from pondera.chess.tracker import PathTracker
@@ -19,7 +19,6 @@ from pondera.chess.vocabulary import (
     VALUE,
 )
 from pondera.data.config import load_config
-from pondera.data.pipeline import profile_roots
 from pondera.data.trace import (
     DRAW_CLAIM_BOUND,
     PRESENTATIONS,
@@ -414,9 +413,9 @@ class SynthesisTests(unittest.TestCase):
 
     def test_wide_teacher_width_is_capped_by_the_legal_root_moves(self):
         sidecar, root, synthesized = synthesize_case("two_moves_w3", teacher_width=3)
-        board = chess.Board(root["fen"])
+        board = rules.Board(root["fen"])
         self.assertFalse(board.is_checkmate() or board.is_stalemate())
-        self.assertEqual(board.legal_moves.count(), 2)
+        self.assertEqual(board.legal_move_count(), 2)
         self.assertEqual(sidecar.events[0]["schema"], 4)
         self.assertEqual(sidecar.session["options"]["multipv"], 3)
         self.assertEqual(sidecar.search_start["multi_pv"], 2)
@@ -509,12 +508,6 @@ class SynthesisTests(unittest.TestCase):
             "board_frontier",
         ):
             self.assertIn(name, stats)
-        profile = profile_roots([synthesized])
-        self.assertEqual(profile["roots"], 1)
-        self.assertEqual(profile["rows"], 3)
-        self.assertEqual(profile["split_counts"], {"train": 1})
-        self.assertEqual(profile["presentation_counts"]["full"], 1)
-        self.assertGreater(profile["thinking_tokens"]["median"], 0)
 
     def test_seed_changes_only_presentation_and_board_choices(self):
         sidecar, root, first = synthesize_case("start_d4", seed=640)

@@ -5,7 +5,7 @@ description: Implement, build, and verify the external instrumented Stockfish 17
 
 # Stockfish trace producer
 
-Pondera ships only the Python consumer under `src/pondera/data/`: root-pool construction, configuration, sidecar validation, trace synthesis and replay, release construction and validation, and dataset adapters. It does not ship Stockfish source, an instrumentation patch, engine binaries, sidecars, or releases.
+Pondera's trace consumer lives under `src/pondera/data/`: root-pool construction, configuration, sidecar validation, trace synthesis and replay, release construction and validation, and dataset adapters. It does not ship Stockfish source, an instrumentation patch, engine binaries, sidecars, or releases.
 
 When you start from a clean Pondera clone, build the producer outside the repository from upstream Stockfish 17.1 and this specification. `src/pondera/data/trace.py` is the consumer contract: if `parse_sidecar`, `synthesize_root`, or `replay` rejects your output, fix the producer. Do not copy Stockfish code into this skill or into the repository.
 
@@ -149,7 +149,7 @@ If any gate fails, stop and fix the C++ instrumentation.
 
 ## 5. Connecting to Pondera's pipeline
 
-1. **Prepare roots**: edit a working copy of `configs/data.toml`, setting the top-level `seed` and named `[sources.*]` tables. PGNs specify `url`, `sha256`, train/validation sizes, and claimable share; puzzles specify a Hub repository, immutable revision, and counts. Zero counts disable a source. Run `uv run python -m pondera.data prepare --config /abs/path/to/data.toml --output /abs/path/to/roots`; add `--input elite=/abs/path/to/archive` for an existing PGN input or `--input puzzles=/abs/path/to/parquet` for local puzzle data. `--cache` selects local download storage; source identities remain in the TOML. Preparation does not start Stockfish. Existing JSONL pools need a unique `root_id`, `split` (`train` or `val`), a legal non-terminal six-field `fen`, and `repetition` in `1..4`; `turn` and `position_key` are checked when present.
+1. **Prepare roots**: edit a working copy of `configs/data.toml` with the named sources and `[roots].validation_count`. The Elite source identifies the archive and SHA-256. The puzzle source specifies its repository, immutable revision, and raw prefix fraction. Run `uv run python -m pondera.data prepare --config /abs/path/to/data.toml --output /abs/path/to/roots`. Supply a local archive or puzzle Parquet input with `--input elite=/abs/path/to/archive` or `--input puzzles=/abs/path/to/parquet`. The prepared directory contains `roots.parquet` and its manifest. External JSONL lists can also supply a unique `root_id`, `split` (`train` or `val`), legal non-terminal six-field `fen`, and `repetition` in `1..4`.
 2. **Configure production**: set `[search].hash_mb`, `timeout_seconds`, and `joint`, `[synthesis]` BOARD/draw/presentation settings, and `[release]` shard size, workers, and optional shard range in the same TOML. `joint` is an array of `{width, depth, probability}` tables: widths are positive integers or `"full"`, depths are positive integers, pairs are unique, and probabilities sum to one. Each root draws a single pair; `"full"` resolves to its legal root-move count before UCI setup. Root rows record concrete `teacher_width` and capped `effective_width`. Presentation is drawn independently and accepts one value or a probability table. There is no separate recipe, smoke, collection, or release configuration.
 3. **Run the single entry point**:
    ```bash
@@ -163,4 +163,4 @@ If any gate fails, stop and fix the C++ instrumentation.
    validate_release("/abs/path/to/release", workers=1)
    PY
    ```
-   Use bounded qualification releases during implementation and when investigating a concrete failure. Validation checks manifests, ragged array layout, stored states, and every trace replay against python-chess. Normal curation relies on the qualified producer and synthesizer. Parallel diagnostics use spawned workers and require an importable script with an `if __name__ == "__main__"` guard.
+   Use bounded qualification releases during implementation and when investigating a concrete failure. Validation checks manifests, ragged array layout, stored states, and every trace by replaying it through Pondera's chess rules. Normal curation relies on the qualified producer and synthesizer. Parallel diagnostics use spawned workers and require an importable script with an `if __name__ == "__main__"` guard.

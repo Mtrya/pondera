@@ -1,16 +1,16 @@
 # Root preparation
 
-`prepare_pool` reads named `[sources.*]` tables from the shared data configuration and writes `roots.jsonl` plus `pool.manifest.json`. Each source declares its train/validation counts. A source with both counts zero is skipped without downloading. Local source files can be supplied as `prepare --input NAME=PATH`; download/cache locations remain runtime paths.
+`prepare` reads the configured Elite PGN archive and puzzle prefix. Supply local inputs with `--input SOURCE=PATH`, or let the command retrieve and cache the configured sources. An omitted source table leaves that source out. `limit_games` bounds Elite replay for fixture runs. `[sources.puzzles].prefix_fraction` selects the floor of its fraction of the total raw Parquet row count, in sorted filename and stored row order. A locally supplied puzzle file retains the complete puzzle row and records a null Hub revision.
 
 | File | Responsibility |
 |---|---|
-| `__init__.py` | Prepare configured source quotas and publish the combined pool. |
-| `pool.py` | Root records, position keys, deterministic splits, sampling, and pool storage. |
-| `pgn.py` | Download/check the configured archive, replay PGNs with repetition history, and build a claim-stratified sample. |
-| `puzzles.py` | Download a pinned HF Parquet revision, apply the first puzzle move, and sample the resulting roots. |
+| `__init__.py` | Provision inputs, run both readers, and publish the combined pool. |
+| `pgn.py` | Stream PGN games through Rust replay and retain eligible positions with their game and ply. |
+| `puzzles.py` | Apply the setup move from each raw row in the ordered prefix in the configured prefix. |
+| `pool.py` | Deduplicate in a temporary SQLite index, assign splits and order, and publish and read the Parquet pool. |
 
-Every puzzle contributes one candidate at the position after `Moves[0]`; the solution begins with `Moves[1]`. Complete original game history is unavailable, so puzzle roots use repetition one and declare that assumption in provenance. Their FEN clock is preserved, and no claimable-position quota is imposed. The full original puzzle row and HF revision are retained in the shared JSON `source` field.
+Deduplication uses the first four canonical FEN fields. The highest repetition wins. On ties the first eligible record wins, with Elite before puzzles. Validation takes the `[roots].validation_count` lowest seeded position ranks. A separate seeded position rank orders the whole pool. Both ranks use the first eight bytes of SHA-256 over the seed, rank name, and position key. The position key breaks ties. `[roots].workers` parallelizes PGN replay while preserving archive order.
 
-Local puzzle inputs retain the complete original row but use a null revision: an arbitrary supplied Parquet file cannot attest to the configured Hub commit. Hub downloads retain the configured immutable revision.
+The completed output directory contains `roots.parquet` and `pool.manifest.json`. The manifest records the pool identity, counts, source provenance, and the selected puzzle prefix. Provenance shared by a source is stored once in the manifest. For a half-open range in published order, use `RootPool(path).iter_range(start, stop)`. The reader reconstructs the full FEN, `fen|repetition` ID, split, and provenance and loads at most one row group at a time. `len(pool)` gives the total count. Curation uses the range reader for prepared pools. Small external JSONL root lists are also supported.
 
-Splits depend only on the position key. Duplicate positions within a puzzle source keep the first row. Sources are considered in configuration order; a later source excludes positions already selected by earlier sources before filling its quota. Selected records are globally ordered with the existing seeded pool-order draw. Source readers create provenance; the Parquet writer preserves it without adding a particular source's identity.
+Put `TMPDIR` and `SQLITE_TMPDIR` on job-local scratch for the temporary index and sort. The output stays on the destination filesystem and is published after both files are complete.

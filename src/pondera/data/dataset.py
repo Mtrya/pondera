@@ -69,31 +69,39 @@ def load_manifest(path):
         return json.load(handle)
 
 
-def parquet_sources(directory):
-    """List release shards or HF split files as (path, row count, split)."""
+def read_release(directory):
+    """Read the ordered completed snapshot, or return empty for standalone Parquet."""
+    from pondera.data.progress import PROGRESS_FILE
+
     directory = Path(directory)
-    manifest = load_manifest(directory / "release.json") if directory.is_dir() else {}
+    manifest = load_manifest(directory / "release.json")
+    if not manifest and (directory / PROGRESS_FILE).is_file():
+        raise ValueError(f"Curation is incomplete: {directory}")
+    return manifest
+
+
+def parquet_sources(directory, manifest=None):
+    """Yield (path, row count, split) in release or split-file order."""
+    directory = Path(directory)
+    manifest = read_release(directory) if manifest is None else manifest
     if manifest:
-        result = []
         for shard in manifest["shards"]:
             path = directory / shard["path"]
             if path.suffix != ".parquet":
                 path /= "data.parquet"
-            result.append((path, shard["rows"], shard.get("split")))
-        return result
+            yield path, shard["rows"], shard.get("split")
+        return
     root = directory / "data" if (directory / "data").is_dir() else directory
     paths = [root] if root.is_file() else sorted(root.glob("*.parquet"))
     if not paths:
         raise FileNotFoundError(f"No Parquet data in {directory}")
     splits = {"train": "train", "validation": "val", "val": "val"}
-    return [
-        (
+    for path in paths:
+        yield (
             path,
             pq.ParquetFile(path).metadata.num_rows,
             splits.get(path.stem.split("-")[0]),
         )
-        for path in paths
-    ]
 
 
 def write_trace_rows(directory, rows):
@@ -134,7 +142,8 @@ class RaggedArray:
     """Numpy views of an Arrow list column, addressed one row at a time."""
 
     def __init__(self, column):
-        column = column.combine_chunks()
+        if isinstance(column, pa.ChunkedArray):
+            column = column.combine_chunks()
         self.values = column.values.to_numpy(zero_copy_only=False)
         self.offsets = column.offsets.to_numpy(zero_copy_only=False)
         self.dtype = self.values.dtype
@@ -172,8 +181,30 @@ def load_trace_arrays(directory, names=TRACE_ARRAYS):
     return _arrays_from_table(table, names)
 
 
+def open_trace_shard(path, expected_rows, columns):
+    file = pq.ParquetFile(path)
+    if file.metadata.num_rows != expected_rows:
+        raise ValueError(f"Shard row count differs from its release: {path}")
+    schema = file.schema_arrow
+    for name in (*TRACE_ARRAYS, *columns):
+        index = schema.get_field_index(name)
+        if index < 0 or schema.field(index).type != TRACE_SCHEMA.field(name).type:
+            raise ValueError(f"Curated shard needs a valid {name} column: {path}")
+    return file
+
+
+def iter_atom_batches(file, columns, batch_size):
+    """Project document metadata and NumPy views of the stored base atoms."""
+    for batch in file.iter_batches(
+        columns=[*columns, *TRACE_ARRAYS], batch_size=batch_size, use_threads=False
+    ):
+        arrays = _arrays_from_table(batch, TRACE_ARRAYS)
+        validate_trace_arrays(arrays, batch.num_rows)
+        yield batch.select(columns).to_pylist(), arrays["trace_atom_ids"]
+
+
 def validate_trace_arrays(arrays, rows=None):
-    """Diagnostic checks of ragged array types and lengths."""
+    """Check ragged array types, lengths, and trace atom IDs."""
     if not arrays:
         raise ValueError("A Trace dataset needs token arrays")
     row_count = len(next(iter(arrays.values())))

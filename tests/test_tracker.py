@@ -1,7 +1,6 @@
 import unittest
 
-import chess
-
+from pondera.chess import _rules as rules
 from pondera.chess.codec import decode_board
 from pondera.chess.tracker import PathTracker
 
@@ -10,50 +9,55 @@ CASTLING_FEN = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"
 
 class PathTrackerTests(unittest.TestCase):
     def test_qualified_push_preserves_san_history_and_undo(self):
-        for fen, moves in (
-            (chess.STARTING_FEN, ("g1f3", "g8f6", "f3g1", "f6g8")),
-            (CASTLING_FEN, ("e1g1", "e8c8")),
-            ("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", ("e5d6",)),
-            ("7k/P7/8/8/8/8/8/4K3 w - - 0 1", ("a7a8q",)),
+        for fen, steps in (
+            (
+                CASTLING_FEN,
+                (
+                    ("e1g1", "O-O", "r3k2r/8/8/8/8/8/8/R4RK1 b kq - 1 1"),
+                    ("e8c8", "O-O-O", "2kr3r/8/8/8/8/8/8/R4RK1 w - - 2 2"),
+                ),
+            ),
+            (
+                "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1",
+                (("e5d6", "exd6", "4k3/8/3P4/8/8/8/8/4K3 b - - 0 1"),),
+            ),
+            (
+                "7k/P7/8/8/8/8/8/4K3 w - - 0 1",
+                (("a7a8q", "a8=Q+", "Q6k/8/8/8/8/8/8/4K3 b - - 0 1"),),
+            ),
         ):
             with self.subTest(fen=fen):
                 tracker = PathTracker(fen)
-                reference = chess.Board(fen)
-                for move in moves:
-                    san = reference.san(chess.Move.from_uci(move))
-                    reference.push_uci(move)
+                for move, san, result in steps:
                     self.assertEqual(tracker.push_legal(move), san)
-                    self.assertEqual(tracker.fen(), reference.fen(en_passant="fen"))
-                self.assertEqual(tracker.path, moves)
-                self.assertEqual(tracker.repetition(), 2 if len(moves) == 4 else 1)
-                for _ in moves:
+                    self.assertEqual(tracker.fen(), result)
+                self.assertEqual(tracker.path, tuple(step[0] for step in steps))
+                self.assertEqual(tracker.repetition(), 1)
+                for _ in steps:
                     tracker.back()
-                self.assertEqual(tracker.fen(), chess.Board(fen).fen(en_passant="fen"))
+                self.assertEqual(tracker.fen(), fen)
                 self.assertEqual(tracker.repetition(), 1)
 
-    def test_push_and_back_match_python_chess(self):
-        tracker = PathTracker(chess.STARTING_FEN)
+    def test_push_and_back_restore_position_and_moves(self):
+        tracker = PathTracker(rules.STARTING_FEN)
         self.assertEqual(tracker.path, ())
-        self.assertEqual(
-            tracker.legal_moves(),
-            sorted(move.uci() for move in chess.Board().legal_moves),
-        )
         tracker.push("g1f3")
-        board = chess.Board()
-        board.push_uci("g1f3")
+        after_nf3 = "rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b KQkq - 1 1"
         self.assertEqual(tracker.path, ("g1f3",))
         self.assertEqual(tracker.depth, 1)
-        self.assertEqual(tracker.fen(), board.fen(en_passant="fen"))
-        self.assertEqual(
-            tracker.legal_moves(), sorted(move.uci() for move in board.legal_moves)
-        )
+        self.assertEqual(tracker.fen(), after_nf3)
+        legal = tracker.legal_moves()
+        self.assertEqual(len(legal), 20)
+        self.assertIn("g8f6", legal)
         tracker.push("g8f6")
-        board.push_uci("g8f6")
-        self.assertEqual(tracker.fen(), board.fen(en_passant="fen"))
+        self.assertEqual(
+            tracker.fen(),
+            "rnbqkb1r/pppppppp/5n2/8/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 2 2",
+        )
         tracker.back()
         self.assertEqual(tracker.path, ("g1f3",))
-        board.pop()
-        self.assertEqual(tracker.fen(), board.fen(en_passant="fen"))
+        self.assertEqual(tracker.fen(), after_nf3)
+        self.assertEqual(tracker.legal_moves(), legal)
 
     def test_reset_returns_to_the_root_from_any_depth(self):
         tracker = PathTracker(CASTLING_FEN)
@@ -63,10 +67,10 @@ class PathTrackerTests(unittest.TestCase):
         tracker.reset()
         self.assertEqual(tracker.path, ())
         self.assertEqual(tracker.depth, 0)
-        self.assertEqual(tracker.fen(), chess.Board(CASTLING_FEN).fen(en_passant="fen"))
+        self.assertEqual(tracker.fen(), CASTLING_FEN)
 
     def test_back_at_the_root_and_illegal_moves_raise(self):
-        tracker = PathTracker(chess.STARTING_FEN)
+        tracker = PathTracker(rules.STARTING_FEN)
         with self.assertRaises(ValueError):
             tracker.back()
         with self.assertRaises(ValueError):
@@ -75,8 +79,8 @@ class PathTrackerTests(unittest.TestCase):
             tracker.push("<claim_draw>")
         self.assertEqual(tracker.path, ())
 
-    def test_repetition_matches_python_chess_along_the_path(self):
-        tracker = PathTracker(chess.STARTING_FEN)
+    def test_repetition_counts_complete_cycles(self):
+        tracker = PathTracker(rules.STARTING_FEN)
         for move in ("g1f3", "g8f6", "f3g1", "f6g8"):
             tracker.push(move)
         self.assertTrue(tracker.board.is_repetition(2))
@@ -88,7 +92,7 @@ class PathTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.repetition(), 3)
 
     def test_root_repetition_joins_the_path_count(self):
-        tracker = PathTracker(chess.STARTING_FEN, repetition=4)
+        tracker = PathTracker(rules.STARTING_FEN, repetition=4)
         self.assertEqual(tracker.repetition(), 4)
         for move in ("g1f3", "g8f6", "f3g1", "f6g8"):
             tracker.push(move)
@@ -104,15 +108,12 @@ class PathTrackerTests(unittest.TestCase):
         ):
             with self.subTest(fen=fen):
                 tracker = PathTracker(fen)
-                reference = chess.Board(fen)
                 for move in ("g1f3", "g8f6", "f3g1", "f6g8"):
                     tracker.push(move)
-                    reference.push_uci(move)
                 self.assertEqual(tracker.repetition(), expected)
-                self.assertEqual(reference.is_repetition(2), expected == 2)
 
     def test_repetition_history_is_restored_on_back_and_reset(self):
-        tracker = PathTracker(chess.STARTING_FEN, repetition=4)
+        tracker = PathTracker(rules.STARTING_FEN, repetition=4)
         cycle = ("g1f3", "g8f6", "f3g1", "f6g8")
         for _ in range(3):
             for move in cycle:
@@ -127,35 +128,35 @@ class PathTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.repetition(), 4)
         self.assertIsNone(tracker.search_terminal())
 
-    def test_board_tokens_are_lossless_against_python_chess(self):
-        fens = [chess.STARTING_FEN, CASTLING_FEN]
+    def test_board_tokens_are_lossless(self):
+        fens = [rules.STARTING_FEN, CASTLING_FEN]
         for fen in fens:
             with self.subTest(fen=fen):
                 tracker = PathTracker(fen, repetition=2)
                 decoded, repetition = decode_board(tracker.board_tokens())
                 self.assertEqual(
                     decoded.split()[:5],
-                    chess.Board(fen).fen(en_passant="fen").split()[:5],
+                    fen.split()[:5],
                 )
                 self.assertEqual(repetition, 2)
 
     def test_deep_observation_keeps_en_passant_and_halfmove(self):
-        tracker = PathTracker(chess.STARTING_FEN)
+        tracker = PathTracker(rules.STARTING_FEN)
         tracker.push("e2e4")
-        board = chess.Board()
-        board.push_uci("e2e4")
         decoded, repetition = decode_board(tracker.board_tokens())
-        self.assertEqual(decoded.split()[:5], board.fen(en_passant="fen").split()[:5])
+        self.assertEqual(
+            decoded.split()[0], "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR"
+        )
         self.assertEqual(decoded.split()[3], "e3")
         self.assertEqual(decoded.split()[4], "0")
         self.assertEqual(repetition, 1)
 
 
 class SearchTerminalTests(unittest.TestCase):
-    """The search rule, cross-checked with python-chess's rule predicates."""
+    """Adjudication for the teacher's search path."""
 
     def test_root_second_occurrence_is_not_terminal(self):
-        tracker = PathTracker(chess.STARTING_FEN)
+        tracker = PathTracker(rules.STARTING_FEN)
         for move in ("g1f3", "g8f6", "f3g1", "f6g8"):
             tracker.push(move)
         self.assertTrue(tracker.board.is_repetition(2))
@@ -170,7 +171,7 @@ class SearchTerminalTests(unittest.TestCase):
         self.assertEqual(tracker.repetition(), 3)
 
     def test_a_position_once_after_the_root_is_terminal(self):
-        tracker = PathTracker(chess.STARTING_FEN)
+        tracker = PathTracker(rules.STARTING_FEN)
         for move in ("g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6"):
             tracker.push(move)
         self.assertTrue(tracker.board.is_repetition(2))
@@ -191,8 +192,8 @@ class SearchTerminalTests(unittest.TestCase):
         # The 50-move rule is claimable at the root, so the root is searched;
         # the child reached by a non-capturing escape is a rule terminal.
         fen = "4k3/4R3/8/8/8/8/8/4K3 b - - 100 1"
-        self.assertTrue(chess.Board(fen).is_check())
-        self.assertFalse(chess.Board(fen).is_checkmate())
+        self.assertTrue(rules.Board(fen).is_check())
+        self.assertFalse(rules.Board(fen).is_checkmate())
         tracker = PathTracker(fen)
         self.assertIsNone(tracker.search_terminal())
         tracker.push("e8d8")
@@ -200,16 +201,16 @@ class SearchTerminalTests(unittest.TestCase):
 
     def test_stalemate_and_insufficient_material(self):
         stalemate = "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1"
-        self.assertTrue(chess.Board(stalemate).is_stalemate())
+        self.assertTrue(rules.Board(stalemate).is_stalemate())
         self.assertEqual(PathTracker(stalemate).search_terminal(), "draw")
 
         bare_kings = "8/8/8/4k3/8/8/8/4K3 w - - 0 1"
-        self.assertTrue(chess.Board(bare_kings).is_game_over())
-        self.assertFalse(chess.Board(bare_kings).is_stalemate())
+        self.assertTrue(rules.Board(bare_kings).is_game_over())
+        self.assertFalse(rules.Board(bare_kings).is_stalemate())
         self.assertIsNone(PathTracker(bare_kings).search_terminal())
 
     def test_root_history_is_not_part_of_the_search_rule(self):
-        tracker = PathTracker(chess.STARTING_FEN, repetition=5)
+        tracker = PathTracker(rules.STARTING_FEN, repetition=5)
         self.assertEqual(tracker.repetition(), 5)
         self.assertIsNone(tracker.search_terminal())
 

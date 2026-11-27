@@ -4,9 +4,9 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import chess
 import torch
 
+from pondera.chess import _rules as rules
 from pondera.chess.codec import encode_board
 from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import (
@@ -42,7 +42,7 @@ class AnswerTests(unittest.TestCase):
         dictionary = MergeDictionary([(a, b), (b, c)])
         forms = ([a, CHESS_VOCAB_SIZE + 1], [CHESS_VOCAB_SIZE, c], [a, b, c])
         for turn, decision, reply in (("w", "e2e4", "e7e5"), ("b", "e7e5", "e2e4")):
-            fen = chess.STARTING_FEN.replace(" w ", f" {turn} ")
+            fen = rules.STARTING_FEN.replace(" w ", f" {turn} ")
             parsed = [
                 parse_answer(
                     [BOARD, BACK, VALUE + 4, FINAL, *form, END], dictionary, fen
@@ -54,9 +54,9 @@ class AnswerTests(unittest.TestCase):
             self.assertEqual(parsed[1], parsed[2])
             self.assertEqual(parsed[0].decision, decision)
             self.assertEqual(parsed[0].pv, [reply])
-            board = chess.Board(fen)
+            board = rules.Board(fen)
             board.push_uci(decision)
-            self.assertIn(chess.Move.from_uci(reply), board.legal_moves)
+            self.assertIn(rules.Move.from_uci(reply), board.legal_moves)
 
     def test_malformed_or_illegal_answers_fail_without_discarding_move_diagnostics(
         self,
@@ -76,10 +76,10 @@ class AnswerTests(unittest.TestCase):
         ]
         for tokens, error in cases:
             with self.subTest(error=error):
-                answer = parse_answer(tokens, MergeDictionary(), chess.STARTING_FEN)
+                answer = parse_answer(tokens, MergeDictionary(), rules.STARTING_FEN)
                 self.assertFalse(answer.valid)
                 self.assertIn(error, answer.errors)
-        partial = parse_answer(cases[1][0], MergeDictionary(), chess.STARTING_FEN)
+        partial = parse_answer(cases[1][0], MergeDictionary(), rules.STARTING_FEN)
         self.assertTrue(partial.move_legal)
         self.assertFalse(partial.format_valid)
 
@@ -100,18 +100,18 @@ class AnswerTests(unittest.TestCase):
         for repetition, legal in ((1, False), (3, True)):
             self.assertEqual(
                 parse_answer(
-                    tokens, MergeDictionary(), chess.STARTING_FEN, repetition
+                    tokens, MergeDictionary(), rules.STARTING_FEN, repetition
                 ).valid,
                 legal,
             )
         invalid = parse_answer(
-            tokens[:-1] + [move("e2e4"), END], MergeDictionary(), chess.STARTING_FEN, 3
+            tokens[:-1] + [move("e2e4"), END], MergeDictionary(), rules.STARTING_FEN, 3
         )
         self.assertFalse(invalid.valid)
         loss = parse_answer(
             [FINAL, move("e2e4"), VALUE, MATE_LOSS + 5, END],
             MergeDictionary(),
-            chess.STARTING_FEN,
+            rules.STARTING_FEN,
         )
         self.assertTrue(loss.valid)
         self.assertEqual(loss.mate_distance, -5)
@@ -123,7 +123,7 @@ class GenerationTests(unittest.TestCase):
 
     def test_cached_predictions_equal_full_context_after_final_insertion(self):
         torch.manual_seed(640)
-        prefix = encode_board(chess.STARTING_FEN).tolist()
+        prefix = encode_board(rules.STARTING_FEN).tolist()
         tokens = [BACK, move("e2e4"), BACK, FINAL, VALUE, END]
         model = PonderaModel(
             segments=[
@@ -159,7 +159,7 @@ class GenerationTests(unittest.TestCase):
     def test_chess_path_reads_are_causal_across_packing_and_cached_decode(self):
         torch.manual_seed(640)
         dictionary = MergeDictionary([(BACK, VALUE + 10)])
-        prefix = encode_board(chess.STARTING_FEN).tolist()
+        prefix = encode_board(rules.STARTING_FEN).tolist()
         e4, e5, back = move("e2e4"), move("e7e5"), CHESS_VOCAB_SIZE
         trace = [e4, e5, back, move("c7c5"), RESET, FINAL, e4]
         document = torch.tensor(prefix + trace)
@@ -249,7 +249,7 @@ class GenerationTests(unittest.TestCase):
         # mask or repair would change these analytically fixed outputs.
         predictor = Predictor(self.model(), MergeDictionary(), {})
         result = predictor.generate(
-            chess.STARTING_FEN, reasoning_tokens=3, answer_tokens=4
+            rules.STARTING_FEN, reasoning_tokens=3, answer_tokens=4
         )
         self.assertEqual(result.tokens, [0, 0, 0, FINAL, 0, 0, 0, 0])
         self.assertEqual(
@@ -263,7 +263,7 @@ class GenerationTests(unittest.TestCase):
         self.assertTrue(result.forced_final)
         self.assertFalse(result.answer.valid)
         zero = predictor.generate(
-            chess.STARTING_FEN, reasoning_tokens=0, answer_tokens=2
+            rules.STARTING_FEN, reasoning_tokens=0, answer_tokens=2
         )
         self.assertEqual(zero.tokens, [FINAL, 0, 0])
         self.assertEqual(zero.generated_tokens, 2)
@@ -275,13 +275,13 @@ class GenerationTests(unittest.TestCase):
             model.head.weight[END].fill_(1)
         predictor = Predictor(model, MergeDictionary(), {})
         result = predictor.generate(
-            chess.STARTING_FEN, reasoning_tokens=3, answer_tokens=4
+            rules.STARTING_FEN, reasoning_tokens=3, answer_tokens=4
         )
         self.assertEqual(result.tokens, [END])
         self.assertEqual(result.stop, "end_before_final")
         self.assertFalse(result.forced_final)
         self.assertFalse(result.answer.valid)
-        result = predictor.generate(chess.STARTING_FEN, answer_tokens=4)
+        result = predictor.generate(rules.STARTING_FEN, answer_tokens=4)
         self.assertEqual(result.tokens, [FINAL, END])
         self.assertFalse(result.answer.valid)
 
@@ -300,7 +300,7 @@ class GenerationTests(unittest.TestCase):
 
         # Uniform causal attention gives e4 its only signal from the emitted BACK.
         predictor = Predictor(model, MergeDictionary(), {})
-        board = chess.Board()
+        board = rules.Board()
         self.assertEqual(
             pick_with_reasoning(predictor, board, "cpu", reasoning_tokens=0), "d2d4"
         )

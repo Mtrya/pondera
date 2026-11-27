@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=82"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
 [project]
 name = "pondera"
@@ -9,7 +9,6 @@ description = "Search-free chess training with internalized search"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "chess>=1.11.2",
     "huggingface-hub>=1.5.0",
     "numpy>=2.4.2",
     "orjson>=3.13,<4",
@@ -24,11 +23,12 @@ dev = ["ruff>=0.15.0", "import-linter>=2.0"]
 [project.optional-dependencies]
 cuda = ["fla-core[cuda]>=0.6.0"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-"pondera.evaluation" = ["*.epd"]
+[tool.maturin]
+manifest-path = "rust/chess/Cargo.toml"
+python-source = "src"
+module-name = "pondera.chess._rules"
+features = ["pyo3/extension-module"]
+include = ["src/pondera/evaluation/*.epd"]
 
 [tool.ruff]
 src = ["src"]

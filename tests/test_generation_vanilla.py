@@ -4,9 +4,9 @@ import json
 import unittest
 from pathlib import Path
 
-import chess
 import torch
 
+from pondera.chess import _rules as rules
 from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, MOVE, REPETITION, UCI_MOVE_TO_IDX
 from pondera.evaluation.puzzles import evaluate_puzzles, solve_puzzle
@@ -37,7 +37,7 @@ class GenerationTests(unittest.TestCase):
     def test_choose_move_is_legal_and_deterministic(self):
         rows = [json.loads(line) for line in FIXTURES.read_text().splitlines()[:3]]
         for row in rows:
-            board = chess.Board(row["FEN"])
+            board = rules.Board(row["FEN"])
             board.push_uci(row["Moves"].split()[0])
             legal = {move.uci() for move in board.legal_moves}
             first = self.choose_move(self.model, board.fen())
@@ -45,7 +45,7 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(first, self.choose_move(self.model, board.fen()))
 
     def test_legal_move_mask_drives_the_choice(self):
-        fen = chess.Board().fen()
+        fen = rules.Board().fen()
         self.assertEqual(
             self.choose_move(self.model, fen, legal_moves=["e2e4"]), "e2e4"
         )
@@ -73,10 +73,10 @@ class GenerationTests(unittest.TestCase):
             lambda module, args: inputs.append(args[0].tolist())
         )
         self.addCleanup(handle.remove)
-        board = chess.Board()
+        board = rules.Board()
         for count in range(1, 5):
             self.assertIn(
-                chess.Move.from_uci(
+                rules.Move.from_uci(
                     pick_with_reasoning(
                         Predictor(self.model, MergeDictionary(), {}),
                         board,
@@ -94,7 +94,7 @@ class GenerationTests(unittest.TestCase):
     def test_choose_move_uses_the_model_device(self):
         model = self.model.to("cuda")
         self.assertEqual(
-            self.choose_move(model, chess.Board().fen(), legal_moves=["e2e4"]), "e2e4"
+            self.choose_move(model, rules.Board().fen(), legal_moves=["e2e4"]), "e2e4"
         )
 
     def test_puzzle_evaluation_counts_and_consistency(self):

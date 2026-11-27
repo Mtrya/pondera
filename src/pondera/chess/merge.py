@@ -41,6 +41,7 @@ from operator import index as _index
 
 import numpy as np
 
+from pondera.chess import _rules
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
 
 MIN_MERGE_LENGTH = 2
@@ -429,104 +430,19 @@ def count_candidates(
     return found
 
 
-def _entry_tables(dictionary: MergeDictionary) -> list:
-    """Per length, sorted match keys and the composite ids they map to."""
-    grouped = {}
-    for index, atoms in enumerate(dictionary.entries):
-        grouped.setdefault(len(atoms), []).append((atoms, MERGE_ID_BASE + index))
-    tables = []
-    for length in sorted(grouped):
-        rows = np.asarray([atoms for atoms, _ in grouped[length]], dtype=np.int64)
-        ids = np.asarray([token for _, token in grouped[length]], dtype=np.int32)
-        keys = _pack(rows)
-        order = np.argsort(keys, kind="stable")
-        tables.append((length, keys[order], ids[order]))
-    return tables
-
-
-def _match(stream: np.ndarray, tables) -> tuple:
-    """Every dictionary entry ending at each position of one stream.
-
-    Returns ``(size + 1, slots)`` entry lengths and composite ids (padding 0
-    and -1) plus the number of entries ending at each position. Columns fill
-    in ascending length order, and no window crosses a stream boundary.
-    """
-    size = stream.size
-    length_at = np.zeros((size + 1, len(tables)), dtype=np.int8)
-    token_at = np.full((size + 1, len(tables)), -1, dtype=np.int32)
-    count_at = np.zeros(size + 1, dtype=np.int8)
-    for length, keys, ids in tables:
-        if stream.size < length:
-            continue
-        windows = np.lib.stride_tricks.sliding_window_view(stream, length)
-        keys_of_stream = _pack(windows)
-        position = np.searchsorted(keys, keys_of_stream)
-        clipped = np.minimum(position, keys.size - 1)
-        hit = keys[clipped] == keys_of_stream
-        starts = np.flatnonzero(hit)
-        if starts.size == 0:
-            continue
-        ends = starts + length
-        columns = count_at[ends]
-        length_at[ends, columns] = length
-        token_at[ends, columns] = ids[clipped[starts]]
-        count_at[ends] += 1
-    return length_at, token_at, count_at
-
-
-def _encode_stream(stream, length_at, token_at, count_at) -> np.ndarray:
-    """Minimum-token segmentation of one stream; ties take the composite.
-
-    Among composites of equal cost the longest wins, matching the previous
-    longest-per-end rule whenever that rule found an optimum.
-    """
-    size = stream.size
-    lengths = length_at.tolist()
-    tokens = token_at.tolist()
-    counts = count_at.tolist()
-    distance = [0] * (size + 1)
-    choice = [-1] * (size + 1)
-    chosen_length = [0] * (size + 1)
-    for index in range(1, size + 1):
-        best = distance[index - 1] + 1
-        token = -1
-        length = 0
-        for slot in range(counts[index]):
-            entry_length = lengths[index][slot]
-            candidate = distance[index - entry_length] + 1
-            if candidate < best or (candidate == best and entry_length > length):
-                best = candidate
-                token = tokens[index][slot]
-                length = entry_length
-        distance[index] = best
-        choice[index] = token
-        chosen_length[index] = length
-    encoded = []
-    index = size
-    while index:
-        token = choice[index]
-        if token < 0:
-            encoded.append(int(stream[index - 1]))
-            index -= 1
-        else:
-            encoded.append(token)
-            index -= chosen_length[index]
-    encoded.reverse()
-    return np.asarray(encoded, dtype=np.int32)
-
-
 class MergeEncoder:
-    """Reuse dictionary match tables across independently encoded streams."""
+    """Reuse the native dictionary index across atom streams."""
 
     def __init__(self, dictionary: MergeDictionary):
         self.dictionary = dictionary
-        self.tables = _entry_tables(dictionary)
+        self._encoder = _rules.MergeEncoder(dictionary.entries, MERGE_ID_BASE)
 
     def encode(self, tokens):
-        stream = _streams((tokens,))[0]
-        if not self.tables:
-            return stream.astype(np.int32)
-        return _encode_stream(stream, *_match(stream, self.tables))
+        stream = _streams((tokens,))[0].astype(np.int32)
+        if not self.dictionary:
+            return stream
+        encoded = self._encoder.encode(stream.tobytes())
+        return np.frombuffer(encoded, dtype=np.int32).copy()
 
 
 _WORKER_STREAMS = None

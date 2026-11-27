@@ -6,21 +6,21 @@ as given. First-move accuracy is the primary metric, whole-line accuracy
 the secondary one. Buckets are declared at execution time, not frozen here.
 """
 
-import chess
+from pondera.chess import _rules as rules
 
 
 def solve_puzzle(choose_move, row):
     """Return (first_move_correct, whole_line_correct) for one puzzle row."""
-    board = chess.Board(row["FEN"])
+    board = rules.Board(row["FEN"])
     moves = row["Moves"].split()
     board.push_uci(moves[0])
     first_correct = False
     for index in range(1, len(moves), 2):
         try:
-            candidate = chess.Move.from_uci(choose_move(board.fen()))
+            candidate = rules.Move.from_uci(choose_move(board.fen()))
         except ValueError:
             return first_correct, False
-        if candidate not in board.legal_moves:
+        if not board.is_legal(candidate):
             return first_correct, False
         board.push(candidate)
         correct = candidate.uci() == moves[index] or board.is_checkmate()
