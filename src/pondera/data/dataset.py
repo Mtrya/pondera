@@ -134,7 +134,8 @@ class RaggedArray:
     """Numpy views of an Arrow list column, addressed one row at a time."""
 
     def __init__(self, column):
-        column = column.combine_chunks()
+        if isinstance(column, pa.ChunkedArray):
+            column = column.combine_chunks()
         self.values = column.values.to_numpy(zero_copy_only=False)
         self.offsets = column.offsets.to_numpy(zero_copy_only=False)
         self.dtype = self.values.dtype
@@ -172,8 +173,30 @@ def load_trace_arrays(directory, names=TRACE_ARRAYS):
     return _arrays_from_table(table, names)
 
 
+def open_trace_shard(path, expected_rows, columns):
+    file = pq.ParquetFile(path)
+    if file.metadata.num_rows != expected_rows:
+        raise ValueError(f"Shard row count differs from its release: {path}")
+    schema = file.schema_arrow
+    for name in (*TRACE_ARRAYS, *columns):
+        index = schema.get_field_index(name)
+        if index < 0 or schema.field(index).type != TRACE_SCHEMA.field(name).type:
+            raise ValueError(f"Curated shard needs a valid {name} column: {path}")
+    return file
+
+
+def iter_atom_batches(file, columns, batch_size):
+    """Project document metadata and NumPy views of the stored base atoms."""
+    for batch in file.iter_batches(
+        columns=[*columns, *TRACE_ARRAYS], batch_size=batch_size, use_threads=False
+    ):
+        arrays = _arrays_from_table(batch, TRACE_ARRAYS)
+        validate_trace_arrays(arrays, batch.num_rows)
+        yield batch.select(columns).to_pylist(), arrays["trace_atom_ids"]
+
+
 def validate_trace_arrays(arrays, rows=None):
-    """Diagnostic checks of ragged array types and lengths."""
+    """Check ragged array types, lengths, and trace atom IDs."""
     if not arrays:
         raise ValueError("A Trace dataset needs token arrays")
     row_count = len(next(iter(arrays.values())))

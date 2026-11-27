@@ -63,8 +63,9 @@ max_rounds = 100000
 top = 20
 # Fitting/encoding worker processes; results are identical at any count.
 workers = 8
-# Omit max_roots to use all input roots; block defaults to max(8, composites // 32).
-# max_roots = 128
+# Fit on the first 500,000 published training documents in release order.
+max_roots = 500000
+# block defaults to max(8, composites // 32).
 # block = 32
 
 batch_size = 128

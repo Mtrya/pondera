@@ -25,7 +25,12 @@ def main():
     encode = commands.add_parser(
         "encode", help="Fit a merge vocabulary and encode traces"
     )
-    encode.add_argument("--input", required=True, type=Path)
+    encode.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        help="Curated release with stored trace atoms",
+    )
     for command in (prepare, curate, encode):
         command.add_argument("--config", default=DEFAULT_CONFIG_PATH, type=Path)
         command.add_argument("--output", required=True, type=Path)

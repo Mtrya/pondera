@@ -19,13 +19,12 @@ from pondera.chess.codec import encode_board
 from pondera.chess.merge import MergeDictionary, decode
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE
 from pondera.data.config import load_config
-from pondera.data.dataset import load_manifest, parquet_sources
+from pondera.data.dataset import HF_COLUMNS, load_manifest, parquet_sources
 from pondera.data.packing import PackedDocuments
 from pondera.data.pipeline import validate_release
 from pondera.data.roots import prepare_pool
 from pondera.data.roots.pool import _claimable, read_roots
 from pondera.data.roots.puzzles import build_pool, puzzle_root
-from pondera.data.text import trace_atoms
 from pondera.data.tokenize import merge_and_encode
 
 FIXTURES = Path(__file__).parent / "fixtures" / "lichess_puzzles"
@@ -215,7 +214,7 @@ class PuzzleTests(unittest.TestCase):
         export_hf(release, exported, batch_size=1)
         training = self.root / "training"
         result = merge_and_encode(
-            exported,
+            release,
             training,
             replace(
                 config.merge, vocab_size=CHESS_VOCAB_SIZE + 8, min_count=1, batch_size=1
@@ -227,9 +226,17 @@ class PuzzleTests(unittest.TestCase):
         )
         rows = [
             row
-            for path, _, _ in parquet_sources(exported)
+            for path, _, _ in parquet_sources(release)
             for row in pq.read_table(path).to_pylist()
         ]
+        self.assertEqual(
+            [
+                row
+                for path, _, _ in parquet_sources(exported)
+                for row in pq.read_table(path).to_pylist()
+            ],
+            [{column: row[column] for column in HF_COLUMNS} for row in rows],
+        )
         documents = PackedDocuments(training)
         self.assertEqual(int((documents.split == 0).sum()), 2)
         for index, row in enumerate(rows):
@@ -239,7 +246,7 @@ class PuzzleTests(unittest.TestCase):
             self.assertEqual(
                 decode(documents.document(index), dictionary).tolist(),
                 encode_board(row["fen"], row["repetition"]).tolist()
-                + trace_atoms(row["trace_text"]).tolist(),
+                + row["trace_atom_ids"],
             )
 
 

@@ -1,4 +1,4 @@
-"""Fit a trace dictionary and encode authoritative text directly to memory maps."""
+"""Fit a trace dictionary and encode stored base atoms directly to memory maps."""
 
 import json
 import multiprocessing
@@ -10,25 +10,24 @@ from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
-import pyarrow.parquet as pq
 
 from pondera.chess.codec import encode_board
 from pondera.chess.merge import MergeDictionary
 from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION, CHESS_VOCAB_SIZE
 from pondera.data.dataset import (
-    HF_SCHEMA,
+    iter_atom_batches,
     load_manifest,
+    open_trace_shard,
     parquet_sources,
     write_manifest,
 )
 from pondera.data.packing import PACKED_FORMAT_VERSION, PRESENTATION_CODES, SPLIT_CODES
-from pondera.data.text import (
+from pondera.data.trace import TRACE_GRAMMAR_VERSION
+from pondera.data.trace_encoding import (
     MERGE_BOUNDARIES,
     TraceEncoder,
-    trace_atoms,
     validate_trace_dictionary,
 )
-from pondera.data.trace import TRACE_GRAMMAR_VERSION
 
 
 def merge_and_encode(source, output, config, *, max_document_tokens=131_072):
@@ -102,6 +101,7 @@ def _fitted_dictionary(checkpoint, source, vocab_size, settings, options):
         if key not in {"batch_size", "workers"}
     }
     fitting["merge_boundaries"] = MERGE_BOUNDARIES
+    fitting["input"] = "stored_atoms_in_release_order"
     source = Path(source).resolve()
     fitting["source"] = {
         "path": str(source),
@@ -133,33 +133,20 @@ def _fitted_dictionary(checkpoint, source, vocab_size, settings, options):
 
 def _encode_shard(encoder, task):
     """Write one shard's token stream with bounded Arrow and token buffers."""
-    path, expected_rows, split, directory, batch_size, check_header = task
-    file = pq.ParquetFile(path)
-    for field in HF_SCHEMA:
-        if file.schema_arrow.field(field.name) != field:
-            raise ValueError(f"Shared field {field.name} has an invalid type")
-    columns = ["fen", "repetition", "trace_text", "presentation"]
-    if "split" in file.schema_arrow.names:
-        columns.append("split")
-    elif split not in SPLIT_CODES:
-        raise ValueError(f"No dataset split for {path}")
+    path, expected_rows, directory, batch_size = task
+    columns = ["fen", "repetition", "presentation", "split"]
+    file = open_trace_shard(path, expected_rows, columns)
     directory = Path(directory)
     directory.mkdir()
     offsets, splits, presentations = [0], [], []
     base_atoms = trace_tokens = 0
     with (directory / "tokens.u16").open("wb") as handle:
-        for batch in file.iter_batches(
-            columns=columns, batch_size=batch_size, use_threads=False
-        ):
-            for row in batch.to_pylist():
-                label = row.get("split", split)
+        for rows, atom_ids in iter_atom_batches(file, columns, batch_size):
+            for index, row in enumerate(rows):
+                label = row["split"]
                 if label not in SPLIT_CODES:
                     raise ValueError(f"Unknown dataset split in {path}: {label}")
-                atoms = trace_atoms(
-                    row["trace_text"],
-                    expected_fen=row["fen"] if check_header else None,
-                    expected_repetition=row["repetition"] if check_header else None,
-                )
+                atoms = atom_ids[index]
                 trace = encoder.encode(atoms)
                 board = encode_board(row["fen"], row["repetition"])
                 board.astype(np.uint16).tofile(handle)
@@ -203,11 +190,10 @@ def encode_dataset(
     workers=1,
     max_document_tokens=131_072,
 ):
-    """Encode local or HF text directly into the final memory-mapped layout.
+    """Encode curated base atoms directly into the final memory-mapped layout.
 
-    Local atom arrays are diagnostic caches and are never read here. Workers
-    stage shard streams on disk; concatenation follows source order without
-    moving token arrays through process IPC. Publish only a complete output.
+    Workers stage shard streams on disk. Concatenation follows source order
+    without moving token arrays through process IPC.
     """
     if batch_size < 1 or workers < 1 or max_document_tokens < 1:
         raise ValueError("Batch size, workers, and document cap must be positive")
@@ -238,12 +224,10 @@ def encode_dataset(
             (
                 path,
                 expected,
-                split,
                 str(work / f"shard-{index:06d}"),
                 batch_size,
-                not manifest,
             )
-            for index, (path, expected, split) in enumerate(parquet_sources(source))
+            for index, (path, expected, _) in enumerate(parquet_sources(source))
         ]
         if workers > 1 and len(tasks) > 1:
             context = multiprocessing.get_context("spawn")

@@ -1,4 +1,4 @@
-"""Real teacher traces qualify authoritative text and merged training inputs."""
+"""Real teacher traces qualify stored atoms and merged training inputs."""
 
 import json
 import shutil
@@ -40,37 +40,13 @@ from pondera.data.dataset import (
 )
 from pondera.data.merge_profile import (
     build_profile,
-    load_full_rows,
+    load_rows,
     write_artifacts,
 )
 from pondera.data.packing import PackedDocuments
 from pondera.data.pipeline import EngineTimeoutError, produce_shards, validate_release
-from pondera.data.text import TraceEncoder, encode_traces, trace_atoms
 from pondera.data.tokenize import encode_dataset, merge_and_encode
-from pondera.data.trace import load_sidecar, synthesize_root
-
-FIXTURES = Path(__file__).parent / "fixtures" / "trace_v2"
-
-
-class TextTests(unittest.TestCase):
-    def test_text_requires_a_final_decision_and_value(self):
-        prefix = "8/8/8/4k3/8/8/8/4K3 w - - 0 1 (repetition 3) "
-        for suffix in ("FINAL END", "FINAL CLAIM_DRAW END"):
-            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
-                trace_atoms(prefix + suffix)
-
-    def test_text_recovers_producer_atoms_for_every_recorded_case(self):
-        config = load_config()
-        for fixture in sorted(FIXTURES.iterdir()):
-            root = json.loads((fixture / "root.json").read_text())
-            result = synthesize_root(
-                load_sidecar(fixture / "sidecar.jsonl"), root, config
-            )
-            for row in result.rows.values():
-                with self.subTest(case=fixture.name, presentation=row.presentation):
-                    np.testing.assert_array_equal(
-                        trace_atoms(row.trace_text), row.tokens
-                    )
+from pondera.data.trace_encoding import TraceEncoder, encode_traces
 
 
 class TokenizeTests(unittest.TestCase):
@@ -141,7 +117,7 @@ class TokenizeTests(unittest.TestCase):
                     .read_text()
                     .replace("vocab_size = 8192", f"vocab_size = {vocab_size}")
                     .replace("min_count = 8", "min_count = 1")
-                    .replace("# max_roots = 128", "max_roots = 3")
+                    .replace("max_roots = 500000", "max_roots = 3")
                     .replace("batch_size = 128", "batch_size = 2")
                     .replace("train = 500000", "train = 0")
                     .replace("val = 2000", "val = 0")
@@ -175,28 +151,52 @@ class TokenizeTests(unittest.TestCase):
                 self.assert_encoded(output)
                 document = json.loads((output / "profile" / "curve.json").read_text())
                 self.assertEqual(document["settings"]["vocab_size"], vocab_size)
-                self.assertEqual(document["corpus"]["loaded"]["rows"], 3)
+                fitting = document["corpus"]["fitting"]
+                self.assertEqual(fitting["release_splits"], {"train": 3})
+                self.assertEqual(
+                    fitting["atoms"],
+                    sum(row["trace_atom_count"] for row in self.original[1:4]),
+                )
                 self.assertEqual(len(document["tiers"]), 1)
                 self.assertGreater(document["timing"]["workflow_peak_rss_bytes"], 0)
                 self.assertEqual(int((PackedDocuments(output).split == 0).sum()), 4)
 
-    def test_encoding_uses_authoritative_text_despite_corrupt_atom_cache(self):
+    def test_fitting_and_encoding_consume_stored_atoms(self):
         path = self.source / "shard-000000" / "data.parquet"
         table = pq.read_table(path)
-        corrupt = [[CHESS_VOCAB_SIZE + 100]] * len(table)
         table = table.set_column(
-            table.schema.get_field_index("trace_atom_ids"),
-            "trace_atom_ids",
-            pa.array(corrupt, type=pa.list_(pa.int32())),
+            table.schema.get_field_index("trace_text"),
+            "trace_text",
+            pa.array(["unparseable trace"] * len(table)),
         )
         pq.write_table(table, path)
-        for expected, profiled in zip(self.original, load_full_rows(self.source)):
+        for expected, profiled in zip(self.original, load_rows(self.source)):
             np.testing.assert_array_equal(profiled.atoms, expected["trace_atom_ids"])
         output = self.root / "encoded"
         result = encode_dataset(self.source, output, self.dictionary, batch_size=1)
         self.assertEqual(result["documents"], len(self.original))
         self.assertLess(result["trace_tokens"], result["base_atoms"])
         self.assert_encoded(output)
+
+    def test_fitting_and_encoding_reject_invalid_stored_atoms(self):
+        path = self.source / "shard-000000" / "data.parquet"
+        table = pq.read_table(path)
+        invalid = [
+            [CHESS_VOCAB_SIZE] * count
+            for count in table["trace_atom_count"].to_pylist()
+        ]
+        table = table.set_column(
+            table.schema.get_field_index("trace_atom_ids"),
+            "trace_atom_ids",
+            pa.array(invalid, type=pa.list_(pa.int32())),
+        )
+        pq.write_table(table, path)
+        output = self.root / "invalid-atoms"
+        with self.assertRaisesRegex(ValueError, "base atom IDs"):
+            load_rows(self.source)
+        with self.assertRaisesRegex(ValueError, "base atom IDs"):
+            encode_dataset(self.source, output, self.dictionary)
+        self.assertFalse(output.exists())
 
     def test_encoding_handles_an_entirely_dropped_shard(self):
         directory = self.root / "drops"
@@ -219,7 +219,7 @@ class TokenizeTests(unittest.TestCase):
         self.assertEqual(summary["documents"], len(roots) - len(dropped))
         self.assertEqual(int((PackedDocuments(output).split == 0).sum()), 3)
 
-    def test_base_vocabulary_needs_no_full_presentation_fitting_rows(self):
+    def test_fitting_includes_zero_and_random_presentations(self):
         from dataclasses import replace
 
         for presentation in ("zero", "random"):
@@ -242,14 +242,20 @@ class TokenizeTests(unittest.TestCase):
             result = merge_and_encode(
                 source,
                 output,
-                replace(load_config().merge, vocab_size=CHESS_VOCAB_SIZE),
+                replace(
+                    load_config().merge,
+                    vocab_size=CHESS_VOCAB_SIZE + 8,
+                    min_count=1,
+                    per_length_limit=32,
+                ),
             )
-            self.assertEqual(result["entries"], 0)
-            self.assertEqual(result["ratio"], 1.0)
             self.assertEqual(result["documents"], len(roots))
             profile = json.loads((output / "profile/curve.json").read_text())
-            self.assertEqual(profile["corpus"]["fitting"]["rows"], 0)
-            self.assertEqual(profile["candidates"]["counted"], 0)
+            self.assertEqual(
+                profile["corpus"]["fitting"]["presentations"],
+                {presentation: len(roots)},
+            )
+            self.assertGreater(profile["candidates"]["counted"], 0)
 
     def test_fit_checkpoint_drives_encoding_and_guards_settings(self):
         from dataclasses import replace
@@ -315,37 +321,6 @@ class TokenizeTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_config(config)
 
-    def test_hf_training_artifacts_have_distinct_persistent_identities(self):
-        identities = []
-        for index, row in enumerate(self.original[:2]):
-            source = self.root / f"hf-{index}" / "data"
-            source.mkdir(parents=True)
-            pq.write_table(
-                pa.Table.from_pylist([row], schema=HF_SCHEMA),
-                source / "train-00000.parquet",
-            )
-            output = self.root / f"hf-encoded-{index}"
-            encode_dataset(source.parent, output)
-            identities.append(
-                load_manifest(output / "packing.json")["source_dataset_id"]
-            )
-        self.assertNotEqual(identities[0], identities[1])
-
-    def test_hf_import_rejects_a_different_root_header(self):
-        original = self.original[0]
-        for field, value in (("fen", self.original[1]["fen"]), ("repetition", 4)):
-            with self.subTest(field=field):
-                source = self.root / field / "data"
-                source.mkdir(parents=True)
-                pq.write_table(
-                    pa.Table.from_pylist(
-                        [{**original, field: value}], schema=HF_SCHEMA
-                    ),
-                    source / "train-00000.parquet",
-                )
-                with self.assertRaises(ValueError):
-                    encode_dataset(source.parent, self.root / f"invalid-{field}")
-
     def test_library_conversion_rejects_unknown_split_labels(self):
         path = self.source / "shard-000000/data.parquet"
         table = pq.read_table(path)
@@ -358,40 +333,17 @@ class TokenizeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             encode_dataset(self.source, self.root / "invalid-split")
 
-    def test_existing_curated_text_is_reusable_without_cache_migration(self):
-        # Old local field names do not affect encoding; only text is read.
-        for path, _, _ in parquet_sources(self.source):
-            table = pq.read_table(path)
-            table = table.rename_columns(
-                [
-                    {
-                        "trace_atom_ids": "trace_token_ids",
-                        "trace_atom_count": "trace_len",
-                    }.get(name, name)
-                    for name in table.column_names
-                ]
-            )
-            pq.write_table(table, path)
-        manifest = load_manifest(self.source / "release.json")
-        manifest["format_version"] = 11
-        write_manifest(self.source / "release.json", manifest)
-        output = self.root / "reused"
-        encode_dataset(self.source, output, self.dictionary)
-        self.assert_encoded(output)
-
-    def test_hf_input_encodes_text_and_preserves_split_membership(self):
+    def test_text_only_export_cannot_be_used_for_training(self):
         exported = self.root / "hf"
         export_hf(self.source, exported, batch_size=2)
         output = self.root / "hf-encoded"
-        encode_dataset(exported, output, self.dictionary, batch_size=1)
-        expected = [row for row in self.original if row["split"] == "train"]
-        expected += [row for row in self.original if row["split"] == "val"]
-        self.assert_encoded(output, expected)
-        self.assertEqual(int((PackedDocuments(output).split == 0).sum()), 4)
-        self.assertEqual(int((PackedDocuments(output).split == 1).sum()), 1)
-        # The shared HF schema stays text-only.
         for path, _, _ in parquet_sources(exported):
             self.assertEqual(pq.ParquetFile(path).schema_arrow, HF_SCHEMA)
+        with self.assertRaisesRegex(ValueError, "trace_atom_ids"):
+            encode_dataset(exported, output, self.dictionary)
+        with self.assertRaisesRegex(ValueError, "trace_atom_ids"):
+            load_rows(exported)
+        self.assertFalse(output.exists())
 
     def test_fitting_keeps_all_controls_standalone(self):
         document, dictionaries = build_profile(
@@ -554,7 +506,7 @@ class TokenizeTests(unittest.TestCase):
             with self.subTest(field=field):
                 write_manifest(path, {**original, field: value})
                 with self.assertRaises(ValueError):
-                    load_full_rows(self.source)
+                    load_rows(self.source)
                 with self.assertRaises(ValueError):
                     encode_dataset(self.source, self.root / "invalid", self.dictionary)
 

@@ -6,7 +6,7 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 |---|---|
 | `chess/` | Action vocabulary, rule-only path tracking, lossless board token encoding, exact symmetry transforms, and min-cost merge dictionaries |
 | `models/` | Neural model definitions |
-| `data/` | Root preparation, trace curation, and vocabulary fitting plus encoding under one TOML recipe; release validation, authoritative text conversion, and packed training datasets |
+| `data/` | Root preparation, trace curation and validation, vocabulary fitting and encoding from stored atoms, and packed training datasets |
 | `tools/export_hf.py` | Bounded projection of an accepted local release into the shared eleven-column Hugging Face dataset; schema definitions remain in `data/` |
 | `training/` | TOML training recipes, supervised optimization, and resumable training state |
 | `inference/` | Checkpoint loading, generic autoregressive generation, expanded-answer parsing, legal move selection, and UCI |
@@ -14,7 +14,7 @@ Pondera is an installable Python package rooted at `src/pondera`. It is a librar
 | `tests/` | Behavioral and integration tests |
 | `results/` | Reviewed summaries of completed evaluations |
 
-Representation code does not import application layers, and models do not import workflows. Training and inference use the model definitions. Encoding writes final memory maps directly from authoritative text, using one shared trace-boundary rule for fitting and encoding. Training selects a seeded document prefix under a configurable length cap from the stored lengths. Training reads these packed datasets and dataset identity checks from `data`; it does not call collection, synthesis, search, or evaluation code. Evaluation orchestrates inference and external engines. Data and evaluation do not import training. Import contracts enforce these boundaries.
+Representation code does not import application layers, and models do not import workflows. Training and inference use the model definitions. Encoding writes final memory maps directly from curated trace atoms. Fitting and encoding share the same merge boundaries. Training selects a seeded document prefix under a configurable length cap from the stored lengths. Training reads these packed datasets and dataset identity checks from `data`; it does not call collection, synthesis, search, or evaluation code. Evaluation orchestrates inference and external engines. Data and evaluation do not import training. Import contracts enforce these boundaries.
 
 The board tokenizer has one format shared by offline data preparation and runtime inputs: sparse self-contained `(square, piece)` atoms plus metadata atoms, preserving piece placement and the first four FEN fields exactly. Base token IDs and names are generated directly from the arithmetic layout in `chess/vocabulary.py`. The fullmove counter is not encoded; halfmove clocks of 100 and above and repetition counts above four share their respective top atoms.
 
