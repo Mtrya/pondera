@@ -2169,11 +2169,9 @@ def produce_shards(
 
 def run_pipeline(config, roots, output, engine="stockfish"):
     """Curate traces from a prepared pool without modifying its records."""
-    from pondera.data.roots.pool import read_roots
+    from pondera.data.roots.pool import pool_path, read_roots
 
-    roots = Path(roots)
-    if roots.is_dir():
-        roots /= "roots.jsonl"
+    roots = pool_path(roots)
     return produce_shards(
         read_roots(roots),
         output,

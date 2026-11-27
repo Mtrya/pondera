@@ -13,12 +13,22 @@ import pyarrow.parquet as pq
 from pondera.chess import _rules as rules
 from pondera.chess.tracker import repetition_count
 from pondera.data.dataset import parquet_sources, write_manifest
+from pondera.data.roots.pool import MANIFEST_FILE, POOL_FILE, RootPool
 from pondera.evaluation.reference import Reference
 from pondera.inference.trace import load_checkpoint
 
 
 def _rows(path, puzzle):
     path = Path(path)
+    candidate = path / POOL_FILE if path.is_dir() else path
+    if (
+        not puzzle
+        and candidate.name == POOL_FILE
+        and candidate.with_name(MANIFEST_FILE).is_file()
+        and candidate.is_file()
+    ):
+        yield from RootPool(candidate).iter_range()
+        return
     if path.is_dir() and (path / "roots.jsonl").exists():
         path /= "roots.jsonl"
     if path.suffix == ".jsonl":

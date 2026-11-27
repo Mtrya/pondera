@@ -119,8 +119,6 @@ class TokenizeTests(unittest.TestCase):
                     .replace("min_count = 8", "min_count = 1")
                     .replace("max_roots = 500000", "max_roots = 3")
                     .replace("batch_size = 128", "batch_size = 2")
-                    .replace("train = 500000", "train = 0")
-                    .replace("val = 2000", "val = 0")
                 )
                 output = self.root / f"training-{vocab_size}"
                 subprocess.run(

@@ -38,6 +38,7 @@ def main():
     config = load_config(args.config)
     if args.command == "prepare":
         from pondera.data.roots import prepare_pool
+        from pondera.data.roots.pool import POOL_FILE
 
         inputs = {}
         for value in args.input:
@@ -47,8 +48,9 @@ def main():
             inputs[name] = Path(path)
         manifest = prepare_pool(config, args.output, inputs=inputs, cache=args.cache)
         result = {
-            "root_pool": str(args.output / "roots.jsonl"),
+            "root_pool": str(args.output / POOL_FILE),
             "roots": sum(manifest["counts"].values()),
+            "pool_id": manifest["pool_id"],
         }
     elif args.command == "curate":
         from pondera.data.pipeline import run_pipeline

@@ -79,9 +79,6 @@ class PgnSourceConfig:
     kind: str
     url: str
     sha256: str
-    train: int
-    val: int
-    claimable_share: float
     limit_games: int | None
 
 
@@ -91,9 +88,14 @@ class PuzzleSourceConfig:
     kind: str
     repo_id: str
     revision: str
-    train: int
-    val: int
+    prefix_fraction: float
     batch_size: int
+
+
+@dataclass(frozen=True)
+class RootsConfig:
+    validation_count: int
+    workers: int
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,7 @@ class MergeConfig:
 class DataConfig:
     seed: int
     sources: tuple
+    roots: RootsConfig
     search: SearchConfig
     synthesis: SynthesisConfig
     release: ReleaseConfig
@@ -227,20 +230,16 @@ def _sources(values):
         if not isinstance(raw, dict):
             raise ValueError(f"[{section}] must be a table")
         kind = raw.get("kind")
-        common = {"kind", "train", "val"}
         if kind == "pgn":
+            raw = _table(raw, section, {"kind", "url", "sha256"}, {"limit_games"})
+        elif kind == "lichess_puzzles":
             raw = _table(
                 raw,
                 section,
-                common | {"url", "sha256", "claimable_share"},
-                {"limit_games"},
+                {"kind", "repo_id", "revision", "prefix_fraction", "batch_size"},
             )
-        elif kind == "lichess_puzzles":
-            raw = _table(raw, section, common | {"repo_id", "revision", "batch_size"})
         else:
             raise ValueError(f"Unknown source kind in [{section}]: {kind}")
-        train = _integer(section, "train", raw["train"], 0)
-        val = _integer(section, "val", raw["val"], 0)
         if kind == "pgn":
             url, digest = raw["url"], raw["sha256"]
             if (
@@ -261,9 +260,6 @@ def _sources(values):
                 kind,
                 url,
                 digest.lower(),
-                train,
-                val,
-                _probability(section, "claimable_share", raw["claimable_share"]),
                 _integer(section, "limit_games", raw["limit_games"], 1)
                 if "limit_games" in raw
                 else None,
@@ -279,16 +275,20 @@ def _sources(values):
                 raise ValueError(
                     f"[{section}] revision must be an immutable Hub commit"
                 )
+            fraction = _probability(section, "prefix_fraction", raw["prefix_fraction"])
+            if not fraction:
+                raise ValueError(f"[{section}] prefix_fraction must be positive")
             source = PuzzleSourceConfig(
                 name,
                 kind,
                 repo_id,
                 revision.lower(),
-                train,
-                val,
+                fraction,
                 _integer(section, "batch_size", raw["batch_size"], 1),
             )
         sources.append(source)
+    if len({source.kind for source in sources}) != len(sources):
+        raise ValueError("[sources] needs at most one archive and one puzzle dataset")
     return tuple(sources)
 
 
@@ -299,6 +299,7 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     allowed = {
         "seed",
         "sources",
+        "roots",
         "search",
         "synthesis",
         "release",
@@ -313,6 +314,11 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     seed = _integer("seed", "seed", values.get("seed", 640))
 
     sources = _sources(values["sources"])
+    roots = _table(values["roots"], "roots", {"validation_count", "workers"})
+    roots = RootsConfig(
+        _integer("roots", "validation_count", roots["validation_count"], 0),
+        _integer("roots", "workers", roots["workers"], 1),
+    )
 
     search = _table(
         values["search"],
@@ -428,4 +434,6 @@ def load_config(path=DEFAULT_CONFIG_PATH):
     cap = _integer(
         "data", "max_document_tokens", values.get("max_document_tokens", 131_072), 1
     )
-    return DataConfig(seed, sources, search, synthesis, release, sampling, merge, cap)
+    return DataConfig(
+        seed, sources, roots, search, synthesis, release, sampling, merge, cap
+    )

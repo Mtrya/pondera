@@ -31,7 +31,7 @@ Gather eligible positions from the full November 2025 Lichess Elite archive and 
 
 Deduplicate the combined candidates by the first four canonical FEN fields. They represent piece placement, side to move, castling rights, and the en passant square when the capture is legal. Keep the record with the highest repetition count. Ties keep the first occurrence, with Elite processed before puzzles. The winning record supplies the full FEN and provenance. Choose the puzzle prefix using the retained counts and observed search drops to target 24–25 million published documents.
 
-After deduplication, select 2,000 validation roots for training telemetry by seeded rank on the position key. Assign the rest to training. Shuffle the combined root pool with a fixed seed to mix Elite and puzzle roots before curation. The pool records each root's stable `fen|repetition` ID, FEN, repetition, split, and source. Curation consumes reproducible ranges and preserves that order among the published documents.
+After deduplication, select 2,000 validation roots for training telemetry by seeded rank on the position key. Assign the rest to training. Shuffle the combined root pool with a fixed seed to mix Elite and puzzle roots before curation. The pool records each root's stable `fen|repetition` ID, FEN, repetition, split, and source. The prepared directory stores ordered row groups in `roots.parquet` and records pool identity and source counts in `pool.manifest.json`. The range reader can reopen any interval in that order.
 
 ## 2. Curate with Stockfish
 
