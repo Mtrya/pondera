@@ -8,6 +8,7 @@ from contextlib import closing, contextmanager
 from itertools import islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from uuid import uuid4
 
 import orjson
 import pyarrow as pa
@@ -167,17 +168,16 @@ class RootIndex:
         return self.cursor.execute("SELECT count(*) FROM elite").fetchone()[0]
 
     def add_puzzle(self, key, halfmove, fullmove, row):
-        overlap = self.cursor.execute(
-            """
-            INSERT OR IGNORE INTO puzzles VALUES (
-                ?, ?, ?, ?, EXISTS (SELECT 1 FROM elite WHERE key=?)
-            ) RETURNING overlaps_elite
-            """,
-            (key, halfmove, fullmove, orjson.dumps(row).decode(), key),
+        (overlaps_elite,) = self.cursor.execute(
+            "SELECT EXISTS (SELECT 1 FROM elite WHERE key = ?)", (key,)
         ).fetchone()
-        if overlap is None:
+        inserted = self.cursor.execute(
+            "INSERT OR IGNORE INTO puzzles VALUES (?, ?, ?, ?, ?)",
+            (key, halfmove, fullmove, orjson.dumps(row).decode(), overlaps_elite),
+        ).rowcount
+        if not inserted:
             return "duplicates_within_source"
-        return "duplicates_elite" if overlap[0] else "retained"
+        return "duplicates_elite" if overlaps_elite else "retained"
 
     def validation(self, count):
         keys = {
@@ -224,7 +224,6 @@ def write_pool(output, index, manifest):
         for name, report in reports.items()
     }
     provenance = {name: report["provenance"] for name, report in reports.items()}
-    identity = hashlib.sha256(orjson.dumps(provenance, option=orjson.OPT_SORT_KEYS))
     validation = index.validation(manifest["validation_count"])
     counts = {name: Counter(train=0, val=0) for name in provenance}
 
@@ -263,13 +262,10 @@ def write_pool(output, index, manifest):
                         puzzle,
                         split,
                     )
-                    identity.update(orjson.dumps(row) + b"\n")
                     counts[name][split] += 1
                     for column, value in zip(columns, row, strict=True):
                         column.append(value)
                 writer.write_table(pa.Table.from_arrays(columns, schema=ROOT_SCHEMA))
-            pool_id = identity.hexdigest()
-            writer.add_key_value_metadata({"pool_id": pool_id})
 
         totals = {
             split: sum(count[split] for count in counts.values())
@@ -282,7 +278,7 @@ def write_pool(output, index, manifest):
         manifest.update(
             kind="root-pool",
             format_version=4,
-            pool_id=pool_id,
+            pool_id=uuid4().hex,
             row_group_size=ROW_GROUP_SIZE,
             counts=totals,
         )
@@ -312,8 +308,7 @@ class RootPool:
         self.rows = metadata.num_rows
         expected_groups = (self.rows + self.group_size - 1) // self.group_size
         if (
-            (metadata.metadata or {}).get(b"pool_id") != self.pool_id.encode()
-            or self.file.schema_arrow.remove_metadata() != ROOT_SCHEMA
+            self.file.schema_arrow.remove_metadata() != ROOT_SCHEMA
             or self.rows != sum(self.manifest["counts"].values())
             or metadata.num_row_groups != expected_groups
         ):

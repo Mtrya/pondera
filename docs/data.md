@@ -1,6 +1,6 @@
 # Data curation and encoding
 
-This document specifies the target pipeline for Pondera's final corpus of roughly 24–25 million documents from Lichess Elite and Lichess Puzzles. The implementation in this checkout is described in the [data module guide](../src/pondera/data/README.md).
+Pondera prepares roots from Lichess Elite and Lichess Puzzles, curates Stockfish traces, and produces Parquet for sharing and packed token streams for training.
 
 **Produce each document's trace atom IDs once.** Curation writes the SAN trace text and its unmerged atom IDs together. Hugging Face export projects the text and its metadata. Fitting and encoding read the stored atom IDs from the accepted local release.
 
@@ -24,12 +24,12 @@ The Hugging Face projection and training encoding read the same accepted release
 
 ## 1. Prepare roots
 
-Gather eligible positions from the full November 2025 Lichess Elite archive and a prefix of the pinned Lichess Puzzles dataset. [Elite archive](https://database.nikonoel.fr/lichess_elite_2025-11.zip) · [Pinned puzzles revision](https://huggingface.co/datasets/Lichess/chess-puzzles/commit/461725966ea46898ec6481372a6326de3281bfbd)
+The data recipe uses the November 2025 Lichess Elite archive and an ordered prefix of a pinned Lichess Puzzles revision. [Elite archive](https://database.nikonoel.fr/lichess_elite_2025-11.zip) · [Pinned puzzles revision](https://huggingface.co/datasets/Lichess/chess-puzzles/commit/461725966ea46898ec6481372a6326de3281bfbd)
 
-- **Elite games.** Replay legal standard-start PGN mainlines, counting the starting position in the repetition history. Omit a game's final position when it has no legal move. Omit a per-game position key when its last occurrence reaches fivefold repetition. Record the archive URL and SHA-256, PGN member, zero-based game index, and ply. Count games in archive order before filtering so the provenance can recover the exact position and its history.
-- **Puzzles.** Read the first `N%` of raw rows in sorted Parquet filename order and stored row order. Count the prefix before filtering or deduplication. Apply `Moves[0]` to the source FEN to obtain the puzzle root and retain its FEN clocks. Omit roots that end in mate or stalemate. Use repetition one for this position reconstructed from a single FEN. Preserve the original row, the Hub revision when verified, `root_after_moves = 1`, and `repetition_is_assumed = true`.
+- **Elite games.** Replay legal standard-start PGN mainlines, counting the starting position in the repetition history. Omit a game's final position when it has no legal move. Omit a per-game position key when its last occurrence reaches fivefold repetition. Record the archive URL when downloaded, PGN member, zero-based game index, and ply. Verify each downloaded archive before placing it in the cache. Count games in archive order before filtering so the provenance can recover the exact position and its history.
+- **Puzzles.** Read the configured prefix of raw rows in sorted Parquet filename order and stored row order. Count the prefix before filtering or deduplication. Apply `Moves[0]` to the source FEN to obtain the puzzle root and retain its FEN clocks. Omit roots that end in mate or stalemate. Use repetition one for this position reconstructed from a single FEN. Preserve the original row, the Hub revision when verified, `root_after_moves = 1`, and `repetition_is_assumed = true`.
 
-Deduplicate the combined candidates by the first four canonical FEN fields. They represent piece placement, side to move, castling rights, and the en passant square when the capture is legal. Keep the record with the highest repetition count. Ties keep the first occurrence, with Elite processed before puzzles. The winning record supplies the full FEN and provenance. Choose the puzzle prefix using the retained counts and observed search drops to target 24–25 million published documents.
+Deduplicate the combined candidates by the first four canonical FEN fields. They represent piece placement, side to move, castling rights, and the en passant square when the capture is legal. Keep the record with the highest repetition count. Ties keep the first occurrence, with Elite processed before puzzles. The winning record supplies the full FEN and provenance.
 
 After deduplication, select 2,000 validation roots for training telemetry by seeded rank on the position key. Assign the rest to training. Shuffle the combined root pool with a fixed seed to mix Elite and puzzle roots before curation. The pool records each root's stable `fen|repetition` ID, FEN, repetition, split, and source. The prepared directory stores ordered row groups in `roots.parquet` and records pool identity and source counts in `pool.manifest.json`. The range reader can reopen any interval in that order.
 
@@ -44,7 +44,7 @@ Synthesis writes two representations of the same trace in each release row.
 - `trace_text` is the portable grammar-v2 transcription. It uses absolute SAN and records the navigation operations, board observations, evaluations, and final answer.
 - `trace_atom_ids` is the unmerged base atom sequence for that presentation. It includes the final answer and starts after the initial board prefix. Move and board observation atoms use the root player's frame. The local release also carries the atom count and per-state diagnostics used to validate the trace.
 
-Each curation job reads its assigned half-open shard range. Jobs targeting the same release can work on disjoint ranges with the same pool, shard size, teacher, and recipe. Completed roots and published shards are reused on restart. Search timeouts are recorded as drops, and other collection failures receive up to three attempts across runs. The ordered release manifest is published once every root has a document or a recorded drop. Bounded qualification replays the stored atoms and verifies split counts and provenance.
+Each curation job reads its assigned half-open shard range. Jobs targeting the same release can work on disjoint ranges with the same pool, shard size, teacher, and recipe. Completed roots and published shards are reused on restart. Search timeouts are recorded as drops, and other collection failures receive up to three attempts across runs. The ordered release manifest is published once every root has a document or a recorded drop and at least one document has been produced.
 
 ## 3. Export to Hugging Face Parquet
 
@@ -80,17 +80,3 @@ The encoded document store contains these files.
 | `packing.json` | Dataset identity, tokenizer version, merge boundaries, ordered dictionary entries, and document length cap |
 
 Document `i` is `tokens[offsets[i]:offsets[i + 1]]`. The length cap selects training documents from the encoded store, and the packed-data reader assembles whole-document packs under the trainer's token budget. [Packed-data reader](../src/pondera/data/packing.py)
-
-## Throughput and qualification
-
-Measure elapsed time from staged source inputs to the completed Hugging Face projection and trainer-readable encoded documents on the intended Inspire CPU jobs. Compare the same input slice, teacher recipe, and output contracts. Use the following stage measurements to locate the limiting work.
-
-| Stage | Measurements |
-| --- | --- |
-| Prepare | Games and puzzle rows read per second, unique roots retained |
-| Curate | Successfully published documents per second, search and synthesis time, drops and retries |
-| Export | Rows written per second, Parquet size and write time |
-| Fit dictionary | Sample size, fitting wall time, and compression on a fixed corpus slice |
-| Encode | Documents and model tokens written per second, peak memory and scratch use |
-
-Qualify on a bounded mixed-source run with the frozen teacher settings. Verify that the Parquet export matches the shared fields and splits in the curated release. Decode the packed documents with the saved dictionary and verify their board prefixes, trace atoms, and splits against the same release.

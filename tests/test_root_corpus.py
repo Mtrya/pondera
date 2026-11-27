@@ -42,7 +42,6 @@ class RootPoolTests(unittest.TestCase):
         source = replace(
             self.config.sources[0],
             url=archive.resolve().as_uri(),
-            sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
             limit_games=limit_games,
         )
         config = replace(
@@ -136,9 +135,7 @@ class RootPoolTests(unittest.TestCase):
             self.assertEqual(row["source"]["game"], 0)
             self.assertEqual(row["source"]["ply"], ply)
             self.assertEqual(row["source"]["file"], "repetition.pgn")
-            self.assertEqual(
-                row["source"]["archive_sha256"], report["provenance"]["archive_sha256"]
-            )
+            self.assertIsNone(row["source"]["archive_url"])
 
     def test_fivefold_last_visit_excludes_the_entire_per_game_key(self):
         pool, report = self.build("fivefold.pgn")
@@ -158,7 +155,6 @@ class RootPoolTests(unittest.TestCase):
         parallel, _ = self.build("dedup.pgn", validation=1, workers=4)
         rows = list(pool.iter_range())
         self.assertEqual(list(parallel.iter_range()), rows)
-        self.assertEqual(pool.pool_id, parallel.pool_id)
         self.assertEqual(list(RootPool(pool.path).iter_range(1, 3)), rows[1:3])
         self.assertEqual(report["duplicates_within_source"], 2)
         roots = by_key(rows)
@@ -173,17 +169,33 @@ class RootPoolTests(unittest.TestCase):
                 (repetition, game, ply),
             )
 
-    def test_reader_rejects_a_different_pool_with_the_same_row_count(self):
-        first, _ = self.build("repetition.pgn", validation=1)
-        second, _ = self.build("dedup.pgn", validation=1)
-        self.assertEqual(len(first), len(second))
-        self.assertNotEqual(first.pool_id, second.pool_id)
-        mixed = self.root / "mixed-files"
-        mixed.mkdir()
-        shutil.copy2(first.path, mixed / first.path.name)
-        shutil.copy2(second.path.with_name("pool.manifest.json"), mixed)
-        with self.assertRaises(CorpusError):
-            RootPool(mixed)
+    def test_relocated_pool_keeps_its_identity_and_order(self):
+        pool, _ = self.build("repetition.pgn", validation=1)
+        destination = self.root / "relocated"
+        shutil.copytree(pool.path.parent, destination)
+        relocated = RootPool(destination)
+        self.assertEqual(relocated.pool_id, pool.pool_id)
+        self.assertEqual(list(relocated.iter_range()), list(pool.iter_range()))
+
+    def test_comments_blank_lines_and_empty_games_preserve_archive_ordinals(self):
+        archive = self.root / "boundaries.pgn"
+        archive.write_text(
+            '[Event "Empty"] [Variant "Chess960"]\n\n'
+            '[Event "Aborted"] [SetUp "1"]\n\n{ no moves }\n'
+            '[Event "First game"]\n\n'
+            "1 . e4 { note\n  % evaluation } e5\n"
+            "% ignored in column one\n\n2. Nf3 Nc6*\n\n"
+            '[Event "Next game"]\n\n1. d4 d5 *\n'
+        )
+        pool, report = self.build(archive, workers=2)
+        self.assertEqual(report["games_read"], 4)
+        self.assertEqual(report["games_skipped"], {"setup": 1, "variant": 1})
+        roots = by_key(pool.iter_range())
+        self.assertEqual(
+            sorted((r["source"]["game"], r["source"]["ply"]) for r in roots.values()),
+            [(2, 1), (2, 2), (2, 3), (2, 4), (3, 1), (3, 2)],
+        )
+        self.assertEqual(roots[E5_KEY]["source"]["ply"], 2)
 
     def test_invalid_games_keep_their_archive_ordinals(self):
         pool, report = self.build("corrupt.pgn")
@@ -231,10 +243,35 @@ class RootPoolTests(unittest.TestCase):
         self.assertEqual(report["provenance"]["file"], "month.zst")
         self.assertEqual(len(pool), 4)
 
-    def test_cached_archive_requires_matching_content(self):
-        source = replace(
-            self.config.sources[0], url=(self.root / "archive.zip").as_uri()
-        )
-        (self.root / "archive.zip").write_bytes(b"wrong bytes")
+    def test_archive_digest_is_checked_at_download(self):
+        archive = self.root / "archive.pgn"
+        contents = (FIXTURES / "repetition.pgn").read_bytes()
+        archive.write_bytes(contents)
+        source = replace(self.config.sources[0], url=archive.as_uri())
+        cache = self.root / "cache"
         with self.assertRaises(CorpusError):
-            ensure_archive(self.root, source)
+            ensure_archive(cache, source)
+        verified = replace(source, sha256=hashlib.sha256(contents).hexdigest())
+        downloaded = ensure_archive(cache, verified)
+        self.assertEqual(downloaded.read_bytes(), contents)
+        archive.unlink()
+        self.assertEqual(ensure_archive(cache, verified), downloaded)
+
+    def test_source_cache_and_pool_can_use_the_default_source_name(self):
+        archive = FIXTURES / "ties.pgn"
+        source = replace(
+            self.config.sources[0],
+            url=archive.as_uri(),
+            sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+        )
+        config = replace(
+            self.config,
+            sources=(source,),
+            roots=replace(self.config.roots, validation_count=1),
+        )
+        output = self.root / "source"
+        with self.assertRaises(ValueError):
+            prepare_pool(config, output, cache=output / "nested")
+        self.assertFalse(output.exists())
+        prepare_pool(config, output)
+        self.assertEqual(len(RootPool(output)), 2)

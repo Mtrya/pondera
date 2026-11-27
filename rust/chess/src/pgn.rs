@@ -13,10 +13,19 @@ fn reject(reason: &'static str) -> Replay {
     (Some(reason), Vec::new(), false)
 }
 
-fn tag(line: &str) -> Option<(&str, &str)> {
-    let line = line.strip_prefix('[')?.strip_suffix(']')?;
-    let (name, value) = line.split_once(char::is_whitespace)?;
-    Some((name, value.trim().strip_prefix('"')?.strip_suffix('"')?))
+fn tag(tail: &str) -> Option<(&str, &str, &str)> {
+    let tail = tail.strip_prefix('[')?.trim_start();
+    let (name, value) = tail.split_once(char::is_whitespace)?;
+    let value = value.trim_start().strip_prefix('"')?;
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate() {
+        if byte == b'"' && !escaped {
+            let rest = value[index + 1..].trim_start().strip_prefix(']')?;
+            return Some((name, &value[..index], rest.trim_start()));
+        }
+        escaped = byte == b'\\' && !escaped;
+    }
+    None
 }
 
 fn replay(game: &str) -> Replay {
@@ -31,16 +40,24 @@ fn replay(game: &str) -> Replay {
     let mut rows = Vec::new();
 
     for line in game.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('%') {
+        if line.starts_with('%') {
             continue;
         }
-        if initial_tags && !comment {
-            if let Some((name, value)) = tag(line) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if initial_tags && !comment && line.starts_with('[') {
+            let mut rest = line;
+            while !rest.is_empty() {
+                let Some((name, value, next)) = tag(rest) else {
+                    return reject("illegal");
+                };
                 variant |= name == "Variant" && !value.eq_ignore_ascii_case("Standard");
                 has_setup |= matches!(name, "SetUp" | "FEN");
-                continue;
+                rest = next;
             }
+            continue;
         }
         let mut tail = line;
         while !tail.is_empty() {
@@ -58,6 +75,8 @@ fn replay(game: &str) -> Replay {
             };
             match byte {
                 b';' => break,
+                b'}' => return reject("illegal"),
+                b'*' => tail = &tail[1..],
                 b'{' => {
                     comment = true;
                     tail = &tail[1..];
@@ -84,17 +103,17 @@ fn replay(game: &str) -> Replay {
                 }
                 _ => {
                     let end = tail
-                        .find(|ch: char| ch.is_whitespace() || "{}();$".contains(ch))
+                        .find(|ch: char| ch.is_whitespace() || "{}();$*".contains(ch))
                         .unwrap_or(tail.len());
                     let word = &tail[..end];
                     tail = &tail[end..];
                     let movetext = word.trim_start_matches(|ch: char| ch.is_ascii_digit());
-                    let word = if movetext.starts_with('.') {
+                    let word = if movetext.is_empty() || movetext.starts_with('.') {
                         movetext.trim_start_matches('.')
                     } else {
                         word
                     };
-                    if word.is_empty() || matches!(word, "*" | "1-0" | "0-1" | "1/2-1/2" | "e.p.") {
+                    if word.is_empty() || matches!(word, "1-0" | "0-1" | "1/2-1/2" | "e.p.") {
                         continue;
                     }
                     if initial_tags {

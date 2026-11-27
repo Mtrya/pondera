@@ -22,6 +22,7 @@ from pondera.data.pipeline import (
     _check_sidecar,
     _collect_root,
     _Engine,
+    _RootCache,
     _start_engine,
     produce_shards,
     run_pipeline,
@@ -404,6 +405,43 @@ class EngineFailureIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     sorted(searches.values()), [1] * (len(roots) - 1) + [2]
                 )
+
+    def test_a_fully_cached_shard_does_not_block_the_search_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            config, roots, script, golog = fixture_engine(directory, timeout=5)
+            roots = roots[:3]
+            manifest_path = script.with_suffix(".json")
+            manifest = json.loads(manifest_path.read_text())
+            manifest.update(
+                fault="none",
+                blocked_fens=[roots[0]["fen"]],
+                unblock_fen=roots[2]["fen"],
+                gate=str(directory / "gate"),
+            )
+            manifest_path.write_text(json.dumps(manifest))
+
+            output = directory / "release"
+            output.mkdir()
+            cached = sample_root_settings(roots, config, config.seed)[1]
+            lines = (
+                Path(manifest["cases"][cached["fen"]]["sidecar"])
+                .read_text()
+                .splitlines()
+            )
+            record = _collect_root(
+                cached, config, None, None, None, {cached["root_id"]: lines}
+            )
+            _RootCache(output).store(1, cached, record)
+            result = produce_shards(
+                roots, output, config, shard_size=1, workers=2, engine=script
+            )
+
+            self.assertEqual(result["roots"], 3)
+            self.assertEqual(result["dropped"], 0)
+            self.assertCountEqual(
+                golog.read_text().splitlines(), [roots[0]["fen"], roots[2]["fen"]]
+            )
 
     def test_later_shards_unblock_slow_roots_in_both_active_shards(self):
         with tempfile.TemporaryDirectory() as directory:

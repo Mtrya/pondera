@@ -11,7 +11,7 @@ This layer prepares teacher traces and reads them for training. It does not impo
 | `pipeline.py` | Joint width/depth sampling with independent presentation draws; worker engines with per-root search resets; curation from a prepared root pool; per-root checkpoints, atomic shard publication, and independent validation. |
 | `progress.py` | Per-shard curation progress, range reconciliation, and publication of the ordered release manifest. |
 | `dataset.py` | Shared HF schema, local trace atom storage, and ordered discovery of completed release shards. |
-| `trace_encoding.py` | Apply shared merge boundaries and project diagnostic roles through dictionary expansions. |
+| `trace_encoding.py` | Apply the same merge boundaries during fitting and encoding. |
 | `tokenize.py` | Fit a dictionary and encode stored trace atoms into memory maps with reusable shard streams and separate ordered assembly. Save the completed fit beside the output for encoding retries. `encode_dataset` applies an existing dictionary. |
 | `merge_profile.py` | Fit merge dictionaries on the selected corpus in release order and measure compression across the stored presentations, optional held-out groups, and resource costs. |
 | `packing.py` | Read memory-mapped documents, select a seeded nested prefix under the configurable length cap, and pack whole documents from a consumed-document cursor into the training batch contract. |

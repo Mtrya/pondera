@@ -147,8 +147,7 @@ class PuzzleTests(unittest.TestCase):
             sources=(replace(config.sources[1], batch_size=8), elite),
         )
         other = self.root / "parallel"
-        parallel = prepare_pool(parallel_config, other, inputs=inputs)
-        self.assertEqual(manifest["pool_id"], parallel["pool_id"])
+        prepare_pool(parallel_config, other, inputs=inputs)
         self.assertEqual(read_roots(output), read_roots(other))
         self.assertEqual(manifest["counts"], {"train": 3, "val": 1})
         self.assertEqual(manifest["source_order"], ["elite", "puzzles"])

@@ -1,7 +1,6 @@
 """Fit a trace dictionary and encode stored base atoms directly to memory maps."""
 
 import fcntl
-import hashlib
 import json
 import multiprocessing
 import shutil
@@ -84,6 +83,12 @@ def checkpoint_path(output):
     return Path(output).parent / f"{Path(output).name}.fit-checkpoint.json"
 
 
+def _source_key(source, manifest):
+    if dataset_id := manifest.get("dataset_id"):
+        return {"dataset_id": dataset_id}
+    return {"path": str(Path(source).resolve())}
+
+
 def _fitted_dictionary(checkpoint, source, vocab_size, settings, options):
     """Load a previous fit from its checkpoint, or run the fit and record it.
 
@@ -102,10 +107,7 @@ def _fitted_dictionary(checkpoint, source, vocab_size, settings, options):
     fitting["merge_boundaries"] = MERGE_BOUNDARIES
     fitting["input"] = "stored_atoms_in_release_order"
     source = Path(source).resolve()
-    fitting["source"] = {
-        "path": str(source),
-        "manifest": read_release(source) if source.is_dir() else None,
-    }
+    fitting["source"] = _source_key(source, read_release(source))
     if checkpoint.exists():
         record = json.loads(checkpoint.read_text())
         if record.get("settings") != fitting:
@@ -173,45 +175,15 @@ def _tokenize_pool_init(entries):
     _TOKENIZE_ENCODER = TraceEncoder(MergeDictionary(entries))
 
 
-def _source_file_identity(path):
-    stat = path.stat()
-    return [str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
-
-
-def _shard_result(directory, rows, identity):
-    result = load_manifest(directory / "manifest.json")
-    if result.get("source") != identity or result.get("rows") != rows:
-        raise ValueError(f"Encoded shard source differs: {directory}")
-    sizes = {
-        "tokens.u16": result["tokens"] * 2,
-        "offsets.i64": (rows + 1) * 8,
-        "split.u8": rows,
-        "presentation.u8": rows,
-    }
-    if any((directory / name).stat().st_size != size for name, size in sizes.items()):
-        raise ValueError(f"Encoded shard files differ from their manifest: {directory}")
-    return result, sum(sizes.values())
-
-
 def _prepare_shard(encoder, task):
     path, expected, directory, batch_size = task
-    identity = _source_file_identity(path)
     if directory.is_dir():
-        _shard_result(directory, expected, identity)
         return True
     stage = directory.with_name(f".{directory.name}.{uuid4().hex}.tmp")
     try:
         result = _encode_shard(encoder, path, expected, stage, batch_size)
-        if _source_file_identity(path) != identity:
-            raise ValueError(f"Source changed during encoding: {path}")
-        write_manifest(stage / "manifest.json", {**result, "source": identity})
-        try:
-            stage.rename(directory)
-        except OSError:
-            if not directory.is_dir():
-                raise
-            _shard_result(directory, expected, identity)
-            return True
+        write_manifest(stage / "manifest.json", result)
+        stage.rename(directory)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     return False
@@ -277,10 +249,7 @@ def _encode_dataset(
     workspace.mkdir(exist_ok=True)
     identity = {
         "format_version": PACKED_FORMAT_VERSION,
-        "source": str(source.resolve()),
-        "source_manifest": hashlib.sha256(
-            json.dumps(manifest, sort_keys=True).encode()
-        ).hexdigest(),
+        "source": _source_key(source, manifest),
         "grammar_version": TRACE_GRAMMAR_VERSION,
         "tokenizer_version": CHESS_TOKENIZER_VERSION,
         "merge_boundaries": MERGE_BOUNDARIES,
@@ -308,7 +277,7 @@ def _encode_dataset(
     shards_seconds = time.monotonic() - started
     dataset.mkdir()
     packed_metadata = {
-        **{key: value for key, value in identity.items() if key != "source_manifest"},
+        **identity,
         "source": str(source),
         "source_dataset_id": manifest.get("dataset_id") or uuid4().hex,
         "vocabulary": vocabulary,
@@ -378,18 +347,10 @@ def _assemble(dataset, tasks, metadata):
         (dataset / "presentation.u8").open("wb") as presentation_file,
     ):
         np.asarray([0], dtype=np.int64).tofile(offsets)
-        for path, expected, directory, _ in tasks:
-            result, size = _shard_result(
-                directory, expected, _source_file_identity(path)
-            )
+        for _, expected, directory, _ in tasks:
+            result = load_manifest(directory / "manifest.json")
             boundaries = np.fromfile(directory / "offsets.i64", dtype=np.int64)
             lengths = np.diff(boundaries)
-            if (
-                boundaries[0]
-                or boundaries[-1] != result["tokens"]
-                or np.any(lengths <= 0)
-            ):
-                raise ValueError(f"Invalid offsets in encoded shard: {directory}")
             with (directory / "tokens.u16").open("rb") as handle:
                 shutil.copyfileobj(handle, tokens, length=1024 * 1024)
             split_codes = np.fromfile(directory / "split.u8", dtype=np.uint8)
@@ -403,7 +364,7 @@ def _assemble(dataset, tasks, metadata):
             rows += result["rows"]
             base_atoms += result["base_atoms"]
             trace_tokens += result["trace_tokens"]
-            staged_bytes += size
+            staged_bytes += 2 * result["tokens"] + boundaries.nbytes + 2 * expected
             unique, counts = np.unique(lengths, return_counts=True)
             length_counts.update(dict(zip(unique.tolist(), counts.tolist())))
             for name, code in SPLIT_CODES.items():

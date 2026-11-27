@@ -5,12 +5,12 @@ import json
 from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from pondera.chess.vocabulary import CHESS_TOKENIZER_VERSION
 from pondera.data.dataset import (
     DATA_FORMAT_VERSION,
     HF_COLUMNS,
@@ -32,8 +32,8 @@ class _SplitParts:
         self.split = split
         self.max_bytes = max_bytes
         self.files = []
-        self.buffer = []
-        self.buffer_bytes = 0
+        self.sink = self.writer = None
+        self.rows = 0
         self.group = []
         self.group_rows = 0
 
@@ -44,52 +44,77 @@ class _SplitParts:
             self.group_rows += take
             batch = batch.slice(take)
             if self.group_rows == ROW_GROUP_ROWS:
-                self._buffer_group()
+                self._write_group()
 
-    def _buffer_group(self):
+    def _write_group(self):
         group = pa.Table.from_batches(self.group, schema=HF_SCHEMA).combine_chunks()
         self.group = []
         self.group_rows = 0
-        if self.buffer and self.buffer_bytes + group.nbytes > self.max_bytes:
-            self._flush()
-        self.buffer.append(group)
-        self.buffer_bytes += group.nbytes
-        if self.buffer_bytes >= self.max_bytes:
-            self._flush()
+        self._append(group)
 
-    def _flush(self):
-        self._write(pa.concat_tables(self.buffer))
-        self.buffer.clear()
-        self.buffer_bytes = 0
+    def _append(self, group, *, rollover=True):
+        if self.writer is None:
+            name = f"{self.split}-{len(self.files):08d}.parquet"
+            self.path = self.directory / name
+            self.sink = pa.OSFile(str(self.path), "wb")
+            self.writer = pq.ParquetWriter(
+                self.sink,
+                HF_SCHEMA,
+                compression="zstd",
+                compression_level=3,
+                use_dictionary=["presentation", "turn", "final_move"],
+            )
+        self.writer.write_table(group, row_group_size=ROW_GROUP_ROWS)
+        self.rows += group.num_rows
+        # Leave room for the footer and most of the next compressed group.
+        if rollover and self.sink.tell() >= self.max_bytes - self.max_bytes // 20:
+            self._finish()
 
-    def _write(self, table):
-        name = f"{self.split}-{len(self.files):05d}.parquet"
-        destination = self.directory / name
-        pq.write_table(
-            table,
-            destination,
-            row_group_size=ROW_GROUP_ROWS,
-            compression="zstd",
-            compression_level=3,
-            use_dictionary=["presentation", "turn", "final_move"],
-        )
-        size = destination.stat().st_size
-        if size > self.max_bytes and table.num_rows > 1:
-            # Check the closed file, including its footer. An oversized document
-            # occupies a part on its own because rows are indivisible.
-            middle = table.num_rows // 2
-            self._write(table.slice(0, middle))
-            self._write(table.slice(middle))
+    def _close_writer(self):
+        if self.writer is not None:
+            self.writer.close()
+            self.sink.close()
+            self.writer = self.sink = None
+
+    def _finish(self):
+        self._close_writer()
+        path, rows = self.path, self.rows
+        self.rows = 0
+        size = path.stat().st_size
+        if size <= self.max_bytes or rows == 1:
+            self.files.append(
+                {"path": f"data/{path.name}", "rows": rows, "bytes": size}
+            )
             return
-        self.files.append(
-            {"path": f"data/{name}", "rows": table.num_rows, "bytes": size}
-        )
+
+        # A large group or footer can overshoot the estimate. Keep the prefix
+        # together and move its last group into a new part. Only a single
+        # oversized group needs to be split by rows.
+        oversized = path.with_name(f".{path.name}.{uuid4().hex}")
+        path.rename(oversized)
+        try:
+            with pq.ParquetFile(oversized) as source:
+                groups = source.num_row_groups
+                if groups == 1:
+                    table = source.read_row_group(0)
+                    middle = rows // 2
+                    for half in (table.slice(0, middle), table.slice(middle)):
+                        self._append(half, rollover=False)
+                        self._finish()
+                else:
+                    for index in range(groups - 1):
+                        self._append(source.read_row_group(index), rollover=False)
+                    self._finish()
+                    self._append(source.read_row_group(groups - 1), rollover=False)
+                    self._finish()
+        finally:
+            oversized.unlink()
 
     def close(self):
         if self.group:
-            self._buffer_group()
-        if self.buffer:
-            self._flush()
+            self._write_group()
+        if self.writer is not None:
+            self._finish()
 
 
 def export_hf(release, output, batch_size=1024, *, max_part_bytes=MAX_PART_BYTES):
@@ -105,7 +130,6 @@ def export_hf(release, output, batch_size=1024, *, max_part_bytes=MAX_PART_BYTES
     for field, expected in (
         ("format_version", DATA_FORMAT_VERSION),
         ("grammar_version", TRACE_GRAMMAR_VERSION),
-        ("tokenizer_version", CHESS_TOKENIZER_VERSION),
     ):
         if manifest.get(field) != expected:
             raise ValueError(f"Unsupported release {field}: {manifest.get(field)}")
@@ -119,32 +143,40 @@ def export_hf(release, output, batch_size=1024, *, max_part_bytes=MAX_PART_BYTES
             label: _SplitParts(directory, name, max_part_bytes)
             for label, name in SPLIT_NAMES.items()
         }
-        for path, expected, _ in parquet_sources(release, manifest):
-            source = pq.ParquetFile(path)
-            if source.schema_arrow != TRACE_SCHEMA:
-                raise ValueError(
-                    f"Shard schema differs from the release contract: {path}"
-                )
-            if source.metadata.num_rows != expected:
-                raise ValueError(f"Shard row count differs from its release: {path}")
-            for batch in source.iter_batches(
-                batch_size=batch_size, columns=[*HF_COLUMNS, "split"], use_threads=False
-            ):
-                labels = batch["split"]
-                projected = batch.select(HF_COLUMNS)
-                selected_rows = 0
-                for label, parts in splits.items():
-                    selected = projected.filter(pc.equal(labels, label))
-                    if selected.num_rows:
-                        parts.add(selected)
-                        counts[parts.split] += selected.num_rows
-                        selected_rows += selected.num_rows
-                if selected_rows != batch.num_rows:
-                    raise ValueError(f"Unknown release split in {path}")
-        if not counts:
-            raise ValueError("Release contains no rows")
-        for parts in splits.values():
-            parts.close()
+        try:
+            for path, expected, _ in parquet_sources(release, manifest):
+                with pq.ParquetFile(path) as source:
+                    if source.schema_arrow != TRACE_SCHEMA:
+                        raise ValueError(
+                            f"Shard schema differs from the release contract: {path}"
+                        )
+                    if source.metadata.num_rows != expected:
+                        raise ValueError(
+                            f"Shard row count differs from its release: {path}"
+                        )
+                    for batch in source.iter_batches(
+                        batch_size=batch_size,
+                        columns=[*HF_COLUMNS, "split"],
+                        use_threads=False,
+                    ):
+                        labels = batch["split"]
+                        projected = batch.select(HF_COLUMNS)
+                        selected_rows = 0
+                        for label, parts in splits.items():
+                            selected = projected.filter(pc.equal(labels, label))
+                            if selected.num_rows:
+                                parts.add(selected)
+                                counts[parts.split] += selected.num_rows
+                                selected_rows += selected.num_rows
+                        if selected_rows != batch.num_rows:
+                            raise ValueError(f"Unknown release split in {path}")
+            if not counts:
+                raise ValueError("Release contains no rows")
+            for parts in splits.values():
+                parts.close()
+        finally:
+            for parts in splits.values():
+                parts._close_writer()
         stage.rename(output)
     files = [file for parts in splits.values() for file in parts.files]
     return {"rows": dict(counts), "files": files, "columns": list(HF_COLUMNS)}

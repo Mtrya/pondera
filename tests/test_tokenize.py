@@ -289,17 +289,18 @@ class TokenizeTests(unittest.TestCase):
             merge_and_encode(self.source, output, config)
         self.assertFalse(output.exists())
 
-    def test_fit_checkpoint_rejects_a_different_source_or_release(self):
+    def test_fit_checkpoint_reuses_a_relocated_release_and_rejects_a_new_release(self):
         from dataclasses import replace
 
         config = replace(load_config().merge, vocab_size=CHESS_VOCAB_SIZE)
         output = self.root / "source-checkpoint"
-        merge_and_encode(self.source, output, config)
+        first = merge_and_encode(self.source, output, config)
         shutil.rmtree(output)
         other = self.root / "other-source"
         shutil.copytree(self.source, other)
-        with self.assertRaises(ValueError):
-            merge_and_encode(other, output, config)
+        resumed = merge_and_encode(other, output, config)
+        self.assertEqual(resumed["documents"], first["documents"])
+        shutil.rmtree(output)
         manifest = load_manifest(self.source / "release.json")
         manifest["dataset_id"] = "replacement-dataset"
         write_manifest(self.source / "release.json", manifest)

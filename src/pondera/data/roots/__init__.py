@@ -13,7 +13,13 @@ def prepare_pool(config, output, *, inputs=None, cache=None):
     if output.exists():
         raise FileExistsError(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    cache = Path(cache) if cache is not None else output.parent / "source"
+    if cache is None:
+        cache = output.parent / "source"
+        if cache.resolve().is_relative_to(output.resolve()):
+            cache = output.with_name(f".{output.name}-source")
+    elif Path(cache).resolve().is_relative_to(output.resolve()):
+        raise ValueError("Source cache must be outside the pool output")
+    cache = Path(cache)
     inputs = inputs or {}
     unknown = set(inputs) - {source.name for source in config.sources}
     if unknown:
@@ -24,11 +30,17 @@ def prepare_pool(config, output, *, inputs=None, cache=None):
             local = inputs.get(source.name)
             if source.kind == "pgn":
                 archive = (
-                    pgn.verify_archive(local, source)
+                    Path(local)
                     if local is not None
                     else pgn.ensure_archive(cache / source.name, source)
                 )
-                report = pgn.collect(archive, source, config.roots.workers, index)
+                report = pgn.collect(
+                    archive,
+                    source,
+                    config.roots.workers,
+                    index,
+                    local=local is not None,
+                )
             else:
                 files = puzzles.parquet_files(source, cache / source.name, local=local)
                 report = puzzles.collect(files, source, index, local=local is not None)

@@ -28,10 +28,10 @@ def verify_archive(path, source):
 
 def ensure_archive(directory, source):
     """Download the configured archive once and verify its digest."""
-    directory = Path(directory)
+    directory = Path(directory) / source.sha256
     path = directory / Path(urllib.parse.urlsplit(source.url).path).name
     if path.exists():
-        return verify_archive(path, source)
+        return path
     directory.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.part")
     request = urllib.request.Request(
@@ -111,31 +111,30 @@ _PGN_DELIMITERS = re.compile(r"[{}();]")
 def _games(stream):
     """Frame PGN games while keeping archive IO outside the chess backend."""
     lines = []
-    in_movetext = in_comment = False
+    tags = post_tags = in_comment = False
     variations = 0
-    for line in stream:
-        stripped = line.strip().removeprefix("\ufeff")
-        if stripped.startswith("%"):
+    for raw_line in stream:
+        line = raw_line.removeprefix("\ufeff")
+        if line.startswith("%"):
             continue
+        stripped = line.strip()
         if not in_comment and not variations:
-            if in_movetext and (not stripped or stripped.startswith("[")):
-                yield "".join(lines)
-                lines = []
-                in_movetext = False
+            if stripped.startswith("["):
+                if post_tags:
+                    yield "".join(lines)
+                    lines = []
+                lines.append(stripped + "\n")
+                tags, post_tags = True, False
+                continue
+            if tags:
+                post_tags = True
             if not stripped:
                 continue
-            if not in_movetext and stripped.startswith("["):
-                lines.append(stripped + "\n")
-                continue
-        lines.append(line.removeprefix("\ufeff"))
+        lines.append(line)
         cursor = 0
         for delimiter in _PGN_DELIMITERS.finditer(line):
-            if (
-                not in_comment
-                and not variations
-                and line[cursor : delimiter.start()].strip()
-            ):
-                in_movetext = True
+            if not post_tags and not in_comment and not variations:
+                post_tags = bool(line[cursor : delimiter.start()].strip())
             cursor = delimiter.end()
             char = delimiter[0]
             if in_comment:
@@ -150,8 +149,8 @@ def _games(stream):
             elif char == ")" and variations:
                 variations -= 1
         else:
-            if not in_comment and not variations and line[cursor:].strip():
-                in_movetext = True
+            if not post_tags and not in_comment and not variations:
+                post_tags = bool(line[cursor:].strip())
     if lines:
         yield "".join(lines)
 
@@ -165,7 +164,7 @@ def _replayed_games(games, workers):
             yield from executor.map(rules.replay_mainline, batch)
 
 
-def collect(archive, source, workers, index):
+def collect(archive, source, workers, index, *, local=False):
     """Stream eligible per-game winners into the deduplication index."""
     started = time.monotonic()
     counts = Counter(
@@ -202,8 +201,7 @@ def collect(archive, source, workers, index):
     return {
         "kind": source.kind,
         "provenance": {
-            "archive_url": source.url,
-            "archive_sha256": source.sha256,
+            "archive_url": None if local else source.url,
             "file": member,
         },
         "limit_games": source.limit_games,

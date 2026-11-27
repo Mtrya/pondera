@@ -2,13 +2,8 @@
 
 import numpy as np
 
-from pondera.chess.merge import MergeDictionary, MergeEncoder, decode, encode_corpus
+from pondera.chess.merge import MergeEncoder, encode_corpus
 from pondera.chess.vocabulary import CHESS_VOCAB_SIZE, DELIM, FINAL
-from pondera.data.trace import ROLE_COUNT, ROLE_FINAL_MOVE, derive_trace_roles
-
-# A mixed composite has one next-token loss, rather than one loss per atom.
-# Decision-containing composites retain the final-decision diagnostic role.
-ROLE_MIXED = ROLE_COUNT
 
 # These atoms and the decision after FINAL must have their own predictions.
 STANDALONE_ATOMS = tuple(range(DELIM, CHESS_VOCAB_SIZE))
@@ -65,26 +60,3 @@ def encode_traces(traces, dictionary, workers=1):
         result.append(np.concatenate(encoded[position : position + len(group)]))
         position += len(group)
     return result
-
-
-def encoded_roles(tokens, dictionary=MergeDictionary()):
-    """One diagnostic role per stored token, interpreting flat expansions.
-
-    Homogeneous composites retain their atom role; heterogeneous composites
-    use MIXED, except a token containing the final decision uses FINAL_MOVE.
-    That role locates a token prediction, not an isolated atom prediction.
-    """
-    if not len(dictionary):
-        return derive_trace_roles(tokens)
-    tokens = np.asarray(tokens, dtype=np.int64)
-    atoms = decode(tokens, dictionary)
-    roles = derive_trace_roles(atoms)
-    lengths = dictionary.token_lengths[tokens]
-    ends = np.cumsum(lengths)
-    starts = ends - lengths
-    low = np.minimum.reduceat(roles, starts)
-    high = np.maximum.reduceat(roles, starts)
-    projected = np.where(low == high, low, ROLE_MIXED).astype(np.int8)
-    decision = np.flatnonzero(roles == ROLE_FINAL_MOVE)
-    projected[np.searchsorted(ends, decision, side="right")] = ROLE_FINAL_MOVE
-    return projected

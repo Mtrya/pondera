@@ -54,6 +54,26 @@ class RulesTests(unittest.TestCase):
         self.assertEqual(board.parse_san("Ngf5").uci(), "g3f5")
         self.assertEqual(board.san(rules.Move.from_uci("g3f5")), "Ngf5")
 
+    def test_castling_san_requires_the_king(self):
+        board = rules.Board("7k/8/8/8/8/8/K7/4R3 w - - 0 1")
+        self.assertEqual(board.parse_san("Rg1").uci(), "e1g1")
+        with self.assertRaises(ValueError):
+            board.parse_san("O-O")
+        board = rules.Board("k7/8/8/8/8/8/8/4K2R w K - 0 1")
+        self.assertEqual(board.parse_san("O-O").uci(), "e1g1")
+
+    def test_pawn_san_advance_cannot_select_a_capture(self):
+        board = rules.Board()
+        board.push(board.parse_san("e4"))
+        board.push(board.parse_san("d5"))
+        with self.assertRaises(ValueError):
+            board.parse_san("d5")
+        self.assertEqual(board.parse_san("exd5").uci(), "e4d5")
+        self.assertEqual(board.parse_san("e4d5").uci(), "e4d5")
+
+    def test_pgn_rejects_an_unmatched_comment_terminator(self):
+        self.assertEqual(rules.replay_mainline("1. e4 } e5 *"), ("illegal", [], False))
+
     def test_game_over_uses_ordinary_draw_rules(self):
         board = rules.Board("6k1/8/8/8/8/8/8/K6R w - - 149 1")
         self.assertFalse(board.is_game_over())

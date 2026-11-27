@@ -19,7 +19,6 @@ from pondera.chess.vocabulary import (
     VALUE,
 )
 from pondera.data.config import load_config
-from pondera.data.pipeline import profile_roots
 from pondera.data.trace import (
     DRAW_CLAIM_BOUND,
     PRESENTATIONS,
@@ -509,12 +508,6 @@ class SynthesisTests(unittest.TestCase):
             "board_frontier",
         ):
             self.assertIn(name, stats)
-        profile = profile_roots([synthesized])
-        self.assertEqual(profile["roots"], 1)
-        self.assertEqual(profile["rows"], 3)
-        self.assertEqual(profile["split_counts"], {"train": 1})
-        self.assertEqual(profile["presentation_counts"]["full"], 1)
-        self.assertGreater(profile["thinking_tokens"]["median"], 0)
 
     def test_seed_changes_only_presentation_and_board_choices(self):
         sidecar, root, first = synthesize_case("start_d4", seed=640)

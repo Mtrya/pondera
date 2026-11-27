@@ -28,7 +28,7 @@ def parquet_files(source, cache, *, local=None):
                     name,
                     repo_type="dataset",
                     revision=source.revision,
-                    local_dir=cache,
+                    cache_dir=cache,
                 )
             )
             for name in sorted(names)
@@ -61,16 +61,11 @@ def _cutoff(rows, fraction):
 def collect(files, source, index, *, local=False):
     """Count the raw prefix before testing eligibility or deduplicating."""
     started = time.monotonic()
-    shards = [pq.ParquetFile(path) for path in files]
-    total = sum(shard.metadata.num_rows for shard in shards)
+    total = 0
+    for path in files:
+        with pq.ParquetFile(path) as shard:
+            total += shard.metadata.num_rows
     limit = _cutoff(total, source.prefix_fraction)
-    fractions = sorted({0.5, 0.75, 0.8, 0.85, 0.9, 0.95, source.prefix_fraction})
-    milestones = iter(
-        (_cutoff(total, fraction), fraction)
-        for fraction in fractions
-        if fraction <= source.prefix_fraction
-    )
-    milestone = next(milestones, None)
     counts = dict(
         raw_rows=0,
         terminal=0,
@@ -78,41 +73,32 @@ def collect(files, source, index, *, local=False):
         duplicates_elite=0,
         retained=0,
     )
-    census = []
-
-    def record_milestones():
-        nonlocal milestone
-        while milestone is not None and counts["raw_rows"] == milestone[0]:
-            census.append({"prefix_fraction": milestone[1], **counts})
-            milestone = next(milestones, None)
-
-    record_milestones()
-    for path, shard in zip(files, shards, strict=True):
+    for path in files:
         if counts["raw_rows"] == limit:
             break
         ordinal = 0
-        for batch in shard.iter_batches(
-            batch_size=source.batch_size, use_threads=False
-        ):
-            remaining = limit - counts["raw_rows"]
-            for row in batch.slice(0, remaining).to_pylist():
-                try:
-                    position = _setup_position(row)
-                    outcome = (
-                        "terminal"
-                        if position is None
-                        else index.add_puzzle(*position, row)
-                    )
-                except (KeyError, TypeError, ValueError) as error:
-                    raise CorpusError(
-                        f"{path}: raw row {ordinal} (zero-based): {error}"
-                    ) from error
-                counts[outcome] += 1
-                counts["raw_rows"] += 1
-                ordinal += 1
-                record_milestones()
-            if counts["raw_rows"] == limit:
-                break
+        with pq.ParquetFile(path) as shard:
+            for batch in shard.iter_batches(
+                batch_size=source.batch_size, use_threads=False
+            ):
+                remaining = limit - counts["raw_rows"]
+                for row in batch.slice(0, remaining).to_pylist():
+                    try:
+                        position = _setup_position(row)
+                        outcome = (
+                            "terminal"
+                            if position is None
+                            else index.add_puzzle(*position, row)
+                        )
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise CorpusError(
+                            f"{path}: raw row {ordinal} (zero-based): {error}"
+                        ) from error
+                    counts[outcome] += 1
+                    counts["raw_rows"] += 1
+                    ordinal += 1
+                if counts["raw_rows"] == limit:
+                    break
 
     return {
         "kind": source.kind,
@@ -126,6 +112,5 @@ def collect(files, source, index, *, local=False):
         "prefix_fraction": source.prefix_fraction,
         "raw_rows_available": total,
         **counts,
-        "census": census,
         "elapsed_seconds": time.monotonic() - started,
     }

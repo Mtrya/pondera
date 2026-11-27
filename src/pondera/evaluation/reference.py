@@ -1,6 +1,5 @@
 """Reusable Stockfish scores for legal moves, kept outside model inference."""
 
-import hashlib
 import json
 import shutil
 import sqlite3
@@ -97,8 +96,6 @@ class _ReferenceEngine(UciProcess):
 class Reference:
     def __init__(self, executable, cache, *, nodes, threads=1, hash_mb=64):
         executable = Path(shutil.which(str(executable)) or executable).resolve()
-        with executable.open("rb") as handle:
-            binary = hashlib.file_digest(handle, "sha256").hexdigest()
         with ExitStack() as resources:
             self.engine = _ReferenceEngine(executable, threads, hash_mb)
             resources.callback(self.engine.close)
@@ -108,10 +105,7 @@ class Reference:
                 "threads": threads,
                 "hash_mb": hash_mb,
             }
-            # Internal cache identity also distinguishes builds sharing an engine name.
-            self.identity = json.dumps(
-                {**self.settings, "binary": binary}, sort_keys=True
-            )
+            self.identity = json.dumps(self.settings, sort_keys=True)
             self.nodes = nodes
             self.cache = sqlite3.connect(cache)
             resources.callback(self.cache.close)

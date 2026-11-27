@@ -121,6 +121,10 @@ class ReleaseProgress:
         counts = self.counts()
         if counts["shards"] != self.shards or counts["pending"]:
             return counts
+        if not counts["roots"]:
+            raise ValueError(
+                "Every selected root was dropped; no release was published"
+            )
         if self.release.is_file():
             return counts
         payload = {
@@ -152,7 +156,12 @@ class ReleaseProgress:
         for index, rows in self.db.execute(
             "SELECT ordinal, rows FROM shard ORDER BY ordinal"
         ):
-            yield {"path": f"shard-{index:06d}", "rows": rows}
+            path = f"shard-{index:06d}"
+            if not (self.directory / path).is_dir():
+                raise FileNotFoundError(
+                    f"Registered curation shard is missing: {self.directory / path}"
+                )
+            yield {"path": path, "rows": rows}
 
     def _drops(self):
         for index, dropped in self.db.execute(

@@ -692,7 +692,9 @@ impl Position {
                 to,
                 promotion: 0,
             };
-            return self.legal(ply).then_some(ply).ok_or("Illegal castling");
+            return (self.at(from) == KING * self.color() && self.legal(ply))
+                .then_some(ply)
+                .ok_or("Illegal castling");
         }
         let mut bytes = token.as_bytes();
         let promotion = match bytes.last() {
@@ -724,7 +726,9 @@ impl Position {
             [_, _] => (None, None, Some(square(hint).ok_or("Invalid SAN origin")?)),
             _ => return Err("Invalid SAN origin"),
         };
-        let must_move = piece.unwrap_or(PAWN) * self.color();
+        let kind = piece.unwrap_or(PAWN);
+        let file = file.or_else(|| (kind == PAWN && from_square.is_none()).then_some(to % 8));
+        let must_move = kind * self.color();
         let mut found = None;
         let ambiguous = (0..64).any(|from| {
             if (piece.is_some() || from_square.is_none()) && self.at(from) != must_move
