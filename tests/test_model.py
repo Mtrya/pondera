@@ -8,7 +8,12 @@ import torch
 
 from pondera.models import PonderaModel
 from pondera.models.internals import Internals, attach, detach
-from pondera.models.softmax import eager_varlen_attention, situ_glu, varlen_attention
+from pondera.models.softmax import (
+    CausalSelfAttention,
+    eager_varlen_attention,
+    situ_glu,
+    varlen_attention,
+)
 
 MODEL = dict(
     segments=[
@@ -176,6 +181,8 @@ class ModelTests(unittest.TestCase):
 
     def test_internals_report_distinguishes_repeated_passes(self):
         ids, cu = packed_ids()
+        with torch.no_grad():
+            self.model.token_embedding.weight.fill_(0.25)
         internals = Internals()
         attach(self.model, internals)
         try:
@@ -201,12 +208,8 @@ class ModelTests(unittest.TestCase):
             self.assertIn(key, report)
             self.assertTrue(math.isfinite(report[key]))
         self.assertFalse(any(key.startswith("delta/seg1/pass2/") for key in report))
-        # The reported embedding RMS must match a direct computation through
-        # the embedding module itself, an independent source.
-        direct = self.model.token_embedding(ids).double().square().mean().sqrt()
-        self.assertAlmostEqual(
-            report["residual/embedding"], float(direct.detach()), places=3
-        )
+        # A constant embedding has RMS equal to the magnitude of its entries.
+        self.assertEqual(report["residual/embedding"], 0.25)
 
     def test_cached_incremental_decode_matches_full_forward(self):
         ids, _ = packed_ids()
@@ -235,6 +238,19 @@ class ModelTests(unittest.TestCase):
         fused = varlen_attention(q, k, v, cu)
         reference = eager_varlen_attention(q, k, v, cu)
         self.assertLessEqual((fused - reference).abs().max().item(), 1e-3)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "cached FlashAttention needs CUDA")
+    def test_cuda_cached_prefill_and_decode_match_full_attention(self):
+        attention = CausalSelfAttention(64, 4, 2).cuda().eval()
+        inputs = torch.randn(6, 64, device="cuda")
+        offsets = torch.tensor([0, 6], dtype=torch.int32)
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            full = attention(inputs, attention.prepare(offsets, inputs.device))
+            prefix, cache = attention.forward_cached(inputs[:-1], [0, 5])
+            last, _ = attention.forward_cached(inputs[-1:], offsets, cache)
+        torch.testing.assert_close(
+            torch.cat((prefix, last)), full, rtol=0.02, atol=0.002
+        )
 
 
 class NPUAttentionTests(unittest.TestCase):

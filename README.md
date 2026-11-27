@@ -14,14 +14,16 @@ cd pondera
 uv sync --group dev
 ```
 
-Python 3.13 or later is required. Stockfish and fastchess are external executables; install them separately and put them on `PATH`. A minimal inference installation needs only `uv sync --no-dev`.
+Python 3.13 or later is required. Install Stockfish and fastchess separately and put them on `PATH`. For CPU inference, use `uv sync --no-dev`.
+
+For CUDA training or inference, pass `--extra cuda` to `uv sync` or `uv run` to install the KDA kernels. Triton also needs a C compiler and the headers for your Python installation. On Ascend, use a compatible Torch NPU, Triton Ascend, and FLA environment. See the [FLA backend installation guide](https://github.com/fla-org/flash-linear-attention/blob/main/INSTALL.md).
 
 ## Usage
 
 The package is a library. Train a model from a packed dataset:
 
 ```bash
-uv run python -m pondera.training.packed --config configs/train.toml --packed ENCODED --output RUN --device cuda
+uv run --extra cuda python -m pondera.training.packed --config configs/train.toml --packed ENCODED --output RUN --device cuda
 ```
 
 Model architecture and dimensions, data selection, optimization, token budgets, stopping targets, validation cadence, and checkpoint retention are configured in [configs/train.toml](configs/train.toml). Dataset/output/checkpoint paths, device selection, and `--track` / `--no-track` remain command arguments. Resume uses the same recipe with `--resume RUN/checkpoint.pth`; change tunables in the TOML, and incompatible model or sampling settings are rejected.

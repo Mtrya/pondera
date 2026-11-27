@@ -276,20 +276,11 @@ def evaluate_checkpoint(
     budgets = sorted({0, config.reasoning_tokens})
     output.mkdir()
     reference_path = Path(cache) if cache is not None else output / "reference.sqlite"
-    reference_path.parent.mkdir(parents=True, exist_ok=True)
-    reference = Reference(
-        engine,
-        reference_path,
-        nodes=config.nodes,
-        threads=config.threads,
-        hash_mb=config.hash_mb,
-    )
     report = {
         "status": "running",
         "checkpoint": str(Path(checkpoint).resolve()),
         "checkpoint_metadata": predictor.metadata,
         "config": asdict(config),
-        "reference": reference.settings,
         "sources": {
             kind: str(Path(path).resolve())
             for kind, path in (("root", roots), ("puzzle", puzzles))
@@ -297,8 +288,18 @@ def evaluate_checkpoint(
         },
         "budgets": {},
     }
-    write_manifest(output / "summary.json", report)
+    reference = None
     try:
+        reference_path.parent.mkdir(parents=True, exist_ok=True)
+        reference = Reference(
+            engine,
+            reference_path,
+            nodes=config.nodes,
+            threads=config.threads,
+            hash_mb=config.hash_mb,
+        )
+        report["reference"] = reference.settings
+        write_manifest(output / "summary.json", report)
         with (output / "positions.jsonl").open("w", buffering=1) as handle:
             for budget in budgets:
                 records = []
@@ -367,7 +368,8 @@ def evaluate_checkpoint(
         write_manifest(output / "summary.json", report)
         raise
     finally:
-        reference.close()
+        if reference is not None:
+            reference.close()
     report["status"] = "complete"
     write_manifest(output / "summary.json", report)
     return report

@@ -78,6 +78,13 @@ def _ddp_worker(rank, store, packed, model_config, output, config, runs):
 
 
 class MuonTests(unittest.TestCase):
+    def test_hyperball_unit_step_preserves_radius_when_candidate_is_zero(self):
+        parameter = torch.nn.Parameter(torch.tensor([[2.0]]))
+        parameter.grad = torch.ones_like(parameter)
+        Muon([parameter], lr=1.0, hyperball=True).step()
+        # A scalar update in the same direction has length 2 and cancels the weight.
+        torch.testing.assert_close(parameter, torch.tensor([[2.0]]))
+
     def test_hyperball_perpendicular_update(self):
         parameter = torch.nn.Parameter(torch.tensor([[3.0, 0.0], [0.0, 4.0]]))
         optimizer = Muon([parameter], lr=0.1, hyperball=True)
@@ -971,7 +978,10 @@ checkpoint_keep_last = 2
             self.config(1),
             output,
             track=False,
+            validation_document_steps=(1,),
         )
+        first_report = output / "validation-00000001" / "summary.json"
+        initial_summary = first_report.read_text()
         old_checkpoint = self.root / "old-checkpoint.pth"
         shutil.copy2(output / "checkpoint.pth", old_checkpoint)
         train(
@@ -982,7 +992,9 @@ checkpoint_keep_last = 2
             output,
             resume=old_checkpoint,
             track=False,
+            validation_document_steps=(2, 3),
         )
+        self.assertTrue((output / "validation-00000003" / "summary.json").is_file())
         history_path = output / "history.jsonl"
         expected = [
             json.loads(line)["loss"] for line in history_path.read_text().splitlines()
@@ -995,7 +1007,11 @@ checkpoint_keep_last = 2
             output,
             resume=old_checkpoint,
             track=False,
+            validation_document_steps=(2,),
         )
+        self.assertEqual(first_report.read_text(), initial_summary)
+        self.assertTrue((output / "validation-00000002" / "documents.jsonl").is_file())
+        self.assertFalse((output / "validation-00000003").exists())
         records = [json.loads(line) for line in history_path.read_text().splitlines()]
         self.assertEqual([record["update"] for record in records], [1, 2, 3])
         self.assertEqual([record["loss"] for record in records], expected)
@@ -1059,20 +1075,42 @@ checkpoint_keep_last = 2
         # partial optimizer update need not match an originally longer run.
         self.assertEqual(partial["presented_documents"], int(count * 0.75))
         self.assertEqual(resumed["presented_documents"], expected_count)
-        expected_new_tokens = sum(
-            int(documents.lengths[batch].sum())
-            for batch, _ in packed_batch_indices(
-                documents,
-                select_documents(documents, seed=640),
-                640,
-                config(1.5).max_pack_tokens,
-                start_document=partial["presented_documents"],
-                presentations=1.5,
-            )
-        )
+        # Uninterrupted training sees the same document suffix without a resume cursor.
         self.assertEqual(
-            sum(record["tokens"] for record in resumed["history"]), expected_new_tokens
+            sum(record["tokens"] for record in partial["history"] + resumed["history"]),
+            sum(record["tokens"] for record in reference["history"]),
         )
+
+    def test_training_without_validation_skips_metrics_and_rejects_report_requests(
+        self,
+    ):
+        packed = self.root / "packed"
+        (packed / "split.u8").write_bytes(bytes(len(PackedDocuments(packed))))
+        output = self.root / "no-validation"
+        result = train(
+            self.make_model(),
+            self.model_config,
+            packed,
+            self.config(2),
+            output,
+            track=False,
+        )
+        self.assertEqual(result["updates"], 2)
+        self.assertNotIn("val_loss", result["history"][-1])
+        self.assertTrue((output / "checkpoint.pth").is_file())
+
+        rejected = self.root / "no-document-report"
+        with self.assertRaises(ValueError):
+            train(
+                self.make_model(),
+                self.model_config,
+                packed,
+                self.config(2),
+                rejected,
+                track=False,
+                validation_document_steps=(1,),
+            )
+        self.assertFalse((rejected / "history.jsonl").exists())
 
     def test_update_stop_keeps_schedule_and_paired_validation(self):
         documents = PackedDocuments(self.root / "packed")

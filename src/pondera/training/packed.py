@@ -12,10 +12,12 @@ import importlib
 import json
 import math
 import os
+import shutil
 import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
@@ -153,8 +155,6 @@ def validation_loss(
     document_losses=None,
 ):
     model = _module(model)
-    was_training = model.training
-    model.eval()
     batches = pack_batches(documents.lengths, indices, budget)
     internals = Internals() if collect_internals and rank == 0 and batches else None
     total_loss = 0.0
@@ -163,6 +163,8 @@ def validation_loss(
     if document_losses is not None:
         positions = {int(document): i for i, document in enumerate(indices)}
         sums = np.zeros(len(indices), dtype=np.float32)
+    was_training = model.training
+    model.eval()
     try:
         for i, batch in enumerate(batches[rank::world_size]):
             probe = i == 0 and internals is not None
@@ -213,10 +215,6 @@ def validation_loss(
 
 def _write_validation(output_dir, record, rows, dataset_id):
     destination = output_dir / f"validation-{record['update']:08d}"
-    destination.mkdir(exist_ok=True)
-    (destination / "documents.jsonl").write_text(
-        "".join(json.dumps(row) + "\n" for row in rows)
-    )
     summary = {
         "update": record["update"],
         "presented_documents": record["presented_documents"],
@@ -225,9 +223,13 @@ def _write_validation(output_dir, record, rows, dataset_id):
         "loss": record["val_loss"],
         "data_identity": dataset_id,
     }
-    temporary = destination / "summary.tmp"
-    temporary.write_text(json.dumps(summary, indent=2) + "\n")
-    temporary.replace(destination / "summary.json")
+    with TemporaryDirectory(dir=output_dir, prefix=".validation-") as staged:
+        staged = Path(staged)
+        (staged / "documents.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows)
+        )
+        (staged / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        staged.rename(destination)
 
 
 def save_training_checkpoint(
@@ -277,7 +279,16 @@ def save_training_checkpoint(
 
 
 def _open_history(path, update):
-    """Discard records after the checkpoint, including an interrupted final write."""
+    """Discard reports and history after the checkpoint."""
+    for report in path.parent.glob("validation-*"):
+        step = report.name.removeprefix("validation-")
+        if (
+            step.isascii()
+            and step.isdecimal()
+            and int(step) > update
+            and report.is_dir()
+        ):
+            shutil.rmtree(report)
     handle = path.open("a+", buffering=1)
     handle.seek(0)
     while True:
@@ -330,6 +341,8 @@ def train(
         documents, seed=config.seed, count=config.documents, max_document_tokens=cap
     )
     validation_indices = np.flatnonzero(documents.split == 1)
+    if validation_document_steps and not len(validation_indices):
+        raise ValueError("Document loss reporting requires validation documents")
     validation_budget = max(
         config.max_pack_tokens,
         int(documents.lengths[validation_indices].max())
@@ -562,7 +575,8 @@ def train(
                 "adamw_lr": optimizers[1].param_groups[0]["lr"],
             }
             if update in validation_document_steps or (
-                config.val_every
+                len(validation_indices)
+                and config.val_every
                 and (
                     update % config.val_every == 0
                     or presented_documents == target_documents

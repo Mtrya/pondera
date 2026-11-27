@@ -36,6 +36,7 @@ class Muon(torch.optim.Optimizer):
     def step(self, closure=None):
         loss = closure() if closure is not None else None
         for group in self.param_groups:
+            lr = group["lr"]
             for param in group["params"]:
                 if param.grad is None:
                     continue
@@ -53,11 +54,18 @@ class Muon(torch.optim.Optimizer):
                     # Hyperball Eq. (1): normalize the update, then project the
                     # resulting weight back to its initial Frobenius radius.
                     update.mul_(radius / update.norm().clamp_min(1e-30))
-                    param.add_(update, alpha=-group["lr"])
-                    param.mul_(radius / param.norm().clamp_min(1e-30))
+                    if lr == 1:
+                        # A unit step can cancel the matrix. Zero has no projection.
+                        candidate = param - update
+                        norm = candidate.norm()
+                        projected = candidate * (radius / norm.clamp_min(1e-30))
+                        param.copy_(torch.where(norm == 0, param, projected))
+                    else:
+                        param.add_(update, alpha=-lr)
+                        param.mul_(radius / param.norm().clamp_min(1e-30))
                 else:
                     scale = max(1, param.shape[-2] / param.shape[-1]) ** 0.5
-                    param.add_(update.to(param.dtype), alpha=-group["lr"] * scale)
+                    param.add_(update.to(param.dtype), alpha=-lr * scale)
         return loss
 
 

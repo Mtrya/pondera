@@ -82,6 +82,26 @@ class PuzzleMateTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_missing_reference_engine_writes_failed_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.pth"
+            save_constant_model(checkpoint)
+            roots = root / "roots.jsonl"
+            roots.write_text(json.dumps({"fen": FEN}) + "\n")
+            output = root / "evaluation"
+            with self.assertRaises(FileNotFoundError):
+                evaluate_checkpoint(
+                    checkpoint,
+                    output,
+                    EvalConfig(),
+                    roots=roots,
+                    engine=root / "missing-stockfish",
+                )
+            report = json.loads((output / "summary.json").read_text())
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["error"]["type"], "FileNotFoundError")
+
     def test_selection_is_invariant_to_input_order_duplicates_and_storage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

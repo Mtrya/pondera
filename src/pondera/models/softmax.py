@@ -103,6 +103,7 @@ def varlen_attention(
         is_causal
         and q.device.type == "npu"
         and q.dtype in (torch.float16, torch.bfloat16)
+        and q.shape[-1] <= 512
     ):
         if sequence_ends is None:
             sequence_ends = cu_seqlens[1:].tolist()
@@ -161,10 +162,14 @@ class CausalSelfAttention(nn.Module):
         return self.attend_projected_cached(q, k, v, cu_seqlens, cache)
 
     def attend_projected_cached(self, q, k, v, cu_seqlens, cache):
-        if cache is not None:
-            k = torch.cat([cache[0], k], dim=0)
-            v = torch.cat([cache[1], v], dim=0)
-        out = self.o(
-            varlen_attention(q, k, v, cu_seqlens, q.shape[0] == k.shape[0]).flatten(1)
-        )
+        if cache is None:
+            return self.attend_projected(q, k, v, self.prepare(cu_seqlens, q.device)), (
+                k,
+                v,
+            )
+        if q.shape[0] != 1:
+            raise ValueError("Cached softmax decoding consumes one new token")
+        k = torch.cat([cache[0], k], dim=0)
+        v = torch.cat([cache[1], v], dim=0)
+        out = self.o(varlen_attention(q, k, v, cu_seqlens, is_causal=False).flatten(1))
         return out, (k, v)
