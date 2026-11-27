@@ -1,4 +1,5 @@
 mod board;
+mod merge;
 mod pgn;
 
 use board::{Ply, Position, START};
@@ -244,6 +245,7 @@ impl Board {
 fn _rules(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Board>()?;
     module.add_class::<Move>()?;
+    module.add_class::<merge::MergeEncoder>()?;
     module.add(
         "IllegalMoveError",
         module.py().get_type::<IllegalMoveError>(),

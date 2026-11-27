@@ -19,7 +19,12 @@ import signal
 import statistics
 import time
 from collections import Counter, deque
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
 from contextlib import ExitStack, contextmanager
 from multiprocessing import get_context
 from multiprocessing.util import Finalize
@@ -600,6 +605,9 @@ class _RootCache:
 
     def _shard(self, index):
         return self.directory / f"shard-{index:06d}"
+
+    def has_checkpoints(self, index):
+        return self._shard(index).is_dir()
 
     def load(self, index, root):
         path = self._shard(index) / f"{self._key(root)}.pkl"
@@ -1672,7 +1680,8 @@ def _synthesize_groups(
     """Refill a bounded set of root searches across shard boundaries.
 
     Yields ``(index, group, records, failures)`` per group, where ``failures``
-    maps positions of uncollected roots to their last collection error. A
+    maps positions of uncollected roots to their last collection error.
+    Parallel workers leave their records on disk for the publisher. A
     group with failures is not publishable; its collected roots are
     checkpointed, so retrying it recollects only the missing roots.
     """
@@ -1682,8 +1691,13 @@ def _synthesize_groups(
             for index, group in groups:
                 records = [None] * len(group)
                 failures = {}
+                has_checkpoints = cache.has_checkpoints(index)
                 for position, root in enumerate(group):
-                    cached, capped, dropped = _cached_or_capped(cache, index, root)
+                    cached, capped, dropped = (
+                        _cached_or_capped(cache, index, root)
+                        if has_checkpoints
+                        else (None, None, False)
+                    )
                     if cached is not None:
                         records[position] = cached
                         continue
@@ -1732,8 +1746,13 @@ def _synthesize_groups(
     def missing_roots():
         for index, group in groups:
             active[index] = {"group": group, "remaining": len(group), "failures": {}}
+            has_checkpoints = cache.has_checkpoints(index)
             for position, root in enumerate(group):
-                cached, capped, dropped = _cached_or_capped(cache, index, root)
+                cached, capped, dropped = (
+                    _cached_or_capped(cache, index, root)
+                    if has_checkpoints
+                    else (None, None, False)
+                )
                 if cached is not None or capped is not None or dropped:
                     if capped is not None:
                         active[index]["failures"][position] = capped
@@ -1778,17 +1797,7 @@ def _synthesize_groups(
             while completed:
                 index = completed.popleft()
                 state = active.pop(index)
-                group, failures = state["group"], state["failures"]
-                records = []
-                if not failures:
-                    for root in group:
-                        record = cache.load(index, root)
-                        if record is None and cache.dropped(index, root) is None:
-                            raise CollectionError(
-                                f"Missing checkpoint for root {root['root_id']}"
-                            )
-                        records.append(record)
-                yield index, group, records, failures
+                yield index, state["group"], None, state["failures"]
             if not pending:
                 if item is exhausted:
                     break
@@ -2015,35 +2024,57 @@ def produce_shards(
                 run,
             )
 
-        if start_shard < stop:
-            for index, group, records, failures in synthesize(pending()):
-                if failures:
-                    deferred.append(index)
-                else:
+        def publish_cached(index, group):
+            records = []
+            for root in group:
+                record = cache.load(index, root)
+                if record is None and cache.dropped(index, root) is None:
+                    raise CollectionError(
+                        f"Missing checkpoint for root {root['root_id']}"
+                    )
+                records.append(record)
+            return _publish_shard(output_dir, index, group, records, shard_metadata)
+
+        # Loading checkpoints and compressing Parquet can otherwise starve
+        # the engine workers while the coordinator publishes a completed shard.
+        queued = deque()
+        with ThreadPoolExecutor(max_workers=1) as publisher:
+
+            def publish(index, group, records):
+                if records is not None:
                     register(
                         index,
                         *_publish_shard(
                             output_dir, index, group, records, shard_metadata
                         ),
                     )
-            if deferred:
-                for index, group, records, failures in synthesize(
-                    (index, group_for(index)) for index in deferred
-                ):
-                    if not failures:
-                        register(
-                            index,
-                            *_publish_shard(
-                                output_dir, index, group, records, shard_metadata
-                            ),
-                        )
-                        continue
-                    failed_count += len(failures)
-                    for position, error in failures.items():
-                        if len(examples) < 10:
-                            examples.append(
-                                f"shard {index:06d} root {group[position]['root_id']} ({error})"
-                            )
+                    return
+                while queued and (len(queued) >= 2 or queued[0][1].done()):
+                    previous, future = queued.popleft()
+                    register(previous, *future.result())
+                queued.append((index, publisher.submit(publish_cached, index, group)))
+
+            if start_shard < stop:
+                for index, group, records, failures in synthesize(pending()):
+                    if failures:
+                        deferred.append(index)
+                    else:
+                        publish(index, group, records)
+                if deferred:
+                    for index, group, records, failures in synthesize(
+                        (index, group_for(index)) for index in deferred
+                    ):
+                        if not failures:
+                            publish(index, group, records)
+                            continue
+                        failed_count += len(failures)
+                        for position, error in failures.items():
+                            if len(examples) < 10:
+                                examples.append(
+                                    f"shard {index:06d} root {group[position]['root_id']} ({error})"
+                                )
+            for index, future in queued:
+                register(index, *future.result())
 
         with _release_lock(output_dir):
             counts = progress.finalize()
